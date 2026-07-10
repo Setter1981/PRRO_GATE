@@ -123,53 +123,15 @@ const ENV_FN: &str = "PRRO_LIVE_DPS_FN";
 const ENV_JKS_PATH: &str = "PRRO_LIVE_DPS_JKS_PATH";
 /// JKS password (NEVER logged).
 const ENV_JKS_PASS: &str = "PRRO_LIVE_DPS_JKS_PASS";
-/// Smoke-9 only: back-date the offline documents (DocType=9 BEGIN + the offline
-/// SHIFT_OPEN + the offline SELL) by this many SECONDS, simulating a REAL
-/// offline period.  Default `0` = docs dated "now" (unchanged behavior).  The
-/// smoke drains near-instantly, so with `0` every offline doc carries the
-/// current second, which DPS intermittently rejects as at/ahead of its clock
-/// (`-8` on the drained BEGIN).  A real offline period dates docs minutes/hours
-/// in the past — set e.g. `600` to date them 10 minutes back and see whether the
-/// `-8` clears.  All three offline docs move together (their frozen `<TS>` and
-/// the drain envelope `date_time` still agree — both derive from the same
-/// back-dated `business_ts`).
+/// Smoke-9 only: optionally back-date BEGIN, SHIFT_OPEN, and SELL to simulate
+/// a real offline interval. Default `0` retains the current timestamp; a
+/// positive value changes the common business timestamp only, never the raw
+/// `<TS>` representation sent as `date_time`.
 const ENV_OFFLINE_BACKDATE_SEC: &str = "PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC";
-/// Recovery-probe knob (default OFF).  When `="1"`, the recovery tests DROP the
-/// held gRPC channel AFTER the chain-tip settle-poll and open a BRAND-NEW
-/// `GrpcDpsChannel::connect(...)` (fresh HTTP/2 connection) RIGHT BEFORE the
-/// recovery send.  Probes the hypothesis that DPS ties chain-validation state to
-/// the held connection: WebCheck opens a FRESH `Client` per attempt, we REUSE a
-/// single held `Channel` (grpc.rs) — a doc sent on a connection already used for
-/// the settle-poll `last_chk` reads may see a STALE per-connection chain view and
-/// draw `-8`.  When unset/OFF, behavior is byte-identical (single held channel).
+/// Recovery-probe knob (default OFF). When `="1"`, recovery probes reconnect
+/// immediately before their send. It is a diagnostic comparison only, not a
+/// production retry/recovery rule; OFF keeps the single held channel.
 const ENV_RECONNECT_BEFORE_SEND: &str = "PRRO_LIVE_DPS_RECONNECT_BEFORE_SEND";
-/// **Smoke-9 loop-drain knob** — when `="1"`, `live_smoke_9_offline_drain_mac_id`
-/// replaces its SINGLE post-`go_online` drain call with a LOOP that re-drives the
-/// scheduled drain across the DPS chain-settle window (mimicking production
-/// reconciliation ticks) until the drain FINALIZES: `[BEGIN, SHIFT_OPEN, SELL,
-/// END]` all ACK and the offline session closes (`Draining→Closed`).  OFF (unset
-/// / any other value) preserves the original single-shot B9 acceptance path
-/// byte-for-byte (one drain, terminal-state assert) so that assertion stays
-/// intact.  The loop exists because the drain-`-8` fix routes a transient `-8` on
-/// any doc to `DrainChainSettleRetry → ErrorRetryable` (bounded re-drive, NO RMR),
-/// so a SINGLE drain cannot reach all-ACK while DPS's chain has not settled — the
-/// held doc must re-drive across ticks until DPS accepts it.
-const ENV_LOOP_DRAIN: &str = "PRRO_LIVE_DPS_SMOKE_LOOP_DRAIN";
-/// **Smoke-9 loop-drain only** — number of drain re-drive iterations the
-/// loop-drain smoke performs before giving up.  Each iteration is one
-/// `drain_offline_backlog_scheduled` call (one production reconciliation tick).
-/// Default `16` — deliberately BELOW `MAX_DRAIN_CHAIN_SETTLE_ATTEMPTS` (18) so a
-/// legitimately-slow settle is not exhausted by the loop budget before DPS
-/// accepts (each re-attempt of a `DrainChainSettleRetry`-held doc consumes one
-/// `attempts_used`).  Env-overridable so the operator can widen/narrow the
-/// window against live DPS latency.
-const ENV_LOOP_ITERS: &str = "PRRO_LIVE_DPS_SMOKE_LOOP_ITERS";
-const DEFAULT_LOOP_ITERS: u32 = 16;
-/// **Smoke-9 loop-drain only** — seconds to sleep between drain re-drive
-/// iterations.  Default `20` → `16 × 20s ≈ 5 min` settle window.  Env-overridable
-/// so the operator can pace the loop to real DPS chain-settle latency.
-const ENV_LOOP_DELAY_SECS: &str = "PRRO_LIVE_DPS_SMOKE_LOOP_DELAY_SECS";
-const DEFAULT_LOOP_DELAY_SECS: u64 = 20;
 
 const DEFAULT_HOST: &str = "https://cabinet.tax.gov.ua:9443";
 const DEFAULT_FN: &str = "4000162280";
@@ -1093,8 +1055,10 @@ const LIVE_TN: &str = "13667753";
 const SHIFT_OPEN_PAYLOAD_JSON: &str = r#"{"opening_sum_kop":0}"#;
 
 /// Current UTC instant as an RFC-3339 string for `business_ts`.  Live docs
-/// need a fresh timestamp — `stage_sign` converts it to the Kyiv-local
-/// `<TS>` / wire `date_time`, and DPS rejects a stale receipt time.
+/// need a fresh timestamp. `stage_sign` converts it to Kyiv-local `<TS>`;
+/// offline/boundary envelopes carry those raw digits as `date_time`, while
+/// ordinary online documents keep the established Kyiv-local-as-epoch wire
+/// representation.
 fn iso_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -1109,31 +1073,6 @@ fn offline_backdate_secs() -> i64 {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(0)
-}
-
-/// Smoke-9 loop-drain gate: `true` iff `PRRO_LIVE_DPS_SMOKE_LOOP_DRAIN=1`.
-fn loop_drain_enabled() -> bool {
-    std::env::var(ENV_LOOP_DRAIN).as_deref() == Ok("1")
-}
-
-/// Loop-drain iteration budget (env `PRRO_LIVE_DPS_SMOKE_LOOP_ITERS`, default 16).
-/// A positive value; falls back to the default on absent/invalid/zero.
-fn loop_drain_iters() -> u32 {
-    std::env::var(ENV_LOOP_ITERS)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_LOOP_ITERS)
-}
-
-/// Loop-drain inter-tick sleep in seconds (env `PRRO_LIVE_DPS_SMOKE_LOOP_DELAY_SECS`,
-/// default 20).  Zero is allowed (back-to-back ticks) but the per-FN scheduled
-/// backoff will still gate re-drives after a Hold.
-fn loop_drain_delay_secs() -> u64 {
-    std::env::var(ENV_LOOP_DELAY_SECS)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_LOOP_DELAY_SECS)
 }
 
 /// `business_ts` for a smoke-9 OFFLINE document: `iso_now()` back-dated by
@@ -1168,23 +1107,6 @@ fn extract_ts_digits(bytes: &[u8]) -> Option<String> {
     let rest = &text[start..];
     let end = rest.find("</TS>")?;
     Some(rest[..end].to_string())
-}
-
-/// Decode a DPS "Kyiv-local-as-epoch" wire `date_time` (the value
-/// `stage_send::kyiv_local_epoch` emits) into a human-readable
-/// `yyyyMMddHHmmss`-shaped string, both as the RAW UTC decode of the epoch AND as
-/// the Kyiv-local wall clock the operator sees.  Because the wire epoch is Kyiv
-/// wall-clock digits re-interpreted as UTC, the UTC decode of that epoch is what
-/// SHOULD equal the signed `<TS>` byte-for-byte — a mismatch here vs `<TS>` is
-/// exactly what draws DPS `-8`.  Print-only.
-fn decode_epoch_utc_and_kyiv(epoch: i64) -> (String, String) {
-    use chrono::{DateTime, Utc};
-    use chrono_tz::Europe::Kiev;
-    let utc: DateTime<Utc> = DateTime::from_timestamp(epoch, 0)
-        .unwrap_or_else(|| panic!("epoch {epoch} out of range for a DateTime decode"));
-    let as_utc = utc.format("%Y%m%d%H%M%S").to_string();
-    let as_kyiv = utc.with_timezone(&Kiev).format("%Y%m%d%H%M%S").to_string();
-    (as_utc, as_kyiv)
 }
 
 /// Seed `fiscal_number_config` for the LIVE FN with the REAL taxpayer code.
@@ -2922,295 +2844,6 @@ async fn live_smoke_9_offline_drain_mac_id() {
         signing_ctx: &drain_signing_ctx,
         fn_sign: &drain_fn_sign,
     };
-
-    // ── Step 9-LOOP (opt-in `PRRO_LIVE_DPS_SMOKE_LOOP_DRAIN=1`) ─────────────
-    // A SINGLE drain cannot reach all-ACK when DPS's chain has not settled: the
-    // drain-`-8` fix routes a transient `-8` on ANY doc to `DrainChainSettleRetry
-    // → ErrorRetryable` (bounded re-drive, NO RMR), so the held doc must RE-DRIVE
-    // across ticks until DPS accepts it — exactly what production reconciliation
-    // does.  This loop re-drives `drain_offline_backlog_scheduled` (one call =
-    // one production tick) until the drain FINALIZES: the full [BEGIN, SHIFT_OPEN,
-    // SELL, END] backlog ACKs and the offline session closes (Draining→Closed).
-    // It PROVES the e2e now that a transient `-8` no longer wedges the shift.  The
-    // END is minted at drain-finalize (AFTER the 3 content docs ACK), so the SAME
-    // loop carries through until the END also drains → ACK and the session closes.
-    //
-    // Budget: DEFAULT 16 iters × 20s ≈ 5 min settle window, BELOW the
-    // `MAX_DRAIN_CHAIN_SETTLE_ATTEMPTS = 18` per-doc re-drive cap (each re-attempt
-    // of a held doc consumes one `attempts_used`), so a legit slow settle is not
-    // exhausted prematurely.  Both env-overridable (`PRRO_LIVE_DPS_SMOKE_LOOP_ITERS`
-    // / `PRRO_LIVE_DPS_SMOKE_LOOP_DELAY_SECS`).  `SkippedBackoff` is EXPECTED after
-    // a Hold (the scheduled entry applies per-FN exponential backoff, mimicking
-    // production) — it is printed and the loop continues, NOT a failure.
-    if loop_drain_enabled() {
-        // Accepted terminal doc states — SENT is the DPS-ACK CAS moment; KVT1/
-        // KVT2/ACK are the confirm ticks.
-        fn is_accepted_terminal(state: &str) -> bool {
-            matches!(state, "SENT" | "KVT1" | "KVT2" | "ACK")
-        }
-        // A per-doc failure that is NOT the transient chain-settle class (the ONLY
-        // class the loop is allowed to re-drive through).  Anything else — incl.
-        // `budget_exhausted` (settle-attempts cap hit → RMR), terminal rejects,
-        // etc. — is a hard FAIL for the loop.
-        fn is_terminal_failure_class(class: &str) -> bool {
-            class != "wire_routing_chain_settle_retry"
-        }
-
-        let max_iters = loop_drain_iters();
-        let delay = Duration::from_secs(loop_drain_delay_secs());
-        println!(
-            "\n--- LOOP-DRAIN (PRRO_LIVE_DPS_SMOKE_LOOP_DRAIN=1): re-drive across chain-settle \
-             window — max_iters={max_iters} delay={}s (~{} min budget; MAX_DRAIN_CHAIN_SETTLE_ATTEMPTS=18) ---",
-            delay.as_secs(),
-            (max_iters as u64 * delay.as_secs()) / 60,
-        );
-
-        let mut finalized_pass = false;
-        for iter in 1..=max_iters {
-            let drain_result = app
-                .drain_offline_backlog_scheduled(&fiscal_number, &drain_view)
-                .await;
-            let outcome = match drain_result {
-                Ok(prro::ScheduledDrainOutcome::Ran(summary)) => summary,
-                Ok(prro::ScheduledDrainOutcome::SkippedBackoff { next_eligible }) => {
-                    // EXPECTED: after a Hold the scheduled entry pushes a per-FN
-                    // exponential backoff window (production behavior).  Not a
-                    // failure — wait out the tick and re-drive.
-                    println!(
-                        "iter {iter}: outcome=SKIPPED_BACKOFF next_eligible={next_eligible:?} \
-                         — waiting {}s for the backoff window",
-                        delay.as_secs()
-                    );
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                Err(e) => panic!(
-                    "Smoke 9 LOOP FAIL (iter {iter}): drain_offline_backlog_scheduled returned \
-                     Err: {e:?}"
-                ),
-            };
-
-            // Snapshot the four backlog docs + the offline session state so the
-            // one-line summary + break decisions read from ground truth.
-            let docs = smoke9_docs_by_lnd(pool, &fiscal_number).await;
-            let session_state: Option<String> = sqlx::query_scalar(
-                "SELECT state FROM offline_sessions WHERE fiscal_number = ? \
-                 ORDER BY rowid DESC LIMIT 1",
-            )
-            .bind(&fiscal_number)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
-            let session_state = session_state.unwrap_or_else(|| "<none>".into());
-
-            // Compact per-doc `[TYPE=STATE, …]` (ordered by lnd) for the live line.
-            let states_str: String = docs
-                .iter()
-                .map(|(_, dt, st)| format!("{dt}={st}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            // Any per-doc failure this tick (class strings from `failure_class_for`).
-            let failures: Vec<String> = outcome
-                .per_doc_failures()
-                .iter()
-                .map(|(d, class)| format!("{}:{class}", hex_lower(d.as_bytes())))
-                .collect();
-
-            println!(
-                "iter {iter}: outcome={} finalized={} acked={} kvt1={} held_kvt1={} held_sent={} \
-                 er_queued={} failures={:?} states=[{states_str}] session={session_state}",
-                if outcome.finalized() {
-                    "FINALIZED"
-                } else {
-                    "PARTIAL"
-                },
-                outcome.finalized(),
-                outcome.advanced_to_ack(),
-                outcome.advanced_to_kvt1(),
-                outcome.held_at_kvt1(),
-                outcome.held_at_sent(),
-                outcome.er_redrive_queued(),
-                failures,
-            );
-
-            // ── FAIL breaks (RMR / abort / non-transient reject) ───────────
-            // (1) Any doc escalated to RequiresManualReconciliation — the drain-
-            //     `-8` fix must NEVER route a transient `-8` here.
-            if let Some((lnd, dt, _)) = docs
-                .iter()
-                .find(|(_, _, st)| st == "REQUIRES_MANUAL_RECONCILIATION")
-            {
-                panic!(
-                    "Smoke 9 LOOP FAIL (iter {iter}): doc ({dt}, lnd={lnd}) reached \
-                     REQUIRES_MANUAL_RECONCILIATION — the drain-`-8` fix must route a transient \
-                     `-8` to DrainChainSettleRetry/ErrorRetryable (bounded re-drive), NOT RMR. \
-                     states=[{states_str}] session={session_state}"
-                );
-            }
-            // (2) Offline session ABORTED — drain gave up.
-            if session_state == "ABORTED" {
-                panic!(
-                    "Smoke 9 LOOP FAIL (iter {iter}): offline session ABORTED — the drain gave up. \
-                     states=[{states_str}]"
-                );
-            }
-            // (3) Any per-doc failure that is NOT the transient chain-settle class
-            //     (e.g. `budget_exhausted` on settle-cap hit, or a terminal reject).
-            if let Some((doc_id_f, class)) = outcome
-                .per_doc_failures()
-                .iter()
-                .find(|(_, class)| is_terminal_failure_class(class))
-            {
-                panic!(
-                    "Smoke 9 LOOP FAIL (iter {iter}): per-doc drain failure class={class:?} \
-                     (document_id={}) is NOT the transient `wire_routing_chain_settle_retry` — the \
-                     drain hit a terminal/non-re-drivable failure (budget_exhausted ⇒ the 18-attempt \
-                     settle cap was reached, i.e. DPS never settled within budget). \
-                     states=[{states_str}] session={session_state}",
-                    hex_lower(doc_id_f.as_bytes())
-                );
-            }
-
-            // ── PASS break: drain FINALIZED + session CLOSED + all four ACK ─
-            let all_four_present_and_acked = {
-                let by_type = |want: &str| docs.iter().find(|(_, dt, _)| dt == want);
-                [
-                    "OFFLINE_SESSION_BEGIN",
-                    "SHIFT_OPEN",
-                    "SELL",
-                    "OFFLINE_SESSION_END",
-                ]
-                .iter()
-                .all(|want| {
-                    by_type(want)
-                        .map(|(_, _, st)| is_accepted_terminal(st))
-                        .unwrap_or(false)
-                })
-            };
-            if outcome.finalized() && session_state == "CLOSED" && all_four_present_and_acked {
-                println!(
-                    "iter {iter}: PASS — drain FINALIZED, offline session CLOSED (Draining→Closed), \
-                     [BEGIN, SHIFT_OPEN, SELL, END] all ACK/issued. states=[{states_str}]"
-                );
-                finalized_pass = true;
-                break;
-            }
-
-            // ── CONTINUE: still partial (only transient chain-settle holds) ─
-            if iter < max_iters {
-                println!(
-                    "iter {iter}: not yet final (session={session_state}) — sleeping {}s before \
-                     the next tick",
-                    delay.as_secs()
-                );
-                tokio::time::sleep(delay).await;
-            }
-        }
-
-        // ── FINAL loop assertions (ground truth after the loop) ────────────
-        let final_docs = smoke9_docs_by_lnd(pool, &fiscal_number).await;
-        let final_session: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM offline_sessions WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
-        )
-        .bind(&fiscal_number)
-        .fetch_optional(pool)
-        .await
-        .unwrap_or(None);
-        let final_session = final_session.unwrap_or_else(|| "<none>".into());
-        println!(
-            "\n--- LOOP-DRAIN FINAL STATE ---\n  docs={final_docs:?}\n  offline_session={final_session}"
-        );
-
-        assert!(
-            finalized_pass,
-            "Smoke 9 LOOP FAIL: the drain did NOT finalize within {max_iters} ticks \
-             (~{} min) — the backlog never fully ACKed / the session never closed. \
-             final docs={final_docs:?} session={final_session}",
-            (max_iters as u64 * delay.as_secs()) / 60
-        );
-        // No `-9` "not ID in MAC" may appear on ANY drained doc (the B9 fix must
-        // hold across every re-drive, not just the first).
-        let neg9_trace: Option<(Vec<u8>, i64)> = sqlx::query_as(
-            "SELECT tt.document_id, tt.server_status_code FROM transport_trace tt \
-             JOIN fiscal_documents fd ON fd.document_id = tt.document_id \
-             WHERE fd.fiscal_number = ? AND tt.server_status_code = -9 LIMIT 1",
-        )
-        .bind(&fiscal_number)
-        .fetch_optional(pool)
-        .await
-        .unwrap_or(None);
-        assert!(
-            neg9_trace.is_none(),
-            "B9 REGRESSION (loop): a drained doc drew DPS -9 \"not ID in MAC\" at some tick \
-             ({neg9_trace:?}) — the `<MAC ID>` must be accepted on every re-drive"
-        );
-        // Assert the FINAL shape: [BEGIN, SHIFT_OPEN, SELL, END] all accepted-
-        // terminal + issued (server_fiscal_no populated), offline session CLOSED,
-        // no RMR anywhere.
-        for want in [
-            "OFFLINE_SESSION_BEGIN",
-            "SHIFT_OPEN",
-            "SELL",
-            "OFFLINE_SESSION_END",
-        ] {
-            let row = final_docs
-                .iter()
-                .find(|(_, dt, _)| dt == want)
-                .unwrap_or_else(|| {
-                    panic!("Smoke 9 LOOP FAIL: no {want} row after finalize; docs={final_docs:?}")
-                });
-            assert!(
-                is_accepted_terminal(&row.2),
-                "Smoke 9 LOOP FAIL: {want} did not reach an accepted terminal \
-                 (state={}); docs={final_docs:?}",
-                row.2
-            );
-        }
-        let all_have_sfn: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? \
-             AND doc_type IN ('OFFLINE_SESSION_BEGIN','SHIFT_OPEN','SELL','OFFLINE_SESSION_END') \
-             AND server_fiscal_no IS NOT NULL",
-        )
-        .bind(&fiscal_number)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            all_have_sfn, 4,
-            "all four accepted drain docs must carry a server_fiscal_no (issued at DPS)"
-        );
-        assert!(
-            final_docs
-                .iter()
-                .all(|(_, _, st)| st != "REQUIRES_MANUAL_RECONCILIATION"),
-            "no doc may rest in REQUIRES_MANUAL_RECONCILIATION after a clean finalize; \
-             docs={final_docs:?}"
-        );
-        assert_eq!(
-            final_session, "CLOSED",
-            "the offline session must be CLOSED (Draining→Closed) after a finalized drain"
-        );
-
-        // Post-bracket: confirm DPS now reports an OPEN shift (offline SHIFT_OPEN
-        // drained) — the online-visible proof the full sequence landed.
-        if let Ok(s) = channel.status_rro(&fn_sign).await {
-            println!(
-                "  post statusRro: open_shift={} online={} last_signer={:?}",
-                s.open_shift, s.online, s.last_signer
-            );
-            assert!(
-                s.open_shift,
-                "after the offline SHIFT_OPEN drained, DPS must report an OPEN shift"
-            );
-        }
-        println!(
-            "\nSmoke 9 LOOP-DRAIN PASS: full [BEGIN, SHIFT_OPEN, SELL, END] → ACK e2e — drain \
-             FINALIZED across the chain-settle window (offline session CLOSED, shift OPEN on DPS, \
-             NO RMR, NO -9). Transient `-8` no longer wedges the shift (drain-`-8` fix)."
-        );
-        return;
-    }
-
     let drain_result = app
         .drain_offline_backlog_scheduled(&fiscal_number, &drain_view)
         .await;
@@ -3264,31 +2897,15 @@ async fn live_smoke_9_offline_drain_mac_id() {
 
     // ── Step 10a: DocType=9 BEGIN vs SELL DATE DIAGNOSTICS (-8 investigation) ─
     //
-    // The drain's FIRST doc is the DocType=9 OFFLINE_SESSION_BEGIN.  Live smoke 9
-    // saw DPS reject that BEGIN with `wire_status_code=-8` on ~6/7 runs (accepted
-    // 1/7).  WebCheck defines `-8` as "the signed XML `<TS>` date does not match
-    // the wire `Check.date`" (SubmitPtr.cs:397).  A prior source trace VERIFIED
-    // that our BEGIN's signed `<TS>` (`stage_sign::format_kyiv_local(business_ts)`)
-    // and its wire `date_time` (`stage_send::kyiv_local_epoch(business_ts)`) BOTH
-    // derive from the SAME stored `fiscal_documents.business_ts` and both truncate
-    // to the same whole second — so they CANNOT diverge in our source.  This block
-    // captures the EXACT wire bytes so the next `-8` run shows what DPS actually
-    // rejects: for BOTH the BEGIN (rejected) and the SELL (accepted), side by side,
-    // it prints (1) the stored `business_ts`, (2) the `<TS>` digits extracted from
-    // the stored SIGNED_XML eContent — the exact wall-clock DPS receives, (3) the
-    // envelope `date_time` computed via the SAME production path the drain uses
-    // (`recover_kyiv_local_epoch`, a byte-verbatim mirror of the private
-    // `stage_send::kyiv_local_epoch`), as raw epoch + UTC/Kyiv decode, (4) the
-    // current wall clock + DPS's own chain clock (the `<TS>` inside the latest
-    // `lastChk` check DPS returns — the closest thing the wire API exposes to
-    // "DPS's clock"), and (5) the BEGIN's chain tip (`previous_hash`) + `lnd`, in
-    // case `-8` correlates with chain state rather than date.  Print-only; no wire
-    // calls beyond the read-only `lastChk` already made above (`pre_ack`).
+    // WebCheck submits the signed raw 14-digit `<TS>` as `Check.date`.
+    // `stage_send` now does the same for offline documents and both boundary
+    // types. This diagnostic prints the stored timestamp, signed `<TS>`, and
+    // the raw wire date derived by that production rule; it performs no extra
+    // wire call beyond the existing pre-bracket `lastChk`.
     println!("\n--- DocType=9 BEGIN vs SELL DATE DIAGNOSTICS (-8 investigation) ---");
 
-    // A print-only helper: for one doc row, surface (business_ts, signed <TS>,
-    // envelope date_time via the production path).  `label` distinguishes BEGIN
-    // (rejected) from SELL (accepted) in the side-by-side output.
+    // A print-only helper: surface business_ts, signed `<TS>`, and the raw
+    // wire date. `label` distinguishes the rows in the side-by-side output.
     async fn print_date_triplet(pool: &SqlitePool, label: &str, doc: DocumentId) {
         // (1) stored business_ts — the single column BOTH the <TS> and the wire
         //     date_time derive from.
@@ -3323,22 +2940,14 @@ async fn live_smoke_9_offline_drain_mac_id() {
                 .and_then(|p| extract_ts_digits(&p)),
         };
         println!("  [{label}] signed <TS> (exact digits DPS reads): {signed_ts:?}");
-        // (3) the wire envelope date_time via the SAME production path the drain
-        //     uses (`recover_kyiv_local_epoch` ≡ `stage_send::kyiv_local_epoch`),
-        //     printed as raw epoch + its UTC/Kyiv decode.  On a clean run the UTC
-        //     decode of this epoch equals the signed <TS> above; a divergence here
-        //     is exactly what DPS rejects with -8.
+        // (3) offline/boundary docs send the raw 14-digit `<TS>` as date_time.
         match &business_ts {
             Some(bts) => {
-                let epoch = recover_kyiv_local_epoch(bts);
-                let (as_utc, as_kyiv) = decode_epoch_utc_and_kyiv(epoch);
+                let comp_date = recover_kyiv_ts_str(bts);
+                println!("  [{label}] wire date_time (raw-comp-date)={comp_date}");
                 println!(
-                    "  [{label}] wire date_time (kyiv_local_epoch): raw_epoch={epoch} \
-                     decode_utc={as_utc} decode_kyiv={as_kyiv}"
-                );
-                println!(
-                    "  [{label}] MATCH signed<TS>==decode_utc(date_time): {}",
-                    signed_ts.as_deref() == Some(as_utc.as_str())
+                    "  [{label}] MATCH signed<TS>==wire date_time: {}",
+                    signed_ts.as_deref() == Some(comp_date.as_str())
                 );
             }
             None => {
@@ -4023,13 +3632,14 @@ async fn live_recover_close_dangling_offline_session() {
     // (NO `ID=`, NO offline code) via a 4-param `SubmitCheck(..., 3, num)` with
     // NO `id_offline`.  There is NO offline code to fetch — the drain-close needs
     // none.  This is the ROOT-CAUSE fix for the `-5 "no id offline"` reject our
-    // OFFLINE-shaped END drew.  One `business_ts` instant drives BOTH the signed
-    // `<TS>` (ts_str) and the wire `date_time` (fake-epoch), exactly as
-    // production stage_sign + stage_send do; `<MAC>` chains off the SETTLED tip.
+    // OFFLINE-shaped END drew. The signed `<TS>` and raw wire `date_time` must
+    // be identical for this boundary; `<MAC>` chains off the confirmed tip.
     println!("\n--- BUILD DocType=10 END (<C T='110'>, WebCheck-EXACT bare-<MAC> online form) ---");
     let business_ts = iso_now();
     let ts_str = recover_kyiv_ts_str(&business_ts);
-    let date_time = recover_kyiv_local_epoch(&business_ts);
+    let date_time = ts_str
+        .parse::<i64>()
+        .expect("Kyiv END <TS> must be a decimal comp-date");
 
     let end_xml_bytes =
         build_webcheck_exact_end_xml(&fiscal_number, tn, recover_di, &ts_str, &settled_tip_hex);
@@ -4041,7 +3651,7 @@ async fn live_recover_close_dangling_offline_session() {
         end_xml_bytes.len(),
         String::from_utf8_lossy(&end_xml_bytes)
     );
-    println!("  END <TS>={ts_str}  wire date_time(fake-epoch)={date_time}");
+    println!("  END <TS>={ts_str}  wire date_time(raw-comp-date)={date_time}");
     println!("  END <MAC>=bare (NO ID=)  wire id_offline=<empty>  typCheck=ServiceChk(3)");
 
     // ── Step 4: sign with the LIVE key (ATTACHED CAdES-BES) ────────────────
@@ -4101,7 +3711,7 @@ async fn live_recover_close_dangling_offline_session() {
     // = DI, id_offline = EMPTY (WebCheck's `CloseOfflineDoc` uses a 4-param
     // `SubmitCheck(..., 3, num)` with NO id_offline — the drain-close is an
     // ONLINE issuance, so DPS interprets empty id_offline as "online"),
-    // date_time = fake-epoch.
+    // date_time = the raw signed `<TS>` comp-date.
     println!("\n--- SEND END → live DPS ---");
     let end_envelope = CheckEnvelope {
         rro_fn: fiscal_number.clone(),
@@ -5193,7 +4803,9 @@ async fn live_probe_webcheck_exact_begin() {
     println!("  BEGIN <MAC ID> previous_hash (post-T=112 tip) = {post_t112_tip_hex}");
     let business_ts = iso_now();
     let ts_str = recover_kyiv_ts_str(&business_ts);
-    let date_time = recover_kyiv_local_epoch(&business_ts);
+    let date_time = ts_str
+        .parse::<i64>()
+        .expect("Kyiv BEGIN <TS> must be a decimal comp-date");
 
     let begin_xml_bytes = build_webcheck_exact_begin_xml(
         &fiscal_number,
@@ -5214,7 +4826,7 @@ async fn live_probe_webcheck_exact_begin() {
         begin_xml_bytes.len(),
         String::from_utf8_lossy(&begin_xml_bytes)
     );
-    println!("  BEGIN <TS>={ts_str}  wire date_time(fake-epoch)={date_time}");
+    println!("  BEGIN <TS>={ts_str}  wire date_time(raw-comp-date)={date_time}");
     println!("  BEGIN <MAC ID='{code}'>  wire id_offline={code}  typCheck=ServiceChk(3)");
     // Print OUR production-form BEGIN bytes for the record (the byte-diff target).
     println!(
@@ -5252,7 +4864,7 @@ async fn live_probe_webcheck_exact_begin() {
 
     // ── Step 6: send the BEGIN + capture the FULL DPS response ─────────────
     // OFFLINE-shaped BEGIN: typCheck=ServiceChk(3), non-empty wire id_offline
-    // (the offline code), date_time = fake-epoch matching the signed `<TS>`.
+    // (the offline code), date_time = raw signed `<TS>` digits.
     println!("\n--- SEND BEGIN → live DPS ---");
     let begin_envelope = CheckEnvelope {
         rro_fn: fiscal_number.clone(),

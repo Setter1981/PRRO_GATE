@@ -29,7 +29,7 @@
 //! Tests (10):
 //!
 //!   1. `c4_happy_path_two_docs_advance_to_ack_via_w12` (renamed)
-//!   2. `c4_routed_terminal_reject_records_wire_routing_failure_class`
+//!   2. `c4_offline_minus_8_is_terminal_and_escalates_manual`
 //!   3. `c4_signer_refused_records_signer_refused_class_and_escalates_manual`
 //!   4. `c4_processes_backlog_in_lnd_asc_order`
 //!   5. `c4_accounting_advanced_plus_failures_equals_backlog`
@@ -481,10 +481,10 @@ async fn c4_happy_path_two_docs_advance_to_ack_via_w12() {
     assert_eq!(advanced_payloads[1]["attempt_no"], 1);
 }
 
-// ─── Test 2: routed terminal reject ──────────────────────────────────
+// ─── Test 2: offline `-8` is terminal ─────────────────────────────────
 
 #[tokio::test]
-async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
+async fn c4_offline_minus_8_is_terminal_and_escalates_manual() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool, CASHIER_OK).await;
@@ -494,15 +494,13 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     // node_state.current_shift_id, so backfill it after seeding the shift.
     set_node_current_shift(&pool, shift_id).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    let _doc =
+    let doc =
         seed_complete_offline_local_ack(&pool, 1, 100, session_id, shift_id, CASHIER_OK).await;
 
-    // Authorization{DocumentReject} → RetryClass::TerminalReject →
-    // FailureClass::WireRoutingTerminalReject.
-    let carriers = carriers_with_responses(vec![Err(DpsError::Authorization {
-        code: -1,
-        kind: AuthorizationKind::DocumentReject,
-        message: "signature_invalid".into(),
+    // ERROR_XML_DATE (-8) is a terminal wire-format rejection, not a retry.
+    let carriers = carriers_with_responses(vec![Err(DpsError::Server {
+        code: -8,
+        message: "ERROR_XML_DATE".into(),
     })]);
     let view = view_for(&carriers);
 
@@ -517,7 +515,7 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     assert_eq!(
         summary.per_doc_failures()[0].1,
         "wire_routing_terminal_reject",
-        "Authorization{{DocumentReject}} must map via RetryClass::TerminalReject"
+        "offline -8 must map via RetryClass::TerminalReject"
     );
 
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await, 0);
@@ -529,6 +527,27 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
         "wire_routing_terminal_reject"
     );
     assert_eq!(failed_payloads[0]["retry_class"], "TerminalReject");
+
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REJECTED",
+        "terminal -8 must not remain retryable"
+    );
+    assert_eq!(
+        carriers.dps.call_count(),
+        1,
+        "-8 must perform exactly one send, never a re-drive"
+    );
+    let trace_code: Option<i64> = sqlx::query_scalar(
+        "SELECT server_status_code FROM transport_trace \
+         WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
+    )
+    .bind(doc)
+    .fetch_optional(&pool)
+    .await
+    .unwrap()
+    .flatten();
+    assert_eq!(trace_code, Some(-8));
 
     // Strict-sequential: terminal reject HALTS + escalates the FN shift to
     // RequiresManualReconciliation even on a plain Opened shift (edge 15), and

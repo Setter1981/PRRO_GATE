@@ -101,20 +101,10 @@ pub enum RetryClass {
     /// not auto-retried.  Routed via ErrorRetryable →
     /// RequiresManualReconciliation chain (W9 step).
     OperatorEscalation,
-    /// B10 offline drain transient `-8` (ERROR_XML_DATE) chain-settle
-    /// latency.  Applies ONLY to an **offline-origin** `-8` observed on the
-    /// backlog drain: DPS `lastChk` (read model) surfaces a tip BEFORE its
-    /// chain-validation (write model) will accept that tip as a valid
-    /// `previous_hash` for the next doc, so a byte-identical form ACCEPTS
-    /// after a wait (only TIME changed).  Routed to `ErrorRetryable` (a
-    /// forward edge) + re-driven under a DEDICATED bounded budget (see
-    /// `MAX_DRAIN_CHAIN_SETTLE_ATTEMPTS`, WebCheck-scale: the common settle
-    /// clears in seconds) → RMR on exhaustion (a genuinely-stuck doc must not
-    /// re-drive forever).  Distinct from `TransientRetry` (transport / `-3`)
-    /// so its budget is independent of the small boot budget
-    /// (`MAX_BOOT_ATTEMPTS = 5`).  An **online** `-8` is a genuine
-    /// builder/adapter format bug and stays terminal (`TerminalReject`) —
-    /// there is no online chain-settle race.
+    /// Historical B10 tag retained solely to decode rows written by the
+    /// withdrawn `-8` chain-settle experiment.  No current routing emits it.
+    /// Reconciliation treats it as manual-only, never as permission to
+    /// re-send the persisted document.
     DrainChainSettleRetry,
 }
 
@@ -183,12 +173,6 @@ pub enum AuditEvent {
     /// Transient retry: Transport / Server-3.  `RetryClass::TransientRetry`;
     /// doc routes to ErrorRetryable for re-drive under Pattern B.
     StageSendTransientRetry,
-    /// B10 offline drain transient `-8` chain-settle latency.
-    /// `RetryClass::DrainChainSettleRetry`; offline-origin doc routes to
-    /// ErrorRetryable for bounded re-drive.  Distinct wire string so
-    /// operators can grep chain-settle re-drives apart from generic
-    /// transient retries and from terminal XML rejects.
-    StageSendTransientChainSettle,
     /// Terminal reject: Authorization{DocumentReject -1}, Server{-2
     /// non-shift, -5, -7..-10, -15 non-shift, -16}.
     StageSendRejected,
@@ -234,7 +218,6 @@ impl AuditEvent {
         match self {
             Self::StageSendResult => "STAGE_SEND_RESULT",
             Self::StageSendTransientRetry => "STAGE_SEND_TRANSIENT_RETRY",
-            Self::StageSendTransientChainSettle => "STAGE_SEND_TRANSIENT_CHAIN_SETTLE",
             Self::StageSendRejected => "STAGE_SEND_REJECTED",
             Self::StageSendFnNotRegistered => "STAGE_SEND_FN_NOT_REGISTERED",
             Self::StageSendWrapperBug => "STAGE_SEND_WRAPPER_BUG",
@@ -280,13 +263,13 @@ pub struct MacRecoveryHint {
 pub fn route_send_result(
     r: Result<CheckAck, DpsError>,
     doc_type: DocType,
-    is_offline_origin: bool,
+    is_live_send: bool,
 ) -> WireDecision {
     match r {
         Ok(ack) => WireDecision::Sent {
             server_fiscal_no: ack.id,
         },
-        Err(err) => WireDecision::Routed(route_dps_error(&err, doc_type, is_offline_origin)),
+        Err(err) => WireDecision::Routed(route_dps_error(&err, doc_type, is_live_send)),
     }
 }
 
@@ -298,21 +281,12 @@ pub fn route_send_result(
 /// `Server { code: i32 }` integer dispatch carries a fail-closed `_`
 /// arm (since `i32` isn't an enum).
 ///
-/// **`is_offline_origin` semantics (B10 drain transient `-8`):** the doc's
-/// offline-origin bit (`offline_fiscal_no.is_some()`), threaded from
-/// `stage_send::run`.  It changes routing for EXACTLY ONE code: an
-/// offline-origin `-8` is a transient chain-settle latency
-/// (`DrainChainSettleRetry` → `ErrorRetryable`), while an online `-8` (and
-/// every other code in every case) is byte-unchanged.  For online issuance
-/// `stage_send` passes `false`, so the online contract is identical to the
-/// pre-B10 routing.  (This slot was previously the inert `is_live_send`
-/// W9-reserved forward-compat param; W9 reconciliation never diverged on it,
-/// so B10 repurposes it as the offline-origin discriminator.)
-pub fn route_dps_error(
-    err: &DpsError,
-    doc_type: DocType,
-    is_offline_origin: bool,
-) -> RoutingDecision {
+/// **`is_live_send` semantics:** W10 implements ONLY `is_live_send=true`.
+/// `is_live_send=false` is RESERVED for W9 (freeze §3.5); the parameter
+/// is threaded through for forward-compat but does not currently change
+/// the routing.  Calling with `false` in W10 yields a routing decision
+/// whose contract has NOT been audited and may change without notice.
+pub fn route_dps_error(err: &DpsError, doc_type: DocType, is_live_send: bool) -> RoutingDecision {
     match err {
         DpsError::Transport(_) => RoutingDecision {
             target_state: DocState::ErrorRetryable,
@@ -357,10 +331,9 @@ pub fn route_dps_error(
             mac_recovery_hint: None,
         },
         DpsError::Server { code, message } => {
-            // Thread the offline-origin bit through to the server-code
-            // sub-table: it flips ONLY the offline-origin `-8` arm (B10
-            // chain-settle transient); all other codes are unchanged.
-            route_server_code(*code, message, doc_type, is_offline_origin)
+            // F1 close: thread is_live_send through forward-compat
+            // for W9, even though W10 body doesn't differentiate.
+            route_server_code(*code, message, doc_type, is_live_send)
         }
         DpsError::NotFound | DpsError::QueryNotSupported(_) => RoutingDecision {
             // B2 close: live send_chk should never produce these
@@ -402,32 +375,22 @@ pub fn route_dps_error(
 /// `WrapperBug`** (`i32` is not an enum, so a fail-closed `_` arm is
 /// the only way to be exhaustive).
 ///
-/// **`is_offline_origin` (B10):** flips EXACTLY ONE arm — an offline-origin
-/// `-8` is a transient chain-settle latency routed to `ErrorRetryable`
-/// (`DrainChainSettleRetry`).  Every other code, and an online `-8`, is
-/// byte-unchanged.
+/// F1 close: `is_live_send` is threaded through the signature for
+/// forward-compat with W9.  W10 body does NOT branch on it (FALSE
+/// branch RESERVED per freeze §3.5); W9 will introduce reconciliation-
+/// side overrides without forcing a signature change.
+///
+/// **W9 follow-up:** drop the underscore prefix on `_is_live_send`
+/// when the FALSE branch lands; F2 pin test
+/// (`is_live_send_false_currently_mirrors_true_w10_reserves_for_w9`)
+/// will fail when divergence is introduced and must be UPDATED, not
+/// deleted, to encode the new W9 contract.
 fn route_server_code(
     code: i32,
     message: &str,
     doc_type: DocType,
-    is_offline_origin: bool,
+    _is_live_send: bool,
 ) -> RoutingDecision {
-    // B10 drain transient `-8` (chain-settle): an OFFLINE-ORIGIN `-8` is a
-    // DPS read/write-model settle race, not a format bug — route it to a
-    // retryable forward edge (ErrorRetryable) under a dedicated bounded
-    // budget so a mere settle latency never wedges the shift into RMR.  An
-    // ONLINE `-8` falls through to the terminal XML arm below (unchanged).
-    if code == -8 && is_offline_origin {
-        return RoutingDecision {
-            target_state: DocState::ErrorRetryable,
-            retry_class: RetryClass::DrainChainSettleRetry,
-            audit_event: AuditEvent::StageSendTransientChainSettle,
-            audit_severity: Severity::Warning,
-            node_mode_flip: None,
-            probe_hint: None,
-            mac_recovery_hint: None,
-        };
-    }
     match code {
         -2 => {
             // ERROR_CHECK.  W0-3 §2.1 row -2 (post-R-W10-F3 amendment):
@@ -829,12 +792,9 @@ mod tests {
 
     #[test]
     fn fixture_16_server_minus_7_to_minus_10_xml_class_routes_to_terminal() {
-        // Parametrised: ONLINE (is_offline_origin=false) XML-class errors all
-        // route terminal — including `-8` (a genuine online format bug, no
-        // chain-settle race exists online).  The offline-origin `-8`
-        // divergence is pinned by `pin1_offline_origin_minus_8_*` above.
+        // Parametrised: XML-class errors all route the same way.
         for code in [-7, -8, -9, -10] {
-            let d = route_server_code(code, "ERROR_XML_*", DocType::Sell, false);
+            let d = route_server_code(code, "ERROR_XML_*", DocType::Sell, true);
             assert_eq!(d.target_state, DocState::Rejected, "code {code}");
             assert_eq!(d.retry_class, RetryClass::TerminalReject, "code {code}");
             assert_eq!(d.audit_event, AuditEvent::StageSendRejected, "code {code}");
@@ -1009,18 +969,22 @@ mod tests {
         );
     }
 
-    // ─── B10: is_offline_origin diverges ONLY on `-8` ───────────────
+    // ─── F2 close: is_live_send forward-compat pin ──────────────────
 
     #[test]
-    fn is_offline_origin_mirrors_online_for_every_case_except_minus_8() {
-        // B10 successor to the former `is_live_send_*_mirrors_*` pin (the
-        // slot was the inert W9-reserved forward-compat param; W9 never
-        // diverged on it, so B10 repurposed it as the offline-origin
-        // discriminator).  Contract PIN: offline-origin (`true`) and online
-        // (`false`) routing are IDENTICAL for every DpsError case EXCEPT an
-        // offline-origin `-8` (the chain-settle transient).  This guards
-        // against accidental over-broadening of the routing split.
-        let non_minus_8: Vec<DpsError> = vec![
+    fn is_live_send_false_currently_mirrors_true_w10_reserves_for_w9() {
+        // F2 close (W10.1 review): the `is_live_send` parameter is
+        // threaded through `route_dps_error` and `route_server_code`
+        // for forward-compat with W9 reconciliation.  W10 body does
+        // NOT branch on it (per freeze §3.5: `false` branch RESERVED).
+        // This test PINS that contract: as long as W10 is on its own,
+        // both `true` and `false` must yield identical decisions for
+        // the full 8 DpsError variants × representative server codes.
+        //
+        // When W9 lands and starts diverging routing on `false`, the
+        // freeze §3.5 STABILITY NOTE will be lifted and this pin test
+        // will be UPDATED (not deleted) to encode the new contract.
+        let cases: Vec<DpsError> = vec![
             DpsError::Transport("TLS".into()),
             DpsError::Authorization {
                 code: -1,
@@ -1048,23 +1012,6 @@ mod tests {
                 code: -3,
                 message: "ERROR_SAVE".into(),
             },
-            // Sibling XML-class codes MUST stay identical (only -8 diverges).
-            DpsError::Server {
-                code: -5,
-                message: "ERROR_TYPE".into(),
-            },
-            DpsError::Server {
-                code: -7,
-                message: "ERROR_XML".into(),
-            },
-            DpsError::Server {
-                code: -9,
-                message: "ERROR_XML_CHK".into(),
-            },
-            DpsError::Server {
-                code: -10,
-                message: "ERROR_XML_ZREPORT".into(),
-            },
             DpsError::Server {
                 code: -11,
                 message: "ERROR_OFFLINE_168".into(),
@@ -1082,52 +1029,17 @@ mod tests {
                 message: "unknown".into(),
             },
         ];
-        for err in &non_minus_8 {
+        for err in &cases {
             for dt in [DocType::Sell, DocType::ShiftClose, DocType::ZReport] {
-                let offline = route_dps_error(err, dt, /* is_offline_origin */ true);
-                let online = route_dps_error(err, dt, /* is_offline_origin */ false);
+                let live = route_dps_error(err, dt, true);
+                let reserved = route_dps_error(err, dt, false);
                 assert_eq!(
-                    offline, online,
-                    "offline-origin must mirror online for every case except -8; \
-                     err={err:?}, doc_type={dt:?}"
+                    live, reserved,
+                    "is_live_send=false must currently mirror is_live_send=true \
+                     in W10 (freeze §3.5 RESERVED); err={err:?}, doc_type={dt:?}"
                 );
             }
         }
-
-        // `-8` is the SOLE divergence: offline-origin retryable vs online terminal.
-        let minus_8 = DpsError::Server {
-            code: -8,
-            message: "ERROR_XML_DATE".into(),
-        };
-        let offline_8 = route_dps_error(&minus_8, DocType::Sell, true);
-        let online_8 = route_dps_error(&minus_8, DocType::Sell, false);
-        assert_ne!(
-            offline_8, online_8,
-            "-8 MUST diverge on offline-origin (chain-settle transient vs terminal format bug)"
-        );
-        assert_eq!(offline_8.retry_class, RetryClass::DrainChainSettleRetry);
-        assert_eq!(online_8.retry_class, RetryClass::TerminalReject);
-    }
-
-    // ─── 🦷 TEETH (pin #8) ──────────────────────────────────────────
-    //
-    // Revert the routing split (delete the `if code == -8 && is_offline_origin`
-    // early-return in `route_server_code`) and this pin REDs: an offline-origin
-    // `-8` falls back into the terminal `-5|-7|-8|-9|-10` arm → `TerminalReject`
-    // / `Rejected`, which is exactly the wedge-the-shift-into-RMR bug.  The
-    // integration `pin1_offline_drain_minus_8_does_not_escalate_to_manual` is
-    // the end-to-end teeth (shift escalates on revert).
-    #[test]
-    fn teeth_offline_minus_8_split_is_load_bearing() {
-        let d = route_server_code(
-            -8,
-            "ERROR_XML_DATE",
-            DocType::Sell,
-            /* is_offline_origin */ true,
-        );
-        // If the split is reverted these two flip to Rejected / TerminalReject.
-        assert_eq!(d.target_state, DocState::ErrorRetryable);
-        assert_eq!(d.retry_class, RetryClass::DrainChainSettleRetry);
     }
 
     #[test]
@@ -1210,125 +1122,13 @@ mod tests {
     #[test]
     fn mac_recovery_class_carries_hint_with_raw_message() {
         let msg = "store ABCDEF0123456789...";
-        let d = route_server_code(-12, msg, DocType::Sell, false);
+        let d = route_server_code(-12, msg, DocType::Sell, true);
         assert_eq!(d.retry_class, RetryClass::MacRecovery);
         assert_eq!(
             d.mac_recovery_hint
                 .as_ref()
                 .map(|h| h.raw_error_message.as_str()),
             Some(msg)
-        );
-    }
-
-    // ─── B10 drain transient `-8` (chain-settle) routing split ──────────
-    //
-    // Root cause (live-verified): the offline backlog drain intermittently
-    // draws DPS `-8` (ERROR_XML_DATE) on a doc that chains off a
-    // just-accepted predecessor.  This is TRANSIENT chain-settle latency
-    // (DPS `lastChk` read-model surfaces a tip BEFORE its write-model will
-    // accept that tip as a valid `previous_hash`), NOT a format error.  Old
-    // routing lumped `-8` into the terminal `-5 | -7 | -8 | -9 | -10` arm →
-    // the shift wedged into RequiresManualReconciliation on a mere settle
-    // latency.  Fix = Seam A1 forward-only: an OFFLINE-ORIGIN `-8` routes to
-    // a retryable class so the doc goes `Sending → ErrorRetryable` and is
-    // re-driven under a bounded budget → RMR only on exhaustion.
-
-    #[test]
-    fn pin1_offline_origin_minus_8_routes_to_error_retryable_not_rejected() {
-        // Core RED: an OFFLINE-ORIGIN `-8` must NOT terminalise to Rejected.
-        // It routes forward to ErrorRetryable with the dedicated
-        // DrainChainSettleRetry class + its own audit event.
-        let d = route_server_code(
-            -8,
-            "ERROR_XML_DATE",
-            DocType::Sell,
-            /* is_offline_origin */ true,
-        );
-        assert_eq!(
-            d.target_state,
-            DocState::ErrorRetryable,
-            "offline-origin -8 must go Sending->ErrorRetryable (forward-only), never Rejected"
-        );
-        assert_eq!(d.retry_class, RetryClass::DrainChainSettleRetry);
-        assert_eq!(d.audit_event, AuditEvent::StageSendTransientChainSettle);
-        assert_eq!(d.audit_severity, Severity::Warning);
-        assert!(d.node_mode_flip.is_none());
-        assert!(d.probe_hint.is_none());
-        assert!(d.mac_recovery_hint.is_none());
-    }
-
-    #[test]
-    fn pin2_online_minus_8_still_terminal_no_leakage() {
-        // No leakage: an ONLINE (non-offline-origin) `-8` stays exactly as
-        // before — terminal Rejected, TerminalReject, CRITICAL.  An online
-        // `-8` IS a genuine builder/adapter format bug that must be fixed in
-        // code (there is no offline chain-settle race online).
-        let d = route_server_code(
-            -8,
-            "ERROR_XML_DATE",
-            DocType::Sell,
-            /* is_offline_origin */ false,
-        );
-        assert_eq!(d.target_state, DocState::Rejected);
-        assert_eq!(d.retry_class, RetryClass::TerminalReject);
-        assert_eq!(d.audit_event, AuditEvent::StageSendRejected);
-        assert_eq!(d.audit_severity, Severity::Critical);
-    }
-
-    #[test]
-    fn pin3_offline_origin_other_xml_codes_still_terminal() {
-        // Narrow scope: only `-8` is the chain-settle transient.  The
-        // siblings `-5 / -7 / -9 / -10` on an offline-origin doc stay
-        // terminal Rejected — they are true format/type errors, not settle
-        // latency.
-        for code in [-5, -7, -9, -10] {
-            let d = route_server_code(
-                code,
-                "ERROR_XML_*",
-                DocType::Sell,
-                /* is_offline_origin */ true,
-            );
-            assert_eq!(
-                d.target_state,
-                DocState::Rejected,
-                "offline-origin {code} must stay terminal Rejected (only -8 is transient)"
-            );
-            assert_eq!(d.retry_class, RetryClass::TerminalReject, "code {code}");
-            assert_eq!(d.audit_event, AuditEvent::StageSendRejected, "code {code}");
-        }
-    }
-
-    #[test]
-    fn pin3b_offline_origin_minus_11_still_terminal_with_node_block() {
-        // Guard against over-broadening: -11 (ERROR_OFFLINE_168) on an
-        // offline-origin doc still terminalises AND flips node to BLOCKED —
-        // the 168h cap is a hard legal stop, never a re-drive.
-        let d = route_server_code(
-            -11,
-            "ERROR_OFFLINE_168",
-            DocType::Sell,
-            /* is_offline_origin */ true,
-        );
-        assert_eq!(d.target_state, DocState::Rejected);
-        assert_eq!(d.retry_class, RetryClass::TerminalReject);
-        assert_eq!(d.node_mode_flip, Some(NodeMode::Blocked));
-    }
-
-    #[test]
-    fn drain_chain_settle_retry_class_wire_string_roundtrips() {
-        // The new class is persisted to `transport_trace.retry_class` (TEXT)
-        // and read back on the next drain tick — pin the wire contract.
-        assert_eq!(
-            RetryClass::DrainChainSettleRetry.as_str(),
-            "DrainChainSettleRetry"
-        );
-        assert_eq!(
-            RetryClass::from_wire_str("DrainChainSettleRetry"),
-            Some(RetryClass::DrainChainSettleRetry)
-        );
-        assert_eq!(
-            AuditEvent::StageSendTransientChainSettle.as_str(),
-            "STAGE_SEND_TRANSIENT_CHAIN_SETTLE"
         );
     }
 }
