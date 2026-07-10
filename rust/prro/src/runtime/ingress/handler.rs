@@ -144,7 +144,10 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // no fiscal commitment → 422, carried by ShiftGuardRefused.
         | "SIGNER_CASHIER_MISMATCH"
         // L1 INV-21 — RETURN would drive cash below zero; pre-inbox, row-less.
-        | "CASH_INSUFFICIENT" => 422,
+        | "CASH_INSUFFICIENT"
+        // HOLE 2 — in-lease re-check (closes the TOCTOU after concurrent RETURNs).
+        // Same 422 class as CASH_INSUFFICIENT: the RETURN is refused fail-closed.
+        | "CASH_INSUFFICIENT_IN_LEASE" => 422,
         "INVALID_CASHIER_ID" | "MALFORMED_JSON" => 400,
         // Adapter-shell codes (server.rs `adapter_error`) carry their own
         // hard-coded status; listed here so the map stays TOTAL over the

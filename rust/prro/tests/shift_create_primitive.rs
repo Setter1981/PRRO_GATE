@@ -96,7 +96,7 @@ async fn create_shift_tx_from_closed_dual_writes_shifts_and_projection() {
     let shift_id = ShiftId::new();
 
     with_immediate(&pool, move |tx| {
-        Box::pin(async move { svc::create_shift_tx(tx, FN, shift_id, "ONLINE", CASHIER).await })
+        Box::pin(async move { svc::create_shift_tx(tx, FN, shift_id, "ONLINE", CASHIER, 0).await })
     })
     .await
     .unwrap();
@@ -126,7 +126,7 @@ async fn create_shift_tx_refuses_and_rolls_back_when_not_closed() {
     let shift_id = ShiftId::new();
 
     let res = with_immediate(&pool, move |tx| {
-        Box::pin(async move { svc::create_shift_tx(tx, FN, shift_id, "ONLINE", CASHIER).await })
+        Box::pin(async move { svc::create_shift_tx(tx, FN, shift_id, "ONLINE", CASHIER, 0).await })
     })
     .await;
 

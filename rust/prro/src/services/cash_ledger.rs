@@ -41,6 +41,7 @@
 //! write-tx.
 
 use crate::db::models::ids::ShiftId;
+use crate::db::tx::WriteTxConn;
 use sqlx::SqlitePool;
 
 /// Derive cash-on-hand from the opening anchor and per-shift cash totals.
@@ -109,6 +110,59 @@ pub async fn aggregate_shift_cash(
 
     Ok((cash_sell, cash_return))
 }
+
+/// Tx-based variant of [`aggregate_shift_cash`] — runs INSIDE a `with_immediate`
+/// envelope, reading from the same serialized snapshot.
+///
+/// Used by the in-lease INV-21 re-check in `stage_acquire` (Step 6b‴‴).  All
+/// other callers (Z aggregation, reconcile) use the pool-based variant.
+///
+/// **Invariant #1**: this is a pure `SELECT` — no network/crypto — so running
+/// it inside a BEGIN IMMEDIATE transaction does NOT violate INV-1.  The
+/// serialize point is the FN write-lease (held by `with_immediate` at this
+/// point), which is EXACTLY what closes the TOCTOU between two concurrent
+/// cash RETURNs for the same FN.
+pub async fn aggregate_shift_cash_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+) -> sqlx::Result<(i64, i64)> {
+    use crate::db::models::enums::DocType;
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT doc_type, payload_json FROM fiscal_documents          WHERE fiscal_number = ? AND shift_id = ?            AND doc_type IN ('SELL','RETURN')            AND state IN ('ACK','OFFLINE_LOCAL_ACK')          ORDER BY lnd",
+    )
+    .bind(fiscal_number)
+    .bind(shift_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut cash_sell: i64 = 0;
+    let mut cash_return: i64 = 0;
+
+    for (doc_type_str, payload_json) in &rows {
+        let Ok(parsed) = serde_json::from_str::<StoredCheckPayments>(payload_json) else {
+            continue;
+        };
+        let doc_type: DocType = match doc_type_str.as_str() {
+            "SELL" => DocType::Sell,
+            "RETURN" => DocType::Return,
+            _ => continue,
+        };
+        for p in parsed.payments {
+            if p.type_code == "0" && p.sum_kop > 0 {
+                match doc_type {
+                    DocType::Sell => cash_sell = cash_sell.saturating_add(p.sum_kop),
+                    DocType::Return => cash_return = cash_return.saturating_add(p.sum_kop),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok((cash_sell, cash_return))
+}
+
 
 /// Derive the closing cash-on-hand for a shift from its DB receipts.
 /// `opening_kop` = the shift's stored `cash_balance_kop` (opening anchor).

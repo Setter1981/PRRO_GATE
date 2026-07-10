@@ -780,8 +780,22 @@ fn drive_sequence(ops: &[Op]) {
         .unwrap();
     rt.block_on(async {
         let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+        // HOLE 1: run a RefModel alongside the real DB so check_cash_on_hand can
+        // compare prod vs model after every op.  The model's INV-21 refusal now
+        // mirrors the in-lease guard (stage_acquire Step 6b‴‴), which IS in the
+        // fuzzer's lane.  Disabling the in-lease guard makes prod issue while the
+        // model refuses → cash divergence → oracle fires → RED.
+        let mut model = RefModel::new_online_open_shift();
         for op in ops {
+            model.apply(op);
             let _ = interp::run_op(&mut ctx, op).await;
+            // Assert cash parity after every op.  `model.cash_on_hand` tracks the
+            // model's predicted balance; `check_cash_on_hand` reads the real DB.
+            // On divergence (prod accepted a RETURN the model refused, or vice
+            // versa) this panics → proptest shrinks to the minimal failing sequence.
+            oracle::check_cash_on_hand(&ctx.pool, ctx.fn_id(), model.cash_on_hand)
+                .await
+                .unwrap_or_else(|e| panic!("cash oracle divergence in drive_sequence: {e:?}"));
         }
     });
 }

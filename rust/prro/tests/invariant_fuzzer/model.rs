@@ -681,13 +681,25 @@ impl RefModel {
             return ExpectedOutcome::NoMutation;
         }
 
-        // NOTE: the INV-21 L1 guard lives in `convert.rs` (ingress layer).
-        // The fuzzer enters at `inline::run`, DOWNSTREAM of convert.rs, so the
-        // guard does NOT fire in the fuzzer lane.  The cash accumulator below
-        // tracks what prod actually does (including going negative on an
-        // empty-drawer RETURN), enabling `check_cash_on_hand` to detect
-        // divergence.  Prediction of ingress refusals is deliberately NOT
-        // modelled here; `l0_l1_cash_ledger::pin_l1_*` tests cover L1 directly.
+        // ── INV-21 in-lease cash-floor check (HOLE 2 fix) ─────────────────────────
+        // The in-lease guard in `stage_acquire` (Step 6b‴‴) is IN the fuzzer's
+        // lane for ONLINE mode.  When `cash_on_hand < CASH_AMOUNT_KOP`, the guard
+        // refuses PRE-MINT (no lnd, no row, audit-only) → NoMutation + no cash delta.
+        //
+        // ONLINE-ONLY: the guard is scoped to `channel == Channel::Online` in prod.
+        // Offline mode has B10 lazy-BEGIN interposition complexity: a BEGIN doc may
+        // fire before the RETURN lands at the in-lease check.  The offline lane is
+        // already protected by the pre-inbox L1 guard (convert.rs); we do not model
+        // the in-lease refusal for offline here (it would require "BEGIN fires, RETURN
+        // refused" multi-doc prediction).
+        //
+        // Only applies when is_return=true (SELL is never gated by INV-21).
+        if is_return && self.shift_is_open() && self.mode == NodeMode::Online
+            && self.cash_on_hand < CASH_AMOUNT_KOP
+        {
+            // In-lease guard fires (online mode): RETURN refused, no row, no cash delta.
+            return ExpectedOutcome::NoMutation;
+        }
 
         match self.mode {
             NodeMode::Online => {

@@ -1654,7 +1654,46 @@ async fn run_one_attempt(
                     opening_kop,
                 )
                 .await
-                .unwrap_or(opening_kop), // safe fallback: don't lose shift commit
+                .unwrap_or_else(|e| {
+                    // HOLE 3 — HOLE 3 fix: audit the derive-cash fallback so it is
+                    // observable.  The fallback is safe (shift commit proceeds with
+                    // the opening anchor), but silently swallowing the error meant
+                    // `cash_balance_kop` on the closed shift would be wrong without
+                    // any trace.  `audit_log::append` is pool-based (outside any
+                    // write-tx — invariant #1 honoured) so this fires synchronously
+                    // before the 4-b envelope.
+                    let doc_hex = format!("{doc:?}");
+                    let fn_str = fiscal_number.clone();
+                    let payload = serde_json::json!({
+                        "doc": doc_hex,
+                        "fiscal_number": fn_str,
+                        "doc_type": format!("{doc_type:?}"),
+                        "error": e.to_string(),
+                        "fallback_kop": opening_kop,
+                    }).to_string();
+                    // Fire the audit in a blocking-on-pool call.  This fn is async
+                    // but `unwrap_or_else` is sync — use tokio::task::block_in_place
+                    // to await; this branch fires only on a rare derive failure
+                    // (DB error reading issued receipts) and is off the hot path.
+                    let pool_ref = pool.clone();
+                    // We can't call `.await` in a closure, so spawn a task and block
+                    // on it.  This is safe here because we are already in a Tokio
+                    // async context (stage_send is always called from an async fn).
+                    let _ = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let _ = audit_log::append(
+                                &pool_ref,
+                                "fiscal_document",
+                                &doc_hex,
+                                "l0_derive_closing_cash_fallback",
+                                Severity::Warning,
+                                None,
+                                Some(&payload),
+                            ).await;
+                        })
+                    });
+                    opening_kop
+                }), // safe fallback: don't lose shift commit
             )
         } else {
             None

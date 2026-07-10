@@ -262,6 +262,19 @@ pub enum RejectionReason {
     /// re-drives the blocker, then the client retries.  Audit shape:
     /// `write_gate_sibling_pending`.
     WriteGateSiblingPending,
+    /// INV-21 TOCTOU close — in-lease cash-floor re-check (HOLE 2).
+    ///
+    /// A RETURN for `fiscal_number` was admitted by the pre-inbox L1 guard
+    /// (`convert.rs`), but by the time stage_acquire holds the FN write lease,
+    /// a concurrent RETURN has already consumed the cash, leaving
+    /// `cash_on_hand < return_cash`.  Fail-closed PRE-MINT (no lnd, no
+    /// fiscal_documents row; audit-only — same persistence class as
+    /// `WriteGateSiblingPending`).  Seed NOT advanced, doc NOT issued.
+    /// Audit shape: `inv21_cash_insufficient_in_lease`.
+    CashInsufficientInLease {
+        cash_on_hand_kop: i64,
+        return_cash_kop: i64,
+    },
 }
 
 /// W14a-2b Commit 4 — channel derived from node mode at stage_acquire

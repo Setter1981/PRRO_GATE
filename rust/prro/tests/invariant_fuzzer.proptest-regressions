@@ -16,3 +16,4 @@ cc 3855176e6f0632e20617380d2d9996ef7606b23577b0907ea97703ecdb681abf # shrinks to
 cc bd915c7a02cdc805522af63666cde665829687e593454a486f0c9f1e548cc866 # shrinks to ops = [RepeatDrain, DuplicateIdemKey, DuplicateIdemKey, OnlineReturn(DpsScript([Reject]))]
 cc f393b9e9a7594d1ac832db16f2438f8ae61fe30091831628e5590472f7ac6d15 # shrinks to ops = [GoOnline(DpsScript([Superseded])), OfflineReturn, GoOnline(DpsScript([Ack, NotFound])), OnlineReturn(DpsScript([Ack, NotFound])), RepeatDrain]
 cc 272f5692a36e8ad67cd1f215899bd29273276fa297293c15f6cebf5c7b6cb36f # shrinks to ops = [OfflineReturn]
+cc 8eb849b6bffdedd31ed49ba2d90dde3776f3039ef76b3ba84caf1b6157a6ec8e # shrinks to ops = [OnlineSell(DpsScript([Ack, NotFound]))]
