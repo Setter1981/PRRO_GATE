@@ -20,13 +20,16 @@ on:
       - 'rust/prro_escpos/**'
       - 'rust/Cargo.*'
       - '.github/workflows/rust-prro.yml'
+  # pull_request is deliberately UNFILTERED: the required
+  # `x86_64-unknown-linux-gnu` context must be authoritative on EVERY PR.
+  # The old scheme (paths-filter here + a same-named 3s skip-companion in
+  # rust-prro-skip.yml) had a bypass on MIXED PRs (docs+rust): BOTH workflows
+  # fired and the skip's instant green could satisfy branch protection before
+  # the real test leg finished (observed on #228). Now ONE workflow always
+  # triggers; the `changes` job diffs the PR and the build job is SKIPPED
+  # (which satisfies a required check) only when NO rust-relevant file
+  # changed — a single authoritative context, no duplicate-name race.
   pull_request:
-    paths:
-      - 'rust/prro/**'
-      - 'rust/prro_crypto/**'
-      - 'rust/prro_escpos/**'
-      - 'rust/Cargo.*'
-      - '.github/workflows/rust-prro.yml'
 
 # Default to least-privilege: this workflow only reads the repo.
 permissions:
@@ -46,12 +49,43 @@ env:
 jobs:
   # `fmt + clippy (gnu)` (also a REQUIRED merge gate) lives in
   # .github/workflows/fmt-clippy.yml — an always-run, NON-path-filtered
-  # workflow — so that required check reports on EVERY PR, including
-  # docs-only / .claude-only ones that never trigger this path-filtered one.
+  # workflow — so that required check reports on EVERY PR.
+
+  # Detect whether the PR touches rust-relevant paths. The pattern list MUST
+  # mirror the push-trigger `paths` above. On push events this job reports
+  # rust=true unconditionally (pushes are already path-filtered).
+  changes:
+    name: detect rust changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags --depth=1 origin "$base"
+          files=$(git diff --name-only "$base" HEAD)
+          echo "changed files:"; echo "$files"
+          if echo "$files" | grep -qE '^(rust/prro/|rust/prro_crypto/|rust/prro_escpos/|rust/Cargo\.|\.github/workflows/rust-prro\.yml$)'; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     # MUST stay exactly `x86_64-unknown-linux-gnu`: this is the REQUIRED
-    # branch-protection context, mirrored by rust-prro-skip.yml on non-rust
-    # PRs (the skip-companion reports the same context name).
+    # branch-protection context. On non-rust PRs this job is SKIPPED via the
+    # `if:` below — GitHub treats a skipped required check as satisfied, so
+    # docs-only PRs stay mergeable WITHOUT a same-named skip-companion
+    # workflow (rust-prro-skip.yml is retired; its mixed-PR bypass with it).
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     name: x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
 
