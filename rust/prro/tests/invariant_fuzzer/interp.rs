@@ -2019,9 +2019,11 @@ async fn crash_send_then_reboot_recovers_without_panic_or_resend() {
 #[tokio::test]
 async fn offline_sell_lands_offline_local_ack() {
     // B10: the first offline sell lazily mints a DocType=9 BEGIN (code#1) before
-    // the SELL (code#2) → seed 2 codes; the op reports `Recovered` (two-doc ledger
-    // delta) and BOTH docs rest OFFLINE_LOCAL_ACK.
-    let mut ctx = FuzzCtx::new_offline_open_shift(2).await;
+    // the SELL (code#2).  T2 close-reserve: the first offline sell is admitted only
+    // while `free >= 1 + reserve(BEGIN+Z=2)` = 3, so seed 3 codes (BEGIN + SELL
+    // consume 2, one stays reserved for the eventual offline Z); the op reports
+    // `Recovered` (two-doc ledger delta) and BOTH docs rest OFFLINE_LOCAL_ACK.
+    let mut ctx = FuzzCtx::new_offline_open_shift(3).await;
     let out = run_op(&mut ctx, &Op::OfflineSell).await;
     assert!(
         matches!(out, RealOutcome::Recovered { .. } | RealOutcome::Doc(_)),
@@ -2055,8 +2057,10 @@ async fn offline_sell_lands_offline_local_ack() {
 
 #[tokio::test]
 async fn go_online_after_backlog_drains_to_ack() {
-    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
-    let _ = run_op(&mut ctx, &Op::OfflineSell).await; // backlog: one OFFLINE_LOCAL_ACK doc
+    // T2 close-reserve: the first offline sell needs pool >= 3 (BEGIN + SELL + a
+    // Z-reserve code) to be admitted; a smaller pool would trip the reserve gate.
+    let mut ctx = FuzzCtx::new_offline_open_shift(3).await;
+    let _ = run_op(&mut ctx, &Op::OfflineSell).await; // backlog: BEGIN + SELL, both OFFLINE_LOCAL_ACK
     let _ = run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
     assert_eq!(
         ctx.only_doc_state().await,
@@ -2067,7 +2071,8 @@ async fn go_online_after_backlog_drains_to_ack() {
 
 #[tokio::test]
 async fn drain_after_going_online_advances_backlog_to_ack() {
-    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
+    // T2 close-reserve: the first offline sell needs pool >= 3 to be admitted.
+    let mut ctx = FuzzCtx::new_offline_open_shift(3).await;
     let _ = run_op(&mut ctx, &Op::OfflineSell).await;
     ctx.force_node_mode(NodeMode::GoingOnline).await; // fixture setter (test setup)
     let _ = run_op(&mut ctx, &Op::Drain(DpsScript::ack_path())).await;
@@ -2087,7 +2092,8 @@ async fn drain_after_going_online_advances_backlog_to_ack() {
 /// re-drives it.
 #[tokio::test]
 async fn drain_provisions_full_cohort_not_just_offline_local_ack() {
-    let mut ctx = FuzzCtx::new_offline_open_shift(1).await;
+    // T2 close-reserve: the first offline sell needs pool >= 3 to be admitted.
+    let mut ctx = FuzzCtx::new_offline_open_shift(3).await;
     let _ = run_op(&mut ctx, &Op::OfflineSell).await; // doc1 OFFLINE_LOCAL_ACK
     ctx.force_node_mode(NodeMode::GoingOnline).await;
     // Partial drain: send→Ack (OLA→Sent), last→NotFound (K4 hold) → doc1 SENT.

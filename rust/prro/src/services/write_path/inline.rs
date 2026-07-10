@@ -1305,6 +1305,18 @@ async fn enforce_offline_close_reserve(
                 | DocState::Ack
         )
     );
+    // Boundary hand-off: when the pool is EMPTY and the BEGIN is not yet minted,
+    // the session cannot even be OPENED — that is the more-specific domain of the
+    // lazy-BEGIN pre-mint guard (`ensure_offline_session_begin` → 503
+    // `OFFLINE_SESSION_BEGIN_PENDING`), which also refuses row-less/retryable.
+    // Defer to it so the empty-pool diagnosis stays "can't open" rather than
+    // "close-reserve held" (both are retryable 503; the specific code aids the
+    // operator).  The reserve gate owns every OTHER starve case, INCLUDING
+    // `free == 0` with a BEGIN already present (a subsequent sell on a drained
+    // pool — the shift still owes a Z, so refusing here is exactly the invariant).
+    if free_codes == 0 && !begin_present {
+        return Ok(());
+    }
     let reserve = i64::from(!begin_present) + 1; // (BEGIN missing?1:0) + Z(1, shift owes a Z here)
     let need = 1 + reserve; // this op's own code + the close-reserve
     if free_codes < need {

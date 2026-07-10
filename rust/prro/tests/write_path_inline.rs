@@ -644,8 +644,12 @@ async fn offline_sell_is_offline_local_ack_success() {
     seed_open_offline_session(&pool).await;
     // B10: the FIRST offline SELL lazily mints a DocType=9 BEGIN that consumes
     // one code BEFORE the SELL — so two codes are needed (BEGIN + SELL).
+    // T2 close-reserve: the first offline sell is only admitted while
+    // `free >= 1 + reserve(BEGIN+Z=2)` = 3, so seed a 3rd code reserved for the
+    // eventual offline Z (BEGIN + SELL still consume just 2, one stays free).
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
     let row = seed_inbox_sell(&pool).await;
 
     // DPS is never called on the offline path (dispatch terminates at offline-ack).
