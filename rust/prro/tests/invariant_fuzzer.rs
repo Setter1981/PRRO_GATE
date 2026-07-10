@@ -886,9 +886,14 @@ fn model_drain_ackpath_advances_backlog_to_ack() {
 
 #[test]
 fn model_drain_reject_halts_and_escalates_manual() {
-    let mut m = RefModel::new_offline_open_shift(2);
-    let _ = m.apply(&Op::OfflineSell); // docs[1]
-    let _ = m.apply(&Op::OfflineSell); // docs[2]
+    // T2 close-reserve: two offline sells in one session need pool >= 4 (lazy
+    // BEGIN@1 + SELL@2 + SELL@3 + one Z-reserve code); a smaller pool would
+    // reserve-refuse the sells, and this drain-reject/RMR scenario needs an
+    // OFFLINE_LOCAL_ACK backlog to exist.  The reject halts on the head cohort
+    // doc (the BEGIN@1), so the docs[1]/docs[2] assertions below are unchanged.
+    let mut m = RefModel::new_offline_open_shift(4);
+    let _ = m.apply(&Op::OfflineSell); // BEGIN@1 + SELL@2
+    let _ = m.apply(&Op::OfflineSell); // SELL@3
     m.mode = NodeMode::GoingOnline;
 
     let out = m.apply(&Op::Drain(DpsScript::send_then_reject()));
@@ -1515,10 +1520,17 @@ async fn differential_invalid_sell_with_closed_shift_is_no_mutation() {
 
 /// Drain / GoOnline differential: after `GoOnline` (probe + drain) the real
 /// ledger matches the model's predicted ledger (the Recovered ledger-delta).
+///
+/// Pool = 3 (T2 close-reserve): the lazy BEGIN@1 + SELL@2 both need admitting,
+/// and the ordinary SELL is only admitted while `free >= 1 + reserve` (reserve =
+/// BEGIN(1)+Z(1) on the FIRST offline doc) — i.e. `free >= 3`.  A smaller pool
+/// would trip the T2 reserve gate and the SELL would be row-less refused (that
+/// gate is pinned in `tests/t2_offline_close_reserve.rs`); here we want the sell
+/// to actually issue offline so the drain path is what's differentiated.
 #[tokio::test]
 async fn differential_go_online_ledger_matches_model() {
-    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
-    let mut model = RefModel::new_offline_open_shift(1);
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let mut model = RefModel::new_offline_open_shift(3);
 
     let _ = model.apply(&Op::OfflineSell);
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
@@ -1532,7 +1544,7 @@ async fn differential_go_online_ledger_matches_model() {
     assert_eq!(
         real_ledger.get(&1),
         Some(&DocState::Ack),
-        "backlog doc reached ACK"
+        "backlog doc (lazy BEGIN@1) reached ACK"
     );
 }
 
@@ -1748,7 +1760,9 @@ async fn mirrors_legal_empty_active_session_passes() {
 /// that catches the mismatch.
 #[tokio::test]
 async fn mirrors_catch_seeded_mirror2_desync() {
-    let mut ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    // T2 close-reserve: the first offline sell needs pool >= 3 to be admitted so a
+    // cohort doc exists to corrupt (a smaller pool would reserve-refuse the sell).
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
 
     // A real offline sell stamps the cohort doc with the ACTIVE session.
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
@@ -2748,9 +2762,13 @@ fn harness_recovered_go_online_full_snapshot_verified() {
 /// deterministic rather than probabilistic.)
 #[tokio::test]
 async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
-    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+    // T2 close-reserve: two offline sells in one session need pool >= 4 (lazy
+    // BEGIN + sell1 + sell2 + one Z-reserve code).  The AUD-K8-1 no-rewire canary
+    // is independent of the pool size — it needs the OFFLINE_LOCAL_ACK backlog to
+    // exist, which pool=4 provides; the teeth still bite on the reverted guard.
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
 
-    // Backlog: two OFFLINE_LOCAL_ACK docs.
+    // Backlog: BEGIN + two OFFLINE_LOCAL_ACK business docs.
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
 
@@ -3223,13 +3241,16 @@ async fn teeth_b10_reverted_begin_chain_reddens_ledger_delta() {
 /// completes as a real `OFFLINE_LOCAL_ACK` sell.
 #[tokio::test]
 async fn teeth_o2_crash_completed_sell_matches_prediction() {
-    // B10: seed 3 codes and issue ONE ordinary offline sell FIRST (which mints the
-    // lazy BEGIN + the sell) so the CRASH-completed sell under test is a SUBSEQUENT
-    // offline doc (no new BEGIN interposed) → it completes as a single `Doc`, the
-    // clean O2 slice.  (A first-offline crash-completed sell would interpose a
-    // BEGIN → a two-doc `Recovered`, covered by the harness ledger-delta branch.)
-    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
-    let mut model = RefModel::new_offline_open_shift(3);
+    // B10: issue ONE ordinary offline sell FIRST (which mints the lazy BEGIN + the
+    // sell) so the CRASH-completed sell under test is a SUBSEQUENT offline doc (no
+    // new BEGIN interposed) → it completes as a single `Doc`, the clean O2 slice.
+    // (A first-offline crash-completed sell would interpose a BEGIN → a two-doc
+    // `Recovered`, covered by the harness ledger-delta branch.)
+    // T2 close-reserve: pool must be 4 — the FIRST sell (BEGIN@1 + SELL@2) needs
+    // free >= 3, then the SUBSEQUENT crash-sell (BEGIN present) needs free >= 2;
+    // 4 total leaves exactly enough for both admissions plus the Z-reserve.
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
+    let mut model = RefModel::new_offline_open_shift(4);
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // BEGIN + sell#1
     let _ = model.apply(&Op::OfflineSell);
     let prior = ctx.read_seed().await;

@@ -1644,6 +1644,7 @@ async fn m2_online_offline_boundary_chain_continuous() {
     seed_open_offline_session(&pool).await;
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await; // T2 close-reserve: +1 reserved for the offline Z (1 offline sell)
     let row1 = seed_inbox_sell_keyed(&pool, "idem-m2-boundary-1").await;
     let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
@@ -1711,9 +1712,11 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     // doc, so it is a valid subject for the "mac_recovery refuses offline-origin"
     // pin (the test's intent is preserved: an offline-origin doc hitting -12 on
     // drain must NOT be re-signed; the shift escalates to RMR; the chain stays clean).
+    // T2 close-reserve: +1 reserved for the offline Z (2 offline sells → pool 4).
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await;
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1858,6 +1861,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await;
     seed_offline_code(&pool, 4).await; // B10: +1 for the lazy BEGIN
+    seed_offline_code(&pool, 5).await; // T2 close-reserve: +1 reserved for the offline Z (3 sells)
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -2008,6 +2012,7 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await;
     seed_offline_code(&pool, 4).await; // B10: +1 for the lazy BEGIN
+    seed_offline_code(&pool, 5).await; // T2 close-reserve: +1 reserved for the offline Z (3 sells)
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -2186,10 +2191,14 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
     // B10: the FIRST offline sell mints BEGIN(lnd1) + SELL1(lnd2); the second
-    // (post-restart) sell mints SELL2(lnd3).  No drain here → no END.  3 codes.
+    // (post-restart) sell mints SELL2(lnd3).  No drain here → no END.
+    // T2 close-reserve: SELL1 admits at free>=3 (consumes codes 1+2); the
+    // post-restart SELL2 (BEGIN already present) needs free>=2, so seed a 4th
+    // code — one stays reserved for the eventual offline Z.
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await;
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -2397,6 +2406,7 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await; // B10: +1 for the lazy BEGIN
+    seed_offline_code(&pool, 4).await; // T2 close-reserve: +1 reserved for the offline Z (2 sells)
 
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
@@ -3014,6 +3024,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await; // B10: +1 for the lazy BEGIN
+    seed_offline_code(&pool, 4).await; // T2 close-reserve: +1 reserved for the offline Z (2 sells)
 
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));

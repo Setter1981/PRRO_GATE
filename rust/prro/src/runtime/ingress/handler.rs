@@ -175,6 +175,11 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // (crashed mid-sign).  RETRYABLE 503: boot-resume drives the BEGIN to
         // OLA, then the client retries.
         | "OFFLINE_SESSION_BEGIN_PENDING"
+        // T2 (RULING 3.5) — an ordinary offline SELL/RETURN was refused pre-mint
+        // to preserve the legal close-reserve (BEGIN + offline Z must stay
+        // reachable so the shift is never wedged un-closable for lack of a code).
+        // RETRYABLE 503: the operator seeds codes and the SAME op retries.
+        | "OFFLINE_CODE_RESERVE_HELD"
         // PR-Z2 (STOP-S6 ruling B) — a live Z hit C10 quiescence-pending: the
         // shift still has in-flight receipts.  RETRYABLE 503; the operator
         // retries the close with a NEW idempotency key after the blockers drain.

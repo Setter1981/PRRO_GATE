@@ -66,6 +66,15 @@ pub(crate) mod codes {
     /// non-issued BEGIN → chain fork.  The boot-resume tick drives the crashed
     /// BEGIN to OFFLINE_LOCAL_ACK; the client retries and then proceeds.
     pub const OFFLINE_SESSION_BEGIN_PENDING: &str = "OFFLINE_SESSION_BEGIN_PENDING";
+    /// T2 (RULING 3.5) — an ORDINARY offline op (SELL/RETURN) was refused
+    /// fail-closed PRE-MINT because granting its code would starve the dynamic
+    /// legal close-reserve (the codes reserved so the shift can always be closed
+    /// offline: the lazy DocType=9 BEGIN, if not yet issued, plus the offline Z).
+    /// RETRYABLE 503: the operator seeds more codes (seed-codes / T=112) and the
+    /// SAME op retries.  Close-path ops (offline Z, the BEGIN mint, the DocType=10
+    /// END) are NEVER blocked by this gate — they always draw the reserve.
+    /// Invariant: «a shift is NEVER wedged un-closable for lack of a code».
+    pub const OFFLINE_CODE_RESERVE_HELD: &str = "OFFLINE_CODE_RESERVE_HELD";
     /// PR-Z2 — a live Z was submitted while the shift still has in-flight
     /// receipts (C10 quiescence pending).  RETRYABLE → 503.  STOP-S6 ruling (B):
     /// carried on `OfflineRefused` for boundary discipline (no ingress/seam

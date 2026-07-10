@@ -695,6 +695,39 @@ impl RefModel {
                     return self.mint_aborted_refusal();
                 }
 
+                // T2 (RULING 3.5) — offline code CLOSE-RESERVE gate, mirrored from
+                // prod `enforce_offline_close_reserve` (services/write_path/inline.rs).
+                // An ordinary offline SELL/RETURN is refused fail-closed PRE-MINT
+                // (row-less 503 `OFFLINE_CODE_RESERVE_HELD` → the interpreter reports
+                // Refused; NO ledger mutation) when granting its code would leave
+                // fewer free codes than the shift needs to CLOSE offline:
+                //   reserve = (BEGIN missing ? 1 : 0) + (offline Z needed ? 1 : 0)
+                //   admit  ⟺  free_codes >= 1 + reserve
+                // Here the shift is Open (asserted above) → a Z is still owed, so the
+                // Z term is 1.  BEGIN "present" == `session_has_begin` (the model's
+                // ISSUED-BEGIN flag; a not-yet-minted BEGIN counts as missing, so its
+                // code is reserved).  This fires BEFORE the lazy-BEGIN mint below,
+                // exactly as prod fires before `ensure_offline_session_begin` — so a
+                // refused SELL mints neither the BEGIN nor the business doc.  Invariant:
+                // «a shift is NEVER wedged un-closable for lack of a code».
+                let free_codes = self.codes_issued - self.codes_consumed;
+                // Boundary hand-off (mirrors prod): an EMPTY pool with no BEGIN yet
+                // is the lazy-BEGIN pre-mint guard's domain (503
+                // `OFFLINE_SESSION_BEGIN_PENDING`) — a "can't OPEN" refusal — so the
+                // reserve gate defers.  Both cases predict `NoMutation` (row-less), so
+                // the ledger prediction is identical; the branch is kept for exact
+                // parity with `enforce_offline_close_reserve`'s ordering.  The reserve
+                // gate still owns `free == 0` with a BEGIN already present.
+                if free_codes == 0 && !self.session_has_begin {
+                    // Falls through to the lazy-BEGIN arm below, which returns
+                    // `NoMutation` on the 0-code path (no BEGIN, no business doc).
+                } else {
+                    let reserve = i64::from(!self.session_has_begin) + 1;
+                    if free_codes < 1 + reserve {
+                        return ExpectedOutcome::NoMutation;
+                    }
+                }
+
                 // B10 — LAZY DocType=9 BEGIN, predicted INDEPENDENTLY (first
                 // principles; NOT read from the impl).  On the FIRST offline doc of
                 // a session (`!session_has_begin`) the impl lazily mints+signs+OLAs

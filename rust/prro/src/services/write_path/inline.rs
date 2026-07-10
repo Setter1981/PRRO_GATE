@@ -27,7 +27,7 @@
 use sqlx::SqlitePool;
 use tokio::sync::OwnedMutexGuard;
 
-use crate::db::models::enums::{DocState, DocType, NodeMode, Severity};
+use crate::db::models::enums::{DocState, DocType, NodeMode, Severity, ShiftState};
 use crate::db::models::ids::DocumentId;
 use crate::db::repositories::audit_log;
 use crate::db::repositories::fiscal_documents::{self, TerminalOutcome};
@@ -740,6 +740,18 @@ async fn run_staged(
         .as_deref()
         .expect("build_canonical/build_z_canonical guarantees driver_id present");
 
+    // T2 (RULING 3.5) — offline code CLOSE-RESERVE gate.  BEFORE the lazy-BEGIN
+    // mint AND before stage_acquire mints any row/lnd, refuse an ORDINARY offline
+    // op (SELL/RETURN) when granting its code would starve the codes the shift
+    // needs to CLOSE offline (the lazy BEGIN, if not yet issued, + the offline Z).
+    // A row-less, pool-less, fail-closed 503 (mirrors ensure_offline_session_begin
+    // below).  Close-path ops (offline Z / BEGIN / END) bypass by doc-type — they
+    // always draw the reserve.  Placed HERE (not deeper at acquire) so a refused
+    // SELL does NOT even trigger its lazy-BEGIN mint, keeping the pool intact for
+    // the eventual BEGIN+Z close.  Invariant: «a shift is NEVER wedged
+    // un-closable for lack of a code».
+    enforce_offline_close_reserve(pool, row, doc_type).await?;
+
     // B10 (W10a) — the COMMON first-offline-doc seam.  BEFORE this doc mints,
     // ensure the session's DocType=9 BEGIN is issued (or fail-closed if a crashed
     // BEGIN rests non-terminal) — for SHIFT_OPEN / SELL / RETURN / Z_REPORT /
@@ -1157,6 +1169,163 @@ fn begin_request_id(fiscal_number: &str) -> [u8; 16] {
     let mut r = [0u8; 16];
     r.copy_from_slice(&h[..16]);
     r
+}
+
+/// T2 (RULING 3.5) — the offline code CLOSE-RESERVE gate.
+///
+/// Refuses an ORDINARY offline op (SELL / RETURN) fail-closed PRE-MINT when
+/// granting its pool code would leave fewer free codes than the shift needs to
+/// be CLOSED offline.  The dynamic legal reserve (per contract):
+///
+/// ```text
+///   reserve = (session BEGIN missing ? 1 : 0) + (offline Z still needed ? 1 : 0)
+///   admit an ordinary offline SELL/RETURN  ⟺  free_codes >= 1 + reserve
+/// ```
+///
+/// The `1 +` is the op's OWN code.  The BEGIN term is complementary across the
+/// admit-cost / close-cost sides (admitting the op mints the BEGIN, so it is
+/// present thereafter and does not need reserving twice) — the reduced form
+/// above is exactly the contract's `required_codes_to_close` (arch adjudication
+/// 2026-07-10).  Example pins: pool=2 + BEGIN-missing + Z-needed → need
+/// `1+2=3 > 2` → REFUSE; pool=1 + BEGIN-present + Z-needed → need `1+1=2 > 1` →
+/// REFUSE; pool=3 + BEGIN-missing + Z-needed → `3 >= 3` → ADMIT.
+///
+/// SCOPE (bypass = fall through to the normal flow, admit):
+///   - doc-type: gate ONLY `Sell` / `Return`.  Close-path ops
+///     (`ZReport` / `ShiftClose` / `OfflineSessionBegin` / `OfflineSessionEnd`)
+///     always draw the reserve → excluded.  The lazy-BEGIN sub-drive re-enters
+///     `run_staged` with `doc_type == OfflineSessionBegin`, so it is excluded too.
+///   - node mode: only `Offline` / `GoingOffline`.  Online ops are never gated
+///     (INV-5 is an OFFLINE budget; the reserve protects the offline pool only).
+///   - shift: only `Opened` / `OpenedLocalPendingDrain` (a shift that still owes
+///     an offline Z).  Other shift states → nothing to protect → bypass.
+///   - an active OPEN offline session MUST exist (residual-hole #2): with no
+///     session there is no offline shift to protect and no BEGIN to reserve for;
+///     the op proceeds online-shaped (deferred at offline-ack) — bypass.
+///
+/// BEGIN-present predicate: `state ∈ {OfflineLocalAck, Sent, Kvt1, Kvt2, Ack}`
+/// (the ISSUED set — the code is already consumed).  EVERYTHING else — `None`
+/// AND terminal-FAILED (Aborted/Rejected/Cancelled/RMR, which
+/// `ensure_offline_session_begin` RE-mints) — counts as MISSING, so its code is
+/// reserved (residual-hole #1).  This mirrors that helper's admit set verbatim.
+///
+/// One `with_immediate` READ probe (INV-1: pure SQLite reads, no crypto/network)
+/// computing the decision atomically under the caller's held FN write-lease
+/// (INV-2: single-writer per fiscal_number — no other writer can interleave
+/// between this probe and the mints that follow).  Read failure → fail-CLOSED
+/// `Internal` (never fail-open — a read fault must not admit an op that could
+/// strand the shift).
+async fn enforce_offline_close_reserve(
+    pool: &SqlitePool,
+    row: &InboxRow,
+    doc_type: DocType,
+) -> Result<(), FiscalError> {
+    // Doc-type filter: ordinary business ops only.  Everything else bypasses.
+    if !matches!(doc_type, DocType::Sell | DocType::Return) {
+        return Ok(());
+    }
+    let request_id = row.request_id;
+    let fiscal_number = row.fiscal_number.as_str();
+
+    // Node-mode gate (pool read; no write tx).  Online → not an offline op → no
+    // reserve to protect.  Reuse the same offline-family predicate as the BEGIN
+    // seam (inline.rs `ensure_offline_session_begin`).
+    let ns = match node_state::get(pool, fiscal_number).await {
+        Ok(Some(ns)) => ns,
+        // No node_state row is a structural breach the op's own stages surface
+        // with precise diagnostics; do not pre-empt them here.
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::error!(error=%e, "enforce_offline_close_reserve: node_state read failed");
+            return Err(FiscalError::Internal {
+                request_id,
+                code: codes::ACQUIRE_INTERNAL,
+            });
+        }
+    };
+    if !matches!(ns.mode, NodeMode::Offline | NodeMode::GoingOffline) {
+        return Ok(());
+    }
+    // Shift gate: only a shift that still owes an offline Z has a close-reserve.
+    if !matches!(
+        ns.shift_state,
+        ShiftState::Opened | ShiftState::OpenedLocalPendingDrain
+    ) {
+        return Ok(());
+    }
+
+    let fn_owned = fiscal_number.to_string();
+    let begin_rid = begin_request_id(fiscal_number);
+    // One atomic read snapshot: (has active OPEN session, free code count, BEGIN
+    // state).  `None` for the whole tuple ⇒ no active OPEN session ⇒ bypass.
+    let probe: Option<(i64, Option<DocState>)> = crate::db::tx::with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // Residual-hole #2: gate only when an active OPEN session exists (the
+            // same early-return the BEGIN seam's probe uses).
+            if offline_sessions::current_active_session_id_tx(tx, &fn_owned)
+                .await?
+                .is_none()
+            {
+                return Ok::<Option<(i64, Option<DocState>)>, anyhow::Error>(None);
+            }
+            // free_codes — identical predicate to `acquire_code_tx`'s WHERE and to
+            // the BEGIN seam's `has_code` probe (kept in lockstep on purpose).
+            let free: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM offline_codes \
+                 WHERE fiscal_number = ? AND consumed_at IS NULL AND dps_code IS NOT NULL",
+            )
+            .bind(&fn_owned)
+            .fetch_one(&mut **tx)
+            .await?;
+            let begin_state = fiscal_documents::doc_state_by_request_id_tx(tx, &begin_rid).await?;
+            Ok(Some((free, begin_state)))
+        })
+    })
+    .await
+    .map_err(|_| FiscalError::Internal {
+        request_id,
+        code: codes::ACQUIRE_INTERNAL,
+    })?;
+
+    let Some((free_codes, begin_state)) = probe else {
+        // No active OPEN session → nothing to protect → bypass.
+        return Ok(());
+    };
+
+    // BEGIN "present" iff it rests in the ISSUED set (code already consumed).
+    // None + terminal-FAILED both count as MISSING (residual-hole #1): the BEGIN
+    // seam re-mints those, so their code must be reserved.
+    let begin_present = matches!(
+        begin_state,
+        Some(
+            DocState::OfflineLocalAck
+                | DocState::Sent
+                | DocState::Kvt1
+                | DocState::Kvt2
+                | DocState::Ack
+        )
+    );
+    // Boundary hand-off: when the pool is EMPTY and the BEGIN is not yet minted,
+    // the session cannot even be OPENED — that is the more-specific domain of the
+    // lazy-BEGIN pre-mint guard (`ensure_offline_session_begin` → 503
+    // `OFFLINE_SESSION_BEGIN_PENDING`), which also refuses row-less/retryable.
+    // Defer to it so the empty-pool diagnosis stays "can't open" rather than
+    // "close-reserve held" (both are retryable 503; the specific code aids the
+    // operator).  The reserve gate owns every OTHER starve case, INCLUDING
+    // `free == 0` with a BEGIN already present (a subsequent sell on a drained
+    // pool — the shift still owes a Z, so refusing here is exactly the invariant).
+    if free_codes == 0 && !begin_present {
+        return Ok(());
+    }
+    let reserve = i64::from(!begin_present) + 1; // (BEGIN missing?1:0) + Z(1, shift owes a Z here)
+    let need = 1 + reserve; // this op's own code + the close-reserve
+    if free_codes < need {
+        return Err(FiscalError::OfflineRefused {
+            request_id,
+            code: codes::OFFLINE_CODE_RESERVE_HELD,
+        });
+    }
+    Ok(())
 }
 
 async fn ensure_offline_session_begin(
