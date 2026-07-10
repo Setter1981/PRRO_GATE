@@ -75,6 +75,25 @@ pub(crate) mod codes {
     /// END) are NEVER blocked by this gate — they always draw the reserve.
     /// Invariant: «a shift is NEVER wedged un-closable for lack of a code».
     pub const OFFLINE_CODE_RESERVE_HELD: &str = "OFFLINE_CODE_RESERVE_HELD";
+    /// T3 (RULING 3.3) — a NEW ordinary fiscal op (SELL/RETURN) was refused
+    /// fail-closed PRE-MINT because a document-derived TIME budget is over its
+    /// legal limit AND that budget's enforcement toggle is ON:
+    ///   - `SHIFT_DURATION_LIMIT_EXCEEDED` — the open shift has run ≥ 24h
+    ///     (`now − SHIFT_OPEN.business_ts`).  Note the UNCONDITIONAL auto-Z
+    ///     ticker also acts at this boundary regardless of the toggle
+    ///     (RULING 3.4), so a live gateway normally closes the shift before an
+    ///     operator sees this refusal.
+    ///   - `OFFLINE_SESSION_LIMIT_EXCEEDED` — the continuous offline session has
+    ///     run ≥ 36h (`now − offline_sessions.opened_at`, INV-09).
+    ///   - `OFFLINE_MONTH_LIMIT_EXCEEDED` — cumulative offline this calendar
+    ///     month has reached ≥ 168h (recomputed from `offline_sessions`, INV-10).
+    /// All three are RETRYABLE 503 (the legal CLOSE path — Z / session END /
+    /// drain — is NEVER blocked): the operator resolves the condition (close the
+    /// shift / return online / wait for month rollover) and retries.  Tracking is
+    /// ALWAYS on (RULING 3.2); only refusal is toggled per budget (RULING 3.3).
+    pub const SHIFT_DURATION_LIMIT_EXCEEDED: &str = "SHIFT_DURATION_LIMIT_EXCEEDED";
+    pub const OFFLINE_SESSION_LIMIT_EXCEEDED: &str = "OFFLINE_SESSION_LIMIT_EXCEEDED";
+    pub const OFFLINE_MONTH_LIMIT_EXCEEDED: &str = "OFFLINE_MONTH_LIMIT_EXCEEDED";
     /// PR-Z2 — a live Z was submitted while the shift still has in-flight
     /// receipts (C10 quiescence pending).  RETRYABLE → 503.  STOP-S6 ruling (B):
     /// carried on `OfflineRefused` for boundary discipline (no ingress/seam
