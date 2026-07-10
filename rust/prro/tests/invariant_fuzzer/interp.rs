@@ -840,6 +840,7 @@ async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -875,6 +876,7 @@ async fn run_inline_row(
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -932,6 +934,7 @@ async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
             &ctx.fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         ));
         tokio::select! {
             res = &mut fut => Some(res),          // wire never reached → not a crash
@@ -1188,6 +1191,7 @@ async fn offline_sell(ctx: &mut FuzzCtx) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1227,6 +1231,7 @@ async fn online_return(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1263,6 +1268,7 @@ async fn offline_return(ctx: &mut FuzzCtx) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1297,6 +1303,7 @@ async fn online_shift_open(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1329,6 +1336,7 @@ async fn offline_shift_open(ctx: &mut FuzzCtx) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1364,6 +1372,7 @@ async fn online_z_report(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1398,6 +1407,7 @@ async fn offline_z_report(ctx: &mut FuzzCtx) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1554,6 +1564,7 @@ async fn sell_with_closed_shift(ctx: &mut FuzzCtx) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1578,6 +1589,7 @@ async fn offline_sell_during_going_online(ctx: &mut FuzzCtx) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);
@@ -1610,6 +1622,7 @@ async fn duplicate_idem_key(ctx: &mut FuzzCtx) -> RealOutcome {
         &ctx.fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await;
     drop(guard);

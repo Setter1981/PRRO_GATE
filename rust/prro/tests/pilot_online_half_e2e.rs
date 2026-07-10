@@ -48,7 +48,7 @@ use prro::db::repositories::ingress_inbox::{
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
-use prro::runtime::ingress::inline_binding::production_write_path;
+use prro::runtime::ingress::inline_binding::production_write_path_with_clock;
 use prro::runtime::ingress::seam::{FiscalError, FiscalOutcome, WritePathEntry};
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
@@ -282,7 +282,13 @@ async fn pilot_online_half_open_sell_sell_z_close_via_live_binding() {
     seed_boot_baseline(app.db()).await;
 
     // Construct the binding EXACTLY as the supervisor DI root does.
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-06-09T12:30:00Z",
+        )),
+    );
 
     // ─── 1) SHIFT_OPEN — edges 1 (Created→Opening) + 3 (Opening→Opened) ───
     let open = drive(

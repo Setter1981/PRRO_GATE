@@ -1,5 +1,11 @@
 # Offline & Shift Limits — enforcement spec (HB5)
 
+> **⚠️ SUPERSEDED IN PART (2026-07-10) by `docs/RULINGS_2026-07-10_SHIFT_T112_AUTOZ.md` RULING 3 + implemented as task T3.**
+> Where this spec and RULING 3 conflict, **RULING 3 governs**. Specifically:
+> - **The shift-limit auto-Z is now UNCONDITIONAL** (RULING 3.4). Operator decision #2 below (per-FN "*whether* it auto-closes") is **withdrawn**: a shift never crosses the 24h wall without a durable Z attempt/outcome (success, or an escalated failure → RMR — never silent continuation), regardless of any toggle. The per-FN `shift_autoclose_enabled` key is **deprecated: parsed-but-ignored** with a one-time boot deprecation audit (`CONFIG_KEY_DEPRECATED_IGNORED`).
+> - **Three document-derived budgets** (24h shift / 36h session / 168h month) are computed from durable rows against **one injected clock**; **tracking is always on**, **enforcement is per-budget toggleable** (default ON), the **legal close path is never blocked**. See `services/time_budget.rs` + the `run_staged` admission gate + the supervisor `auto-z` ticker.
+> The "*at what time*" part of decision #2 (a configurable close hour distinct from the 24h legal wall) is **not implemented** and is out of T3 scope.
+
 **Date:** 2026-05-30 · **Branch:** `rust-gateway` · **Status:** design spec — enforce ALL limits, operator-decided · no code yet
 **Inputs:** WebCheck decompile (`docs/webcheck_reverse`), PRRODPS C# source (`/mnt/d/prrodps_src`), ФСКО protocol
 (`docs/dps_protocol/251051_(1).md`), `LEGAL_INVARIANTS.md` §8 / INV-09 / INV-10. Two 7-agent reference sweeps.

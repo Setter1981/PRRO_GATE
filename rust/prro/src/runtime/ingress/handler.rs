@@ -180,6 +180,14 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // reachable so the shift is never wedged un-closable for lack of a code).
         // RETRYABLE 503: the operator seeds codes and the SAME op retries.
         | "OFFLINE_CODE_RESERVE_HELD"
+        // T3 (RULING 3.3) — a NEW ordinary op refused because a document-derived
+        // TIME budget is over-limit AND that budget's enforcement toggle is ON.
+        // RETRYABLE 503: the legal CLOSE path (Z / session END / drain) is never
+        // blocked, so the operator resolves the condition (close the shift /
+        // return online / wait for month rollover) and retries.
+        | "SHIFT_DURATION_LIMIT_EXCEEDED"
+        | "OFFLINE_SESSION_LIMIT_EXCEEDED"
+        | "OFFLINE_MONTH_LIMIT_EXCEEDED"
         // PR-Z2 (STOP-S6 ruling B) — a live Z hit C10 quiescence-pending: the
         // shift still has in-flight receipts.  RETRYABLE 503; the operator
         // retries the close with a NEW idempotency key after the blockers drain.

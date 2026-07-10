@@ -286,9 +286,18 @@ async fn build_resting_sent(pool: &SqlitePool, pool_secure: &SqlitePool, stub: &
     let fn_sign = fn_sign_blob();
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
-    let outcome = inline::run(pool, pool_secure, stub, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("inline::run with Hold lastChk returns Ok(Sent)");
+    let outcome = inline::run(
+        pool,
+        pool_secure,
+        stub,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("inline::run with Hold lastChk returns Ok(Sent)");
     assert_eq!(outcome.document_state, DocState::Sent);
     assert_eq!(read_doc_state(pool, FN).await, "SENT");
 }
@@ -1049,6 +1058,7 @@ async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("inline::run with a transient send → Ok(InProgress)");

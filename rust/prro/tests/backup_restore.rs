@@ -451,9 +451,18 @@ async fn issue_receipt_to_ack(pool: &SqlitePool, pool_secure: &SqlitePool, n: i6
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
-    let outcome = inline::run(pool, pool_secure, &stub, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .unwrap_or_else(|e| panic!("receipt {n} must reach ACK: {e:?}"));
+    let outcome = inline::run(
+        pool,
+        pool_secure,
+        &stub,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("receipt {n} must reach ACK: {e:?}"));
     assert_eq!(outcome.document_state, DocState::Ack, "receipt {n} → ACK");
 }
 
@@ -586,9 +595,18 @@ async fn issue_receipt_to_ack_sfn(
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
-    let outcome = inline::run(pool, pool_secure, &stub, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .unwrap_or_else(|e| panic!("receipt {n} (sfn {server_fiscal_no}) must reach ACK: {e:?}"));
+    let outcome = inline::run(
+        pool,
+        pool_secure,
+        &stub,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("receipt {n} (sfn {server_fiscal_no}) must reach ACK: {e:?}"));
     assert_eq!(outcome.document_state, DocState::Ack, "receipt {n} → ACK");
 }
 
