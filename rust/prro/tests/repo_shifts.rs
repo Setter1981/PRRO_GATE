@@ -51,7 +51,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
 async fn insert_created_then_get() {
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier", 0)
         .await
         .unwrap();
     let row = shifts::get(&pool, id).await.unwrap().unwrap();
@@ -66,7 +66,7 @@ async fn insert_created_then_get() {
 async fn allowed_transitions_succeed() {
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier", 0)
         .await
         .unwrap();
     assert!(
@@ -90,7 +90,7 @@ async fn forbidden_transitions_blocked_in_code() {
     // Code-level whitelist must short-circuit BEFORE touching the DB.
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier", 0)
         .await
         .unwrap();
     let did_it = tx_shift_transition(&pool, id, ShiftState::Created, ShiftState::Closed)
@@ -109,7 +109,7 @@ async fn cas_blocks_when_state_diverged() {
     // Allowed transition Opening → Opened, but row is in Created — CAS must reject.
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier", 0)
         .await
         .unwrap();
     let did_it = tx_shift_transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
@@ -191,10 +191,10 @@ async fn allowed_transition_table_matrix() {
 #[tokio::test]
 async fn second_active_shift_per_fiscal_is_rejected() {
     let (pool, fn_id) = fresh_with_fn().await;
-    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-1")
+    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-1", 0)
         .await
         .expect("first active shift OK");
-    let err = shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2")
+    let err = shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2", 0)
         .await
         .expect_err("a second active shift for the same FN must be rejected by the uq index");
     assert!(
@@ -210,7 +210,7 @@ async fn second_active_shift_per_fiscal_is_rejected() {
 async fn new_shift_allowed_after_prior_left_active_set() {
     let (pool, fn_id) = fresh_with_fn().await;
     let id1 = ShiftId::new();
-    shifts::insert_created(&pool, id1, &fn_id, "ONLINE", "csh-1")
+    shifts::insert_created(&pool, id1, &fn_id, "ONLINE", "csh-1", 0)
         .await
         .unwrap();
     // Drive id1 OUT of the active set (raw UPDATE to terminal CLOSED — the full
@@ -221,7 +221,7 @@ async fn new_shift_allowed_after_prior_left_active_set() {
         .execute(&pool)
         .await
         .unwrap();
-    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2")
+    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2", 0)
         .await
         .expect(
             "a new active shift is allowed once the prior is CLOSED (excluded from the uq index)",

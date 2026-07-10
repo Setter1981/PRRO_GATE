@@ -1142,6 +1142,10 @@ pub async fn run(
 /// APPLIED shift is a structural breach unreachable under the FN single-writer
 /// lease and is the ONLY path that propagates an error (fail-closed) — every
 /// reachable non-Applied outcome returns `Ok` (no rollback).
+///
+/// `closing_cash_kop` — when `to == Closed`, the computed closing cash-on-hand
+/// to persist in `shifts.cash_balance_kop` (L0 carry anchor for the next shift).
+/// For all other transitions this value is ignored (`None` is fine; `Some(0)` also safe).
 async fn confirm_shift_edge(
     tx: &mut crate::db::tx::WriteTxConn<'_>,
     fiscal_number: &str,
@@ -1150,6 +1154,7 @@ async fn confirm_shift_edge(
     from: ShiftState,
     to: ShiftState,
     edge: &str,
+    closing_cash_kop: Option<i64>,
 ) -> anyhow::Result<()> {
     // `shift_id == None` on an online SHIFT_OPEN / Z / SHIFT_CLOSE is
     // impossible after piece 3 (edge 1/8 bind it at acquire).  Fail closed —
@@ -1167,7 +1172,17 @@ async fn confirm_shift_edge(
         return Ok(());
     };
     match transition::apply_shift_transition(tx, fiscal_number, shift_id, from, to).await? {
-        shifts::TransitionOutcome::Applied => Ok(()),
+        shifts::TransitionOutcome::Applied => {
+            // L0 — persist closing cash at the CLOSE edge (Closing → Closed or
+            // ClosingLocalPendingDrain → Closed), atomically in this envelope
+            // (invariant #2).  The value becomes the next shift's opening carry.
+            if to == ShiftState::Closed {
+                if let Some(kop) = closing_cash_kop {
+                    shifts::update_cash_balance_tx(tx, shift_id, kop).await?;
+                }
+            }
+            Ok(())
+        }
         shifts::TransitionOutcome::Conflict { observed } if observed == to => {
             // Benign idempotent no-op — the shift is already at the target.
             // Unreachable by trace: this block runs on a FRESH `Sending → Sent`
@@ -1608,6 +1623,45 @@ async fn run_one_attempt(
     //   - `decision.probe_hint` → W9 reconciliation territory; never
     //     actioned in stage 4 (only surfaced in audit payload for
     //     forensic grep, per W10.2 review LOW/MED 3).
+
+    // L0 — derive closing cash BEFORE the 4-b write-tx (invariant #1: no
+    // DB reads are forbidden inside write-tx, but the derive call is a
+    // SELECT-only pool read that must happen OUTSIDE the IMMEDIATE lock).
+    // Only computed for the CLOSE edge (ZReport/ShiftClose, online-origin).
+    // Opening stored in cash_balance_kop at create-time; re-read here so
+    // the derive is self-contained (no extra state threaded from acquire).
+    let closing_cash_kop_for_4b: Option<i64> = if offline_fiscal_no.is_none()
+        && matches!(doc_type, DocType::ZReport | DocType::ShiftClose)
+    {
+        if let Some(sid) = shift_id {
+            // Re-read the opening anchor from shifts.cash_balance_kop
+            // (written at shift-open acquire, this is the opening value
+            // before the close overwrites it).
+            let opening_kop: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT cash_balance_kop FROM shifts WHERE shift_id = ?",
+            )
+            .bind(sid.as_bytes().to_vec())
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(0);
+            Some(
+                crate::services::cash_ledger::derive_closing_cash(
+                    pool,
+                    &fiscal_number,
+                    sid,
+                    opening_kop,
+                )
+                .await
+                .unwrap_or(opening_kop), // safe fallback: don't lose shift commit
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let decision_for_closure = wire_decision.clone();
     let forensics_for_closure = wire_forensics.clone();
     let started_for_closure = wire_call_started_at;
@@ -1621,6 +1675,7 @@ async fn run_one_attempt(
         let forensics = forensics_for_closure;
         let started = started_for_closure;
         let finished = finished_for_closure;
+        let closing_cash_kop = closing_cash_kop_for_4b;
         // `fiscal_number` captured directly via `move`; no rebind
         // (R-W10.3-review LOW 3 close — the previous self-rebind
         // `let fiscal_number = fiscal_number;` was a no-op).
@@ -1745,6 +1800,7 @@ async fn run_one_attempt(
                                 ShiftState::Opening,
                                 ShiftState::Opened,
                                 "edge3_open",
+                                None, // opening edge: no closing cash to persist
                             )
                             .await?;
                         }
@@ -1757,6 +1813,7 @@ async fn run_one_attempt(
                                 ShiftState::Closing,
                                 ShiftState::Closed,
                                 "edge10_close",
+                                closing_cash_kop, // L0 closing anchor
                             )
                             .await?;
                         }

@@ -196,6 +196,17 @@ pub async fn run(
             None => None,
         };
 
+    // L0 carry anchor — derive BEFORE the write-tx (invariant #1: pure pool read,
+    // no network/crypto).  Only needed for SHIFT_OPEN; 0 for all other doc-types.
+    // `opening_carry_for_fn` reads the most-recently-closed shift's
+    // `cash_balance_kop` (persisted as closing balance at that shift-close)
+    // as the new shift's opening anchor.  First shift (no closed row) → 0.
+    let opening_cash_kop: i64 = if command.doc_type == DocType::ShiftOpen {
+        crate::services::cash_ledger::opening_carry_for_fn(pool, &peeked_fn_id).await?
+    } else {
+        0
+    };
+
     let driver_id_owned = driver_id.to_string();
     let peeked_fn_id_owned = peeked_fn_id.clone();
     let tax_snapshot_for_tx = tax_snapshot.clone();
@@ -778,7 +789,7 @@ pub async fn run(
                             .expect("Step 6b′ refuses ShiftOpen with no cashier")
                             .as_str();
                         let shift_id = ShiftId::deterministic_for_shift_open(document_id);
-                        transition::create_shift_tx(tx, &fn_id, shift_id, "ONLINE", opener)
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "ONLINE", opener, opening_cash_kop)
                             .await?;
                         expect_applied(
                             transition::apply_shift_transition(
@@ -845,7 +856,7 @@ pub async fn run(
                             .expect("Step 6b′ refuses ShiftOpen with no cashier")
                             .as_str();
                         let shift_id = ShiftId::deterministic_for_shift_open(document_id);
-                        transition::create_shift_tx(tx, &fn_id, shift_id, "OFFLINE", opener)
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "OFFLINE", opener, opening_cash_kop)
                             .await?;
                         expect_applied(
                             transition::apply_shift_transition(
