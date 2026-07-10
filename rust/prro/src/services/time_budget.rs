@@ -315,12 +315,11 @@ pub async fn compute_budgets_for_fn(
     // (3) 168h/calendar-month — recompute from every offline session row.
     // CLOSED rows carry closed_at; OPEN/OPENING/DRAINING/ABORTED-without-close
     // carry NULL → clamped to `now` by month_overlap_seconds.
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT opened_at, closed_at FROM offline_sessions WHERE fiscal_number = ?",
-    )
-    .bind(fiscal_number)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT opened_at, closed_at FROM offline_sessions WHERE fiscal_number = ?")
+            .bind(fiscal_number)
+            .fetch_all(pool)
+            .await?;
     let intervals: Vec<SessionInterval> = rows
         .into_iter()
         .map(|(opened_at, closed_at)| SessionInterval {
@@ -389,8 +388,8 @@ impl<'a> TimeBudgetGate<'a> {
 /// a legacy fixture with a stale (far-past) SHIFT_OPEN `business_ts` is not
 /// tripped by the 24h gate. The PRODUCTION path builds its gate in
 /// [`crate::runtime::ingress::inline_binding`] from real config (default all-ON)
-/// + the [`SystemClock`]; the T3 pins build explicit gates with a `FixedClock` +
-/// the toggle set under test.
+/// over the [`SystemClock`]; the T3 pins build explicit gates over a
+/// `FixedClock` with the toggle set under test.
 pub fn system_gate() -> TimeBudgetGate<'static> {
     static SYSTEM: SystemClock = SystemClock;
     TimeBudgetGate::new(

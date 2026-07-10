@@ -386,7 +386,13 @@ async fn b10_drain_sends_begin_first_content_then_end_last() {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     // online SHIFT_OPEN
     let open = drive(
@@ -501,7 +507,13 @@ async fn b10_lazy_begin_minted_once_across_multiple_offline_docs() {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     drive(
         &*write_path,
@@ -546,7 +558,13 @@ async fn b10_no_begin_for_session_with_zero_offline_business_docs() {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     drive(
         &*write_path,
@@ -576,7 +594,13 @@ async fn b10_begin_stamped_with_session_opened_at() {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     drive(
         &*write_path,
@@ -636,7 +660,13 @@ async fn b10_crashed_prepared_begin_fails_closed_fresh_sell() {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     drive(
         &*write_path,
@@ -718,7 +748,13 @@ async fn run_full_offline_drain(n_drain_docs: usize) -> (App, DrainCarriers) {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     drive(
         &*write_path,
@@ -918,7 +954,13 @@ async fn b10_offline_shift_open_first_doc_still_mints_begin_lowest_lnd() {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     // Pattern C: the shift opens OFFLINE (no prior online SHIFT_OPEN).
     prro::admin::go_offline(app.db(), FN, "morning without network")
@@ -1010,7 +1052,13 @@ async fn b10_offline_z_does_not_sign_past_a_crash_stuck_begin() {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     drive(
         &*write_path,

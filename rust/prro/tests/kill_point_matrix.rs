@@ -1436,18 +1436,36 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1, prro::services::time_budget::system_gate())
-            .await
-            .expect("offline receipt 1 → OFFLINE_LOCAL_ACK");
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub1,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row1,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .expect("offline receipt 1 → OFFLINE_LOCAL_ACK");
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
     let row2 = seed_inbox_sell_keyed(&pool, "idem-m2-pin-2").await;
     let stub2 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub2, &sign_ctx, &fn_sign, &g, &row2, prro::services::time_budget::system_gate())
-            .await
-            .expect("offline receipt 2 → OFFLINE_LOCAL_ACK");
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub2,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row2,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .expect("offline receipt 2 → OFFLINE_LOCAL_ACK");
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
 
@@ -1605,9 +1623,18 @@ async fn m2_online_offline_boundary_chain_continuous() {
     stub0.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → online Hold → SENT
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub0, &sign_ctx, &fn_sign, &g, &row0, prro::services::time_budget::system_gate())
-            .await
-            .unwrap();
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub0,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row0,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .unwrap();
         assert_eq!(o.document_state, DocState::Sent);
     }
     let doc0 = doc_id_by_req(&pool, &row0.request_id).await;
@@ -1657,9 +1684,18 @@ async fn m2_online_offline_boundary_chain_continuous() {
     let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1, prro::services::time_budget::system_gate())
-            .await
-            .unwrap();
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub1,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row1,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
     // The lazy BEGIN is the lowest-lnd offline doc; it chains off the online ACK.
@@ -1735,18 +1771,36 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     {
         let g = gate.clone().lock_owned().await;
         let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row1, prro::services::time_budget::system_gate())
-            .await
-            .unwrap();
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row1,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
     let row2 = seed_inbox_sell_keyed(&pool, "idem-m2x1-2").await;
     {
         let g = gate.clone().lock_owned().await;
         let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row2, prro::services::time_budget::system_gate())
-            .await
-            .unwrap();
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row2,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
 

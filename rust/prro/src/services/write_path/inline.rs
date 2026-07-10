@@ -41,10 +41,10 @@ use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
 use crate::runtime::ingress::z_builder::{
     build_z_canonical, ensure_full_z_surface_ready, quiesce_shift_before_z, QuiescenceOutcome,
 };
-use crate::services::time_budget::{self, TimeBudgetGate};
 use crate::services::offline_sync::kvt2_confirm::{
     classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
 };
+use crate::services::time_budget::{self, TimeBudgetGate};
 use crate::services::write_path::dispatch::{dispatch_post_sign, PostSignRoute};
 use crate::services::write_path::inline_map::{
     classify_send_outcome, code_of, codes, map_build_reject, map_dispatcher_refusal,
@@ -714,7 +714,17 @@ pub async fn run(
     // common first-offline-doc seam), so it fires for SHIFT_OPEN / SELL / RETURN
     // AND the Z path (`run_z_dispatch` → `run_staged`) — regardless of which doc
     // type is the session's first offline doc.  (Review Finding B + HOLE A.)
-    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command, budget_gate).await
+    run_staged(
+        pool,
+        pool_secure,
+        dps,
+        sign_ctx,
+        fn_sign,
+        row,
+        command,
+        budget_gate,
+    )
+    .await
 }
 
 /// The shared staged pipeline (acquire → sign → dispatch → send → confirm →
@@ -775,7 +785,14 @@ async fn run_staged(
     // (INV-1: the BEGIN signs in its own `run_staged` sign stage).  The boundary
     // docs themselves are excluded inside the helper (no recursion).
     ensure_offline_session_begin(
-        pool, pool_secure, dps, sign_ctx, fn_sign, row, &command, budget_gate,
+        pool,
+        pool_secure,
+        dps,
+        sign_ctx,
+        fn_sign,
+        row,
+        &command,
+        budget_gate,
     )
     .await?;
 
@@ -1381,29 +1398,39 @@ async fn enforce_time_budgets(
     let request_id = row.request_id;
     let fiscal_number = row.fiscal_number.as_str();
 
-    let budgets =
-        match time_budget::compute_budgets_for_fn(pool, gate.clock, fiscal_number).await {
-            Ok(b) => b,
-            Err(e) => {
-                // Fail-CLOSED: a read fault must not admit an op that could push a
-                // budget past its legal wall (RULING 3.6 — never fail-open).
-                tracing::error!(error=%e, "enforce_time_budgets: budget read failed");
-                return Err(FiscalError::Internal {
-                    request_id,
-                    code: codes::ACQUIRE_INTERNAL,
-                });
-            }
-        };
+    let budgets = match time_budget::compute_budgets_for_fn(pool, gate.clock, fiscal_number).await {
+        Ok(b) => b,
+        Err(e) => {
+            // Fail-CLOSED: a read fault must not admit an op that could push a
+            // budget past its legal wall (RULING 3.6 — never fail-open).
+            tracing::error!(error=%e, "enforce_time_budgets: budget read failed");
+            return Err(FiscalError::Internal {
+                request_id,
+                code: codes::ACQUIRE_INTERNAL,
+            });
+        }
+    };
 
     if let Some(refusal) = budgets.admission_refusal(gate.toggles) {
-        return Err(FiscalError::OfflineRefused {
-            request_id,
-            code: refusal.code(),
-        });
+        // Map to the canonical `codes::` registry constant (the round-trip fence
+        // in inline_map + the handler's 503 status map key off these literals).
+        // `BudgetRefusal::code()` returns the SAME string (SSOT-checked below).
+        let code = match refusal {
+            time_budget::BudgetRefusal::Shift24h => codes::SHIFT_DURATION_LIMIT_EXCEEDED,
+            time_budget::BudgetRefusal::Session36h => codes::OFFLINE_SESSION_LIMIT_EXCEEDED,
+            time_budget::BudgetRefusal::Month168h => codes::OFFLINE_MONTH_LIMIT_EXCEEDED,
+        };
+        debug_assert_eq!(
+            code,
+            refusal.code(),
+            "code registry ↔ BudgetRefusal::code drift"
+        );
+        return Err(FiscalError::OfflineRefused { request_id, code });
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // T3 threaded the budget gate (deps kept explicit)
 async fn ensure_offline_session_begin(
     pool: &SqlitePool,
     pool_secure: &SqlitePool,
@@ -1895,7 +1922,17 @@ async fn run_z_dispatch(
         }
     };
 
-    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command, budget_gate).await
+    run_staged(
+        pool,
+        pool_secure,
+        dps,
+        sign_ctx,
+        fn_sign,
+        row,
+        command,
+        budget_gate,
+    )
+    .await
 }
 
 #[cfg(test)]

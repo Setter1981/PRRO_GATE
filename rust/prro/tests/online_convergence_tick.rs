@@ -296,8 +296,8 @@ async fn build_resting_sent(pool: &SqlitePool, pool_secure: &SqlitePool, stub: &
         &row,
         prro::services::time_budget::system_gate(),
     )
-        .await
-        .expect("inline::run with Hold lastChk returns Ok(Sent)");
+    .await
+    .expect("inline::run with Hold lastChk returns Ok(Sent)");
     assert_eq!(outcome.document_state, DocState::Sent);
     assert_eq!(read_doc_state(pool, FN).await, "SENT");
 }

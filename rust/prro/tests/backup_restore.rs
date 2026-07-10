@@ -461,8 +461,8 @@ async fn issue_receipt_to_ack(pool: &SqlitePool, pool_secure: &SqlitePool, n: i6
         &row,
         prro::services::time_budget::system_gate(),
     )
-        .await
-        .unwrap_or_else(|e| panic!("receipt {n} must reach ACK: {e:?}"));
+    .await
+    .unwrap_or_else(|e| panic!("receipt {n} must reach ACK: {e:?}"));
     assert_eq!(outcome.document_state, DocState::Ack, "receipt {n} → ACK");
 }
 
@@ -605,8 +605,8 @@ async fn issue_receipt_to_ack_sfn(
         &row,
         prro::services::time_budget::system_gate(),
     )
-        .await
-        .unwrap_or_else(|e| panic!("receipt {n} (sfn {server_fiscal_no}) must reach ACK: {e:?}"));
+    .await
+    .unwrap_or_else(|e| panic!("receipt {n} (sfn {server_fiscal_no}) must reach ACK: {e:?}"));
     assert_eq!(outcome.document_state, DocState::Ack, "receipt {n} → ACK");
 }
 

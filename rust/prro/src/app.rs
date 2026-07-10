@@ -858,6 +858,44 @@ impl App {
         .await
     }
 
+    /// T3 (RULING 3.4) — the UNCONDITIONAL shift-limit auto-Z for one FN.
+    ///
+    /// Reads the 24h shift budget against the injected `clock` (the SAME seam the
+    /// admission gate + all budgets use). When the open shift has reached the
+    /// boundary, makes a DURABLE Z attempt REGARDLESS of any enforcement toggle:
+    /// a synthetic `Z_REPORT` inbox row is minted (deterministic idempotency key
+    /// for crash-safety) and driven through the real write path
+    /// (`inline::run` → `run_z_dispatch`) under the held FN lease — so an ONLINE
+    /// shift gets the normal Z dispatch and an OFFLINE shift gets the Pattern-C
+    /// local Z (the T2 close-reserve guarantees a code), and a Z FAILURE routes
+    /// through the existing Z failure paths (edges 4/12 → RequiresManual
+    /// Reconciliation), NEVER silent continuation (RULING 3.4).
+    ///
+    /// Returns the [`AutoZOutcome`]: `NotDue` (under 24h / no closable shift),
+    /// `Issued` (the Z reached OFFLINE_LOCAL_ACK / ACK), or `Escalated` (the Z
+    /// attempt failed and the FN was escalated / left for recovery — durable, not
+    /// silent). Idempotent: a re-tick after a successful Z sees the shift closed →
+    /// `NotDue`; a re-tick with the Z still resting resolves the existing row.
+    pub async fn auto_z_close_over_limit_for_fn(
+        &self,
+        fiscal_number: &str,
+        clock: &dyn crate::services::time_budget::Clock,
+        view: &crate::services::reconciliation::RuntimeView<'_>,
+    ) -> anyhow::Result<crate::services::write_path::AutoZOutcome> {
+        let gate = self.acquire_fn_gate(fiscal_number).await;
+        crate::services::write_path::run_auto_z_if_over_limit(
+            self.db(),
+            self.db_secure(),
+            view.dps,
+            view.signing_ctx,
+            view.fn_sign,
+            &gate,
+            fiscal_number,
+            clock,
+        )
+        .await
+    }
+
     pub fn config(&self) -> &AppConfig {
         &self.inner.config
     }

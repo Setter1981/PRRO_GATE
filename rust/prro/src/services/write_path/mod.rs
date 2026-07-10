@@ -10,10 +10,13 @@
 //!   - W10: DpsError routing dispatch
 //!   - W11: cross-stage deterministic-replay gate
 
+pub mod auto_z;
 pub mod dispatch;
 pub mod error_routing;
 pub mod inline;
 pub(crate) mod inline_map;
+
+pub use auto_z::{run_auto_z_if_over_limit, AutoZOutcome};
 pub mod kvt2_advance;
 pub mod mac_recovery;
 pub mod signer_guard;

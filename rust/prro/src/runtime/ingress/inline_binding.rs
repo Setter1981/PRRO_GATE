@@ -49,7 +49,11 @@ impl InlineWritePath {
 
     /// Test/injection constructor — a caller-supplied [`Clock`] (a `FixedClock`
     /// in tests). All budgets + the admission gate read THIS clock (RULING 3.6).
-    pub fn new_with_clock(app: App, registry: Arc<BindingsRegistry>, clock: Arc<dyn Clock>) -> Self {
+    pub fn new_with_clock(
+        app: App,
+        registry: Arc<BindingsRegistry>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             app,
             registry,

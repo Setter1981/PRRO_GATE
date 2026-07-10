@@ -87,6 +87,7 @@ pub(crate) mod codes {
     ///     run ≥ 36h (`now − offline_sessions.opened_at`, INV-09).
     ///   - `OFFLINE_MONTH_LIMIT_EXCEEDED` — cumulative offline this calendar
     ///     month has reached ≥ 168h (recomputed from `offline_sessions`, INV-10).
+    ///
     /// All three are RETRYABLE 503 (the legal CLOSE path — Z / session END /
     /// drain — is NEVER blocked): the operator resolves the condition (close the
     /// shift / return online / wait for month rollover) and retries.  Tracking is

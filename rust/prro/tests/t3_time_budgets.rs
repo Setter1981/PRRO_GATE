@@ -34,7 +34,9 @@ use prro::config::AppConfig;
 use prro::crypto::session::SigningSession;
 use prro::db::models::enums::{DocState, FiscalMode, NodeMode, Protocol, ShiftState};
 use prro::db::models::ids::RequestId;
-use prro::db::repositories::ingress_inbox::{self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry};
+use prro::db::repositories::ingress_inbox::{
+    self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
+};
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
@@ -372,7 +374,12 @@ async fn pin2_offline_session_36h_sell_refused_z_allowed() {
 
     // The offline Z (close path) is NEVER blocked by the budget → it proceeds
     // (draws reserve, mints BEGIN + Z, closes locally).
-    let z = drive(&*wp, app.db(), entry("Z_REPORT", r#"{}"#, "idem-t3-p2-Z", None)).await;
+    let z = drive(
+        &*wp,
+        app.db(),
+        entry("Z_REPORT", r#"{}"#, "idem-t3-p2-Z", None),
+    )
+    .await;
     let outcome = z.expect("offline Z must be ALLOWED over-budget (close path never blocked)");
     assert_eq!(outcome.document_state, DocState::OfflineLocalAck);
     assert_eq!(doc_count_by_type(app.db(), "Z_REPORT").await, 1, "Z minted");
@@ -413,7 +420,12 @@ async fn pin3_month_168h_accumulator_and_rollover() {
 
     let wp = rebind_with_clock(&app, clock).await;
     // Just under 168h → the SELL is ADMITTED (lands OFFLINE_LOCAL_ACK).
-    let ok = drive(&*wp, app.db(), entry("SELL", SELL_PAYLOAD, "idem-t3-p3-A", Some(TOTAL_KOP))).await;
+    let ok = drive(
+        &*wp,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-t3-p3-A", Some(TOTAL_KOP)),
+    )
+    .await;
     assert_eq!(
         ok.expect("under-168h SELL admits").document_state,
         DocState::OfflineLocalAck,
@@ -423,7 +435,12 @@ async fn pin3_month_168h_accumulator_and_rollover() {
     // Now push the live session's opened_at back so the month total crosses 168h:
     // set live opened_at to 2026-07-19T11:30:00Z → 25h live + 167h closed = 192h.
     set_session_opened_at(app.db(), "2026-07-19T11:30:00Z").await;
-    let over = drive(&*wp, app.db(), entry("SELL", SELL_PAYLOAD, "idem-t3-p3-B", Some(TOTAL_KOP))).await;
+    let over = drive(
+        &*wp,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-t3-p3-B", Some(TOTAL_KOP)),
+    )
+    .await;
     match over {
         Err(FiscalError::OfflineRefused { code, .. }) => assert_eq!(
             code, "OFFLINE_MONTH_LIMIT_EXCEEDED",
@@ -477,13 +494,20 @@ async fn pin3b_rollover_does_not_reset_running_36h_session() {
     // continuous, spanning the July→August boundary.
     set_session_opened_at(app.db(), "2026-07-31T00:00:00Z").await;
     let wp = rebind_with_clock(&app, "2026-08-01T13:00:00Z").await;
-    let res = drive(&*wp, app.db(), entry("SELL", SELL_PAYLOAD, "idem-t3-p3b", Some(TOTAL_KOP))).await;
+    let res = drive(
+        &*wp,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-t3-p3b", Some(TOTAL_KOP)),
+    )
+    .await;
     match res {
         Err(FiscalError::OfflineRefused { code, .. }) => assert_eq!(
             code, "OFFLINE_SESSION_LIMIT_EXCEEDED",
             "a 37h continuous session is refused even after the month rolled over"
         ),
-        other => panic!("expected OFFLINE_SESSION_LIMIT_EXCEEDED (session, not month), got {other:?}"),
+        other => {
+            panic!("expected OFFLINE_SESSION_LIMIT_EXCEEDED (session, not month), got {other:?}")
+        }
     }
 }
 
@@ -588,7 +612,7 @@ async fn pin6_backwards_clock_clamps_no_negative_no_failopen() {
     // Clock BEFORE the open anchor (OPEN_TS 12:00) — 11:00, one hour earlier.
     let backwards = "2026-07-07T11:00:00Z";
     let (app, wp) = boot_opened_shift(CLOCK_FRESH).await; // open stamped at OPEN_TS
-    // A backwards clock: shift elapsed = now(11:00) − open(12:00) < 0 → clamp 0.
+                                                          // A backwards clock: shift elapsed = now(11:00) − open(12:00) < 0 → clamp 0.
     let clock = FixedClock::from_rfc3339(backwards);
     let b = time_budget::compute_budgets_for_fn(app.db(), &clock, FN)
         .await
@@ -609,15 +633,21 @@ async fn pin6_backwards_clock_clamps_no_negative_no_failopen() {
         StubDpsChannel::with_queue(vec![Ok(ack("DPS-SELL"))])
             .with_last_chk_queue(vec![Ok(kvt1("DPS-SELL"))]),
     );
-    let registry = BindingsRegistry::build_from_db(app.db_secure(), app.db(), sell_dps, &FixtureLoader)
-        .await
-        .unwrap();
+    let registry =
+        BindingsRegistry::build_from_db(app.db_secure(), app.db(), sell_dps, &FixtureLoader)
+            .await
+            .unwrap();
     let wp_back = production_write_path_with_clock(
         app.clone(),
         Arc::new(registry),
         Arc::new(FixedClock::from_rfc3339(backwards)),
     );
-    let sell = drive(&*wp_back, app.db(), entry("SELL", SELL_PAYLOAD, "idem-t3-p6", Some(TOTAL_KOP))).await;
+    let sell = drive(
+        &*wp_back,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-t3-p6", Some(TOTAL_KOP)),
+    )
+    .await;
     assert_eq!(
         sell.expect("backwards-clock SELL admits").document_state,
         DocState::Ack,
