@@ -517,3 +517,48 @@ async fn pin1d_online_auto_z_issues_normal_z_to_ack() {
         "the shift is CLOSED via the normal online Z (edges 8+10)"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// PIN 1e (DURABILITY on a build-reject) — if the recovered identity is somehow
+//         unusable (the SHIFT_OPEN inbox row's driver_id is NULL — should never
+//         happen since ingress listeners always stamp it, but defense-in-depth),
+//         the auto-Z's Z build REJECTS → run_z_dispatch terminalises the inbox +
+//         returns Err → auto_z maps to `Escalated` (DURABLE, never silent, never
+//         panic). RULING 3.4: failure → existing route, never silent continuation.
+// ════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+async fn pin1e_null_driver_reject_escalates_durably_never_silent() {
+    let app = boot_offline_opened_shift_enforcement_off().await;
+    // Corrupt the recovered identity: NULL the SHIFT_OPEN inbox row's driver_id.
+    let n = sqlx::query(
+        "UPDATE ingress_inbox SET driver_id = NULL \
+         WHERE fiscal_number = ? AND operation_type = 'SHIFT_OPEN'",
+    )
+    .bind(FN)
+    .execute(app.db())
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(n, 1, "nulled the SHIFT_OPEN driver_id");
+
+    let (dps, sign_ctx, fn_sign) = offline_view();
+    let view = RuntimeView {
+        dps: dps.as_ref(),
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let clock = FixedClock::from_rfc3339(CLOCK_OVER_24H);
+
+    let outcome = app
+        .auto_z_close_over_limit_for_fn(FN, &clock, &view)
+        .await
+        .expect("auto-Z tick must not error (a build-reject is a durable Escalated, not a panic)");
+
+    // DURABLE, not silent: an Escalated outcome (the Z build rejected, the row was
+    // terminalised) — NEVER Issued, NEVER a silent NotDue that would leave the
+    // shift over the wall with no attempt recorded.
+    assert!(
+        matches!(outcome, AutoZOutcome::Escalated { .. }),
+        "a build-reject auto-Z must ESCALATE durably, got {outcome:?}"
+    );
+}

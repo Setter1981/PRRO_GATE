@@ -31,8 +31,6 @@
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::NodeMode;
-
 // ─── budget thresholds (INV-08 / INV-09 / INV-10, LEGAL_INVARIANTS.md) ───
 
 /// 24h continuous shift duration (INV — LEGAL_INVARIANTS.md "24h shift limit").
@@ -353,13 +351,6 @@ impl Budgets {
     pub fn shift_over_24h(&self) -> bool {
         self.shift_seconds.is_some_and(|s| s >= SHIFT_MAX_SECONDS)
     }
-}
-
-/// Whether an FN's node mode counts as "offline" for the offline budgets — the
-/// session (36h) and month (168h) budgets only accrue while offline. Kept here
-/// so the gate + ticker share one predicate.
-pub fn is_offline_mode(mode: NodeMode) -> bool {
-    matches!(mode, NodeMode::Offline | NodeMode::GoingOffline)
 }
 
 /// The T3 policy inputs threaded into the write-path admission point: the ONE
