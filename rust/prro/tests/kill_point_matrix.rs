@@ -329,6 +329,7 @@ async fn k6_offline_local_ack_drains_to_ack() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("offline SELL must land at OFFLINE_LOCAL_ACK (success, not error)");
@@ -479,6 +480,7 @@ async fn k5_kvt2_committed_finalizes_to_ack() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("online SELL with Hold lastChk returns Ok(Sent), a 202");
@@ -593,6 +595,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         ));
         tokio::select! {
             _ = &mut fut => panic!("inline::run must hang on lastChk, not complete"),
@@ -727,6 +730,7 @@ async fn k3_sending_committed_resumes_to_error_retryable_without_resend() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         ));
         tokio::select! {
             _ = &mut fut => panic!("inline::run must hang on send_chk, not complete"),
@@ -1065,6 +1069,7 @@ async fn m1_02_reachability_second_sell_while_first_rests_sent() {
             &fn_sign1,
             &guard,
             &row1,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("run #1: online SELL with Hold lastChk returns Ok(Sent)");
@@ -1090,6 +1095,7 @@ async fn m1_02_reachability_second_sell_while_first_rests_sent() {
             &fn_sign2,
             &guard,
             &row2,
+            prro::services::time_budget::system_gate(),
         )
         .await
     };
@@ -1200,6 +1206,7 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("phase 1 rests at SENT");
@@ -1345,6 +1352,7 @@ async fn k4b_sent_probe_matching_id_empty_data_sign_holds_at_sent() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("phase 1 rests at SENT");
@@ -1428,7 +1436,7 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1)
+        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1, prro::services::time_budget::system_gate())
             .await
             .expect("offline receipt 1 → OFFLINE_LOCAL_ACK");
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
@@ -1437,7 +1445,7 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let stub2 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub2, &sign_ctx, &fn_sign, &g, &row2)
+        let o = inline::run(&pool, &pool_secure, &stub2, &sign_ctx, &fn_sign, &g, &row2, prro::services::time_budget::system_gate())
             .await
             .expect("offline receipt 2 → OFFLINE_LOCAL_ACK");
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
@@ -1597,7 +1605,7 @@ async fn m2_online_offline_boundary_chain_continuous() {
     stub0.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → online Hold → SENT
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub0, &sign_ctx, &fn_sign, &g, &row0)
+        let o = inline::run(&pool, &pool_secure, &stub0, &sign_ctx, &fn_sign, &g, &row0, prro::services::time_budget::system_gate())
             .await
             .unwrap();
         assert_eq!(o.document_state, DocState::Sent);
@@ -1649,7 +1657,7 @@ async fn m2_online_offline_boundary_chain_continuous() {
     let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1)
+        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1, prro::services::time_budget::system_gate())
             .await
             .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
@@ -1727,7 +1735,7 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     {
         let g = gate.clone().lock_owned().await;
         let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row1)
+        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row1, prro::services::time_budget::system_gate())
             .await
             .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
@@ -1736,7 +1744,7 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     {
         let g = gate.clone().lock_owned().await;
         let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row2)
+        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row2, prro::services::time_budget::system_gate())
             .await
             .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
@@ -1884,6 +1892,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .unwrap_or_else(|e| panic!("offline SELL {i} must land OFFLINE_LOCAL_ACK: {e:?}"));
@@ -2033,6 +2042,7 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .unwrap_or_else(|e| panic!("offline SELL {i} must land OFFLINE_LOCAL_ACK: {e:?}"));
@@ -2236,6 +2246,7 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
             &fn_sign,
             &guard,
             &row1,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("doc1 → OFFLINE_LOCAL_ACK");
@@ -2289,6 +2300,7 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
             &fn_sign,
             &guard,
             &row2,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("doc2 → OFFLINE_LOCAL_ACK");
@@ -2428,6 +2440,7 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .unwrap_or_else(|e| panic!("offline SELL {n} must land OFFLINE_LOCAL_ACK: {e:?}"));
@@ -2597,6 +2610,7 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("online SELL Hold rests at SENT");
@@ -2720,6 +2734,7 @@ async fn m1_02_online_seed_fork_a24_prerequisite() {
             &fn_sign,
             &guard,
             &row1,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("doc1 rests at SENT");
@@ -2738,6 +2753,7 @@ async fn m1_02_online_seed_fork_a24_prerequisite() {
             &fn_sign,
             &guard,
             &row2,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("doc2 rests at SENT");
@@ -2817,6 +2833,7 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("online SELL Hold rests at SENT");
@@ -2940,6 +2957,7 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("online SELL Hold rests at SENT");
@@ -3045,6 +3063,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .unwrap_or_else(|e| panic!("offline SELL {n} must land OFFLINE_LOCAL_ACK: {e:?}"));

@@ -41,6 +41,7 @@ use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
 use crate::runtime::ingress::z_builder::{
     build_z_canonical, ensure_full_z_surface_ready, quiesce_shift_before_z, QuiescenceOutcome,
 };
+use crate::services::time_budget::{self, TimeBudgetGate};
 use crate::services::offline_sync::kvt2_confirm::{
     classify_check_result, Kvt2ConfirmOutcome, Kvt2ConfirmSource,
 };
@@ -644,6 +645,7 @@ pub async fn run(
     fn_sign: &CheckSignBlob,
     _fn_gate: &OwnedMutexGuard<()>,
     row: &InboxRow,
+    budget_gate: TimeBudgetGate<'_>,
 ) -> Result<FiscalOutcome, FiscalError> {
     let request_id = row.request_id;
 
@@ -665,7 +667,8 @@ pub async fn run(
             // `debug_assert(surface.is_err())` is superseded — the routing IS the
             // deliberate handling now.
             if ensure_full_z_surface_ready().is_ok() {
-                return run_z_dispatch(pool, pool_secure, dps, sign_ctx, fn_sign, row).await;
+                return run_z_dispatch(pool, pool_secure, dps, sign_ctx, fn_sign, row, budget_gate)
+                    .await;
             }
             // Build the error FIRST so the audit code comes from code_of —
             // audit ↔ returned error agree by construction (review HTTP-1;
@@ -711,7 +714,7 @@ pub async fn run(
     // common first-offline-doc seam), so it fires for SHIFT_OPEN / SELL / RETURN
     // AND the Z path (`run_z_dispatch` → `run_staged`) — regardless of which doc
     // type is the session's first offline doc.  (Review Finding B + HOLE A.)
-    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command).await
+    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command, budget_gate).await
 }
 
 /// The shared staged pipeline (acquire → sign → dispatch → send → confirm →
@@ -729,6 +732,7 @@ async fn run_staged(
     fn_sign: &CheckSignBlob,
     row: &InboxRow,
     command: CanonicalFiscalCommand,
+    budget_gate: TimeBudgetGate<'_>,
 ) -> Result<FiscalOutcome, FiscalError> {
     let request_id = row.request_id;
     // Captured BEFORE `command` is moved into stage_acquire — the reject arm
@@ -752,6 +756,15 @@ async fn run_staged(
     // un-closable for lack of a code».
     enforce_offline_close_reserve(pool, row, doc_type).await?;
 
+    // T3 (RULING 3.2/3.3) — the document-derived TIME-budget enforcement gate.
+    // Placed in the SAME pre-mint lane as the T2 close-reserve: a NEW ordinary
+    // SELL/RETURN over an ENFORCED budget (24h shift / 36h session / 168h month)
+    // is refused row-less (503), BEFORE the lazy BEGIN mint / stage_acquire, so
+    // no row/lnd/code is consumed. Close-path ops bypass by doc-type inside the
+    // gate (the legal close is never blocked). Tracking is always on; the auto-Z
+    // ticker owns the UNCONDITIONAL 24h close (RULING 3.4), separate from here.
+    enforce_time_budgets(pool, budget_gate, row, doc_type).await?;
+
     // B10 (W10a) — the COMMON first-offline-doc seam.  BEFORE this doc mints,
     // ensure the session's DocType=9 BEGIN is issued (or fail-closed if a crashed
     // BEGIN rests non-terminal) — for SHIFT_OPEN / SELL / RETURN / Z_REPORT /
@@ -761,7 +774,10 @@ async fn run_staged(
     // caller's held FN gate (sequential sub-drive) and OUTSIDE every write tx
     // (INV-1: the BEGIN signs in its own `run_staged` sign stage).  The boundary
     // docs themselves are excluded inside the helper (no recursion).
-    ensure_offline_session_begin(pool, pool_secure, dps, sign_ctx, fn_sign, row, &command).await?;
+    ensure_offline_session_begin(
+        pool, pool_secure, dps, sign_ctx, fn_sign, row, &command, budget_gate,
+    )
+    .await?;
 
     let acq = match stage_acquire::run(pool, pool_secure, driver_id, request_id, command).await {
         Ok(r) => r,
@@ -1328,6 +1344,66 @@ async fn enforce_offline_close_reserve(
     Ok(())
 }
 
+/// T3 (RULING 3.2/3.3) — the document-derived TIME-budget enforcement gate.
+///
+/// Refuses a NEW ordinary op (SELL / RETURN) fail-closed PRE-MINT (row-less 503
+/// `FiscalError::OfflineRefused`, the same lane as the T2 close-reserve) when a
+/// budget is over its legal limit AND that budget's enforcement toggle is ON:
+///   - 24h shift duration (`now − SHIFT_OPEN.business_ts`) — the widest wedge;
+///   - 36h continuous offline session (`now − offline_sessions.opened_at`);
+///   - 168h cumulative offline / calendar month (recomputed from sessions).
+///
+/// The legal CLOSE path is NEVER blocked (RULING 3.2): close-path ops
+/// (`ZReport` / `ShiftClose` / `OfflineSessionBegin` / `OfflineSessionEnd`)
+/// bypass by doc-type — a shift over 24h must still be closable, and the offline
+/// budgets must not trap the offline Z / session END / drain. Tracking is ALWAYS
+/// on (RULING 3.2); only refusal is toggled per budget via `gate.toggles`
+/// (RULING 3.3). The auto-Z ticker acts on the 24h boundary UNCONDITIONALLY
+/// (RULING 3.4) — separate from this gate.
+///
+/// Reads only (pure SQLite SELECTs via [`time_budget::compute_budgets_for_fn`];
+/// INV-1 safe) under the caller's held FN write-lease (INV-2). A read fault →
+/// fail-CLOSED `Internal` (never fail-open — RULING 3.6). Placed BEFORE the lazy
+/// BEGIN mint + `stage_acquire`, so a refused op mints no row/lnd/code.
+async fn enforce_time_budgets(
+    pool: &SqlitePool,
+    gate: TimeBudgetGate<'_>,
+    row: &InboxRow,
+    doc_type: DocType,
+) -> Result<(), FiscalError> {
+    // Doc-type filter: ordinary business ops only. Close-path + boundary ops
+    // (Z / SHIFT_CLOSE / BEGIN / END) always pass — the legal close is never
+    // blocked (RULING 3.2). SHIFT_OPEN is a lifecycle op that STARTS the shift
+    // clock; refusing it on a stale budget makes no sense → excluded.
+    if !matches!(doc_type, DocType::Sell | DocType::Return) {
+        return Ok(());
+    }
+    let request_id = row.request_id;
+    let fiscal_number = row.fiscal_number.as_str();
+
+    let budgets =
+        match time_budget::compute_budgets_for_fn(pool, gate.clock, fiscal_number).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Fail-CLOSED: a read fault must not admit an op that could push a
+                // budget past its legal wall (RULING 3.6 — never fail-open).
+                tracing::error!(error=%e, "enforce_time_budgets: budget read failed");
+                return Err(FiscalError::Internal {
+                    request_id,
+                    code: codes::ACQUIRE_INTERNAL,
+                });
+            }
+        };
+
+    if let Some(refusal) = budgets.admission_refusal(gate.toggles) {
+        return Err(FiscalError::OfflineRefused {
+            request_id,
+            code: refusal.code(),
+        });
+    }
+    Ok(())
+}
+
 async fn ensure_offline_session_begin(
     pool: &SqlitePool,
     pool_secure: &SqlitePool,
@@ -1336,6 +1412,7 @@ async fn ensure_offline_session_begin(
     fn_sign: &CheckSignBlob,
     row: &InboxRow,
     command: &CanonicalFiscalCommand,
+    budget_gate: TimeBudgetGate<'_>,
 ) -> Result<(), FiscalError> {
     // (a) The boundary docs themselves never recurse here (the BEGIN's own
     // `run_staged`, and the drain-time END, are excluded).  EVERY other offline
@@ -1498,6 +1575,7 @@ async fn ensure_offline_session_begin(
                 fiscal_number,
                 row.driver_id.as_deref(),
                 request_id,
+                budget_gate,
             )
             .await
         }
@@ -1532,6 +1610,7 @@ async fn mint_offline_session_begin(
     fiscal_number: &str,
     driver_id: Option<&str>,
     parent_request_id: [u8; 16],
+    budget_gate: TimeBudgetGate<'_>,
 ) -> Result<(), FiscalError> {
     let internal_fail = |code: &'static str| FiscalError::Internal {
         request_id: parent_request_id,
@@ -1627,6 +1706,7 @@ async fn mint_offline_session_begin(
         fn_sign,
         &synth_row,
         command,
+        budget_gate,
     ));
     match begin_run.await {
         Ok(outcome) if outcome.document_state == DocState::OfflineLocalAck => Ok(()),
@@ -1651,6 +1731,7 @@ async fn run_z_dispatch(
     sign_ctx: &SigningContext,
     fn_sign: &CheckSignBlob,
     row: &InboxRow,
+    budget_gate: TimeBudgetGate<'_>,
 ) -> Result<FiscalOutcome, FiscalError> {
     let request_id = row.request_id;
     let fiscal_number = row.fiscal_number.clone();
@@ -1814,7 +1895,7 @@ async fn run_z_dispatch(
         }
     };
 
-    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command).await
+    run_staged(pool, pool_secure, dps, sign_ctx, fn_sign, row, command, budget_gate).await
 }
 
 #[cfg(test)]

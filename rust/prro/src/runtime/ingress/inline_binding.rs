@@ -21,20 +21,40 @@ use crate::db::repositories::ingress_inbox::InboxRow;
 use crate::runtime::bindings::BindingsRegistry;
 use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome, WritePathEntry};
 use crate::runtime::key_loader::build_fn_sign;
+use crate::services::time_budget::{Clock, SystemClock, TimeBudgetGate};
 use crate::services::write_path::inline;
 use crate::services::write_path::inline_map::codes;
 
 /// The inline write-path binding.  Holds an [`App`] (pools + per-FN gate) and
 /// the boot-built [`BindingsRegistry`] (per-FN DPS + signing context); resolves
 /// both by `row.fiscal_number` at `fiscalize` time.
+///
+/// T3 (RULING 3.6) — also holds the ONE injected [`Clock`]: prod is
+/// [`SystemClock`]; tests inject a `FixedClock` via [`new_with_clock`] so the
+/// document-derived time-budget admission gate advances deterministically. The
+/// per-budget enforcement toggles are read from `app.config().offline`.
+///
+/// [`new_with_clock`]: InlineWritePath::new_with_clock
 pub struct InlineWritePath {
     app: App,
     registry: Arc<BindingsRegistry>,
+    clock: Arc<dyn Clock>,
 }
 
 impl InlineWritePath {
+    /// Production constructor — the system-UTC clock (RULING 3.6).
     pub fn new(app: App, registry: Arc<BindingsRegistry>) -> Self {
-        Self { app, registry }
+        Self::new_with_clock(app, registry, Arc::new(SystemClock))
+    }
+
+    /// Test/injection constructor — a caller-supplied [`Clock`] (a `FixedClock`
+    /// in tests). All budgets + the admission gate read THIS clock (RULING 3.6).
+    pub fn new_with_clock(app: App, registry: Arc<BindingsRegistry>, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            app,
+            registry,
+            clock,
+        }
     }
 }
 
@@ -46,6 +66,19 @@ impl InlineWritePath {
 /// (`tests/a3_final_binding_flip.rs`).
 pub fn production_write_path(app: App, registry: Arc<BindingsRegistry>) -> Arc<dyn WritePathEntry> {
     Arc::new(InlineWritePath::new(app, registry))
+}
+
+/// T3 (RULING 3.6) — the same production binding with an INJECTED [`Clock`].
+/// Tests build this with a `FixedClock` so the document-derived time budgets
+/// advance deterministically end-to-end through the real write path (the seam
+/// RAGE W5 `Op::AdvanceClock` drives). Prod always uses [`production_write_path`]
+/// (system UTC).
+pub fn production_write_path_with_clock(
+    app: App,
+    registry: Arc<BindingsRegistry>,
+    clock: Arc<dyn Clock>,
+) -> Arc<dyn WritePathEntry> {
+    Arc::new(InlineWritePath::new_with_clock(app, registry, clock))
 }
 
 #[async_trait]
@@ -77,6 +110,13 @@ impl WritePathEntry for InlineWritePath {
         // (NEW→PROCESSING) and owns the inbox-terminalise obligation + the
         // fail-safe replay semantics (audited in the A2.4 Phase-1 arm-table).
         let gate = self.app.acquire_fn_gate(fn_id).await;
+        // T3 (RULING 3.3/3.6) — the time-budget policy: the injected clock +
+        // the per-budget enforcement toggles from config. Read fresh per call so
+        // a config hot-reload (future) takes effect without a rebind.
+        let budget_gate = TimeBudgetGate::new(
+            self.clock.as_ref(),
+            self.app.config().offline.enforcement_toggles(),
+        );
         inline::run(
             self.app.db(),
             self.app.db_secure(),
@@ -85,6 +125,7 @@ impl WritePathEntry for InlineWritePath {
             &fn_sign,
             &gate,
             row,
+            budget_gate,
         )
         .await
     }

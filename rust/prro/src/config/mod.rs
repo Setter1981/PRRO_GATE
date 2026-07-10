@@ -220,12 +220,56 @@ pub struct OfflineCfg {
     /// bound is one hour (operator pin).
     #[serde(default = "default_return_online_probe_interval_seconds")]
     pub return_online_probe_interval_seconds: u64,
+
+    // ── T3 (RULING 3.3) — per-budget ENFORCEMENT toggles (refuse NEW ordinary
+    //    ops over-budget). Tracking is ALWAYS on (RULING 3.2) regardless; only
+    //    refusal is toggled. Defaults ON (RULING 3.3). Turning a budget off is
+    //    an operator decision that never disables tracking OR the auto-Z below.
+    /// Enforce the 24h shift-duration limit (refuse NEW SELL/RETURN once the
+    /// open shift has run ≥ 24h). The UNCONDITIONAL auto-Z ticker acts at this
+    /// boundary regardless of this toggle (RULING 3.4).
+    #[serde(default = "default_true")]
+    pub enforce_shift_24h: bool,
+    /// Enforce the 36h continuous-offline-session limit (INV-09).
+    #[serde(default = "default_true")]
+    pub enforce_offline_session_36h: bool,
+    /// Enforce the 168h cumulative-offline-per-calendar-month limit (INV-10).
+    #[serde(default = "default_true")]
+    pub enforce_offline_month_168h: bool,
+
+    /// **DEPRECATED (RULING 3.4).** The May spec's per-FN auto-close toggle is
+    /// superseded: the shift-limit auto-Z is now UNCONDITIONAL. This key is
+    /// PARSED-BUT-IGNORED for config back-compat; on boot a one-time deprecation
+    /// audit is emitted if it is present. Reading it changes NO behaviour.
+    #[serde(default)]
+    pub shift_autoclose_enabled: Option<bool>,
 }
 
 impl Default for OfflineCfg {
     fn default() -> Self {
         Self {
             return_online_probe_interval_seconds: default_return_online_probe_interval_seconds(),
+            enforce_shift_24h: true,
+            enforce_offline_session_36h: true,
+            enforce_offline_month_168h: true,
+            shift_autoclose_enabled: None,
+        }
+    }
+}
+
+/// Shared serde default for the T3 enforcement bools (default ON, RULING 3.3).
+fn default_true() -> bool {
+    true
+}
+
+impl OfflineCfg {
+    /// The per-budget enforcement toggle set consumed by the write-path
+    /// admission gate (`services::time_budget::EnforcementToggles`).
+    pub fn enforcement_toggles(&self) -> crate::services::time_budget::EnforcementToggles {
+        crate::services::time_budget::EnforcementToggles {
+            shift_24h: self.enforce_shift_24h,
+            session_36h: self.enforce_offline_session_36h,
+            month_168h: self.enforce_offline_month_168h,
         }
     }
 }
@@ -305,6 +349,15 @@ pub struct SupervisorCfg {
     /// per-FN backoff gating.
     #[serde(default = "default_online_convergence_interval_seconds")]
     pub online_convergence_interval_seconds: u64,
+
+    /// T3 (RULING 3.4) — the UNCONDITIONAL auto-Z ticker cadence (seconds). Each
+    /// tick recomputes the 24h shift budget for every FN and makes a durable Z
+    /// attempt at any shift that has crossed the boundary — regardless of any
+    /// enforcement toggle. **Raw value** — route boot callers through
+    /// [`SupervisorCfg::clamped_auto_z_interval_seconds`]. Like the drain/
+    /// convergence tickers this is just the wake cadence.
+    #[serde(default = "default_auto_z_interval_seconds")]
+    pub auto_z_interval_seconds: u64,
 }
 
 impl Default for SupervisorCfg {
@@ -318,6 +371,7 @@ impl Default for SupervisorCfg {
             drain_interval_seconds: default_drain_interval_seconds(),
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
             online_convergence_interval_seconds: default_online_convergence_interval_seconds(),
+            auto_z_interval_seconds: default_auto_z_interval_seconds(),
         }
     }
 }
@@ -355,6 +409,18 @@ fn default_online_convergence_interval_seconds() -> u64 {
 pub const ONLINE_CONVERGENCE_INTERVAL_MIN_SECONDS: u64 = 15;
 pub const ONLINE_CONVERGENCE_INTERVAL_MAX_SECONDS: u64 = 3600;
 
+/// T3 (RULING 3.4) — default auto-Z tick cadence (seconds). 5min: the 24h
+/// boundary is coarse, so a tight cadence buys nothing; a tick after the wall is
+/// still well inside the operator's tolerance, and the tracking gate blocks new
+/// sales in the interim regardless.
+fn default_auto_z_interval_seconds() -> u64 {
+    300
+}
+/// Inclusive clamp bounds for the auto-Z tick cadence. Floor 15s (a shift-limit
+/// close is not latency-sensitive); ceiling 1h.
+pub const AUTO_Z_INTERVAL_MIN_SECONDS: u64 = 15;
+pub const AUTO_Z_INTERVAL_MAX_SECONDS: u64 = 3600;
+
 impl SupervisorCfg {
     /// Validate + clamp `drain_interval_seconds` to
     /// `[DRAIN_INTERVAL_MIN_SECONDS, DRAIN_INTERVAL_MAX_SECONDS]`.  Returns
@@ -385,6 +451,15 @@ impl SupervisorCfg {
             ONLINE_CONVERGENCE_INTERVAL_MIN_SECONDS,
             ONLINE_CONVERGENCE_INTERVAL_MAX_SECONDS,
         );
+        (clamped, clamped != raw)
+    }
+
+    /// T3 (RULING 3.4) — validate + clamp `auto_z_interval_seconds` to
+    /// `[AUTO_Z_INTERVAL_MIN_SECONDS, AUTO_Z_INTERVAL_MAX_SECONDS]`. Mirror of
+    /// [`SupervisorCfg::clamped_online_convergence_interval_seconds`].
+    pub fn clamped_auto_z_interval_seconds(&self) -> (u64, bool) {
+        let raw = self.auto_z_interval_seconds;
+        let clamped = raw.clamp(AUTO_Z_INTERVAL_MIN_SECONDS, AUTO_Z_INTERVAL_MAX_SECONDS);
         (clamped, clamped != raw)
     }
 }
@@ -812,6 +887,7 @@ mod tests {
             drain_interval_seconds: 0,
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
             online_convergence_interval_seconds: default_online_convergence_interval_seconds(),
+            auto_z_interval_seconds: default_auto_z_interval_seconds(),
         };
         let (clamped, was_clamped) = sup.clamped_drain_interval_seconds();
         assert_eq!(clamped, DRAIN_INTERVAL_MIN_SECONDS);
@@ -832,6 +908,7 @@ mod tests {
             drain_interval_seconds: default_drain_interval_seconds(),
             shutdown_grace_seconds: 0,
             online_convergence_interval_seconds: default_online_convergence_interval_seconds(),
+            auto_z_interval_seconds: default_auto_z_interval_seconds(),
         };
         let (clamped, was_clamped) = sup.clamped_shutdown_grace_seconds();
         assert_eq!(clamped, SHUTDOWN_GRACE_MIN_SECONDS);
@@ -843,6 +920,7 @@ mod tests {
             drain_interval_seconds: default_drain_interval_seconds(),
             shutdown_grace_seconds: 99_999,
             online_convergence_interval_seconds: default_online_convergence_interval_seconds(),
+            auto_z_interval_seconds: default_auto_z_interval_seconds(),
         };
         let (clamped, was_clamped) = too_big.clamped_shutdown_grace_seconds();
         assert_eq!(clamped, SHUTDOWN_GRACE_MAX_SECONDS);
@@ -865,6 +943,7 @@ mod tests {
             drain_interval_seconds: default_drain_interval_seconds(),
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
             online_convergence_interval_seconds: 1,
+            auto_z_interval_seconds: default_auto_z_interval_seconds(),
         };
         let (clamped, was_clamped) = too_small.clamped_online_convergence_interval_seconds();
         assert_eq!(clamped, ONLINE_CONVERGENCE_INTERVAL_MIN_SECONDS);
@@ -878,6 +957,7 @@ mod tests {
             drain_interval_seconds: default_drain_interval_seconds(),
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
             online_convergence_interval_seconds: 9999,
+            auto_z_interval_seconds: default_auto_z_interval_seconds(),
         };
         let (clamped, was_clamped) = too_big.clamped_online_convergence_interval_seconds();
         assert_eq!(clamped, ONLINE_CONVERGENCE_INTERVAL_MAX_SECONDS);

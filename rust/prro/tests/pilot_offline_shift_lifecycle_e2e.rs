@@ -41,7 +41,7 @@ use prro::db::repositories::ingress_inbox::{
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
-use prro::runtime::ingress::inline_binding::production_write_path;
+use prro::runtime::ingress::inline_binding::production_write_path_with_clock;
 use prro::runtime::ingress::seam::{FiscalOutcome, WritePathEntry};
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -303,7 +303,7 @@ async fn drill_a_morning_without_network_offline_open_drain_online_z_close() {
     // the drain never touch it).
     let registry = build_registry(&app, online_dps(&["DPS-A-Z"])).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
 
     // ─── 1) the net is down BEFORE the shift opens: GO_OFFLINE on Closed ──
     prro::admin::go_offline(app.db(), FN, "morning net down")
@@ -455,7 +455,7 @@ async fn drill_b_full_offline_day_offline_open_sells_offline_z_close_drain_conve
     // queues would panic loudly if any leg tried the wire).
     let registry = build_registry(&app, online_dps(&[])).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
 
     // ─── 1) GO_OFFLINE on Closed + codes ───────────────────────────────────
     prro::admin::go_offline(app.db(), FN, "full offline day")

@@ -40,7 +40,7 @@ use prro::db::repositories::ingress_inbox::{
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
-use prro::runtime::ingress::inline_binding::production_write_path;
+use prro::runtime::ingress::inline_binding::production_write_path_with_clock;
 use prro::runtime::ingress::seam::{FiscalOutcome, WritePathEntry};
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -300,7 +300,7 @@ async fn pilot_offline_full_drill_go_offline_sell_return_go_online_drain_converg
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
 
     // ─── 1) online SHIFT_OPEN (edge 3, live) ──────────────────────────────
     let open = drive(
@@ -459,7 +459,7 @@ async fn combined_pilot_gate_online_and_offline_cohorts_in_one_shift() {
     )
     .await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let write_path = production_write_path_with_clock(app.clone(), Arc::new(registry), std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339("2026-07-07T12:30:00Z")));
 
     // 1) online SHIFT_OPEN + 2) an ONLINE SELL (issued online → ACK).
     let open = drive(

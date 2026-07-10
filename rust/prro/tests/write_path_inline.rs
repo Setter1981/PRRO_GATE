@@ -517,7 +517,7 @@ async fn online_sell_reaches_ack() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect("online SELL must reach a terminal ACK FiscalOutcome");
 
@@ -571,7 +571,7 @@ async fn online_sell_transient_send_returns_in_progress() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect("transient send is IN_PROGRESS (202), never a terminal Err");
 
@@ -607,7 +607,7 @@ async fn online_sell_lastchk_hold_returns_sent_in_progress() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect("Hold leaves the doc at Sent → 202, never a terminal Err");
 
@@ -662,7 +662,7 @@ async fn offline_sell_is_offline_local_ack_success() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect("offline auto-ack is a SUCCESS (200), never a FiscalError");
 
@@ -737,7 +737,7 @@ async fn offline_no_code_aborts_begin_and_returns_retryable_refusal() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a no-code offline sell must be refused, not issued");
 
@@ -802,7 +802,7 @@ async fn online_shift_open_reaches_ack() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect("online SHIFT_OPEN must reach a terminal ACK FiscalOutcome");
 
@@ -839,7 +839,7 @@ async fn online_shift_open_while_open_is_shift_already_open() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("SHIFT_OPEN on an already-open shift must be guard-refused");
     match err {
@@ -879,7 +879,7 @@ async fn online_z_report_closes_shift_reaches_ack() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect("online Z_REPORT must reach a terminal ACK FiscalOutcome");
     assert_eq!(
@@ -926,6 +926,7 @@ async fn online_z_report_quiescence_pending_is_503_and_rejects_inbox() {
             &fn_sign,
             &guard,
             &sell_row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("transient SELL is a 202 in-flight, not an Err");
@@ -951,6 +952,7 @@ async fn online_z_report_quiescence_pending_is_503_and_rejects_inbox() {
         &fn_sign,
         &guard,
         &z_row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect_err("a Z with an in-flight receipt is quiescence-pending (503)");
@@ -994,7 +996,7 @@ async fn online_z_report_no_open_shift_is_shift_not_open() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a Z with no open shift must be ShiftNotOpen");
     assert!(
@@ -1033,7 +1035,7 @@ async fn acquire_rejected_maps_only_no_double_terminalise() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a SELL with no open shift is refused");
     assert!(matches!(err, FiscalError::ShiftNotOpen { .. }));
@@ -1080,7 +1082,7 @@ async fn offline_no_session_is_internal_500_and_terminalises_inbox() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("offline-ack with no session is a structural refusal");
     match err {
@@ -1119,7 +1121,7 @@ async fn sign_crypto_failure_is_sign_failure_and_terminalises_inbox() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a crypto sign failure is a terminal refusal");
     assert!(matches!(err, FiscalError::SignFailure { .. }));
@@ -1158,7 +1160,7 @@ async fn z_report_dps_reject_escalates_shift_to_manual_recon() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a rejected Z escalates the shift to manual recon");
     assert!(
@@ -1208,7 +1210,7 @@ async fn sell_dps_reject_does_not_escalate_shift() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a SELL DPS reject is a per-doc terminal");
     assert!(
@@ -1254,7 +1256,7 @@ async fn dps_hard_reject_is_dps_rejected_and_terminalises_inbox() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a DPS hard reject is a terminal refusal");
     assert!(matches!(err, FiscalError::DpsRejected { .. }));
@@ -1301,7 +1303,7 @@ async fn blocked_node_is_offline_refused_and_inbox_terminal() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a BLOCKED node refuses fiscalization");
     match err {
@@ -1342,7 +1344,7 @@ async fn lastchk_drift_terminalises_inbox_and_leaves_doc_sent() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a Sent-fresh NotFound is structural drift (500)");
     match err {
@@ -1405,7 +1407,7 @@ async fn noop_resolves_accepted_truth_from_ledger() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect("Noop must resolve the accepted ledger truth, not fail");
     assert_eq!(
@@ -1480,7 +1482,7 @@ async fn build_reject_terminalises_pre_acquire() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect_err("a hash-mismatched row is a structural reject");
     match err {
@@ -1518,7 +1520,7 @@ async fn online_return_reaches_ack() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
+    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row, prro::services::time_budget::system_gate())
         .await
         .expect("online RETURN must reach a terminal ACK");
     assert_eq!(

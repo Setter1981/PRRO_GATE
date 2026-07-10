@@ -439,6 +439,7 @@ impl Harness {
             &self.fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await;
         drop(guard);

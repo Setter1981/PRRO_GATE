@@ -21,12 +21,17 @@
 //! clock input MUST NOT produce a negative budget or fail-open — every elapsed
 //! computation clamps at zero.
 //!
-//! This module is PURE (no DB, no IO): callers read the durable timestamps and
-//! hand them in. The SQL readers + the `run_staged` enforcement gate + the
-//! supervisor auto-Z ticker live in their respective hot-zone files and all read
-//! the SAME `Clock` seam (RULING 3.4/3.6).
+//! The pure calculation (elapsed/overlap/admission) takes durable timestamps as
+//! inputs. The DB reader [`compute_budgets_for_fn`] reads the durable rows and
+//! applies the injected [`Clock`]; the `run_staged` enforcement gate + the
+//! supervisor auto-Z ticker + tests all read the SAME `Clock` seam
+//! (RULING 3.4/3.6). Reads only (pure SQLite SELECTs — no crypto/network,
+//! INV-1 safe).
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
+use sqlx::SqlitePool;
+
+use crate::db::models::enums::NodeMode;
 
 // ─── budget thresholds (INV-08 / INV-09 / INV-10, LEGAL_INVARIANTS.md) ───
 
@@ -241,6 +246,161 @@ impl BudgetRefusal {
             BudgetRefusal::Month168h => "OFFLINE_MONTH_LIMIT_EXCEEDED",
         }
     }
+}
+
+// ─── DB-backed budget reader (RULING 3.1/3.2, tracking ALWAYS on) ───
+
+/// The three document-derived budgets for an FN at a given `now`, in seconds.
+/// `None` = no anchor / not applicable (e.g. no open shift → `shift_seconds`
+/// None; no open offline session → `session_seconds` None). Computed
+/// unconditionally (tracking is ALWAYS on — RULING 3.2); enforcement + auto-Z
+/// consume these separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budgets {
+    /// `now − SHIFT_OPEN.business_ts` of the FN's current open shift (24h limit).
+    pub shift_seconds: Option<i64>,
+    /// `now − opened_at` of the FN's current OPEN offline session (36h limit).
+    pub session_seconds: Option<i64>,
+    /// Cumulative offline seconds this calendar month, recomputed from
+    /// `offline_sessions` (168h limit). Always `Some` (0 when no sessions).
+    pub month_seconds: Option<i64>,
+}
+
+/// Read the durable rows for `fiscal_number` and compute the three budgets at
+/// `clock.now_utc()`. Pure SQLite reads (INV-1: no crypto/network); safe to call
+/// from the write-path admission gate (on the caller's held FN lease) and from
+/// the supervisor ticker. Read errors propagate `sqlx::Error` — the caller
+/// decides fail-closed (admission) vs log-and-skip (ticker).
+///
+/// Shift anchor: the SHIFT_OPEN doc's `business_ts` for the FN's
+/// `node_state.current_shift_id`. `shifts.opened_at` is a dead column (never
+/// stamped by the live write path — verified), so the doc is authoritative.
+pub async fn compute_budgets_for_fn(
+    pool: &SqlitePool,
+    clock: &dyn Clock,
+    fiscal_number: &str,
+) -> Result<Budgets, sqlx::Error> {
+    let now = clock.now_utc();
+
+    // (1) 24h shift — the SHIFT_OPEN business_ts of the FN's current shift.
+    let shift_open_business_ts: Option<String> = sqlx::query_scalar(
+        "SELECT fd.business_ts \
+         FROM fiscal_documents fd \
+         JOIN node_state ns ON ns.current_shift_id = fd.shift_id \
+         WHERE ns.fiscal_number = ? AND fd.doc_type = 'SHIFT_OPEN' \
+         ORDER BY fd.lnd ASC LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    let shift_seconds = shift_open_business_ts
+        .as_deref()
+        .and_then(parse_ts)
+        .map(|start| elapsed_seconds_clamped(start, now));
+
+    // (2) 36h continuous offline session — the FN's current OPEN session.
+    let session_opened_at: Option<String> = sqlx::query_scalar(
+        "SELECT opened_at FROM offline_sessions \
+         WHERE fiscal_number = ? AND state = 'OPEN' LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await?;
+    let session_seconds = session_opened_at
+        .as_deref()
+        .and_then(parse_ts)
+        .map(|start| elapsed_seconds_clamped(start, now));
+
+    // (3) 168h/calendar-month — recompute from every offline session row.
+    // CLOSED rows carry closed_at; OPEN/OPENING/DRAINING/ABORTED-without-close
+    // carry NULL → clamped to `now` by month_overlap_seconds.
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT opened_at, closed_at FROM offline_sessions WHERE fiscal_number = ?",
+    )
+    .bind(fiscal_number)
+    .fetch_all(pool)
+    .await?;
+    let intervals: Vec<SessionInterval> = rows
+        .into_iter()
+        .map(|(opened_at, closed_at)| SessionInterval {
+            opened_at,
+            closed_at,
+        })
+        .collect();
+    let month_seconds = Some(month_offline_seconds(&intervals, now));
+
+    Ok(Budgets {
+        shift_seconds,
+        session_seconds,
+        month_seconds,
+    })
+}
+
+impl Budgets {
+    /// The over-budget admission verdict for a NEW ordinary op given the
+    /// per-budget enforcement toggles (RULING 3.3). `None` ⇒ admit.
+    pub fn admission_refusal(&self, toggles: EnforcementToggles) -> Option<BudgetRefusal> {
+        admission_refusal(
+            self.shift_seconds,
+            self.session_seconds,
+            self.month_seconds,
+            toggles,
+        )
+    }
+
+    /// Whether the 24h shift budget has reached its boundary — the UNCONDITIONAL
+    /// auto-Z trigger (RULING 3.4). Independent of every enforcement toggle.
+    pub fn shift_over_24h(&self) -> bool {
+        self.shift_seconds.is_some_and(|s| s >= SHIFT_MAX_SECONDS)
+    }
+}
+
+/// Whether an FN's node mode counts as "offline" for the offline budgets — the
+/// session (36h) and month (168h) budgets only accrue while offline. Kept here
+/// so the gate + ticker share one predicate.
+pub fn is_offline_mode(mode: NodeMode) -> bool {
+    matches!(mode, NodeMode::Offline | NodeMode::GoingOffline)
+}
+
+/// The T3 policy inputs threaded into the write-path admission point: the ONE
+/// injected clock (RULING 3.6) + the per-budget enforcement toggles
+/// (RULING 3.3). Bundled so the many-arg `run` / `run_staged` gain a single
+/// param. Built from `App` config (`SystemClock` + config toggles) in prod; a
+/// `FixedClock` + explicit toggles in tests.
+#[derive(Clone, Copy)]
+pub struct TimeBudgetGate<'a> {
+    pub clock: &'a dyn Clock,
+    pub toggles: EnforcementToggles,
+}
+
+impl<'a> TimeBudgetGate<'a> {
+    pub fn new(clock: &'a dyn Clock, toggles: EnforcementToggles) -> Self {
+        Self { clock, toggles }
+    }
+}
+
+/// A `'static` [`TimeBudgetGate`] with time-budget enforcement DISABLED — the
+/// NO-POLICY gate for call sites that drive `inline::run` / stages directly
+/// without threading a config (existing write-path unit/integration tests and
+/// the fuzzer interpreter, which seed backdated fixture `business_ts` values and
+/// predate T3; and the offline drain sub-drive whose doc-type bypasses the gate
+/// anyway). Enforcement OFF makes it BYTE-BEHAVIOUR-NEUTRAL: it never refuses, so
+/// a legacy fixture with a stale (far-past) SHIFT_OPEN `business_ts` is not
+/// tripped by the 24h gate. The PRODUCTION path builds its gate in
+/// [`crate::runtime::ingress::inline_binding`] from real config (default all-ON)
+/// + the [`SystemClock`]; the T3 pins build explicit gates with a `FixedClock` +
+/// the toggle set under test.
+pub fn system_gate() -> TimeBudgetGate<'static> {
+    static SYSTEM: SystemClock = SystemClock;
+    TimeBudgetGate::new(
+        &SYSTEM,
+        EnforcementToggles {
+            shift_24h: false,
+            session_36h: false,
+            month_168h: false,
+        },
+    )
 }
 
 #[cfg(test)]
