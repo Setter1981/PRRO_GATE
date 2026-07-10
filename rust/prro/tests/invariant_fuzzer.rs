@@ -336,6 +336,72 @@ async fn teeth_d5_send_ack_notfound_drain_predicts_sent_held() {
     .await;
 }
 
+/// U1 D5 (KNOWN-RED tooth, PRRO_GATE-eid) — online shift-management docs with
+/// D5 `Superseded` currently leave production/model without an agreed legal
+/// terminal: the doc is routed to a non-issued retry/error shape after
+/// stage_acquire has already moved the shift into `Opening` / `Closing`.
+///
+/// We do NOT normalize that behavior in the model and we do NOT generate these
+/// scripts yet.  This test proves the fuzzer bites: the directed sequence must
+/// panic until PRRO_GATE-eid resolves the production/model contract and promotes
+/// these scripts into `shift_dps_script()`.
+#[test]
+fn teeth_d5_shift_doc_superseded_known_red() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_online_open_shift().await;
+            let model = RefModel::new_online_open_shift();
+            run_harness(
+                &[Op::OnlineZReport(DpsScript::superseded_tip())],
+                ctx,
+                model,
+            )
+            .await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(
+        panicked,
+        "PRRO_GATE-eid: OnlineZReport(Superseded) returned cleanly. That means \
+         the D5 shift-doc gap was silently adopted or normalized instead of being \
+         resolved with an explicit production/model contract."
+    );
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ctx = interp::FuzzCtx::new_online_closed_shift().await;
+            let model = RefModel::new_online_closed_shift();
+            run_harness(
+                &[Op::OnlineShiftOpen(DpsScript::superseded_tip())],
+                ctx,
+                model,
+            )
+            .await;
+        });
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    assert!(
+        panicked,
+        "PRRO_GATE-eid: OnlineShiftOpen(Superseded) returned cleanly. That means \
+         the D5 shift-doc gap was silently adopted or normalized instead of being \
+         resolved with an explicit production/model contract."
+    );
+}
+
 /// U1 D5 (NEG tooth) — a `[BadHashPrev]` (MAC-recovery) drain stays GENUINELY
 /// deferred to Fault (§7 #1) — NOT force-promoted, so run_harness adopts via
 /// resync and completes without a false differential.
@@ -893,6 +959,7 @@ fn differential_catches_lnd_divergence() {
         seed_after: Some([2u8; 32]),
         previous_hash: Some([1u8; 32]),
         code_consumed: None,
+        shift_state_after: None,
     });
     let real = interp::RealOutcome::Doc(interp::ObservedDoc {
         lnd: 3, // ← divergence: model expected lnd 2
@@ -900,12 +967,519 @@ fn differential_catches_lnd_divergence() {
         previous_hash: Some(vec![1u8; 32]),
         seed_after: Some(vec![9u8; 32]),
         code_consumed: None,
+        shift_state_after: ShiftState::Opened,
     });
     let res = oracle::check_differential(&real, &expected, Some(&[1u8; 32]));
     assert!(
         res.is_err(),
         "real lnd 3 != model lnd 2 must be flagged; got {res:?}"
     );
+}
+
+/// Tier-1 slice 1 — online Z_REPORT is a genuine fuzzer op, not a side test:
+/// model predicts the Z doc and the shift transition, interpreter drives the
+/// production inline Z dispatcher, and the differential checks both.
+#[tokio::test]
+async fn differential_online_z_report_closes_shift_matches_model() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineZReport(DpsScript::ack_path());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online Z_REPORT must match model: {d:?}"));
+    assert_eq!(
+        ctx.only_doc_type().await,
+        "Z_REPORT",
+        "interpreter must drive a real Z_REPORT doc"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "online Z_REPORT must close the shift"
+    );
+}
+
+/// D5 shift-doc green pin: online Z_REPORT that crosses SEND but gets no KVT1
+/// evidence (`Ack, NotFound`) must rest at SENT while the shift close is already
+/// committed at the SEND boundary.
+#[tokio::test]
+async fn differential_online_z_report_ack_notfound_holds_sent_and_closes_shift() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineZReport(DpsScript::send_ack_then_last_not_found());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online Z_REPORT Ack/NotFound must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_type().await, "Z_REPORT");
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "Z_REPORT Ack/NotFound must rest as SENT pending later KVT2 confirmation"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "Z_REPORT Ack/NotFound crosses SEND, so edge 10 closes the shift"
+    );
+}
+
+/// Z-tax oracle pin: two taxable receipts in the shift (SELL + RETURN, both
+/// group 1 at 20% VAT-included) must aggregate into the Z payload with matching
+/// payment turnover and TXS totals.  The oracle recomputes from persisted
+/// receipt payloads + signing snapshot JSON, not from the production aggregator.
+#[tokio::test]
+async fn z_aggregation_oracle_checks_taxable_sell_return_turnover() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.seed_tax_group_20_percent().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let sell_script = DpsScript::ack_path();
+    let sell_op = Op::OnlineSell(sell_script.clone());
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&sell_op);
+    let real = ctx.run_taxable_online_sell(&sell_script).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable online SELL must match model: {d:?}"));
+
+    let return_script = DpsScript::ack_path();
+    let return_op = Op::OnlineReturn(return_script.clone());
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&return_op);
+    let real = ctx.run_taxable_online_return(&return_script).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable online RETURN must match model: {d:?}"));
+
+    let z_op = Op::OnlineZReport(DpsScript::ack_path());
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&z_op);
+    let real = interp::run_op(&mut ctx, &z_op).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable online Z_REPORT must match model: {d:?}"));
+    oracle::check_latest_z_aggregation(&ctx.pool)
+        .await
+        .unwrap_or_else(|d| panic!("taxable Z aggregation oracle must pass: {d:?}"));
+}
+
+/// Z quiescence pin: an online receipt that crossed SEND but has no KVT1/ACK
+/// evidence yet (`SENT`) must block a live Z before the Z row is minted.  This
+/// is stricter than the normal write gate and protects the shift close from
+/// aggregating an incomplete receipt set.
+#[tokio::test]
+async fn online_z_report_is_true_noop_while_receipt_sent_is_in_flight() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    let sell_op = Op::OnlineSell(DpsScript::send_ack_then_last_not_found());
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&sell_op);
+    let real = interp::run_op(&mut ctx, &sell_op).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online SENT-hold sell must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_state().await, DocState::Sent);
+
+    let doc_count_before = ctx.observed_doc_count().await;
+    let next_lnd_before = ctx.read_next_lnd().await;
+    let seed_before = ctx.read_seed().await;
+    let sends_before = ctx.send_calls();
+    let z_op = Op::OnlineZReport(DpsScript::ack_path());
+    let expected = model.apply(&z_op);
+    assert!(
+        matches!(expected, ExpectedOutcome::NoMutation),
+        "model must classify Z over in-flight receipt as true no-op"
+    );
+    let real = interp::run_op(&mut ctx, &z_op).await;
+    oracle::check_differential(&real, &expected, seed_before.as_deref())
+        .unwrap_or_else(|d| panic!("blocked Z must match model: {d:?}"));
+
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        doc_count_before,
+        "blocked Z must not mint a Z row"
+    );
+    assert_eq!(
+        ctx.read_next_lnd().await,
+        next_lnd_before,
+        "blocked Z must not allocate an lnd"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "blocked Z must not advance the seed"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "blocked Z must fail before any wire send"
+    );
+    assert_eq!(ctx.read_shift_state().await, ShiftState::Opened);
+}
+
+/// Tier-1 slice 2 seed — offline Z_REPORT local-acks through the production
+/// path and moves the shift into ClosingLocalPendingDrain.
+#[tokio::test]
+async fn differential_offline_z_report_enters_closing_pending_drain() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+    let mut model = RefModel::new_offline_open_shift(2);
+
+    let _ = model.apply(&Op::OfflineZReport);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+
+    // B10 — the FIRST offline doc of a session is a TWO-doc event (the lazy
+    // DocType=9 BEGIN@lnd1 precedes the Z@lnd2 via the `run_staged` hoist),
+    // so the per-doc chain-continuity check (which pins the pre-op tip) does
+    // not apply; the ledger delta is the authoritative check.
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline Z_REPORT (with lazy BEGIN) ledger must match the model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("offline Z_REPORT shift state must match the model");
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::ClosingLocalPendingDrain
+    );
+}
+
+/// Offline full-day pin: taxable offline SELL + RETURN are locally issued, an
+/// offline Z local-acks over that backlog, and the same independently-computed
+/// Z aggregation must still hold after return-online drains the whole cohort.
+#[tokio::test]
+async fn offline_full_day_z_aggregation_survives_return_online_drain() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
+    ctx.seed_tax_group_20_percent().await;
+    let mut model = RefModel::new_offline_open_shift(4);
+
+    // B10 — the FIRST offline doc is a TWO-doc event (lazy BEGIN@lnd1 + the
+    // SELL@lnd2), so the per-doc chain-continuity check does not apply to this
+    // leg; the ledger delta is the authoritative check.
+    let _ = model.apply(&Op::OfflineSell);
+    let _ = ctx.run_taxable_offline_sell().await;
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("taxable offline SELL (with lazy BEGIN) ledger must match the model");
+
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&Op::OfflineReturn);
+    let real = ctx.run_taxable_offline_return().await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable offline RETURN must match model: {d:?}"));
+
+    let prior_tip = ctx.read_seed().await;
+    let expected = model.apply(&Op::OfflineZReport);
+    let real = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("taxable offline Z_REPORT must match model: {d:?}"));
+    oracle::check_latest_z_aggregation(&ctx.pool)
+        .await
+        .unwrap_or_else(|d| panic!("offline local Z aggregation oracle must pass: {d:?}"));
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::ack_path()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline full-day drain ledger must match model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("offline full-day drain shift state must match model");
+    assert_eq!(model.shift_state, ShiftState::Closed);
+    oracle::check_latest_z_aggregation(&ctx.pool)
+        .await
+        .unwrap_or_else(|d| panic!("drained offline Z aggregation oracle must still pass: {d:?}"));
+}
+
+/// Offline Z_REPORT followed by GoOnline(AckPath) drains the Z doc and closes
+/// the shift.  This is the first edge-13/close proof in the model harness.
+#[tokio::test]
+async fn differential_offline_z_report_go_online_ack_closes_shift() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+    let mut model = RefModel::new_offline_open_shift(2);
+
+    let _ = model.apply(&Op::OfflineZReport);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::ack_path()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline Z drain ledger must match the model");
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "drained offline Z_REPORT must close the shift"
+    );
+}
+
+/// Edge 14 RMR pin: an offline Z_REPORT has crossed the local-commit threshold
+/// (`ClosingLocalPendingDrain`).  A drain reject cannot roll the close back; it
+/// must halt the FN in RequiresManualReconciliation.
+#[tokio::test]
+async fn differential_offline_z_report_drain_reject_escalates_edge14_rmr() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+    let mut model = RefModel::new_offline_open_shift(2);
+
+    let _ = model.apply(&Op::OfflineZReport);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::send_then_reject()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("edge-14 reject ledger must match the model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("edge-14 reject must match the model shift state");
+    assert_eq!(
+        model.shift_state,
+        ShiftState::RequiresManualReconciliation,
+        "model must classify drain reject from CLPD as edge-14 RMR"
+    );
+}
+
+async fn assert_rmr_tombstone_no_fiscal_mutation(ctx: &mut interp::FuzzCtx, op: Op) {
+    let docs_before = ctx.observed_doc_count().await;
+    let next_lnd_before = ctx.read_next_lnd().await;
+    let seed_before = ctx.read_seed().await;
+    let codes_before = ctx.consumed_codes_count().await;
+    let sends_before = ctx.send_calls();
+
+    let _ = interp::run_op(ctx, &op).await;
+
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::RequiresManualReconciliation,
+        "RMR tombstone op {op:?} must leave shift in RMR"
+    );
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        docs_before,
+        "RMR tombstone op {op:?} minted a fiscal_documents row"
+    );
+    assert_eq!(
+        ctx.read_next_lnd().await,
+        next_lnd_before,
+        "RMR tombstone op {op:?} allocated an lnd"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "RMR tombstone op {op:?} advanced the seed"
+    );
+    assert_eq!(
+        ctx.consumed_codes_count().await,
+        codes_before,
+        "RMR tombstone op {op:?} consumed an offline code"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "RMR tombstone op {op:?} made a wire send"
+    );
+}
+
+/// RMR tombstone pin: after a legal edge-14 escalation, every fiscal/shift/Z
+/// re-entry must be a true no-op with no row, lnd, seed, code, or wire-send
+/// movement.  This broadens AUD-K8 from "drain re-tick" to the whole alphabet
+/// surface that should remain operator-owned once manual reconciliation is set.
+#[tokio::test]
+async fn rmr_tombstone_blocks_fiscal_shift_z_and_recovery_reentry() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+
+    let _ = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::RequiresManualReconciliation
+    );
+
+    for op in [
+        Op::OnlineSell(DpsScript::ack_path()),
+        Op::OnlineReturn(DpsScript::ack_path()),
+        Op::OnlineZReport(DpsScript::ack_path()),
+        Op::OnlineShiftOpen(DpsScript::ack_path()),
+        Op::OfflineSell,
+        Op::OfflineReturn,
+        Op::OfflineZReport,
+        Op::OfflineShiftOpen,
+        Op::Drain(DpsScript::ack_path()),
+        Op::GoOnline(DpsScript::ack_path()),
+        Op::Reboot,
+    ] {
+        assert_rmr_tombstone_no_fiscal_mutation(&mut ctx, op).await;
+    }
+}
+
+/// Teeth canary: the shift oracle must go RED on a wrong predicted shift state.
+/// If this ever passes, shift/Z predictions are tautological.
+#[test]
+fn teeth_shift_state_oracle_catches_drift() {
+    let res = oracle::check_shift_state(ShiftState::Opened, Some(ShiftState::Closed));
+    assert!(
+        res.is_err(),
+        "shift-state oracle must reject Opened when the model predicted Closed"
+    );
+}
+
+/// Tier-1 shift-open slice — online SHIFT_OPEN is driven through production
+/// inline path and opens a closed shift.
+#[tokio::test]
+async fn differential_online_shift_open_opens_shift_matches_model() {
+    let mut ctx = interp::FuzzCtx::new_online_closed_shift().await;
+    let mut model = RefModel::new_online_closed_shift();
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineShiftOpen(DpsScript::ack_path());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online SHIFT_OPEN must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_type().await, "SHIFT_OPEN");
+    assert_eq!(ctx.read_shift_state().await, ShiftState::Opened);
+}
+
+/// D5 shift-doc green pin: online SHIFT_OPEN with no KVT1 evidence after SEND
+/// rests at SENT, but the shift is already Opened at the SEND boundary.
+#[tokio::test]
+async fn differential_online_shift_open_ack_notfound_holds_sent_and_opens_shift() {
+    let mut ctx = interp::FuzzCtx::new_online_closed_shift().await;
+    let mut model = RefModel::new_online_closed_shift();
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineShiftOpen(DpsScript::send_ack_then_last_not_found());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online SHIFT_OPEN Ack/NotFound must match model: {d:?}"));
+    assert_eq!(ctx.only_doc_type().await, "SHIFT_OPEN");
+    assert_eq!(
+        ctx.only_doc_state().await,
+        DocState::Sent,
+        "SHIFT_OPEN Ack/NotFound must rest as SENT pending later KVT2 confirmation"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Opened,
+        "SHIFT_OPEN Ack/NotFound crosses SEND, so edge 3 opens the shift"
+    );
+}
+
+/// Offline SHIFT_OPEN local-acks and leaves the shift in
+/// OpenedLocalPendingDrain until the backlog drains.
+#[tokio::test]
+async fn differential_offline_shift_open_enters_opened_pending_drain() {
+    let mut ctx = interp::FuzzCtx::new_offline_closed_shift(2).await;
+    let mut model = RefModel::new_offline_closed_shift(2);
+
+    let _ = model.apply(&Op::OfflineShiftOpen);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineShiftOpen).await;
+
+    // B10 — the FIRST offline doc of a session is a TWO-doc event (the lazy
+    // DocType=9 BEGIN@lnd1 precedes the SHIFT_OPEN@lnd2 via the `run_staged`
+    // hoist), so the per-doc chain-continuity check (which pins the pre-op
+    // tip) does not apply; the ledger delta is the authoritative check.
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline SHIFT_OPEN (with lazy BEGIN) ledger must match the model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("offline SHIFT_OPEN shift state must match the model");
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::OpenedLocalPendingDrain
+    );
+}
+
+/// B10 composite pin — a duplicate OfflineShiftOpen (shift already open) is
+/// REFUSED by the acquire shift-guard, but the `run_staged` lazy-BEGIN hoist
+/// has ALREADY minted the session BEGIN by then: the refusal leaves exactly
+/// one issued BEGIN row resting (OLA), one code consumed, and the seed
+/// advanced — with the shift untouched.  The pure model defers this composite
+/// to the fault-oracle re-sync; this pin keeps the impl semantics from
+/// drifting silently.
+#[tokio::test]
+async fn offline_shift_open_refused_after_lazy_begin_mints_begin_row() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(2).await;
+
+    let doc_count_before = ctx.observed_doc_count().await;
+    let codes_before = ctx.consumed_codes_count().await;
+    let seed_before = ctx.read_seed().await;
+
+    let real = interp::run_op(&mut ctx, &Op::OfflineShiftOpen).await;
+
+    assert!(
+        matches!(real, interp::RealOutcome::Refused(_)),
+        "duplicate offline SHIFT_OPEN must be refused (SHIFT_ALREADY_OPEN), got {real:?}"
+    );
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        doc_count_before + 1,
+        "the lazy BEGIN row must rest despite the refusal"
+    );
+    assert_eq!(
+        ctx.consumed_codes_count().await,
+        codes_before + 1,
+        "the BEGIN consumes one offline pool code"
+    );
+    assert_ne!(
+        ctx.read_seed().await,
+        seed_before,
+        "the BEGIN advances the offline seed"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Opened,
+        "the refused duplicate SHIFT_OPEN must not move the shift"
+    );
+}
+
+/// Offline SHIFT_OPEN followed by GoOnline(AckPath) drains the open artifact and
+/// reaches Opened.
+#[tokio::test]
+async fn differential_offline_shift_open_go_online_ack_opens_shift() {
+    let mut ctx = interp::FuzzCtx::new_offline_closed_shift(2).await;
+    let mut model = RefModel::new_offline_closed_shift(2);
+
+    let _ = model.apply(&Op::OfflineShiftOpen);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineShiftOpen).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::ack_path()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("offline SHIFT_OPEN drain ledger must match model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("offline SHIFT_OPEN drain shift state must match model");
+    assert_eq!(model.shift_state, ShiftState::Opened);
+}
+
+/// Edge 6 RMR pin: an offline SHIFT_OPEN has crossed the local-commit threshold
+/// (`OpenedLocalPendingDrain`).  A drain reject requires manual reconciliation.
+#[tokio::test]
+async fn differential_offline_shift_open_drain_reject_escalates_edge6_rmr() {
+    let mut ctx = interp::FuzzCtx::new_offline_closed_shift(2).await;
+    let mut model = RefModel::new_offline_closed_shift(2);
+
+    let _ = model.apply(&Op::OfflineShiftOpen);
+    let _ = interp::run_op(&mut ctx, &Op::OfflineShiftOpen).await;
+
+    let _ = model.apply(&Op::GoOnline(DpsScript::send_then_reject()));
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+
+    let real_ledger = ctx.read_ledger().await;
+    oracle::check_ledger_delta(&model.docs, &real_ledger)
+        .expect("edge-6 reject ledger must match model");
+    oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
+        .expect("edge-6 reject shift state must match model");
+    assert_eq!(model.shift_state, ShiftState::RequiresManualReconciliation);
 }
 
 /// Acceptance [3]: an invalid op (`SellWithClosedShift`) is `ExpectedNoMutation`
@@ -1654,6 +2228,11 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                             "B3: recovered drain/go-online {op:?} — real seed-advance \
                              ({real_advanced}) must match the model's ({model_advanced})"
                         );
+                    }
+                }
+                if matches!(op, Op::OnlineZReport(_) | Op::OfflineZReport) {
+                    if let Err(d) = oracle::check_latest_z_aggregation(&ctx.pool).await {
+                        panic!("Z aggregation oracle on {op:?}: {d:?}");
                     }
                 }
             }

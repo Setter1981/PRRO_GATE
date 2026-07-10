@@ -98,6 +98,16 @@ pub enum Op {
     /// LOCAL so `OfflineReturn` carries none.
     OnlineReturn(DpsScript),
     OfflineReturn,
+    /// Online shift-open path.  The script drives send/last.
+    OnlineShiftOpen(DpsScript),
+    /// Offline shift-open path.  Issuance is local; Drain/GoOnline submits it.
+    OfflineShiftOpen,
+    /// Online close-shift / Z-report path.  The production write path treats
+    /// `Z_REPORT` as the close-shift wire artifact; the script drives send/last.
+    OnlineZReport(DpsScript),
+    /// Offline close-shift / Z-report path.  Issuance is local; later wire
+    /// interaction is driven by the existing Drain/GoOnline ops.
+    OfflineZReport,
     Drain(DpsScript),
     Crash(Stage),
     Reboot,

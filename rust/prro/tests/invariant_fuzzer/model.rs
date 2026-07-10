@@ -53,6 +53,9 @@ pub struct Mutation {
     pub previous_hash: Option<[u8; 32]>,
     /// The offline code ordinal consumed (1-based), or None for online ops.
     pub code_consumed: Option<i64>,
+    /// Expected shift state after this op when the op intentionally drives the
+    /// shift machine.  Receipt-only ops leave this as None.
+    pub shift_state_after: Option<ShiftState>,
 }
 
 /// The predicted outcome of applying one op.
@@ -95,6 +98,11 @@ pub struct RefModel {
     pub codes_consumed: i64,
     /// Per-lnd document state.
     pub docs: BTreeMap<i64, DocState>,
+    /// LNDs of shift-lifecycle docs (`SHIFT_OPEN` / `SHIFT_CLOSE` /
+    /// `Z_REPORT`).  Z quiescence blocks on in-flight receipts, not on earlier
+    /// lifecycle artifacts that can legally rest at `SENT` while the shift has
+    /// already advanced at the SEND boundary.
+    pub shift_lifecycle_lnds: BTreeSet<i64>,
     /// A.3 PR-C — lnds of OFFLINE-origin docs (`offline_fiscal_no` was
     /// assigned).  Distinguishes an offline-ER (issued, NOT a D5-gate blocker)
     /// from an online-ER (non-issued, a blocker) — the `docs` map stores only
@@ -124,6 +132,25 @@ impl RefModel {
             codes_issued: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            shift_lifecycle_lnds: BTreeSet::new(),
+            offline_origin_lnds: BTreeSet::new(),
+            session_has_begin: false,
+            session_has_end: false,
+        }
+    }
+
+    /// Fixture: ONLINE node with no open shift.
+    pub fn new_online_closed_shift() -> Self {
+        Self {
+            seed: None,
+            next_lnd: 1,
+            shift_state: ShiftState::Closed,
+            mode: NodeMode::Online,
+            session: None,
+            codes_issued: 0,
+            codes_consumed: 0,
+            docs: BTreeMap::new(),
+            shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
@@ -143,6 +170,25 @@ impl RefModel {
             codes_issued: codes,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            shift_lifecycle_lnds: BTreeSet::new(),
+            offline_origin_lnds: BTreeSet::new(),
+            session_has_begin: false,
+            session_has_end: false,
+        }
+    }
+
+    /// Fixture: OFFLINE node with no open shift and an OPEN offline session.
+    pub fn new_offline_closed_shift(codes: i64) -> Self {
+        Self {
+            seed: None,
+            next_lnd: 1,
+            shift_state: ShiftState::Closed,
+            mode: NodeMode::Offline,
+            session: Some(OfflineSessionState::Open),
+            codes_issued: codes,
+            codes_consumed: 0,
+            docs: BTreeMap::new(),
+            shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
@@ -221,6 +267,10 @@ impl RefModel {
             // same mode-dispatch, same lnd/seed/code bookkeeping.
             Op::OnlineReturn(script) => self.apply_return(script),
             Op::OfflineReturn => self.apply_return(&DpsScript(Vec::new())),
+            Op::OnlineShiftOpen(script) => self.apply_online_shift_open(script),
+            Op::OfflineShiftOpen => self.apply_offline_shift_open(),
+            Op::OnlineZReport(script) => self.apply_online_z_report(script),
+            Op::OfflineZReport => self.apply_offline_z_report(),
             // The advancing transition / drain ops predict a real ledger
             // mutation (PredictableMutating, NOT Fault).
             Op::GoOnline(script) => self.apply_go_online(script),
@@ -297,6 +347,28 @@ impl RefModel {
         })
     }
 
+    /// Z quiescence is stricter than the ordinary D5 write gate for RECEIPTS: a
+    /// Z must not aggregate/close the shift while any receipt is still in-flight,
+    /// including retryable or issued-but-not-final `ERROR_RETRYABLE`/`SENT`/
+    /// `KVT1`/`KVT2` docs.  Shift-lifecycle docs are excluded; they advance the
+    /// shift at SEND and are not part of receipt aggregation.
+    fn has_z_quiescence_blocker(&self) -> bool {
+        self.docs.iter().any(|(lnd, st)| {
+            !self.shift_lifecycle_lnds.contains(lnd)
+                && matches!(
+                    st,
+                    DocState::Prepared
+                        | DocState::Signed
+                        | DocState::Encrypted
+                        | DocState::Sending
+                        | DocState::ErrorRetryable
+                        | DocState::Sent
+                        | DocState::Kvt1
+                        | DocState::Kvt2
+                )
+        })
+    }
+
     /// A RETURN — chain-wise IDENTICAL to a SELL at the model level.  All three
     /// production symmetries were verified doc-type-agnostic: the offline-code
     /// CAS (`acquire_code_tx`), the D5 acquire/sign gate predicate
@@ -308,6 +380,249 @@ impl RefModel {
     /// the RETURN write-path against this (SELL-identical) prediction.
     fn apply_return(&mut self, script: &DpsScript) -> ExpectedOutcome {
         self.apply_sell(script)
+    }
+
+    /// Online SHIFT_OPEN.  Closed → Opening at acquire, then Opening → Opened
+    /// once the doc crosses SEND.  ACK only confirms.
+    fn apply_online_shift_open(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        if self.mode != NodeMode::Online || self.shift_state != ShiftState::Closed {
+            return ExpectedOutcome::NoMutation;
+        }
+        if self.has_write_gate_blocker() {
+            return ExpectedOutcome::NoMutation;
+        }
+        if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
+            return ExpectedOutcome::Fault;
+        }
+
+        let lnd = self.next_lnd;
+        let previous_hash = self.seed;
+        let unsigned_hash = synth_unsigned_hash(lnd);
+        let doc_state = online_outcome_state(script);
+        self.docs.insert(lnd, doc_state);
+        self.shift_lifecycle_lnds.insert(lnd);
+        self.next_lnd += 1;
+
+        if Self::online_origin_advances_seed(doc_state) {
+            self.seed = Some(unsigned_hash);
+            self.shift_state = ShiftState::Opened;
+        } else if doc_state == DocState::Rejected {
+            self.shift_state = ShiftState::RequiresManualReconciliation;
+            return ExpectedOutcome::NoIssuanceRow;
+        }
+
+        ExpectedOutcome::Mutated(Mutation {
+            lnd,
+            doc_state,
+            seed_after: self.seed,
+            previous_hash,
+            code_consumed: self.code_consumed_observable(),
+            shift_state_after: Some(self.shift_state),
+        })
+    }
+
+    /// Offline SHIFT_OPEN local issuance.  It consumes one offline code, advances
+    /// the seed at OFFLINE_LOCAL_ACK, and leaves the shift pending drain.
+    fn apply_offline_shift_open(&mut self) -> ExpectedOutcome {
+        if self.mode != NodeMode::Offline {
+            return ExpectedOutcome::NoMutation;
+        }
+        if self.session != Some(OfflineSessionState::Open) {
+            return ExpectedOutcome::NoMutation;
+        }
+        // B10 — the `run_staged` hoist mints the lazy DocType=9 BEGIN for ANY
+        // offline doc-type (HOLE-A fix), SHIFT_OPEN included, and it runs
+        // BEFORE the business doc's acquire guards: a SHIFT_OPEN refused for
+        // an already-open shift still leaves the just-minted BEGIN resting
+        // (the op's observable is then the BEGIN mutation alone).  Same
+        // first-principles prediction as the offline sell lane (`apply_sell`):
+        // 0 codes → the pre-mint pool guard refuses the WHOLE op (no rows);
+        // else the BEGIN mints FIRST (lowest lnd, code#1, seed advance); a
+        // post-BEGIN empty pool aborts the business doc at offline-ack
+        // (Aborted row).
+        // Business acquire guard (runs AFTER the hoist in the impl): SHIFT_OPEN
+        // needs a Closed shift.  A duplicate shift-open still mints the session
+        // BEGIN first (+code, +seed) and THEN refuses SHIFT_ALREADY_OPEN — a
+        // composite (issued BEGIN row + Refused outcome) the pure model defers
+        // to the fault-oracle re-sync (which restores `session_has_begin` from
+        // the adopted ledger).  Directed pin:
+        // `offline_shift_open_refused_after_lazy_begin_mints_begin_row`.
+        if self.shift_state != ShiftState::Closed {
+            if !self.session_has_begin {
+                if self.codes_consumed >= self.codes_issued {
+                    // Pre-mint pool guard fires BEFORE the shift guard →
+                    // whole-op 503 refusal, no rows.
+                    return ExpectedOutcome::NoMutation;
+                }
+                return ExpectedOutcome::Fault;
+            }
+            return ExpectedOutcome::NoMutation;
+        }
+        let mut just_minted_begin = false;
+        if !self.session_has_begin {
+            if self.codes_consumed >= self.codes_issued {
+                return ExpectedOutcome::NoMutation;
+            }
+            self.session_has_begin = true;
+            just_minted_begin = true;
+            let begin_lnd = self.next_lnd;
+            let begin_unsigned = synth_unsigned_hash(begin_lnd);
+            self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+            self.offline_origin_lnds.insert(begin_lnd);
+            self.next_lnd += 1;
+            self.codes_consumed += 1;
+            self.seed = Some(begin_unsigned);
+        }
+        if self.codes_consumed >= self.codes_issued {
+            // Shift-class offline docs are refused ROW-LESS on pool
+            // exhaustion (the lane guard refuses pre-dispatch — unlike the
+            // SELL/RETURN lane, whose exhausted business doc aborts WITH a
+            // row at offline-ack).  The BEGIN-consumed-the-last-code
+            // composite defers to the fault re-sync.
+            return if just_minted_begin {
+                ExpectedOutcome::Fault
+            } else {
+                ExpectedOutcome::NoMutation
+            };
+        }
+
+        let lnd = self.next_lnd;
+        let previous_hash = self.seed;
+        let unsigned_hash = synth_unsigned_hash(lnd);
+        self.docs.insert(lnd, DocState::OfflineLocalAck);
+        self.shift_lifecycle_lnds.insert(lnd);
+        self.offline_origin_lnds.insert(lnd);
+        self.next_lnd += 1;
+        self.codes_consumed += 1;
+        self.seed = Some(unsigned_hash);
+        self.shift_state = ShiftState::OpenedLocalPendingDrain;
+
+        ExpectedOutcome::Mutated(Mutation {
+            lnd,
+            doc_state: DocState::OfflineLocalAck,
+            seed_after: self.seed,
+            previous_hash,
+            code_consumed: self.code_consumed_observable(),
+            shift_state_after: Some(self.shift_state),
+        })
+    }
+
+    /// Online Z_REPORT / close-shift.  This is the first Tier-1 shift-machine
+    /// slice: Opened → Closing at acquire, then Closing → Closed once the doc
+    /// crosses SEND.  ACK is confirmation; issuance is the SEND crossing.
+    fn apply_online_z_report(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        if self.mode != NodeMode::Online || self.shift_state != ShiftState::Opened {
+            return ExpectedOutcome::NoMutation;
+        }
+        // A live Z first quiesces the shift.  If the model sees a non-terminal
+        // online blocker, reality refuses before minting a Z row.
+        if self.has_z_quiescence_blocker() {
+            return ExpectedOutcome::NoMutation;
+        }
+        if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
+            return ExpectedOutcome::Fault;
+        }
+        let lnd = self.next_lnd;
+        let previous_hash = self.seed;
+        let unsigned_hash = synth_unsigned_hash(lnd);
+        let doc_state = online_outcome_state(script);
+        self.docs.insert(lnd, doc_state);
+        self.shift_lifecycle_lnds.insert(lnd);
+        self.next_lnd += 1;
+
+        if Self::online_origin_advances_seed(doc_state) {
+            self.seed = Some(unsigned_hash);
+            self.shift_state = ShiftState::Closed;
+        } else if doc_state == DocState::Rejected {
+            // Current production escalates shift-class send rejects to RMR while
+            // the document itself rests as non-issued Rejected.
+            self.shift_state = ShiftState::RequiresManualReconciliation;
+            return ExpectedOutcome::NoIssuanceRow;
+        }
+
+        ExpectedOutcome::Mutated(Mutation {
+            lnd,
+            doc_state,
+            seed_after: self.seed,
+            previous_hash,
+            code_consumed: self.code_consumed_observable(),
+            shift_state_after: Some(self.shift_state),
+        })
+    }
+
+    /// Offline Z_REPORT / close-shift.  Local issuance consumes an offline code,
+    /// advances the seed at OFFLINE_LOCAL_ACK, and moves the shift into
+    /// ClosingLocalPendingDrain.  Drain/GoOnline later closes or escalates it.
+    fn apply_offline_z_report(&mut self) -> ExpectedOutcome {
+        if self.mode != NodeMode::Offline {
+            return ExpectedOutcome::NoMutation;
+        }
+        if self.session != Some(OfflineSessionState::Open) {
+            return ExpectedOutcome::NoMutation;
+        }
+        // B10 — the lazy DocType=9 BEGIN precedes ANY first offline doc of the
+        // session (the `run_staged` hoist), the offline Z included, and it
+        // runs BEFORE the business doc's acquire guards (see
+        // `apply_offline_shift_open`).
+        // Business acquire guard (runs AFTER the hoist in the impl): the
+        // offline Z needs an open(-pending) shift.  The BEGIN-then-refuse
+        // composite defers to the fault-oracle re-sync (see
+        // `apply_offline_shift_open`).
+        if !matches!(
+            self.shift_state,
+            ShiftState::Opened | ShiftState::OpenedLocalPendingDrain
+        ) {
+            if !self.session_has_begin {
+                if self.codes_consumed >= self.codes_issued {
+                    return ExpectedOutcome::NoMutation;
+                }
+                return ExpectedOutcome::Fault;
+            }
+            return ExpectedOutcome::NoMutation;
+        }
+        let mut just_minted_begin = false;
+        if !self.session_has_begin {
+            if self.codes_consumed >= self.codes_issued {
+                return ExpectedOutcome::NoMutation;
+            }
+            self.session_has_begin = true;
+            just_minted_begin = true;
+            let begin_lnd = self.next_lnd;
+            let begin_unsigned = synth_unsigned_hash(begin_lnd);
+            self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+            self.offline_origin_lnds.insert(begin_lnd);
+            self.next_lnd += 1;
+            self.codes_consumed += 1;
+            self.seed = Some(begin_unsigned);
+        }
+        if self.codes_consumed >= self.codes_issued {
+            // Row-less refusal on exhaustion (see `apply_offline_shift_open`).
+            return if just_minted_begin {
+                ExpectedOutcome::Fault
+            } else {
+                ExpectedOutcome::NoMutation
+            };
+        }
+
+        let lnd = self.next_lnd;
+        let previous_hash = self.seed;
+        let unsigned_hash = synth_unsigned_hash(lnd);
+        self.docs.insert(lnd, DocState::OfflineLocalAck);
+        self.shift_lifecycle_lnds.insert(lnd);
+        self.offline_origin_lnds.insert(lnd);
+        self.next_lnd += 1;
+        self.codes_consumed += 1;
+        self.seed = Some(unsigned_hash);
+        self.shift_state = ShiftState::ClosingLocalPendingDrain;
+
+        ExpectedOutcome::Mutated(Mutation {
+            lnd,
+            doc_state: DocState::OfflineLocalAck,
+            seed_after: self.seed,
+            previous_hash,
+            code_consumed: self.code_consumed_observable(),
+            shift_state_after: Some(self.shift_state),
+        })
     }
 
     /// A sell — the lane is the NODE MODE (the interpreter's `inline::run`
@@ -370,6 +685,7 @@ impl RefModel {
                     // the real doc still reports the codes a PRIOR offline sell
                     // consumed (read-back is `COUNT(*) consumed`, not per-op).
                     code_consumed: self.code_consumed_observable(),
+                    shift_state_after: None,
                 })
             }
             NodeMode::Offline => {
@@ -436,6 +752,7 @@ impl RefModel {
                     previous_hash,
                     // Cumulative observable (this op's consume is now counted).
                     code_consumed: self.code_consumed_observable(),
+                    shift_state_after: None,
                 })
             }
             // GoingOnline / Blocked / etc — a sell is refused by the POST-SIGN
@@ -553,6 +870,20 @@ impl RefModel {
                 for lnd in &backlog {
                     self.docs.insert(*lnd, DocState::Ack);
                 }
+                // Tier-1 shift resolution — a full-ACK drain resolves a
+                // pending-drain shift BEFORE the END mints (the impl confirms
+                // the shift edge on the content backlog, then mints the END at
+                // drain finalize), so the END's Mutation carries the
+                // post-transition shift state.
+                match self.shift_state {
+                    ShiftState::OpenedLocalPendingDrain => {
+                        self.shift_state = ShiftState::Opened;
+                    }
+                    ShiftState::ClosingLocalPendingDrain => {
+                        self.shift_state = ShiftState::Closed;
+                    }
+                    _ => {}
+                }
                 // B10 END-online fix — at drain finalize the DocType=10 END is
                 // minted + sent LAST as an ONLINE ISSUANCE (predicted
                 // INDEPENDENTLY).  The impl (`ensure_and_drain_session_end`) mints
@@ -596,6 +927,7 @@ impl RefModel {
                         seed_after: self.seed,
                         previous_hash: end_prev,
                         code_consumed: None,
+                        shift_state_after: Some(self.shift_state),
                     });
                 }
                 self.mode = NodeMode::Online; // full drain → GoingOnline → Online
@@ -606,6 +938,7 @@ impl RefModel {
                     seed_after: self.seed,
                     previous_hash,
                     code_consumed: None,
+                    shift_state_after: Some(self.shift_state),
                 })
             }
             [WireResponse::Reject, ..] => {
@@ -619,6 +952,7 @@ impl RefModel {
                     seed_after: self.seed,
                     previous_hash,
                     code_consumed: None,
+                    shift_state_after: Some(self.shift_state),
                 })
             }
             // U1 D5 — Superseded tip: the strict-sequential drain escalates to
@@ -638,6 +972,7 @@ impl RefModel {
                     seed_after: self.seed,
                     previous_hash,
                     code_consumed: None,
+                    shift_state_after: Some(self.shift_state),
                 })
             }
             // U1 D5 — send Ack'd, last_chk NotFound: the HEAD doc is HELD at SENT
@@ -652,6 +987,7 @@ impl RefModel {
                     seed_after: self.seed,
                     previous_hash,
                     code_consumed: None,
+                    shift_state_after: Some(self.shift_state),
                 })
             }
             // MAC-recovery (BadHashPrev) drain stays genuinely deferred (§7 #1).
@@ -692,6 +1028,14 @@ impl RefModel {
                 .await
                 .unwrap();
         self.offline_origin_lnds = offline_lnds.into_iter().map(|(lnd,)| lnd).collect();
+        let shift_lifecycle_lnds: Vec<(i64,)> = sqlx::query_as(
+            "SELECT lnd FROM fiscal_documents \
+             WHERE doc_type IN ('SHIFT_OPEN','SHIFT_CLOSE','Z_REPORT')",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        self.shift_lifecycle_lnds = shift_lifecycle_lnds.into_iter().map(|(lnd,)| lnd).collect();
         let tip_lnd = self.docs.keys().copied().max().unwrap_or(0);
 
         // mode / shift_state / next_lnd ← node_state.

@@ -19,6 +19,7 @@
 //! `drain_test_guard` ARE shared from `tests/common/`.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -31,7 +32,8 @@ use prro::db::models::enums::{
 };
 use prro::db::models::ids::{CashierId, OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
-use prro::db::repositories::{fiscal_documents, offline_sessions};
+use prro::db::repositories::tax_groups::NewTaxGroup;
+use prro::db::repositories::{fiscal_documents, offline_sessions, tax_groups};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
@@ -60,7 +62,13 @@ const CASHIER: &str = "test-cashier";
 const DRIVER: &str = "drv-test";
 const SERVER_FISCAL_NO: &str = "DPS-FN-ONLINE-1";
 const SELL_PAYLOAD: &str = r#"{"items":[{"code":"item-1","name":"Test item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
+const TAXABLE_PAYLOAD: &str = r#"{"items":[{"code":"tax-1","name":"Taxed item","price_kop":15000,"quantity_thousandths":1000,"sum_kop":15000,"tax_group_1":1}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#;
 const TOTAL_KOP: i64 = 15000;
+/// Live SHIFT_OPEN payload consumed by stage_sign's `ShiftOpenJson`.
+const SHIFT_OPEN_PAYLOAD: &str = r#"{"opening_sum_kop":0}"#;
+/// A live Z_REPORT's inbox payload is the wire intent; inline Z dispatch
+/// replaces it with the aggregated body before stage_acquire/stage_sign.
+const Z_WIRE_INTENT: &str = r#"{}"#;
 
 // ─── Observed result (read back from the ledger after each op) ──────────────
 
@@ -76,6 +84,9 @@ pub struct ObservedDoc {
     pub seed_after: Option<Vec<u8>>,
     /// Count of consumed offline codes (None when zero — online ops).
     pub code_consumed: Option<i64>,
+    /// Real `node_state.shift_state` after the op.  Most receipt ops leave this
+    /// unchecked (`Mutation::shift_state_after = None`), but shift/Z ops pin it.
+    pub shift_state_after: ShiftState,
 }
 
 /// What `run_op` observed for one op.
@@ -148,6 +159,53 @@ impl FuzzCtx {
         }
     }
 
+    /// Fixture variant used by the cleanup test: keep all DB tempdirs under a
+    /// caller-owned base dir without mutating the process-global `TMPDIR`.
+    async fn new_online_open_shift_in(base: &Path) -> Self {
+        let (pool, _tempdir) = fresh_pool_in(base).await;
+        let (pool_secure, _tempdir_secure) = fresh_secure_pool_in(base).await;
+        seed_fn_config(&pool).await;
+        let shift_id = seed_open_shift(&pool).await;
+        seed_node_state(&pool, NodeMode::Online, shift_id).await;
+        Self {
+            pool,
+            pool_secure,
+            _tempdir,
+            _tempdir_secure,
+            sign_ctx: det_signing_ctx(),
+            fn_sign: fn_sign_blob(),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            fn_id: FN.to_string(),
+            send_calls: Arc::new(AtomicUsize::new(0)),
+            last_calls: Arc::new(AtomicUsize::new(0)),
+            seq: 0,
+            last_row: None,
+        }
+    }
+
+    /// Fixture: a fresh DB with an ONLINE node and no open/current shift.
+    /// `SHIFT_OPEN` should create and open the shift through stage_acquire.
+    pub async fn new_online_closed_shift() -> Self {
+        let (pool, _tempdir) = fresh_pool().await;
+        let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
+        seed_fn_config(&pool).await;
+        seed_node_state_with_shift(&pool, NodeMode::Online, ShiftState::Closed, None).await;
+        Self {
+            pool,
+            pool_secure,
+            _tempdir,
+            _tempdir_secure,
+            sign_ctx: det_signing_ctx(),
+            fn_sign: fn_sign_blob(),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            fn_id: FN.to_string(),
+            send_calls: Arc::new(AtomicUsize::new(0)),
+            last_calls: Arc::new(AtomicUsize::new(0)),
+            seq: 0,
+            last_row: None,
+        }
+    }
+
     /// Fixture: a fresh DB with an OFFLINE node + open shift + an OPEN offline
     /// session carrying `codes` offline codes (the offline lane is fixture-
     /// seeded — there is no go_offline op, spec §5).
@@ -157,6 +215,33 @@ impl FuzzCtx {
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Offline, shift_id).await;
+        seed_open_offline_session(&pool).await;
+        for code_lnd in 1..=codes {
+            seed_offline_code(&pool, code_lnd).await;
+        }
+        Self {
+            pool,
+            pool_secure,
+            _tempdir,
+            _tempdir_secure,
+            sign_ctx: det_signing_ctx(),
+            fn_sign: fn_sign_blob(),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            fn_id: FN.to_string(),
+            send_calls: Arc::new(AtomicUsize::new(0)),
+            last_calls: Arc::new(AtomicUsize::new(0)),
+            seq: 0,
+            last_row: None,
+        }
+    }
+
+    /// Fixture: a fresh DB with an OFFLINE node, no open/current shift, and an
+    /// OPEN offline session carrying `codes`.  `SHIFT_OPEN` local-acks.
+    pub async fn new_offline_closed_shift(codes: i64) -> Self {
+        let (pool, _tempdir) = fresh_pool().await;
+        let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
+        seed_fn_config(&pool).await;
+        seed_node_state_with_shift(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
         seed_open_offline_session(&pool).await;
         for code_lnd in 1..=codes {
             seed_offline_code(&pool, code_lnd).await;
@@ -329,6 +414,70 @@ impl FuzzCtx {
         seed_inbox_keyed(&self.pool, &idem, "RETURN").await
     }
 
+    async fn seed_inbox_taxable(&mut self, operation_type: &str) -> InboxRow {
+        let idem = self.next_idem();
+        seed_inbox_keyed_payload(
+            &self.pool,
+            &idem,
+            operation_type,
+            TAXABLE_PAYLOAD,
+            Some(TOTAL_KOP),
+        )
+        .await
+    }
+
+    /// Test-only tax fixture for Z aggregation: tax group 1 is 20% VAT-included
+    /// and maps identity from the driver payload into the canonical snapshot.
+    pub async fn seed_tax_group_20_percent(&self) {
+        tax_groups::insert(
+            &self.pool_secure,
+            &NewTaxGroup {
+                fn_id: FN.to_string(),
+                tx_num: 1,
+                letter: "A".to_string(),
+                dtpr: 0.0,
+                txpr: 20.0,
+                txal: 0,
+                txty: 0,
+            },
+        )
+        .await
+        .expect("seed tax group 1");
+    }
+
+    pub async fn run_taxable_online_sell(&mut self, script: &DpsScript) -> RealOutcome {
+        let row = self.seed_inbox_taxable("SELL").await;
+        run_inline_row(self, row, Some(script)).await
+    }
+
+    pub async fn run_taxable_online_return(&mut self, script: &DpsScript) -> RealOutcome {
+        let row = self.seed_inbox_taxable("RETURN").await;
+        run_inline_row(self, row, Some(script)).await
+    }
+
+    pub async fn run_taxable_offline_sell(&mut self) -> RealOutcome {
+        let row = self.seed_inbox_taxable("SELL").await;
+        run_inline_row(self, row, None).await
+    }
+
+    pub async fn run_taxable_offline_return(&mut self) -> RealOutcome {
+        let row = self.seed_inbox_taxable("RETURN").await;
+        run_inline_row(self, row, None).await
+    }
+
+    /// Seed a live `SHIFT_OPEN` inbox row (opening payload, no total).
+    async fn seed_inbox_shift_open(&mut self) -> InboxRow {
+        let idem = self.next_idem();
+        seed_inbox_keyed_payload(&self.pool, &idem, "SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, None).await
+    }
+
+    /// Seed a live `Z_REPORT` inbox row (wire intent, no total).  The write path
+    /// aggregates the shift ledger into the canonical Z payload internally.
+    async fn seed_inbox_z_report(&mut self) -> InboxRow {
+        let idem = self.next_idem();
+        seed_inbox_keyed_payload(&self.pool, &idem, "Z_REPORT", Z_WIRE_INTENT, None).await
+    }
+
     pub async fn observed_doc_count(&self) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
             .bind(self.fn_id.as_str())
@@ -392,6 +541,7 @@ impl FuzzCtx {
             previous_hash,
             seed_after: self.read_seed().await,
             code_consumed: self.read_codes_consumed().await,
+            shift_state_after: self.read_shift_state().await,
         }
     }
 
@@ -446,8 +596,13 @@ impl FuzzCtx {
         let (begin_prev, begin_unsigned) =
             begin.ok_or_else(|| "B10 teeth: no OFFLINE_SESSION_BEGIN row".to_string())?;
         let biz: Option<ChainHashPair> = sqlx::query_as(
+            // Tier-1 widened the offline business-doc set: the lazy BEGIN can
+            // interpose before a SHIFT_OPEN / Z_REPORT too, with identical
+            // chain semantics (business chains OFF the BEGIN).
             "SELECT previous_hash, unsigned_xml_sha256 FROM fiscal_documents \
-             WHERE fiscal_number = ? AND doc_type IN ('SELL','RETURN') AND fs_mode = 'OFFLINE' \
+             WHERE fiscal_number = ? \
+             AND doc_type IN ('SELL','RETURN','SHIFT_OPEN','Z_REPORT') \
+             AND fs_mode = 'OFFLINE' \
              ORDER BY lnd DESC LIMIT 1",
         )
         .bind(self.fn_id.as_str())
@@ -621,6 +776,10 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         // `return_check_number` guard, so `return_check_number` is never set.
         Op::OnlineReturn(script) => online_return(ctx, script).await,
         Op::OfflineReturn => offline_return(ctx).await,
+        Op::OnlineShiftOpen(script) => online_shift_open(ctx, script).await,
+        Op::OfflineShiftOpen => offline_shift_open(ctx).await,
+        Op::OnlineZReport(script) => online_z_report(ctx, script).await,
+        Op::OfflineZReport => offline_z_report(ctx).await,
         Op::GoOnline(script) => go_online(ctx, script).await,
         Op::Drain(script) => drain_op(ctx, script).await,
         Op::Reboot => reboot(ctx).await,
@@ -693,6 +852,37 @@ async fn online_sell(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
                 };
             }
             RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+async fn run_inline_row(
+    ctx: &mut FuzzCtx,
+    row: InboxRow,
+    script: Option<&DpsScript>,
+) -> RealOutcome {
+    let dps = ctx.new_dps();
+    if let Some(script) = script {
+        load_script(&dps, script);
+    }
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_outcome) => {
+            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
+            ctx.last_row = Some(row);
+            RealOutcome::Doc(observed)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
@@ -1090,6 +1280,141 @@ async fn offline_return(ctx: &mut FuzzCtx) -> RealOutcome {
     }
 }
 
+/// `OnlineShiftOpen` → live SHIFT_OPEN through production inline path.
+async fn online_shift_open(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Online {
+        return RealOutcome::Refused("online SHIFT_OPEN requires an Online node".into());
+    }
+    let row = ctx.seed_inbox_shift_open().await;
+    let dps = ctx.new_dps();
+    load_script(&dps, script);
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_outcome) => {
+            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
+            ctx.last_row = Some(row);
+            RealOutcome::Doc(observed)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `OfflineShiftOpen` → live SHIFT_OPEN local-ack through production inline path.
+/// B10: the first offline doc interposes a lazy BEGIN — report `Recovered` so
+/// the differential routes to the two-doc ledger-delta (see `offline_sell`).
+async fn offline_shift_open(ctx: &mut FuzzCtx) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Offline {
+        return RealOutcome::Refused("offline SHIFT_OPEN requires an Offline node".into());
+    }
+    let begin_before = begin_doc_count(ctx).await;
+    let row = ctx.seed_inbox_shift_open().await;
+    let dps = ctx.new_dps(); // offline branch never touches the wire
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_outcome) => {
+            ctx.last_row = Some(row.clone());
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `OnlineZReport` → live inline Z dispatcher on an Online node.  This drives
+/// the production quiesce → aggregate → build_z_canonical → staged write path.
+async fn online_z_report(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Online {
+        return RealOutcome::Refused("online Z_REPORT requires an Online node".into());
+    }
+    let row = ctx.seed_inbox_z_report().await;
+    let dps = ctx.new_dps();
+    load_script(&dps, script);
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_outcome) => {
+            let observed = ctx.observe_doc_by_request_id(&row.request_id).await;
+            ctx.last_row = Some(row);
+            RealOutcome::Doc(observed)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// `OfflineZReport` → live inline Z dispatcher on an Offline node.  The Z doc
+/// local-acks and moves the shift to ClosingLocalPendingDrain; Drain/GoOnline
+/// owns the later wire submission.
+async fn offline_z_report(ctx: &mut FuzzCtx) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Offline {
+        return RealOutcome::Refused("offline Z_REPORT requires an Offline node".into());
+    }
+    // B10: the first offline doc interposes a lazy BEGIN — report `Recovered`
+    // so the differential routes to the two-doc ledger-delta (`offline_sell`).
+    let begin_before = begin_doc_count(ctx).await;
+    let row = ctx.seed_inbox_z_report().await;
+    let dps = ctx.new_dps();
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_outcome) => {
+            ctx.last_row = Some(row.clone());
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
 /// `GoOnline` → the REAL transition seam: `return_online_probe::run_tick_for_fn`
 /// (Offline → GoingOnline via `status_rro`) THEN `backlog_drain::drain`
 /// (GoingOnline → Online, draining the backlog).  NOT a setter.
@@ -1436,6 +1761,26 @@ async fn fresh_secure_pool() -> (SqlitePool, tempfile::TempDir) {
     (pool, dir)
 }
 
+async fn fresh_pool_in(base: &Path) -> (SqlitePool, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix("fuzz-db-")
+        .tempdir_in(base)
+        .unwrap();
+    let path = dir.path().join("fuzz.db");
+    let pool = open_pool(&path).await.unwrap();
+    (pool, dir)
+}
+
+async fn fresh_secure_pool_in(base: &Path) -> (SqlitePool, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix("fuzz-secure-db-")
+        .tempdir_in(base)
+        .unwrap();
+    let path = dir.path().join("fuzz-secure.db");
+    let pool = open_secure_pool(&path).await.unwrap();
+    (pool, dir)
+}
+
 async fn seed_fn_config(pool: &SqlitePool) {
     fn_repo::insert(
         pool,
@@ -1475,6 +1820,15 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
 }
 
 async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
+    seed_node_state_with_shift(pool, mode, ShiftState::Opened, Some(shift_id)).await;
+}
+
+async fn seed_node_state_with_shift(
+    pool: &SqlitePool,
+    mode: NodeMode,
+    shift_state: ShiftState,
+    current_shift_id: Option<ShiftId>,
+) {
     sqlx::query(
         "INSERT INTO node_state \
          (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
@@ -1483,8 +1837,8 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
     )
     .bind(FN)
     .bind(mode)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(shift_state)
+    .bind(current_shift_id)
     .execute(pool)
     .await
     .unwrap();
@@ -1522,9 +1876,19 @@ async fn seed_offline_code(pool: &SqlitePool, code_lnd: i64) {
 /// the write-path layer; the direction is carried by `operation_type` (→
 /// `DocType::Sell` / `DocType::Return` in `build_canonical`), not the body.
 async fn seed_inbox_keyed(pool: &SqlitePool, idem: &str, operation_type: &str) -> InboxRow {
+    seed_inbox_keyed_payload(pool, idem, operation_type, SELL_PAYLOAD, Some(TOTAL_KOP)).await
+}
+
+async fn seed_inbox_keyed_payload(
+    pool: &SqlitePool,
+    idem: &str,
+    operation_type: &str,
+    payload_json: &str,
+    total_sum_kop: Option<i64>,
+) -> InboxRow {
     let req_id = RequestId::new();
     let request_id: [u8; 16] = *req_id.as_bytes();
-    let payload_sha256_canonical: [u8; 32] = Sha256::digest(SELL_PAYLOAD.as_bytes()).into();
+    let payload_sha256_canonical: [u8; 32] = Sha256::digest(payload_json.as_bytes()).into();
     inbox::insert(
         pool,
         &NewInboxEntry {
@@ -1533,13 +1897,13 @@ async fn seed_inbox_keyed(pool: &SqlitePool, idem: &str, operation_type: &str) -
             protocol: Protocol::Rest,
             operation_type: operation_type.into(),
             idempotency_key: idem.into(),
-            payload_json: SELL_PAYLOAD.into(),
+            payload_json: payload_json.into(),
             payload_sha256_canonical,
             correlation_id: None,
             signed_by_cashier_id: Some(CASHIER.into()),
             driver_id: Some(DRIVER.into()),
             business_ts: Some("2026-06-09T12:00:00Z".into()),
-            total_sum_kop: Some(TOTAL_KOP),
+            total_sum_kop,
         },
     )
     .await
@@ -1551,14 +1915,14 @@ async fn seed_inbox_keyed(pool: &SqlitePool, idem: &str, operation_type: &str) -
         operation_type: operation_type.into(),
         idempotency_key: idem.into(),
         status: "NEW".into(),
-        payload_json: SELL_PAYLOAD.into(),
+        payload_json: payload_json.into(),
         payload_sha256_canonical,
         correlation_id: None,
         received_at: "2026-06-09T12:00:00Z".into(),
         signed_by_cashier_id: Some(CASHIER.into()),
         driver_id: Some(DRIVER.into()),
         business_ts: Some("2026-06-09T12:00:00Z".into()),
-        total_sum_kop: Some(TOTAL_KOP),
+        total_sum_kop,
     }
 }
 
@@ -1566,38 +1930,26 @@ async fn seed_inbox_keyed(pool: &SqlitePool, idem: &str, operation_type: &str) -
 
 /// Phase-2 U1 (spec §3 / acceptance A1): per-case temp DBs are cleaned when
 /// their owning `FuzzCtx` drops — no `std::mem::forget` leak. Measured in an
-/// isolated `TMPDIR` so the count reflects only this harness, not global /tmp
-/// noise. `nextest` runs each test in its own process, so mutating the
-/// process-global `TMPDIR` here does not race other tests.
+/// isolated base dir so the count reflects only this harness, not global /tmp
+/// noise.  The test does not mutate process-global `TMPDIR`, so it is safe under
+/// ordinary parallel `cargo test` as well as nextest.
 #[tokio::test]
 async fn fuzz_ctx_drop_cleans_per_case_temp_dbs() {
-    // `base` is created under the original temp dir, then becomes the isolated
-    // `TMPDIR` into which every subsequent `tempfile::tempdir()` (inside
-    // `fresh_pool` / `fresh_secure_pool`) is created.
     let base = tempfile::tempdir().unwrap();
-    let prior_tmpdir = std::env::var_os("TMPDIR");
-    std::env::set_var("TMPDIR", base.path());
 
     let count = || std::fs::read_dir(base.path()).unwrap().count();
-    assert_eq!(count(), 0, "isolated TMPDIR must start empty");
+    assert_eq!(count(), 0, "isolated temp base must start empty");
 
     // Create + drop many ctxs. With the `mem::forget` leak each iteration
     // forgets two `TempDir`s (pool + pool_secure) → the dir count grows
     // monotonically (32 leaked dirs after 16 iterations). Under RAII the count
     // returns to zero after every drop.
     for _ in 0..16 {
-        let ctx = FuzzCtx::new_online_open_shift().await;
+        let ctx = FuzzCtx::new_online_open_shift_in(base.path()).await;
         drop(ctx);
     }
 
     let leaked = count();
-
-    // Restore TMPDIR before asserting so a RED failure does not leave the
-    // process env pointing at a since-deleted dir.
-    match prior_tmpdir {
-        Some(v) => std::env::set_var("TMPDIR", v),
-        None => std::env::remove_var("TMPDIR"),
-    }
 
     assert_eq!(
         leaked, 0,
