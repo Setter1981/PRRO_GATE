@@ -47,7 +47,7 @@ use prro::runtime::ingress::inline_binding::production_write_path;
 use prro::runtime::ingress::seam::{FiscalError, FiscalOutcome, WritePathEntry};
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
-use prro::transports::dps::dto::{CheckAck, CheckSignBlob};
+use prro::transports::dps::dto::CheckAck;
 use sqlx::SqlitePool;
 
 use common::{ack, det_signing_ctx_for, StubDpsChannel};
@@ -253,20 +253,24 @@ async fn doc_count_by_request_id(pool: &SqlitePool, request_id: &[u8; 16]) -> i6
 }
 
 async fn doc_count_in_state(pool: &SqlitePool, state: &str) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND state = ?")
-        .bind(FN)
-        .bind(state)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND state = ?",
+    )
+    .bind(FN)
+    .bind(state)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn shift_state(pool: &SqlitePool) -> String {
-    sqlx::query_scalar("SELECT state FROM shifts WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1")
-        .bind(FN)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(
+        "SELECT state FROM shifts WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 /// Boot → online SHIFT_OPEN (Opened) → GO_OFFLINE (live door: mode=OFFLINE +
@@ -363,7 +367,12 @@ async fn pin2_pool2_no_begin_offline_z_allowed_draws_reserve_closes_shift() {
     seed_codes(app.db(), 2).await;
     assert_eq!(free_codes(app.db()).await, 2);
 
-    let res = drive(&*wp, app.db(), entry("Z_REPORT", r#"{}"#, "idem-t2-p2-Z", None)).await;
+    let res = drive(
+        &*wp,
+        app.db(),
+        entry("Z_REPORT", r#"{}"#, "idem-t2-p2-Z", None),
+    )
+    .await;
     let outcome = res.expect("offline Z must be ALLOWED (close-path draws the reserve)");
     assert_eq!(
         outcome.document_state,
@@ -422,7 +431,11 @@ async fn pin3_pool1_begin_present_sell_refused_z_allowed() {
         1,
         "BEGIN now issued"
     );
-    assert_eq!(free_codes(app.db()).await, 1, "pool trimmed to 1 (BEGIN+SELL)");
+    assert_eq!(
+        free_codes(app.db()).await,
+        1,
+        "pool trimmed to 1 (BEGIN+SELL)"
+    );
 
     // Second SELL: free=1, BEGIN present (reserve = 0+Z(1) = 1) → need 1+1=2 > 1
     // → REFUSE, no consume.
@@ -441,9 +454,13 @@ async fn pin3_pool1_begin_present_sell_refused_z_allowed() {
     );
 
     // Z on that same single code → ALLOWED (close-path draws the reserve).
-    let z = drive(&*wp, app.db(), entry("Z_REPORT", r#"{}"#, "idem-t2-p3-Z", None))
-        .await
-        .expect("offline Z ALLOWED on the last reserved code");
+    let z = drive(
+        &*wp,
+        app.db(),
+        entry("Z_REPORT", r#"{}"#, "idem-t2-p3-Z", None),
+    )
+    .await
+    .expect("offline Z ALLOWED on the last reserved code");
     assert_eq!(z.document_state, DocState::OfflineLocalAck);
     assert_eq!(free_codes(app.db()).await, 0, "Z drew the last code");
 }
@@ -523,7 +540,10 @@ async fn pin5_refusal_is_rowless_503_reserve_held_code() {
     }
     // Row-less: no fiscal_documents row at all for this FN's SELL/BEGIN.
     assert_eq!(doc_count_by_type(app.db(), "SELL").await, 0);
-    assert_eq!(doc_count_by_type(app.db(), "OFFLINE_SESSION_BEGIN").await, 0);
+    assert_eq!(
+        doc_count_by_type(app.db(), "OFFLINE_SESSION_BEGIN").await,
+        0
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
