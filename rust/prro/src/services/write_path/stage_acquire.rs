@@ -755,54 +755,75 @@ pub async fn run(
             // **Invariant #1**: this is a pure SELECT (no network/crypto),
             // so running it inside BEGIN IMMEDIATE does NOT violate INV-1.
             // The serialized section allows DB reads; it forbids I/O.
-            if channel == Channel::Online && command.doc_type == DocType::Return {
-                // Sum the cash legs of this RETURN from the converted payload.
+            // INV-21 guard-3a (RETURN cash leg) + guard-3b (SERVICE_OUT).
+            // Both are ONLINE-only in-lease re-checks.  Offline RETURNs are
+            // protected by the pre-inbox L1 guard (convert.rs).
+            // **Invariant #1**: pure SELECT — no network/crypto inside tx.
+            if channel == Channel::Online
+                && (command.doc_type == DocType::Return
+                    || command.doc_type == DocType::ServiceOut)
+            {
+                // Derive the outgoing-cash amount for this doc:
+                // - RETURN: sum of cash legs (type_code "0") from converted payload.
+                // - SERVICE_OUT: amount_kop from the service-io payload.
                 #[derive(serde::Deserialize)]
                 struct ReturnPayment { type_code: String, sum_kop: i64 }
                 #[derive(serde::Deserialize)]
                 struct ReturnPayload { payments: Vec<ReturnPayment> }
-                if let Ok(rp) = serde_json::from_str::<ReturnPayload>(&command.payload_json) {
-                    let return_cash_kop: i64 = rp.payments
-                        .iter()
-                        .filter(|p| p.type_code == "0" && p.sum_kop > 0)
-                        .map(|p| p.sum_kop)
-                        .fold(0i64, |a, b| a.saturating_add(b));
+                #[derive(serde::Deserialize)]
+                struct ServiceIoPayload { amount_kop: i64 }
 
-                    if return_cash_kop > 0 {
-                        // Re-derive cash-on-hand from the same tx snapshot.
-                        // active_shift is Some (shift_state == Opened* was verified
-                        // at Step 5); for any other shift_state the shift guard
-                        // (Step 4) would have refused already.
-                        let cash_on_hand_kop: i64 = if let Some(ref shift) = active_shift {
-                            let (sell, ret) = crate::services::cash_ledger::aggregate_shift_cash_tx(
+                let outgoing_cash_kop: i64 = if command.doc_type == DocType::Return {
+                    if let Ok(rp) = serde_json::from_str::<ReturnPayload>(&command.payload_json) {
+                        rp.payments
+                            .iter()
+                            .filter(|p| p.type_code == "0" && p.sum_kop > 0)
+                            .map(|p| p.sum_kop)
+                            .fold(0i64, |a, b| a.saturating_add(b))
+                    } else {
+                        0
+                    }
+                } else {
+                    // SERVICE_OUT
+                    serde_json::from_str::<ServiceIoPayload>(&command.payload_json)
+                        .map(|p| p.amount_kop.max(0))
+                        .unwrap_or(0)
+                };
+
+                if outgoing_cash_kop > 0 {
+                    // Re-derive cash-on-hand under the write-lease tx snapshot.
+                    // active_shift is Some (Opened* verified at Step 5).
+                    let cash_on_hand_kop: i64 = if let Some(ref shift) = active_shift {
+                        let (sell, ret, svc_in, svc_out) =
+                            crate::services::cash_ledger::aggregate_shift_cash_tx(
                                 tx, &fn_id, shift.shift_id,
                             )
                             .await?;
-                            crate::services::cash_ledger::derive_cash_on_hand(
-                                shift.cash_balance_kop, sell, ret,
-                            )
-                        } else {
-                            0 // no open shift → 0 (the shift guard handles no-shift refusal)
-                        };
+                        crate::services::cash_ledger::derive_cash_on_hand(
+                            shift.cash_balance_kop, sell, ret, svc_in, svc_out,
+                        )
+                    } else {
+                        0 // no open shift → 0; shift guard (Step 4) handles no-shift refusal
+                    };
 
-                        if cash_on_hand_kop < return_cash_kop {
-                            return reject(
-                                tx,
-                                &request_id,
-                                RejectionReason::CashInsufficientInLease {
-                                    cash_on_hand_kop,
-                                    return_cash_kop,
-                                },
-                                "inv21_cash_insufficient_in_lease",
-                                Severity::Warning,
-                                Some(serde_json::json!({
-                                    "fn": fn_id,
-                                    "cash_on_hand_kop": cash_on_hand_kop,
-                                    "return_cash_kop": return_cash_kop,
-                                })),
-                            )
-                            .await;
-                        }
+                    if cash_on_hand_kop < outgoing_cash_kop {
+                        return reject(
+                            tx,
+                            &request_id,
+                            RejectionReason::CashInsufficientInLease {
+                                cash_on_hand_kop,
+                                return_cash_kop: outgoing_cash_kop,
+                            },
+                            "inv21_cash_insufficient_in_lease",
+                            Severity::Warning,
+                            Some(serde_json::json!({
+                                "fn": fn_id,
+                                "cash_on_hand_kop": cash_on_hand_kop,
+                                "outgoing_cash_kop": outgoing_cash_kop,
+                                "doc_type": format!("{:?}", command.doc_type),
+                            })),
+                        )
+                        .await;
                     }
                 }
             }

@@ -792,6 +792,22 @@ pub struct ZReportCheckCount {
     pub return_count: u32,
 }
 
+/// L3 — service cash-in / cash-out service receipt (`<C T='2'>`).
+///
+/// Wire shape (byte-pinned to WebCheck `StringXML.cs:DealCheck:2606`):
+///   - internal `<I N='1' T='0' SM='{amount}'/>` for cash-in (DocType::ServiceIn)
+///   - internal `<O N='1' T='0' SM='{amount}'/>` for cash-out (DocType::ServiceOut)
+/// Followed by `<E N='2'/>` closing element (WebCheck `:2642`).
+/// DI = `local_number`.
+#[derive(Debug, Clone)]
+pub struct ServiceCheckPayload {
+    pub header: DocumentHeader,
+    /// Per-FN local document number (`<DAT DI=...>`).
+    pub local_number: u32,
+    /// Amount in kopecks.  Emitted as the `SM` attribute.
+    pub amount_kop: i64,
+}
+
 /// Top-level discriminated wrapper consumed by `build_canonical_xml`.
 #[derive(Debug, Clone)]
 pub enum CanonicalDoc {
@@ -808,6 +824,10 @@ pub enum CanonicalDoc {
     /// B10 — offline-session END (`<C T="110">`).  Closes the DPS-side
     /// offline window at drain; sent LAST.
     OfflineSessionEnd(OfflineSessionBoundaryPayload),
+    /// L3 — service cash-in (`<C T='2'>…<I N='1' T='0' SM=…/>…`).
+    ServiceIn(ServiceCheckPayload),
+    /// L3 — service cash-out (`<C T='2'>…<O N='1' T='0' SM=…/>…`).
+    ServiceOut(ServiceCheckPayload),
 }
 
 // ─── Build entry point ────────────────────────────────────────────────
@@ -843,6 +863,8 @@ pub fn build_canonical_xml(doc: &CanonicalDoc) -> Result<Vec<u8>, XmlBuildError>
         CanonicalDoc::ZReport(p) => emit_z_report(p, &mut out),
         CanonicalDoc::OfflineSessionBegin(p) => emit_offline_session_boundary(p, "109", &mut out),
         CanonicalDoc::OfflineSessionEnd(p) => emit_offline_session_boundary(p, "110", &mut out),
+        CanonicalDoc::ServiceIn(p) => emit_service_check(p, true, &mut out),
+        CanonicalDoc::ServiceOut(p) => emit_service_check(p, false, &mut out),
     }
     cp1251::encode(&out)
 }
@@ -883,6 +905,39 @@ fn emit_offline_session_boundary(
     let di = p.local_number.to_string();
     open_dat(out, h, &di);
     tag_attrs(out, "C", &[("T", c_type)]);
+    close(out, "C");
+    tag_text(out, "TS", &h.ts_str);
+    close(out, "DAT");
+    emit_mac(out, h);
+    close(out, "RQ");
+}
+
+/// L3 — service cash-in / cash-out service receipt.
+///
+/// Wire shape (byte-pinned to WebCheck `StringXML.cs:DealCheck:2606-2642`):
+///   `<DAT …><C T='2'><I N='1' T='0' SM='{amount}'/><E N='2'/></C><TS>…</TS></DAT><MAC …/>`
+/// `is_in=true` emits `<I …/>` (cash-in, DocType 3 in WebCheck).
+/// `is_in=false` emits `<O …/>` (cash-out, DocType 4 in WebCheck).
+fn emit_service_check(p: &ServiceCheckPayload, is_in: bool, out: &mut String) {
+    let h = &p.header;
+    open_rq(out, h);
+    let di = p.local_number.to_string();
+    open_dat(out, h, &di);
+    // <C T='2'> — service receipt type (WebCheck DealCheck:2606)
+    tag_attrs(out, "C", &[("T", "2")]);
+    let sm = p.amount_kop.to_string();
+    if is_in {
+        // <I N='1' T='0' SM='{amount}'/> — cash-in (WebCheck :2611)
+        tag_attrs(out, "I", &[("N", "1"), ("T", "0"), ("SM", &sm)]);
+        close(out, "I");
+    } else {
+        // <O N='1' T='0' SM='{amount}'/> — cash-out (WebCheck :2622)
+        tag_attrs(out, "O", &[("N", "1"), ("T", "0"), ("SM", &sm)]);
+        close(out, "O");
+    }
+    // <E N='2'/> — closing element (WebCheck :2642)
+    tag_attrs(out, "E", &[("N", "2")]);
+    close(out, "E");
     close(out, "C");
     tag_text(out, "TS", &h.ts_str);
     close(out, "DAT");

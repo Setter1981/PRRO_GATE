@@ -140,7 +140,7 @@ pub struct RefModel {
     // → 100% cash. Model hard-codes CASH_AMOUNT_KOP (see below) instead of
     // per-op amounts (the op alphabet does not expose payment details).
     //
-    // **L3 scope:** service-in/out/EPZ terms stay 0 until wired.
+    // **L3:** service-in/out terms wired (apply_service_io). EPZ stays 0 (fail-closed).
     pub cash_on_hand: i64,
 }
 
@@ -302,6 +302,12 @@ impl RefModel {
             // same mode-dispatch, same lnd/seed/code bookkeeping.
             Op::OnlineReturn(script) => self.apply_return(script),
             Op::OfflineReturn => self.apply_return(&DpsScript(Vec::new())),
+            // L3 service-io: online-only, wire-hitting, same lnd/seed bookkeeping as
+            // a sell, but: ServiceIn adds to cash, ServiceOut subtracts from cash.
+            // ServiceOut is refused (NoMutation) when cash_on_hand < CASH_AMOUNT_KOP
+            // (guard-3b mirrors `stage_acquire` in-lease check).
+            Op::OnlineServiceIn(script) => self.apply_service_io(script, false),
+            Op::OnlineServiceOut(script) => self.apply_service_io(script, true),
             Op::OnlineShiftOpen(script) => self.apply_online_shift_open(script),
             Op::OfflineShiftOpen => self.apply_offline_shift_open(),
             Op::OnlineZReport(script) => self.apply_online_z_report(script),
@@ -412,6 +418,70 @@ impl RefModel {
     /// Routes through `apply_sell` with `is_return=true` for the SSOT cash delta.
     fn apply_return(&mut self, script: &DpsScript) -> ExpectedOutcome {
         self.apply_sell(script, true)
+    }
+
+    /// L3 — Online service cash-in (`is_out=false`) or cash-out (`is_out=true`).
+    ///
+    /// **Wire semantics:** online-only; same lnd/seed bookkeeping as the online arm
+    /// of `apply_sell` (D5 gate, advance-at-SEND, Rejected→NoIssuanceRow, etc.).
+    ///
+    /// **Cash accounting:** counted at ACK (mirrors `aggregate_shift_cash` which
+    /// filters `state IN ('ACK','OFFLINE_LOCAL_ACK')`):
+    ///   ServiceIn  → `cash_on_hand += CASH_AMOUNT_KOP`
+    ///   ServiceOut → `cash_on_hand -= CASH_AMOUNT_KOP`
+    ///
+    /// **Guard-3b (INV-21):** ServiceOut is refused fail-closed PRE-MINT (NoMutation)
+    /// when `cash_on_hand < CASH_AMOUNT_KOP`.  Mirrors the in-lease check added in
+    /// `stage_acquire` for ServiceOut (online-only; the fuzzer enters at
+    /// `inline::run` downstream of `convert.rs`, so only the in-lease arm is
+    /// in-lane here).
+    fn apply_service_io(&mut self, script: &DpsScript, is_out: bool) -> ExpectedOutcome {
+        // Service-io is online-only in production.
+        if self.mode != NodeMode::Online {
+            return ExpectedOutcome::NoMutation;
+        }
+        if !self.shift_is_open() {
+            return ExpectedOutcome::NoMutation;
+        }
+        // Guard-3b (in-lease): ServiceOut refused pre-mint when drawer insufficient.
+        if is_out && self.cash_on_hand < CASH_AMOUNT_KOP {
+            return ExpectedOutcome::NoMutation;
+        }
+        // D5 gate: refused pre-mint while a non-issued sibling rests.
+        if self.has_write_gate_blocker() {
+            return ExpectedOutcome::NoMutation;
+        }
+        if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
+            return ExpectedOutcome::Fault;
+        }
+        let lnd = self.next_lnd;
+        let previous_hash = self.seed;
+        let unsigned_hash = synth_unsigned_hash(lnd);
+        let doc_state = online_outcome_state(script);
+        self.docs.insert(lnd, doc_state);
+        self.next_lnd += 1;
+        if Self::online_origin_advances_seed(doc_state) {
+            self.seed = Some(unsigned_hash);
+        }
+        if doc_state == DocState::Rejected {
+            return ExpectedOutcome::NoIssuanceRow;
+        }
+        // Cash update only at ACK (matches aggregate_shift_cash filter).
+        if doc_state == DocState::Ack {
+            if is_out {
+                self.cash_on_hand -= CASH_AMOUNT_KOP;
+            } else {
+                self.cash_on_hand += CASH_AMOUNT_KOP;
+            }
+        }
+        ExpectedOutcome::Mutated(Mutation {
+            lnd,
+            doc_state,
+            seed_after: self.seed,
+            previous_hash,
+            code_consumed: self.code_consumed_observable(),
+            shift_state_after: None,
+        })
     }
 
     /// Online SHIFT_OPEN.  Closed → Opening at acquire, then Opening → Opened

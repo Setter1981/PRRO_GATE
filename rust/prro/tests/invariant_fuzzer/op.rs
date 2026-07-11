@@ -98,6 +98,13 @@ pub enum Op {
     /// LOCAL so `OfflineReturn` carries none.
     OnlineReturn(DpsScript),
     OfflineReturn,
+    /// Online service cash-in (службове внесення).  Wire-hitting; carries a
+    /// script.  Does NOT exist in an offline variant — service-io is online-only
+    /// (no offline code consumed, no chain advance local-only).
+    OnlineServiceIn(DpsScript),
+    /// Online service cash-out (службова видача).  Wire-hitting; carries a
+    /// script.  Like `OnlineServiceIn`, online-only.
+    OnlineServiceOut(DpsScript),
     /// Online shift-open path.  The script drives send/last.
     OnlineShiftOpen(DpsScript),
     /// Offline shift-open path.  Issuance is local; Drain/GoOnline submits it.

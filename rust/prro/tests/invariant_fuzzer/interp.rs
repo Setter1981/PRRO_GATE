@@ -69,6 +69,13 @@ const SHIFT_OPEN_PAYLOAD: &str = r#"{"opening_sum_kop":0}"#;
 /// A live Z_REPORT's inbox payload is the wire intent; inline Z dispatch
 /// replaces it with the aggregated body before stage_acquire/stage_sign.
 const Z_WIRE_INTENT: &str = r#"{}"#;
+/// L3 — service cash-in signer payload (stage_sign parses as `ServiceIoJson`).
+/// Amount = CASH_AMOUNT_KOP so the cash oracle stays in sync with the model.
+const SERVICE_IN_PAYLOAD: &str =
+    r#"{"schema_version":"1.0","amount_kop":15000,"name":"SERVICE_IN"}"#;
+/// L3 — service cash-out signer payload.  Same amount so guard-3b symmetry holds.
+const SERVICE_OUT_PAYLOAD: &str =
+    r#"{"schema_version":"1.0","amount_kop":15000,"name":"SERVICE_OUT"}"#;
 
 // ─── Observed result (read back from the ledger after each op) ──────────────
 
@@ -482,6 +489,35 @@ impl FuzzCtx {
     async fn seed_inbox_z_report(&mut self) -> InboxRow {
         let idem = self.next_idem();
         seed_inbox_keyed_payload(&self.pool, &idem, "Z_REPORT", Z_WIRE_INTENT, None).await
+    }
+
+    /// L3 — seed a `SERVICE_IN` inbox row.  The payload is the already-converted
+    /// signer format (`stage_sign::parse_payload` expects `ServiceIoJson`).
+    /// Uses `CASH_AMOUNT_KOP` (= `TOTAL_KOP`) so the cash oracle stays in sync.
+    async fn seed_inbox_service_in(&mut self) -> InboxRow {
+        let idem = self.next_idem();
+        seed_inbox_keyed_payload(
+            &self.pool,
+            &idem,
+            "SERVICE_IN",
+            SERVICE_IN_PAYLOAD,
+            None, // no total_sum_kop for service-io (not a SELL/RETURN)
+        )
+        .await
+    }
+
+    /// L3 — seed a `SERVICE_OUT` inbox row.  Same shape as `SERVICE_IN` with
+    /// `name = "SERVICE_OUT"`.
+    async fn seed_inbox_service_out(&mut self) -> InboxRow {
+        let idem = self.next_idem();
+        seed_inbox_keyed_payload(
+            &self.pool,
+            &idem,
+            "SERVICE_OUT",
+            SERVICE_OUT_PAYLOAD,
+            None,
+        )
+        .await
     }
 
     pub async fn observed_doc_count(&self) -> i64 {
@@ -1286,6 +1322,65 @@ async fn offline_return(ctx: &mut FuzzCtx) -> RealOutcome {
                     branch: "b10_lazy_begin_interposed".into(),
                 };
             }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// L3 `OnlineServiceIn` → `inline::run` on an Online node with a `SERVICE_IN`
+/// inbox row.  Wire-hitting; same seam as [`online_sell`] — only the
+/// `operation_type` differs (→ `DocType::ServiceIn`).  No offline variant.
+async fn online_service_in(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    let row = ctx.seed_inbox_service_in().await;
+    let dps = ctx.new_dps();
+    load_script(&dps, script);
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => {
+            ctx.last_row = Some(row.clone());
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// L3 `OnlineServiceOut` → `inline::run` on an Online node with a `SERVICE_OUT`
+/// inbox row.  Same seam as [`online_service_in`].  Guard-3b (in-lease
+/// cash-floor) applies: a `SERVICE_OUT` on an empty drawer is refused in-lease
+/// (pre-mint, `Refused` outcome, no fiscal_documents row).
+async fn online_service_out(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    let row = ctx.seed_inbox_service_out().await;
+    let dps = ctx.new_dps();
+    load_script(&dps, script);
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => {
+            ctx.last_row = Some(row.clone());
             RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
