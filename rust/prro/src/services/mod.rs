@@ -5,6 +5,7 @@
 //! `crypto` and `transports` modules themselves do NOT see DB handles —
 //! W5's static check enforces that boundary at build time.
 
+pub mod cash_ledger;
 pub mod cert_refresher;
 pub mod offline_session;
 pub mod offline_sync;

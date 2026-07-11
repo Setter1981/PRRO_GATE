@@ -137,6 +137,12 @@ pub struct FuzzCtx {
 
 impl FuzzCtx {
     /// Fixture: a fresh DB with an ONLINE node + open shift.
+    /// Return the fiscal number for this ctx (used by drive_sequence to call
+    /// `check_cash_on_hand` after each op).
+    pub fn fn_id(&self) -> &str {
+        &self.fn_id
+    }
+
     pub async fn new_online_open_shift() -> Self {
         let (pool, _tempdir) = fresh_pool().await;
         let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
@@ -2160,4 +2166,254 @@ async fn crash_kvt1_leaves_sent_committed() {
         other => panic!("expected Crashed{{Kvt1}}, got {other:?}"),
     }
     assert_eq!(ctx.send_calls(), 1, "one send_chk before the lastChk crash");
+}
+
+// ─── L0 cash-ledger differential tests ──────────────────────────────────────
+//
+// (A) `cash_differential_sell_and_return` — after each issued SELL prod cash
+//     increments; after a RETURN with sufficient cash it decrements. The
+//     `check_cash_on_hand` oracle asserts prod == model at every step.
+//
+// (B) `cash_oracle_detects_divergence_and_matches_on_valid_path` — proves the
+//     oracle FIRES on divergence (prod negative, model 0) and stays green on
+//     the matching valid path.  The L1 guard lives in `convert.rs` (ingress);
+//     the dedicated pin `pin_l1_teeth_revert_guard` in `l0_l1_cash_ledger.rs`
+//     tests the guard directly.  These fuzzer tests verify the ORACLE layer.
+
+/// L0 cash-differential — SELL builds cash; RETURN decrements; oracle
+/// confirms prod == model after every issued op.
+///
+/// Sequence:
+///   SELL₁  → prod 15000, model 15000
+///   SELL₂  → prod 30000, model 30000
+///   RETURN  → prod 15000, model 15000 (cash sufficient → admitted)
+#[tokio::test]
+async fn cash_differential_sell_and_return() {
+    use crate::model::CASH_AMOUNT_KOP;
+    use crate::oracle::check_cash_on_hand;
+
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+
+    // ── SELL₁ ──────────────────────────────────────────────────────────────
+    let out1 = run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out1, RealOutcome::Doc(_)),
+        "SELL₁ must issue; got {out1:?}"
+    );
+    let model_cash_after_sell1 = CASH_AMOUNT_KOP;
+    check_cash_on_hand(&ctx.pool, &ctx.fn_id, model_cash_after_sell1)
+        .await
+        .expect("cash oracle mismatch after SELL₁");
+
+    // ── SELL₂ ──────────────────────────────────────────────────────────────
+    let out2 = run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out2, RealOutcome::Doc(_)),
+        "SELL₂ must issue; got {out2:?}"
+    );
+    let model_cash_after_sell2 = 2 * CASH_AMOUNT_KOP;
+    check_cash_on_hand(&ctx.pool, &ctx.fn_id, model_cash_after_sell2)
+        .await
+        .expect("cash oracle mismatch after SELL₂");
+
+    // ── RETURN (cash sufficient → admitted) ────────────────────────────────
+    let out3 = run_op(&mut ctx, &Op::OnlineReturn(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out3, RealOutcome::Doc(_)),
+        "RETURN with sufficient cash must issue; got {out3:?}"
+    );
+    let model_cash_after_return = CASH_AMOUNT_KOP; // 30000 − 15000
+    check_cash_on_hand(&ctx.pool, &ctx.fn_id, model_cash_after_return)
+        .await
+        .expect("cash oracle mismatch after RETURN");
+}
+
+/// L0 cash-oracle teeth — HOLE 2 update: in-lease guard is now in the lane.
+///
+/// **Post-HOLE-2 reality**: the in-lease guard (`stage_acquire` Step 6b‴‴) is
+/// in the fuzzer's lane for Online mode.  An `OnlineReturn` on an empty drawer
+/// is NOW refused in-lease (pre-mint, no row minted, `Refused` outcome).
+///
+/// This test verifies three things:
+///   (a) A RETURN on empty drawer is REFUSED by the in-lease guard (not issued).
+///   (b) The valid path (SELL → RETURN) leaves the oracle green at every step.
+///   (c) The oracle FIRES when model ≠ prod (teeth check via mismatched
+///       model value — tells oracle model=CASH_AMOUNT_KOP when prod=0).
+///
+/// ★TEETH (generative): disabling the in-lease guard → the
+/// `op_sequences_run_without_panic` proptest goes RED (`drive_sequence` calls
+/// `check_cash_on_hand` after every op; minimal shrunk input:
+/// `[OnlineReturn(DpsScript([Ack, Ack]))]`).  This unit test documents the
+/// oracle layer; the proptest is the GENERATIVE teeth.
+#[tokio::test]
+async fn cash_oracle_detects_divergence_and_matches_on_valid_path() {
+    use crate::model::CASH_AMOUNT_KOP;
+    use crate::oracle::check_cash_on_hand;
+
+    // ── (a): RETURN on empty drawer is REFUSED by in-lease guard ──────────
+    // Post-HOLE-2: stage_acquire Step 6b‴‴ (Online-scoped) is in the fuzzer
+    // lane.  A RETURN with cash_on_hand=0 is refused pre-mint.
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+    let out_return = run_op(&mut ctx, &Op::OnlineReturn(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_return, RealOutcome::Refused(_)),
+        "RETURN on empty drawer must be refused by in-lease guard (HOLE 2); got {out_return:?}"
+    );
+    // Cash unchanged (0) — refusal is pre-mint (no cash delta).
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
+        .await
+        .expect("oracle: refused RETURN must leave cash at 0");
+
+    // ── (b): valid path (SELL → RETURN) — oracle stays green ──────────────
+    let mut ctx2 = FuzzCtx::new_online_open_shift().await;
+    let out_sell = run_op(&mut ctx2, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_sell, RealOutcome::Doc(_)),
+        "SELL must issue; got {out_sell:?}"
+    );
+    check_cash_on_hand(&ctx2.pool, ctx2.fn_id(), CASH_AMOUNT_KOP)
+        .await
+        .expect("oracle after SELL: prod==model==CASH_AMOUNT_KOP");
+    let out_return2 = run_op(&mut ctx2, &Op::OnlineReturn(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_return2, RealOutcome::Doc(_)),
+        "RETURN with sufficient cash must issue; got {out_return2:?}"
+    );
+    check_cash_on_hand(&ctx2.pool, ctx2.fn_id(), 0)
+        .await
+        .expect("oracle after valid RETURN: prod==model==0");
+
+    // ── (c): oracle catches divergence (deliberate model mismatch) ─────────
+    // ★TEETH: if check_cash_on_hand is weakened to always return Ok(()), this
+    // expect_err fires and the teeth go RED.
+    // After SELL+RETURN, prod cash=0.  Tell oracle model=CASH_AMOUNT_KOP →
+    // divergence: prod(0) != model(15000).
+    let divergence_result = check_cash_on_hand(&ctx2.pool, ctx2.fn_id(), CASH_AMOUNT_KOP).await;
+    assert!(
+        divergence_result.is_err(),
+        "oracle must detect divergence when model != prod (teeth check)"
+    );
+}
+
+// ─── HOLE 2 in-lease cash-floor re-check tests ──────────────────────────────
+//
+// These tests drive the write-path (inline::run) directly, bypassing the
+// pre-inbox L1 guard in convert.rs.  They test the in-lease guard added in
+// stage_acquire Step 6b‴‴ — the serialized check that fires under the FN
+// write-lease and closes the TOCTOU between concurrent cash RETURNs.
+
+/// HOLE 2 Pin 1 — serial RETURN pair: second is refused in-lease.
+///
+/// Sequence:
+///   SELL   → cash_on_hand = CASH_AMOUNT_KOP
+///   RETURN₁ → issued (cash_on_hand → 0)
+///   RETURN₂ → REFUSED by in-lease guard (drawer empty after RETURN₁)
+///              No fiscal_documents row minted; inbox row REJECTED.
+///
+/// ★TEETH: disable the in-lease guard → RETURN₂ ISSUES (cash < 0) → this
+/// assertion goes RED.
+#[tokio::test]
+async fn pin_hole2_serial_return_second_refused_in_lease() {
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+
+    // SELL to build cash.
+    let sell_out = online_sell(&mut ctx, &DpsScript::ack_path()).await;
+    assert!(
+        matches!(sell_out, RealOutcome::Doc(_)),
+        "SELL must issue; got {sell_out:?}"
+    );
+
+    // RETURN₁ — cash sufficient; must issue.
+    let return1_out = online_return(&mut ctx, &DpsScript::ack_path()).await;
+    assert!(
+        matches!(return1_out, RealOutcome::Doc(_)),
+        "RETURN₁ must issue (cash sufficient at that point); got {return1_out:?}"
+    );
+
+    // RETURN₂ — drawer is now empty; must be REFUSED by the in-lease guard.
+    // Note: the pre-inbox L1 guard (convert.rs) is bypassed by online_return
+    // (which seeds an inbox row directly); only the in-lease guard catches this.
+    let return2_out = online_return(&mut ctx, &DpsScript::ack_path()).await;
+    assert!(
+        matches!(return2_out, RealOutcome::Refused(_)),
+        "RETURN₂ must be refused by in-lease guard (empty drawer after RETURN₁);          got {return2_out:?}"
+    );
+
+    // Confirm: no fiscal_documents row was minted for RETURN₂ (row-non-issued).
+    // The last ctx.last_row is RETURN₁ (last successful issue); RETURN₂ is the
+    // refused one. We verify the total issued doc count = 2 (SELL + RETURN₁).
+    let issued_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?          AND state NOT IN ('REJECTED','ABORTED','CANCELLED')",
+    )
+    .bind(ctx.fn_id())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        issued_count, 2,
+        "exactly 2 docs (SELL + RETURN₁); RETURN₂ minted no row"
+    );
+
+    // Confirm the in-lease refusal audit row was written.
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'inv21_cash_insufficient_in_lease'",
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert!(
+        audit_count >= 1,
+        "audit row for in-lease refusal must be written; got {audit_count}"
+    );
+}
+
+/// HOLE 2 Pin 2 — in-lease refusal is row-non-issued: no server_fiscal_no,
+/// seed unchanged.
+///
+/// A RETURN on an empty drawer (bypassing L1 pre-inbox) MUST:
+///   - produce no fiscal_documents row (inbox REJECTED only)
+///   - leave node_state.last_known_unsigned_xml_sha256 unchanged
+#[tokio::test]
+async fn pin_hole2_in_lease_refusal_is_row_non_issued() {
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+
+    // Read seed before the refused RETURN.
+    let seed_before: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(ctx.fn_id())
+    .fetch_optional(&ctx.pool)
+    .await
+    .unwrap()
+    .flatten();
+
+    // RETURN on an empty drawer (no prior SELL) — passes L1 (bypassed) but hits in-lease.
+    let out = online_return(&mut ctx, &DpsScript::ack_path()).await;
+    assert!(
+        matches!(out, RealOutcome::Refused(_)),
+        "RETURN on empty drawer must be refused in-lease; got {out:?}"
+    );
+
+    // No row in fiscal_documents.
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(ctx.fn_id())
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "in-lease refusal: no fiscal_documents row minted");
+
+    // Seed unchanged.
+    let seed_after: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(ctx.fn_id())
+    .fetch_optional(&ctx.pool)
+    .await
+    .unwrap()
+    .flatten();
+    assert_eq!(
+        seed_before, seed_after,
+        "in-lease refusal: chain seed must not advance"
+    );
 }

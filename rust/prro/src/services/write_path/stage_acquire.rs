@@ -196,6 +196,17 @@ pub async fn run(
             None => None,
         };
 
+    // L0 carry anchor — derive BEFORE the write-tx (invariant #1: pure pool read,
+    // no network/crypto).  Only needed for SHIFT_OPEN; 0 for all other doc-types.
+    // `opening_carry_for_fn` reads the most-recently-closed shift's
+    // `cash_balance_kop` (persisted as closing balance at that shift-close)
+    // as the new shift's opening anchor.  First shift (no closed row) → 0.
+    let opening_cash_kop: i64 = if command.doc_type == DocType::ShiftOpen {
+        crate::services::cash_ledger::opening_carry_for_fn(pool, &peeked_fn_id).await?
+    } else {
+        0
+    };
+
     let driver_id_owned = driver_id.to_string();
     let peeked_fn_id_owned = peeked_fn_id.clone();
     let tax_snapshot_for_tx = tax_snapshot.clone();
@@ -713,6 +724,89 @@ pub async fn run(
                 .await;
             }
 
+            // [Step 6b‴‴] INV-21 TOCTOU close — in-lease cash-floor re-check.
+            //
+            // The pre-inbox L1 guard (`convert.rs`) is the FAST row-less UX
+            // refusal.  Two concurrent same-FN cash RETURNs can both pass the
+            // pre-inbox guard reading the same DB snapshot, then race to this
+            // point.  The FN write lease (held since `acquire_lease` above)
+            // serializes them: the second RETURN sees the cash balance AFTER
+            // the first RETURN's doc was committed (or is in-flight under the
+            // lock).  Re-checking here — under the lease, from the tx-snapshot
+            // — closes the TOCTOU.
+            //
+            // **Scoped to Online channel**: offline ops go through the same
+            // FN write-lease (single-writer), so TOCTOU is structurally closed
+            // for offline too.  However, offline ops may have a B10 lazy-BEGIN
+            // interposed (a separate committed doc) BEFORE the RETURN lands here.
+            // The in-lease guard fires after the BEGIN is committed, so the BEGIN
+            // doc is unaffected; the RETURN itself is refused pre-mint (no code
+            // consumed, no RETURN doc).  Modelling this in the fuzzer's RefModel
+            // would require predicting "BEGIN fires, RETURN refused" as a
+            // multi-document outcome — significant complexity for a low-risk
+            // offline edge.  Offline RETURNs are already protected by the
+            // pre-inbox L1 guard (convert.rs) which is always in the offline
+            // ingress path.  Online-only scoping preserves the TOCTOU protection
+            // for the concurrent-online case where it matters most.
+            //
+            // This is a RETURN with a cash leg (type_code "0") only.
+            // SELL is excluded (cash in is always safe for INV-21).
+            //
+            // **Invariant #1**: this is a pure SELECT (no network/crypto),
+            // so running it inside BEGIN IMMEDIATE does NOT violate INV-1.
+            // The serialized section allows DB reads; it forbids I/O.
+            if channel == Channel::Online && command.doc_type == DocType::Return {
+                // Sum the cash legs of this RETURN from the converted payload.
+                #[derive(serde::Deserialize)]
+                struct ReturnPayment { type_code: String, sum_kop: i64 }
+                #[derive(serde::Deserialize)]
+                struct ReturnPayload { payments: Vec<ReturnPayment> }
+                if let Ok(rp) = serde_json::from_str::<ReturnPayload>(&command.payload_json) {
+                    let return_cash_kop: i64 = rp.payments
+                        .iter()
+                        .filter(|p| p.type_code == "0" && p.sum_kop > 0)
+                        .map(|p| p.sum_kop)
+                        .fold(0i64, |a, b| a.saturating_add(b));
+
+                    if return_cash_kop > 0 {
+                        // Re-derive cash-on-hand from the same tx snapshot.
+                        // active_shift is Some (shift_state == Opened* was verified
+                        // at Step 5); for any other shift_state the shift guard
+                        // (Step 4) would have refused already.
+                        let cash_on_hand_kop: i64 = if let Some(ref shift) = active_shift {
+                            let (sell, ret) = crate::services::cash_ledger::aggregate_shift_cash_tx(
+                                tx, &fn_id, shift.shift_id,
+                            )
+                            .await?;
+                            crate::services::cash_ledger::derive_cash_on_hand(
+                                shift.cash_balance_kop, sell, ret,
+                            )
+                        } else {
+                            0 // no open shift → 0 (the shift guard handles no-shift refusal)
+                        };
+
+                        if cash_on_hand_kop < return_cash_kop {
+                            return reject(
+                                tx,
+                                &request_id,
+                                RejectionReason::CashInsufficientInLease {
+                                    cash_on_hand_kop,
+                                    return_cash_kop,
+                                },
+                                "inv21_cash_insufficient_in_lease",
+                                Severity::Warning,
+                                Some(serde_json::json!({
+                                    "fn": fn_id,
+                                    "cash_on_hand_kop": cash_on_hand_kop,
+                                    "return_cash_kop": return_cash_kop,
+                                })),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+
             // [Step 6c] W4-Z2a piece 6b-self-review Important #1 —
             //           insert tax_snapshot ONLY now that we're
             //           definitively on the Proceed path (Resume and
@@ -778,7 +872,7 @@ pub async fn run(
                             .expect("Step 6b′ refuses ShiftOpen with no cashier")
                             .as_str();
                         let shift_id = ShiftId::deterministic_for_shift_open(document_id);
-                        transition::create_shift_tx(tx, &fn_id, shift_id, "ONLINE", opener)
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "ONLINE", opener, opening_cash_kop)
                             .await?;
                         expect_applied(
                             transition::apply_shift_transition(
@@ -845,7 +939,7 @@ pub async fn run(
                             .expect("Step 6b′ refuses ShiftOpen with no cashier")
                             .as_str();
                         let shift_id = ShiftId::deterministic_for_shift_open(document_id);
-                        transition::create_shift_tx(tx, &fn_id, shift_id, "OFFLINE", opener)
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "OFFLINE", opener, opening_cash_kop)
                             .await?;
                         expect_applied(
                             transition::apply_shift_transition(
@@ -1073,6 +1167,7 @@ fn spec_event_for(reason: &RejectionReason) -> Option<&'static str> {
         ZReportBlockedBacklogDrainPending => Some("OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED"),
         OfflineLifecycleNoActiveSession => Some("OFFLINE_LIFECYCLE_NO_ACTIVE_SESSION_REFUSED"),
         OfflineLifecycleCodePoolEmpty => Some("OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED"),
+        CashInsufficientInLease { .. } => Some("inv21_cash_insufficient_in_lease"),
         _ => None,
     }
 }

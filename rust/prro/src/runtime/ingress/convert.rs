@@ -195,6 +195,20 @@ pub enum ConvertError {
     )]
     ReturnCheckNumberNotSupported,
 
+    /// **INV-21** — RETURN would drive cash-on-hand below zero.
+    /// Fail-closed before inbox insert (row-less), HTTP 422, code CASH_INSUFFICIENT.
+    ///
+    /// `cash_on_hand_kop` = current cash-on-hand for the FN's open shift;
+    /// `return_cash_kop`  = cash leg of the RETURN being attempted.
+    #[error(
+        "INV-21: RETURN would drive cash below zero — \
+         cash_on_hand {cash_on_hand_kop} kop < return {return_cash_kop} kop (fail-closed)"
+    )]
+    CashInsufficient {
+        cash_on_hand_kop: i64,
+        return_cash_kop: i64,
+    },
+
     /// `ZReport` / `ShiftClose` with no open shift — a Z closes the open
     /// shift; closing when none is open is a state-machine breach.
     #[error(
@@ -825,6 +839,35 @@ pub async fn convert_to_signer_payload(
             for p in &cmd.payload.payments {
                 payments.push(convert_payment(p, fiscal_number, secure_pool).await?);
             }
+
+            // ── INV-21 guard — L1 cash-on-hand floor (pre-inbox, row-less) ─────
+            // RETURN only: refuse if the cash leg exceeds current cash-on-hand.
+            // SELL is excluded (cash in = always safe for this invariant).
+            // Guard runs AFTER payment conversion so `type_code` is available.
+            // Uses `main_pool` (invariant #1: no write-tx; pure pool read).
+            if cmd.command_type == CommandType::Return {
+                // Sum the cash legs of this RETURN (type_code == "0", D1 frozen).
+                let return_cash_kop: i64 = payments
+                    .iter()
+                    .filter(|p| p.type_code == "0" && p.sum_kop > 0)
+                    .map(|p| p.sum_kop)
+                    .fold(0i64, |a, b| a.saturating_add(b));
+
+                if return_cash_kop > 0 {
+                    // Read cash-on-hand for the open shift.
+                    let cash_on_hand_kop =
+                        crate::services::cash_ledger::cash_on_hand_for_fn(main_pool, fiscal_number)
+                            .await
+                            .map_err(ConvertError::LedgerRead)?;
+                    if cash_on_hand_kop < return_cash_kop {
+                        return Err(ConvertError::CashInsufficient {
+                            cash_on_hand_kop,
+                            return_cash_kop,
+                        });
+                    }
+                }
+            }
+
             finalize(&CheckOut { items, payments })
         }
         // RS-3 A1Z: the Z-class aggregation lives in `aggregate_z_payload`

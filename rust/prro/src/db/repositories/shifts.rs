@@ -129,15 +129,17 @@ pub async fn insert_created(
     fiscal_number: &str,
     open_mode: &str,
     opened_by_cashier_id: &str,
+    opening_cash_kop: i64,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
             opened_by_cashier_id) \
-         VALUES (?, ?, 'CREATED', ?, 0, ?)",
+         VALUES (?, ?, 'CREATED', ?, ?, ?)",
     )
     .bind(id)
     .bind(fiscal_number)
     .bind(open_mode)
+    .bind(opening_cash_kop)
     .bind(opened_by_cashier_id)
     .execute(pool)
     .await?;
@@ -148,24 +150,48 @@ pub async fn insert_created(
 /// but enrolled in the caller's `with_immediate` envelope so the shift-row
 /// create commits (or rolls back) atomically with the `create_shift_tx`
 /// node_state projection CAS.
+///
+/// `opening_cash_kop` — the carry-over opening balance for this shift
+/// (prior shift's closing cash in `shifts.cash_balance_kop`; 0 for the
+/// FN's first shift).  L0 carry semantics: persisted in `cash_balance_kop`
+/// at create-time, re-derivable from the journal via `invariant_scan`.
 pub async fn insert_created_tx(
     tx: &mut WriteTxConn<'_>,
     id: ShiftId,
     fiscal_number: &str,
     open_mode: &str,
     opened_by_cashier_id: &str,
+    opening_cash_kop: i64,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
             opened_by_cashier_id) \
-         VALUES (?, ?, 'CREATED', ?, 0, ?)",
+         VALUES (?, ?, 'CREATED', ?, ?, ?)",
     )
     .bind(id)
     .bind(fiscal_number)
     .bind(open_mode)
+    .bind(opening_cash_kop)
     .bind(opened_by_cashier_id)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// L0 — update `cash_balance_kop` for a shift row.  Called at shift CLOSE
+/// (inside the same `with_immediate` envelope as the `Closing → Closed`
+/// transition) to persist the closing cash as the next shift's carry anchor.
+/// Pure SQL; no crypto/network (invariant #1 preserved).
+pub async fn update_cash_balance_tx(
+    tx: &mut WriteTxConn<'_>,
+    id: ShiftId,
+    cash_balance_kop: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE shifts SET cash_balance_kop = ? WHERE shift_id = ?")
+        .bind(cash_balance_kop)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 

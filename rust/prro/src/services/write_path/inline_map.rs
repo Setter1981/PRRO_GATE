@@ -47,6 +47,10 @@ pub(crate) mod codes {
     /// Q-A — the true signer-vs-opening-cashier mismatch (operator reissues
     /// with the correct cashier); pre-wire, no fiscal commitment → 422.
     pub const SIGNER_CASHIER_MISMATCH: &str = "SIGNER_CASHIER_MISMATCH";
+    /// INV-21 in-lease re-check (HOLE 2 fix) — a RETURN was admitted by the
+    /// pre-inbox L1 guard but cash was consumed concurrently; fail-closed 422
+    /// (same HTTP class as the pre-inbox `CASH_INSUFFICIENT` from convert.rs).
+    pub const CASH_INSUFFICIENT_IN_LEASE: &str = "CASH_INSUFFICIENT_IN_LEASE";
 
     // ── OfflineRefused → 503 (node-mode refusals; GOING_ONLINE is retryable) ──
     pub const NODE_BLOCKED: &str = "NODE_BLOCKED";
@@ -248,6 +252,10 @@ pub(crate) fn map_rejection(reason: &RejectionReason, request_id: [u8; 16]) -> F
         // OfflineRefused, NOT a client-fixable 422 (the client cannot fix
         // its input to clear the blocker — it retries after the resolver).
         R::WriteGateSiblingPending => node_refused(request_id, codes::WRITE_GATE_SIBLING_PENDING),
+        // INV-21 in-lease re-check — same 422 class as the pre-inbox L1 guard.
+        R::CashInsufficientInLease { .. } => {
+            shift_guard(request_id, codes::CASH_INSUFFICIENT_IN_LEASE)
+        }
         // T2/T3 — structural / manual-recon (500).
         R::ShiftInError => internal(request_id, codes::SHIFT_IN_ERROR),
         R::ShiftInvariantViolation => internal(request_id, codes::SHIFT_INVARIANT_VIOLATION),

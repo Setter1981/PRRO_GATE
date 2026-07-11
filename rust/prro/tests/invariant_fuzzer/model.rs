@@ -117,7 +117,38 @@ pub struct RefModel {
     /// B10 — whether this session has already minted its DocType=10
     /// OFFLINE_SESSION_END (at drain finalize).  Once-only, like the BEGIN.
     pub session_has_end: bool,
+
+    // ── L0 cash-on-hand accumulator (INV-21) ──────────────────────────────
+    //
+    // **RAGE W1 coordination note (task #18 — shift-op model additions):**
+    // W1 adds shift-lifecycle ops (ShiftOpen/Close/ZReport) to the model.
+    // When W1 merges onto this branch it MUST:
+    //   - reset `cash_on_hand = 0` in new shift-open prediction (carry across
+    //     shifts is L3/L4 scope; the current alphabet uses a SINGLE open shift
+    //     per fixture so 0 is correct).
+    //   - NOT change sign convention: SELL(cash) → +kop, RETURN(cash) → −kop.
+    //   - The INV-21 oracle in oracle.rs reads `model.cash_on_hand` directly.
+    //
+    // **Model formula (§1.2 restricted, L0 scope):**
+    //   cash_on_hand += CASH_AMOUNT_KOP  (per issued SELL — cash leg)
+    //   cash_on_hand -= CASH_AMOUNT_KOP  (per issued RETURN — cash leg)
+    //   INV-21 refusal: a RETURN is refused fail-closed (NoMutation) when
+    //                   cash_on_hand < CASH_AMOUNT_KOP.
+    //
+    // **Cash identification:** type_code "0" (D1 frozen invariant).
+    // Fuzzer fixture (interp.rs:64-65) always uses type_code:"0", sum_kop:15000
+    // → 100% cash. Model hard-codes CASH_AMOUNT_KOP (see below) instead of
+    // per-op amounts (the op alphabet does not expose payment details).
+    //
+    // **L3 scope:** service-in/out/EPZ terms stay 0 until wired.
+    pub cash_on_hand: i64,
 }
+
+/// L0 — the cash amount used by every SELL/RETURN in the fuzzer fixture.
+/// Mirrors `SELL_PAYLOAD` / interp.rs:64: `"sum_kop":15000`, `"type_code":"0"`.
+/// INDEPENDENT constant — NOT derived from the prod impl (anti-shared-const,
+/// mirrors U1 D3 discipline for the cash oracle).
+pub const CASH_AMOUNT_KOP: i64 = 15_000;
 
 impl RefModel {
     /// Fixture: an ONLINE node with an open shift, no offline session, genesis
@@ -136,6 +167,7 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
+            cash_on_hand: 0, // L0: opening = 0 (first shift; carry is L3/L4)
         }
     }
 
@@ -154,6 +186,7 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
+            cash_on_hand: 0, // L0: no open shift → no cash-on-hand
         }
     }
 
@@ -174,6 +207,7 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
+            cash_on_hand: 0, // L0: opening = 0 (first shift)
         }
     }
 
@@ -192,6 +226,7 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
+            cash_on_hand: 0, // L0: no open shift
         }
     }
 
@@ -261,8 +296,8 @@ impl RefModel {
             // (OnlineSell on an Offline node issues offline; OfflineSell on an
             // Online node is a mis-targeted online sell).  Both route through
             // `apply_sell`; OfflineSell carries no wire script.
-            Op::OnlineSell(script) => self.apply_sell(script),
-            Op::OfflineSell => self.apply_sell(&DpsScript(Vec::new())),
+            Op::OnlineSell(script) => self.apply_sell(script, false),
+            Op::OfflineSell => self.apply_sell(&DpsScript(Vec::new()), false),
             // PR-R-fuzz — a RETURN is chain-wise identical to a SELL (§ apply_return):
             // same mode-dispatch, same lnd/seed/code bookkeeping.
             Op::OnlineReturn(script) => self.apply_return(script),
@@ -327,7 +362,7 @@ impl RefModel {
     /// nondeterministic crash recoveries (wire-reached `Crashed`, MAC-recovery)
     /// stay `Fault`; this is the ONE narrow predictable slice (spec §9 / U2/O2).
     pub fn predict_crash_completed_sell(&mut self) -> ExpectedOutcome {
-        self.apply_sell(&DpsScript(Vec::new()))
+        self.apply_sell(&DpsScript(Vec::new()), false)
     }
 
     /// A.3 PR-C — does a NON-ISSUED sibling rest on the FN (the D5-gate blocker
@@ -369,17 +404,14 @@ impl RefModel {
         })
     }
 
-    /// A RETURN — chain-wise IDENTICAL to a SELL at the model level.  All three
-    /// production symmetries were verified doc-type-agnostic: the offline-code
-    /// CAS (`acquire_code_tx`), the D5 acquire/sign gate predicate
-    /// (`exists_blocking_non_issued_sibling`), and stage_sign/stage_send.  The
-    /// SELL vs RETURN difference is purely differential-level (sum_out / wire
-    /// `T=1`), NOT model state (lnd / seed / codes) — so the model delegates to
-    /// `apply_sell` (a single SSOT, zero two-arm drift).  The interp still drives
-    /// a genuine `DocType::Return` doc through prod, so the differential exercises
-    /// the RETURN write-path against this (SELL-identical) prediction.
+    /// A RETURN — chain-wise IDENTICAL to a SELL at the model level for lnd/seed/
+    /// codes.  The fuzzer enters at `inline::run`, downstream of `convert.rs`, so
+    /// INV-21 does NOT refuse here.  The cash accumulator (`cash_on_hand`) tracks
+    /// what prod actually does (may go negative on empty-drawer returns); the
+    /// `check_cash_on_hand` oracle detects divergence independently.
+    /// Routes through `apply_sell` with `is_return=true` for the SSOT cash delta.
     fn apply_return(&mut self, script: &DpsScript) -> ExpectedOutcome {
-        self.apply_sell(script)
+        self.apply_sell(script, true)
     }
 
     /// Online SHIFT_OPEN.  Closed → Opening at acquire, then Opening → Opened
@@ -625,13 +657,53 @@ impl RefModel {
         })
     }
 
-    /// A sell — the lane is the NODE MODE (the interpreter's `inline::run`
-    /// dispatches by mode), not the op name.  Online → per-script outcome;
-    /// Offline → OFFLINE_LOCAL_ACK (consuming a code); any other mode → refused.
-    fn apply_sell(&mut self, script: &DpsScript) -> ExpectedOutcome {
+    /// A sell (or return when `is_return=true`) — the lane is the NODE MODE
+    /// (the interpreter's `inline::run` dispatches by mode), not the op name.
+    /// Online → per-script outcome; Offline → OFFLINE_LOCAL_ACK (consuming a
+    /// code); any other mode → refused.
+    ///
+    /// **L0 INV-21 (cash-on-hand):**
+    /// A RETURN with `is_return=true` is refused fail-closed (`NoMutation`) when
+    /// `cash_on_hand < CASH_AMOUNT_KOP` (the cash floor). When it proceeds (or
+    /// when `is_return=false` for a SELL), the model updates `cash_on_hand`:
+    ///   - SELL:   `cash_on_hand += CASH_AMOUNT_KOP`
+    ///   - RETURN: `cash_on_hand -= CASH_AMOUNT_KOP`
+    ///
+    /// Both only when the doc IS actually issued (online: seed advances / not
+    /// Rejected; offline: OLA assigned).  Aborted / Rejected rows do NOT change
+    /// cash (no issued receipt was produced).
+    ///
+    /// **Offline RETURN note:** the L1 guard fires pre-inbox (pre-convert) in
+    /// prod, so it fires BEFORE the offline code is consumed.  In the model we
+    /// apply the same ordering: check cash BEFORE any lazy-BEGIN or code
+    /// accounting.
+    fn apply_sell(&mut self, script: &DpsScript, is_return: bool) -> ExpectedOutcome {
         if !self.shift_is_open() {
             return ExpectedOutcome::NoMutation;
         }
+
+        // ── INV-21 in-lease cash-floor check (HOLE 2 fix) ─────────────────────────
+        // The in-lease guard in `stage_acquire` (Step 6b‴‴) is IN the fuzzer's
+        // lane for ONLINE mode.  When `cash_on_hand < CASH_AMOUNT_KOP`, the guard
+        // refuses PRE-MINT (no lnd, no row, audit-only) → NoMutation + no cash delta.
+        //
+        // ONLINE-ONLY: the guard is scoped to `channel == Channel::Online` in prod.
+        // Offline mode has B10 lazy-BEGIN interposition complexity: a BEGIN doc may
+        // fire before the RETURN lands at the in-lease check.  The offline lane is
+        // already protected by the pre-inbox L1 guard (convert.rs); we do not model
+        // the in-lease refusal for offline here (it would require "BEGIN fires, RETURN
+        // refused" multi-doc prediction).
+        //
+        // Only applies when is_return=true (SELL is never gated by INV-21).
+        if is_return
+            && self.shift_is_open()
+            && self.mode == NodeMode::Online
+            && self.cash_on_hand < CASH_AMOUNT_KOP
+        {
+            // In-lease guard fires (online mode): RETURN refused, no row, no cash delta.
+            return ExpectedOutcome::NoMutation;
+        }
+
         match self.mode {
             NodeMode::Online => {
                 // A.3 PR-C (D5 gate, acquire layer) — an ONLINE mint is refused
@@ -675,6 +747,26 @@ impl RefModel {
                 // next_lnd / docs stay in sync with reality).
                 if doc_state == DocState::Rejected {
                     return ExpectedOutcome::NoIssuanceRow;
+                }
+                // L0 cash-on-hand update: only when the doc reaches ACK state.
+                //
+                // Prod `aggregate_shift_cash` / `aggregate_shift_cash_tx` filter
+                // `state IN ('ACK','OFFLINE_LOCAL_ACK')`.  Docs at SENT/KVT1/KVT2
+                // have crossed the issuance boundary (seed advanced) but are NOT yet
+                // counted in cash-on-hand — they sit probe-pending until they reach
+                // ACK.  The in-lease guard also reads from that same aggregate, so
+                // cash availability reflects ONLY ack'd receipts, not in-flight ones.
+                // This matches Z aggregation (Z counts ACK docs) — consistent.
+                //
+                // NOTE (follow-up, not blocking): cash-on-hand counts at ACK, not at
+                // SENT.  The deep question of "should SENT docs pre-book cash capacity"
+                // is a policy question separate from INV-21 correctness.
+                if doc_state == DocState::Ack {
+                    if is_return {
+                        self.cash_on_hand -= CASH_AMOUNT_KOP;
+                    } else {
+                        self.cash_on_hand += CASH_AMOUNT_KOP;
+                    }
                 }
                 ExpectedOutcome::Mutated(Mutation {
                     lnd,
@@ -778,6 +870,12 @@ impl RefModel {
                 self.next_lnd += 1;
                 self.codes_consumed += 1;
                 self.seed = Some(unsigned_hash);
+                // L0 cash-on-hand update: offline-origin doc is issued at OLA.
+                if is_return {
+                    self.cash_on_hand -= CASH_AMOUNT_KOP;
+                } else {
+                    self.cash_on_hand += CASH_AMOUNT_KOP;
+                }
                 ExpectedOutcome::Mutated(Mutation {
                     lnd,
                     doc_state: DocState::OfflineLocalAck,

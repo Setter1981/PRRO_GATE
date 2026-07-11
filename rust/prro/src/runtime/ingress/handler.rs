@@ -142,7 +142,12 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // RS-3 A2 (Q-A) — the true signer-vs-opening-cashier mismatch is
         // client/operator-fixable (reissue with the correct cashier), pre-wire,
         // no fiscal commitment → 422, carried by ShiftGuardRefused.
-        | "SIGNER_CASHIER_MISMATCH" => 422,
+        | "SIGNER_CASHIER_MISMATCH"
+        // L1 INV-21 — RETURN would drive cash below zero; pre-inbox, row-less.
+        | "CASH_INSUFFICIENT"
+        // HOLE 2 — in-lease re-check (closes the TOCTOU after concurrent RETURNs).
+        // Same 422 class as CASH_INSUFFICIENT: the RETURN is refused fail-closed.
+        | "CASH_INSUFFICIENT_IN_LEASE" => 422,
         "INVALID_CASHIER_ID" | "MALFORMED_JSON" => 400,
         // Adapter-shell codes (server.rs `adapter_error`) carry their own
         // hard-coded status; listed here so the map stays TOTAL over the
@@ -294,6 +299,8 @@ fn convert_error_code(e: &ConvertError) -> &'static str {
         ConvertError::PaymentSlotKindMismatch { .. } => "PAYMENT_SLOT_KIND_MISMATCH",
         ConvertError::AcquirerSlipMappingDeferred { .. } => "ACQUIRER_SLIP_DEFERRED",
         ConvertError::ReturnCheckNumberNotSupported => "RETURN_CHECK_NUMBER_NOT_SUPPORTED",
+        // L1 INV-21 — pre-inbox refuse, row-less.
+        ConvertError::CashInsufficient { .. } => "CASH_INSUFFICIENT",
         ConvertError::NoOpenShiftForZReport { .. } => "NO_OPEN_SHIFT",
         ConvertError::NegativeStoredPaymentSum { .. } => "LEDGER_CORRUPTION",
         ConvertError::ZReportSumOverflow { .. } => "LEDGER_CORRUPTION",
