@@ -353,7 +353,15 @@ async fn pin_l0_boot_reconcile_detects_drift() {
     // totals 10000 kop to produce carry=10000 via `derive_cash_on_hand(0, 10000, 0)`.
     let shift_a = ShiftId::new();
     seed_closed_shift_with_closing_cash(&pool, shift_a, 0, 10000).await;
-    seed_issued_receipt(&pool, shift_a, 1, DocType::Sell, DocState::Ack, &cash(10000)).await;
+    seed_issued_receipt(
+        &pool,
+        shift_a,
+        1,
+        DocType::Sell,
+        DocState::Ack,
+        &cash(10000),
+    )
+    .await;
 
     // Shift B: opens with correct carry 10000, has one SELL 20.00.
     let shift_b = ShiftId::new();

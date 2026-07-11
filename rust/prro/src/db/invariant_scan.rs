@@ -530,11 +530,10 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
     //
     // In production the force-close seam does NOT exist; Check 16 runs on
     // all FNs unconditionally.
-    let fns_for_check16: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT fiscal_number FROM node_state",
-    )
-    .fetch_all(pool)
-    .await?;
+    let fns_for_check16: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT fiscal_number FROM node_state")
+            .fetch_all(pool)
+            .await?;
 
     for (fiscal_number,) in fns_for_check16 {
         // Skip: last closed shift has cash_balance_kop=0 AND has issued receipts

@@ -19,3 +19,4 @@ cc 272f5692a36e8ad67cd1f215899bd29273276fa297293c15f6cebf5c7b6cb36f # shrinks to
 cc 8eb849b6bffdedd31ed49ba2d90dde3776f3039ef76b3ba84caf1b6157a6ec8e # shrinks to ops = [OnlineSell(DpsScript([Ack, NotFound]))]
 cc aa50a73a092f341f0074967a5c15817e175aaa9fc5341b06adedc74238bfea6c # shrinks to ops = [Crash(Sign), OnlineSell(DpsScript([Ack, Ack]))]
 cc a7926cf1dd4b71bb9ce097c97f1c94957f94855294bf2947c07c6e48da355e16 # shrinks to ops = [OfflineSell, Reboot, OnlineSell(DpsScript([Ack, Ack]))]
+cc 03321d06851f3510bbfe43eef9e04f5b2c5823430d6b75d38176a105187097c4 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), OnlineZReport(DpsScript([Ack, Ack]))]

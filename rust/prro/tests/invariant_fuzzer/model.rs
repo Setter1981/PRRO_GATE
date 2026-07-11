@@ -668,6 +668,7 @@ impl RefModel {
     /// when `is_return=false` for a SELL), the model updates `cash_on_hand`:
     ///   - SELL:   `cash_on_hand += CASH_AMOUNT_KOP`
     ///   - RETURN: `cash_on_hand -= CASH_AMOUNT_KOP`
+    ///
     /// Both only when the doc IS actually issued (online: seed advances / not
     /// Rejected; offline: OLA assigned).  Aborted / Rejected rows do NOT change
     /// cash (no issued receipt was produced).
@@ -694,7 +695,9 @@ impl RefModel {
         // refused" multi-doc prediction).
         //
         // Only applies when is_return=true (SELL is never gated by INV-21).
-        if is_return && self.shift_is_open() && self.mode == NodeMode::Online
+        if is_return
+            && self.shift_is_open()
+            && self.mode == NodeMode::Online
             && self.cash_on_hand < CASH_AMOUNT_KOP
         {
             // In-lease guard fires (online mode): RETURN refused, no row, no cash delta.

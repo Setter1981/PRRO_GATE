@@ -2349,7 +2349,10 @@ async fn pin_hole2_serial_return_second_refused_in_lease() {
     .fetch_one(&ctx.pool)
     .await
     .unwrap();
-    assert_eq!(issued_count, 2, "exactly 2 docs (SELL + RETURN₁); RETURN₂ minted no row");
+    assert_eq!(
+        issued_count, 2,
+        "exactly 2 docs (SELL + RETURN₁); RETURN₂ minted no row"
+    );
 
     // Confirm the in-lease refusal audit row was written.
     let audit_count: i64 = sqlx::query_scalar(
@@ -2392,13 +2395,12 @@ async fn pin_hole2_in_lease_refusal_is_row_non_issued() {
     );
 
     // No row in fiscal_documents.
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?",
-    )
-    .bind(ctx.fn_id())
-    .fetch_one(&ctx.pool)
-    .await
-    .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(ctx.fn_id())
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
     assert_eq!(count, 0, "in-lease refusal: no fiscal_documents row minted");
 
     // Seed unchanged.

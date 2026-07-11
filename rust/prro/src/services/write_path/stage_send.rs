@@ -1670,7 +1670,8 @@ async fn run_one_attempt(
                         "doc_type": format!("{doc_type:?}"),
                         "error": e.to_string(),
                         "fallback_kop": opening_kop,
-                    }).to_string();
+                    })
+                    .to_string();
                     // Fire the audit in a blocking-on-pool call.  This fn is async
                     // but `unwrap_or_else` is sync — use tokio::task::block_in_place
                     // to await; this branch fires only on a rare derive failure
@@ -1679,7 +1680,7 @@ async fn run_one_attempt(
                     // We can't call `.await` in a closure, so spawn a task and block
                     // on it.  This is safe here because we are already in a Tokio
                     // async context (stage_send is always called from an async fn).
-                    let _ = tokio::task::block_in_place(|| {
+                    tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
                             let _ = audit_log::append(
                                 &pool_ref,
@@ -1689,7 +1690,8 @@ async fn run_one_attempt(
                                 Severity::Warning,
                                 None,
                                 Some(&payload),
-                            ).await;
+                            )
+                            .await;
                         })
                     });
                     opening_kop

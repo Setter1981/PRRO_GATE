@@ -163,7 +163,6 @@ pub async fn aggregate_shift_cash_tx(
     Ok((cash_sell, cash_return))
 }
 
-
 /// Derive the closing cash-on-hand for a shift from its DB receipts.
 /// `opening_kop` = the shift's stored `cash_balance_kop` (opening anchor).
 pub async fn derive_closing_cash(
