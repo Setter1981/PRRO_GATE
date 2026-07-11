@@ -24,3 +24,5 @@ cc 7241b23bbcc525332abeed1e8dbfdbe57e0c4cfa32097b471d7e2f85f864acca # shrinks to
 cc f18ae6169255bfb2056c156ed975e725e9742f9302c94f43eaaf98ea62636d31 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), SellWithClosedShift, OfflineShiftOpen]
 cc 82f573bf6deaae294d0165262ee6c87602869f77485208d83cce9db72b3a01db # shrinks to ops = [OnlineSell(DpsScript([Ack, NotFound])), OnlineReturn(DpsScript([Ack, Ack]))]
 cc 8c6453e4ea6cd684a2358f872cb4efbde0b1970213b5900dbcb69175bacf0ac3 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), OnlineZReport(DpsScript([Ack, Ack])), OnlineShiftOpen(DpsScript([Ack, Ack]))]
+cc 5685661535fcdd2f2417f531d7dd8454a61552d32cbff19724cdb718d9826ef8 # shrinks to ops = [SellWithClosedShift, OfflineShiftOpen, GoOnline(DpsScript([Ack, NotFound])), Drain(DpsScript([Ack, Ack]))]
+cc e742fddcc901fb4722076f9b1f28b49ce2ecd9fca576b084c7a759a04a587626 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), SellWithClosedShift, OnlineShiftOpen(DpsScript([Ack, Ack])), OnlineReturn(DpsScript([Ack, Ack]))]

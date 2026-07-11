@@ -89,6 +89,15 @@ fn op() -> impl Strategy<Value = Op> {
         Just(Op::GoOnlineWithoutBacklog),
         Just(Op::OfflineSellDuringGoingOnline),
         Just(Op::SellWithClosedShift),
+        // L3 service cash-in/out — APPENDED AFTER existing ops to preserve
+        // regression-seed indices (proptest encodes by prop_oneof! position;
+        // inserting before existing arms would re-decode saved seeds to wrong ops).
+        // guard-3b cash-floor fires on online ServiceOut with empty drawer (model
+        // predicts NoMutation; differential detects mismatch).
+        dps_script().prop_map(Op::OnlineServiceIn),
+        dps_script().prop_map(Op::OnlineServiceOut),
+        Just(Op::OfflineServiceIn),
+        Just(Op::OfflineServiceOut),
     ]
 }
 

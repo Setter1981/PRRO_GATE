@@ -256,7 +256,10 @@ async fn pin_service_in_issues_and_counts() {
 
     // payload_json must contain amount_kop
     let v: serde_json::Value = serde_json::from_str(&payload.payload_json).unwrap();
-    assert_eq!(v["amount_kop"], 10000, "payload must carry amount_kop=10000");
+    assert_eq!(
+        v["amount_kop"], 10000,
+        "payload must carry amount_kop=10000"
+    );
     assert_eq!(
         v["schema_version"], "1.0",
         "invariant #7: schema_version must be present"
@@ -266,7 +269,10 @@ async fn pin_service_in_issues_and_counts() {
     seed_service_doc(&main, shift, 1, DocType::ServiceIn, 10000).await;
 
     let cash = cash_on_hand_for_fn(&main, FN).await.unwrap();
-    assert_eq!(cash, 10000, "ServiceIn 100.00 → cash-on-hand must be 10000 kop");
+    assert_eq!(
+        cash, 10000,
+        "ServiceIn 100.00 → cash-on-hand must be 10000 kop"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -392,7 +398,10 @@ async fn pin_z_carries_io_section() {
     let sums = v["service_sums"]
         .as_array()
         .expect("service_sums must be present and an array");
-    assert!(!sums.is_empty(), "service_sums must be non-empty after service-in and service-out");
+    assert!(
+        !sums.is_empty(),
+        "service_sums must be non-empty after service-in and service-out"
+    );
 
     // Find the service_in sum.
     let si = sums
@@ -412,7 +421,8 @@ async fn pin_z_carries_io_section() {
 
     // The signer handoff: ZReportJson must deserialize service_sums and pass
     // them to ZReportPayload.  Verify via z_report_xml_from_json_for_testing.
-    let header = DocumentHeader::with_defaults("4000100002", "12345678", 1_u32, "20260711100000", "");
+    let header =
+        DocumentHeader::with_defaults("4000100002", "12345678", 1_u32, "20260711100000", "");
     let xml_bytes = prro::services::write_path::stage_sign::z_report_xml_from_json_for_testing(
         header,
         99,
@@ -501,10 +511,15 @@ fn pin_stop_s2_coupling() {
     );
 
     // FULL_Z_SURFACE_READY must be true — the IO half is built in this PR.
-    assert!(
-        FULL_Z_SURFACE_READY,
-        "FULL_Z_SURFACE_READY must stay true: the IO half is built in the same PR (STOP-S2)"
-    );
+    // The assertion on a constant is intentional: it is a coupling pin that
+    // turns RED if someone flips the flag without updating this test.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(
+            FULL_Z_SURFACE_READY,
+            "FULL_Z_SURFACE_READY must stay true: the IO half is built in the same PR (STOP-S2)"
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

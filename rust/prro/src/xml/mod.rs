@@ -795,8 +795,10 @@ pub struct ZReportCheckCount {
 /// L3 — service cash-in / cash-out service receipt (`<C T='2'>`).
 ///
 /// Wire shape (byte-pinned to WebCheck `StringXML.cs:DealCheck:2606`):
-///   - internal `<I N='1' T='0' SM='{amount}'/>` for cash-in (DocType::ServiceIn)
-///   - internal `<O N='1' T='0' SM='{amount}'/>` for cash-out (DocType::ServiceOut)
+///
+/// - internal `<I N='1' T='0' SM='{amount}'/>` for cash-in (DocType::ServiceIn)
+/// - internal `<O N='1' T='0' SM='{amount}'/>` for cash-out (DocType::ServiceOut)
+///
 /// Followed by `<E N='2'/>` closing element (WebCheck `:2642`).
 /// DI = `local_number`.
 #[derive(Debug, Clone)]

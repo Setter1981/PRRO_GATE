@@ -2305,12 +2305,8 @@ mod tests {
 
     #[test]
     fn build_envelope_unsupported_doc_type_fails_closed() {
-        for dt in [
-            DocType::ServiceIn,
-            DocType::ServiceOut,
-            DocType::CashWithdrawal,
-            DocType::XReport,
-        ] {
+        // ServiceIn/Out are wired (L3); only CashWithdrawal/XReport stay unsupported.
+        for dt in [DocType::CashWithdrawal, DocType::XReport] {
             let r = build_send_envelope(&inputs(dt, 1, "2026-05-09T12:34:56Z"), b"PAY".to_vec());
             match r {
                 Err(StageSendError::UnsupportedDocType { doc_type }) => {

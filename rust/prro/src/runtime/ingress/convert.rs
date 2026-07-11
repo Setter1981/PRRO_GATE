@@ -993,10 +993,13 @@ pub async fn aggregate_z_payload_for_shift(
     // L3 — aggregate service-in/out docs into Z `<IO>` rows.
     // Reads SERVICE_IN/OUT ACK docs for this shift, accumulates by name.
     // Invariant #1: pool-bound SELECT, no write-tx, no network.
-    let (svc_in_kop, svc_out_kop) =
-        crate::services::cash_ledger::aggregate_shift_service_io(main_pool, fiscal_number, shift_id)
-            .await
-            .map_err(ConvertError::LedgerRead)?;
+    let (svc_in_kop, svc_out_kop) = crate::services::cash_ledger::aggregate_shift_service_io(
+        main_pool,
+        fiscal_number,
+        shift_id,
+    )
+    .await
+    .map_err(ConvertError::LedgerRead)?;
     // Only emit rows for non-zero totals (absent-when-empty, mirrors Python parity).
     if svc_in_kop > 0 {
         out.service_sums.push(ZReportServiceIoOut {

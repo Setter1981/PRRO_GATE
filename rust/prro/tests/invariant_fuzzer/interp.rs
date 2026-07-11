@@ -510,14 +510,7 @@ impl FuzzCtx {
     /// `name = "SERVICE_OUT"`.
     async fn seed_inbox_service_out(&mut self) -> InboxRow {
         let idem = self.next_idem();
-        seed_inbox_keyed_payload(
-            &self.pool,
-            &idem,
-            "SERVICE_OUT",
-            SERVICE_OUT_PAYLOAD,
-            None,
-        )
-        .await
+        seed_inbox_keyed_payload(&self.pool, &idem, "SERVICE_OUT", SERVICE_OUT_PAYLOAD, None).await
     }
 
     pub async fn observed_doc_count(&self) -> i64 {
@@ -818,6 +811,12 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         // `return_check_number` guard, so `return_check_number` is never set.
         Op::OnlineReturn(script) => online_return(ctx, script).await,
         Op::OfflineReturn => offline_return(ctx).await,
+        // L3 — service cash-in/out: bimodal (online wire-hitting + offline local-ack).
+        // Drain is generic (no doc_type filter) so offline service-io drains for free.
+        Op::OnlineServiceIn(script) => online_service_in(ctx, script).await,
+        Op::OnlineServiceOut(script) => online_service_out(ctx, script).await,
+        Op::OfflineServiceIn => offline_service_in(ctx).await,
+        Op::OfflineServiceOut => offline_service_out(ctx).await,
         Op::OnlineShiftOpen(script) => online_shift_open(ctx, script).await,
         Op::OfflineShiftOpen => offline_shift_open(ctx).await,
         Op::OnlineZReport(script) => online_z_report(ctx, script).await,
@@ -1328,9 +1327,80 @@ async fn offline_return(ctx: &mut FuzzCtx) -> RealOutcome {
     }
 }
 
+/// L3 `OfflineServiceIn` → `inline::run` on an Offline node with a `SERVICE_IN`
+/// inbox row.  Local issuance — OFFLINE_LOCAL_ACK + code consumed + seed advance.
+/// B10: first offline doc of a session interposes a lazy BEGIN (same as
+/// [`offline_sell`]); report `Recovered` so the differential uses the two-doc
+/// ledger-delta path.
+async fn offline_service_in(ctx: &mut FuzzCtx) -> RealOutcome {
+    let begin_before = begin_doc_count(ctx).await;
+    let row = ctx.seed_inbox_service_in().await;
+    let dps = ctx.new_dps(); // offline branch never touches the wire
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => {
+            ctx.last_row = Some(row.clone());
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// L3 `OfflineServiceOut` → `inline::run` on an Offline node with a `SERVICE_OUT`
+/// inbox row.  Local issuance (OFFLINE_LOCAL_ACK); same as [`offline_service_in`].
+/// Guard-3b (in-lease cash-floor) does NOT apply in the offline lane; only the
+/// pre-inbox L1 guard (convert.rs) fires, which is upstream of `inline::run`.
+async fn offline_service_out(ctx: &mut FuzzCtx) -> RealOutcome {
+    let begin_before = begin_doc_count(ctx).await;
+    let row = ctx.seed_inbox_service_out().await;
+    let dps = ctx.new_dps(); // offline branch never touches the wire
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => {
+            ctx.last_row = Some(row.clone());
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
 /// L3 `OnlineServiceIn` → `inline::run` on an Online node with a `SERVICE_IN`
 /// inbox row.  Wire-hitting; same seam as [`online_sell`] — only the
-/// `operation_type` differs (→ `DocType::ServiceIn`).  No offline variant.
+/// `operation_type` differs (→ `DocType::ServiceIn`).
 async fn online_service_in(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
     let row = ctx.seed_inbox_service_in().await;
     let dps = ctx.new_dps();
@@ -2511,4 +2581,108 @@ async fn pin_hole2_in_lease_refusal_is_row_non_issued() {
         seed_before, seed_after,
         "in-lease refusal: chain seed must not advance"
     );
+}
+
+// ─── L3 guard-3b seeded-harness teeth ───────────────────────────────────────
+//
+// These tests drive `inline::run` directly (bypassing `convert.rs`'s pre-inbox
+// guard) and verify the IN-LEASE guard-3b in `stage_acquire`.  ServiceOut on an
+// empty drawer must be refused; ServiceIn must issue and build cash.
+//
+// ★TEETH: disable the in-lease guard for ServiceOut in `stage_acquire` →
+// the `pin_guard3b_service_out_refused_in_lease` assertion goes RED.
+
+/// Guard-3b teeth pin 1 — ServiceOut on empty drawer is refused in-lease.
+///
+/// Sequence:
+///   ServiceOut(15000) on empty drawer → Refused (in-lease guard-3b fires)
+///   No fiscal_documents row minted; seed unchanged.
+///
+/// ★TEETH: remove the ServiceOut branch from `stage_acquire`'s in-lease check →
+/// this assert turns RED (ServiceOut issues, cash goes negative).
+#[tokio::test]
+async fn pin_guard3b_service_out_refused_in_lease() {
+    use crate::oracle::check_cash_on_hand;
+
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+
+    // Read seed before the refused ServiceOut.
+    let seed_before: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(ctx.fn_id())
+    .fetch_optional(&ctx.pool)
+    .await
+    .unwrap()
+    .flatten();
+
+    // ServiceOut on empty drawer (no prior ServiceIn or Sell): must be refused.
+    let out = online_service_out(&mut ctx, &DpsScript::ack_path()).await;
+    assert!(
+        matches!(out, RealOutcome::Refused(_)),
+        "ServiceOut on empty drawer must be refused by in-lease guard-3b; got {out:?}"
+    );
+
+    // No row in fiscal_documents.
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(ctx.fn_id())
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "guard-3b refusal: no fiscal_documents row minted");
+
+    // Seed unchanged.
+    let seed_after: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(ctx.fn_id())
+    .fetch_optional(&ctx.pool)
+    .await
+    .unwrap()
+    .flatten();
+    assert_eq!(
+        seed_before, seed_after,
+        "guard-3b refusal: chain seed must not advance"
+    );
+
+    // Cash stays at 0.
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
+        .await
+        .expect("oracle: refused ServiceOut must leave cash at 0");
+}
+
+/// Guard-3b teeth pin 2 — ServiceIn builds cash; subsequent ServiceOut is admitted.
+///
+/// Sequence:
+///   ServiceIn(15000) → issued (cash_on_hand → 15000)
+///   ServiceOut(15000) → issued (cash_on_hand → 0) [guard-3b admits it]
+///
+/// This confirms the ADMIT path is live (guard-3b is not over-broad).
+#[tokio::test]
+async fn pin_guard3b_service_in_then_service_out_admitted() {
+    use crate::model::CASH_AMOUNT_KOP;
+    use crate::oracle::check_cash_on_hand;
+
+    let mut ctx = FuzzCtx::new_online_open_shift().await;
+
+    // ServiceIn → builds cash.
+    let out_in = online_service_in(&mut ctx, &DpsScript::ack_path()).await;
+    assert!(
+        matches!(out_in, RealOutcome::Doc(_)),
+        "ServiceIn must issue; got {out_in:?}"
+    );
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), CASH_AMOUNT_KOP)
+        .await
+        .expect("oracle: cash must be CASH_AMOUNT_KOP after ServiceIn");
+
+    // ServiceOut → cash sufficient; must be admitted.
+    let out_out = online_service_out(&mut ctx, &DpsScript::ack_path()).await;
+    assert!(
+        matches!(out_out, RealOutcome::Doc(_)),
+        "ServiceOut must issue when cash sufficient; got {out_out:?}"
+    );
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
+        .await
+        .expect("oracle: cash must be 0 after ServiceIn+ServiceOut");
 }

@@ -47,8 +47,8 @@ use crate::db::tx::with_immediate;
 use crate::xml::{
     build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckLevelAdjustment,
     CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader, LineAdjustment,
-    LineAdjustmentKind, ServiceCheckPayload, ZReportCheckCount, ZReportPayload,
-    ZReportPaymentSum, ZReportServiceSum, ZReportTaxSummary,
+    LineAdjustmentKind, ServiceCheckPayload, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
+    ZReportServiceSum, ZReportTaxSummary,
 };
 
 use super::tax_summary::{derive_check_tax_summaries, TaxResolutionSnapshot};

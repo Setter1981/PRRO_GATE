@@ -302,12 +302,14 @@ impl RefModel {
             // same mode-dispatch, same lnd/seed/code bookkeeping.
             Op::OnlineReturn(script) => self.apply_return(script),
             Op::OfflineReturn => self.apply_return(&DpsScript(Vec::new())),
-            // L3 service-io: online-only, wire-hitting, same lnd/seed bookkeeping as
-            // a sell, but: ServiceIn adds to cash, ServiceOut subtracts from cash.
-            // ServiceOut is refused (NoMutation) when cash_on_hand < CASH_AMOUNT_KOP
-            // (guard-3b mirrors `stage_acquire` in-lease check).
+            // L3 service-io: online variant is wire-hitting; offline variant is
+            // local-ack (same as OfflineSell/OfflineReturn — code consumed at OLA).
+            // ServiceOut guard-3b is IN-LEASE ONLINE-ONLY; the offline lane uses
+            // the pre-inbox L1 guard only — we do not model in-lease refusal here.
             Op::OnlineServiceIn(script) => self.apply_service_io(script, false),
             Op::OnlineServiceOut(script) => self.apply_service_io(script, true),
+            Op::OfflineServiceIn => self.apply_offline_service_io(false),
+            Op::OfflineServiceOut => self.apply_offline_service_io(true),
             Op::OnlineShiftOpen(script) => self.apply_online_shift_open(script),
             Op::OfflineShiftOpen => self.apply_offline_shift_open(),
             Op::OnlineZReport(script) => self.apply_online_z_report(script),
@@ -484,6 +486,94 @@ impl RefModel {
         })
     }
 
+    /// L3 — Offline service cash-in/out.  Mirrors `OfflineSell`/`OfflineReturn`:
+    /// local issuance (OFFLINE_LOCAL_ACK + code consumed + seed advance), no wire.
+    ///
+    /// **Guard-3b:** the in-lease guard is ONLINE-ONLY (`stage_acquire` scopes
+    /// the check to `Channel::Online`).  Offline ServiceOut only has the
+    /// pre-inbox L1 guard (convert.rs), which is downstream of `inline::run`.
+    /// We do not model the L1 refusal here — the fuzzer fixture ensures
+    /// sufficient cash via prior `OfflineServiceIn` (or starts with enough).
+    ///
+    /// **Cash accounting:** counted at OLA, same as offline SELL/RETURN.
+    fn apply_offline_service_io(&mut self, is_out: bool) -> ExpectedOutcome {
+        // Offline lane requires Offline mode + open offline session.
+        if self.mode != NodeMode::Offline {
+            return ExpectedOutcome::NoMutation;
+        }
+        if self.session != Some(OfflineSessionState::Open) {
+            return ExpectedOutcome::NoMutation;
+        }
+        if !self.shift_is_open() {
+            return ExpectedOutcome::NoMutation;
+        }
+
+        // T2 close-reserve gate — mirrors apply_sell's offline arm.
+        // An Opened shift still owes a Z, so reserve = (BEGIN missing ? 1 : 0) + 1.
+        let free_codes = self.codes_issued - self.codes_consumed;
+        if free_codes == 0 && !self.session_has_begin {
+            // Falls through to lazy-BEGIN arm below → NoMutation on 0-code path.
+        } else {
+            let reserve = i64::from(!self.session_has_begin) + 1;
+            if free_codes < 1 + reserve {
+                return ExpectedOutcome::NoMutation;
+            }
+        }
+
+        // B10 — lazy DocType=9 BEGIN interposition, mirrored from apply_sell's
+        // offline arm.  On the FIRST offline doc of a session the impl mints+OLAs
+        // a BEGIN before the business doc.  The harness calls check_ledger_delta
+        // when real=Recovered{b10_lazy_begin_interposed}, so the model MUST predict
+        // BOTH the BEGIN and the business doc in self.docs.
+        //   0 codes → NoMutation (pre-mint pool guard, no rows)
+        //   1 code  → BEGIN(OLA); pool exhausted → Aborted business row (Fault)
+        //   ≥2 codes → BEGIN(OLA) + ServiceIn/Out(OLA)
+        if !self.session_has_begin {
+            if self.codes_consumed >= self.codes_issued {
+                return ExpectedOutcome::NoMutation;
+            }
+            self.session_has_begin = true;
+            let begin_lnd = self.next_lnd;
+            let begin_unsigned = synth_unsigned_hash(begin_lnd);
+            self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+            self.offline_origin_lnds.insert(begin_lnd);
+            self.next_lnd += 1;
+            self.codes_consumed += 1;
+            self.seed = Some(begin_unsigned);
+            // fall through to the business doc (chains off BEGIN's seed)
+        }
+
+        // Business doc — after any lazy BEGIN above.
+        if self.codes_consumed >= self.codes_issued {
+            // Pool exhausted for the business doc → offline-ack aborts it.
+            return self.mint_aborted_refusal();
+        }
+        let lnd = self.next_lnd;
+        let previous_hash = self.seed;
+        let unsigned_hash = synth_unsigned_hash(lnd);
+        self.docs.insert(lnd, DocState::OfflineLocalAck);
+        self.offline_origin_lnds.insert(lnd);
+        self.next_lnd += 1;
+        self.codes_consumed += 1;
+        // Offline-origin advances seed at OFFLINE_LOCAL_ACK (spec § offline chain).
+        self.seed = Some(unsigned_hash);
+        // Cash update at OLA (mirrors aggregate_shift_cash filter
+        // `state IN ('ACK','OFFLINE_LOCAL_ACK')`).
+        if is_out {
+            self.cash_on_hand -= CASH_AMOUNT_KOP;
+        } else {
+            self.cash_on_hand += CASH_AMOUNT_KOP;
+        }
+        ExpectedOutcome::Mutated(Mutation {
+            lnd,
+            doc_state: DocState::OfflineLocalAck,
+            seed_after: self.seed,
+            previous_hash,
+            code_consumed: self.code_consumed_observable(),
+            shift_state_after: None,
+        })
+    }
+
     /// Online SHIFT_OPEN.  Closed → Opening at acquire, then Opening → Opened
     /// once the doc crosses SEND.  ACK only confirms.
     fn apply_online_shift_open(&mut self, script: &DpsScript) -> ExpectedOutcome {
@@ -508,6 +598,12 @@ impl RefModel {
         if Self::online_origin_advances_seed(doc_state) {
             self.seed = Some(unsigned_hash);
             self.shift_state = ShiftState::Opened;
+            // W1 cash-on-hand reset (W1 coordination note, line 126):
+            // A new shift starts with opening balance = 0 (the fixture seeds shifts
+            // with cash_balance_kop = 0).  Reset the accumulator so the model's
+            // INV-21 guard mirrors prod's `derive_cash_on_hand(opening=0, ...)`.
+            // Carry across shifts is L3/L4 scope — not modelled here.
+            self.cash_on_hand = 0;
         } else if doc_state == DocState::Rejected {
             self.shift_state = ShiftState::RequiresManualReconciliation;
             return ExpectedOutcome::NoIssuanceRow;

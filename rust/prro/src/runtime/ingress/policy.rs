@@ -101,10 +101,7 @@ mod tests {
     /// `ServiceIn`/`ServiceOut` are now Signable (L3) — removed from this list.
     #[test]
     fn cash_movement_and_periodic_are_unsupported() {
-        for c in [
-            CommandType::CashWithdrawal,
-            CommandType::PeriodicReport,
-        ] {
+        for c in [CommandType::CashWithdrawal, CommandType::PeriodicReport] {
             assert_eq!(classify_command(c), CommandClass::Unsupported, "{c:?}");
         }
     }

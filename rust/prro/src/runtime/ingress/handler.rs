@@ -868,6 +868,15 @@ mod tests {
         ))
     }
 
+    fn cash_withdrawal_cmd(idem: &str) -> CanonicalCommand {
+        parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"CASH_WITHDRAWAL",
+                "idempotency_key":"{idem}","cashier_id":null,"department":null,
+                "return_check_number":null,
+                "payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+        ))
+    }
+
     /// A SELL with one CASH payment (drives the `payment_methods`-backed
     /// convert path, so the converted hash includes the slot `name`).
     fn sell_cash_cmd(idem: &str) -> CanonicalCommand {
@@ -1428,16 +1437,19 @@ mod tests {
         assert_eq!(c, 0, "read-only command must not enter the inbox");
     }
 
-    /// An unsupported cash-movement command (`SERVICE_IN`) is rejected 422
-    /// UNSUPPORTED_COMMAND at the boundary and NEVER enters the inbox (the
+    /// An unsupported cash-movement command (`CASH_WITHDRAWAL` / EPZ) is rejected
+    /// 422 UNSUPPORTED_COMMAND at the boundary and NEVER enters the inbox (the
     /// "before any inbox write" claim, asserted at the HANDLER level — piece-7
     /// review Low; complements the policy-level classify test).
+    /// NOTE (L3): `SERVICE_IN` / `SERVICE_OUT` are now `Signable` (not Unsupported)
+    /// and reach the write path; this test uses `CASH_WITHDRAWAL` which remains
+    /// permanently `Unsupported` (STOP-S2, EPZ fail-closed).
     #[tokio::test]
     async fn unsupported_command_is_rejected_422_without_inbox_row() {
         let (_d, main, secure) = fresh_pools().await;
         let wp = UnimplementedWritePath;
         let r = handle_command(
-            &service_in_cmd("idem-svc"),
+            &cash_withdrawal_cmd("idem-epz"),
             FN,
             drv(),
             Protocol::Rest,
@@ -1458,23 +1470,39 @@ mod tests {
         assert_eq!(c, 0, "an unsupported command must not enter the inbox");
     }
 
-    /// **PR-Z2 (STOP-S2) coupling-pin — the `FULL_Z_SURFACE_READY = true` flip is
-    /// COUPLED to the two ingress guards that make IO/EPZ legitimately absent.**
-    /// If either is relaxed WITHOUT building its IO/EPZ Z-half, a live close-shift
-    /// would sign an UNDER-REPORTING Z — so this pin asserts both still hold and
-    /// MUST break loudly if one is dropped: (1) `SERVICE_IN/OUT` stay
-    /// ingress-rejected (422 `UNSUPPORTED_COMMAND`, never minted → no service/IO
-    /// turnover to report); (2) an `acquirer_slip`-carrying payment stays
-    /// fail-closed (422 `ACQUIRER_SLIP_DEFERRED`, never minted → no card/EPZ
-    /// turnover to report).  Flag-independent (guards, not the flag) — it stays
-    /// GREEN under a flag revert.  See the `FULL_Z_SURFACE_READY` doc-comment.
+    /// **L3 + PR-Z2 (STOP-S2) coupling-pin — Z `<IO>` surface is coherent with
+    /// ingress classification.**
+    ///
+    /// After L3: `SERVICE_IN/OUT` are **Signable** (reach the write path and mint
+    /// docs that contribute to `<IO>` in the Z report) — the Z surface is now
+    /// COMPLETE for service-io.  The pin has two legs:
+    ///
+    /// (1) `SERVICE_IN` reaches the write path (NOT rejected 422 UNSUPPORTED) —
+    ///     verifying the policy gate is open and IO turnover IS reported.
+    ///     `UnimplementedWritePath` returns `NotImplemented`, so the handler
+    ///     returns a non-422 error, but crucially the inbox row IS written
+    ///     (the command passed the policy gate and entered the inbox).
+    ///
+    /// (2) An `acquirer_slip`-carrying CASHLESS payment stays fail-closed
+    ///     (422 `ACQUIRER_SLIP_DEFERRED`, never minted → no EPZ turnover to
+    ///     report) — EPZ remains STOP-S2 closed.
+    ///
+    /// `CASH_WITHDRAWAL` (EPZ) also stays `UNSUPPORTED_COMMAND` (verified by
+    /// `unsupported_command_is_rejected_422_without_inbox_row`).
+    ///
+    /// Flag-independent (guards, not the flag) — GREEN under a flag revert.
     #[tokio::test]
     async fn z_surface_flip_is_coupled_to_ingress_guards() {
         let (_d, main, secure) = fresh_pools().await;
         let wp = UnimplementedWritePath;
 
-        // (1) SERVICE_IN → 422 UNSUPPORTED (the IO-half premise: no service doc
-        // ever mints, so IO turnover is legitimately zero).
+        // (1) SERVICE_IN now reaches the write path (Signable, IO Z-half is built).
+        // `UnimplementedWritePath` returns `NotImplemented` (501), releasing the
+        // inbox row — but the command DID pass the policy gate (not rejected as
+        // UNSUPPORTED_COMMAND at 422).  The coupling assertion is: NOT a 422
+        // UNSUPPORTED_COMMAND.  The inbox row is released by NotImplemented (by
+        // design — see `retry_after_not_implemented_reattempts_not_stuck`), so
+        // inbox_count=0 is correct here.
         let r = handle_command(
             &service_in_cmd("idem-svc-couple"),
             FN,
@@ -1485,10 +1513,18 @@ mod tests {
             &wp,
         )
         .await;
-        assert_eq!(r.http_status, 422, "SERVICE_IN must stay ingress-rejected");
-        match r.body {
-            IngressBody::Error(e) => assert_eq!(e.error_code, "UNSUPPORTED_COMMAND"),
-            other => panic!("expected UNSUPPORTED_COMMAND, got {other:?}"),
+        // Must NOT be 422 UNSUPPORTED_COMMAND — SERVICE_IN is now Signable (L3).
+        assert_eq!(
+            r.http_status, 501,
+            "SERVICE_IN must reach the write path (501 NOT_IMPLEMENTED from stub, \
+             not 422 UNSUPPORTED_COMMAND)"
+        );
+        match &r.body {
+            IngressBody::Error(e) => assert_eq!(
+                e.error_code, "NOT_IMPLEMENTED",
+                "SERVICE_IN reaches write path — not policy-rejected"
+            ),
+            other => panic!("expected Error(NOT_IMPLEMENTED), got {other:?}"),
         }
 
         // (2) An acquirer_slip-carrying CASHLESS payment → 422 ACQUIRER_SLIP_DEFERRED
@@ -1530,11 +1566,16 @@ mod tests {
             IngressBody::Error(e) => assert_eq!(e.error_code, "ACQUIRER_SLIP_DEFERRED"),
             other => panic!("expected ACQUIRER_SLIP_DEFERRED, got {other:?}"),
         }
+        // Neither the acquirer_slip SELL nor the SERVICE_IN (which was released
+        // by NotImplemented) leaves a row in the inbox at rest.
         let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
             .fetch_one(&main)
             .await
             .unwrap();
-        assert_eq!(c, 0, "neither coupled guard may mint an inbox row");
+        assert_eq!(
+            c, 0,
+            "acquirer_slip guard must not mint an inbox row; SERVICE_IN row was released by NotImplemented"
+        );
     }
 
     /// A convert failure (SELL with empty goods → `EMPTY_GOODS`) is rejected

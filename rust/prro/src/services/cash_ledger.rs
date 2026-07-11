@@ -152,7 +152,6 @@ pub async fn aggregate_shift_service_io(
     fiscal_number: &str,
     shift_id: ShiftId,
 ) -> sqlx::Result<(i64, i64)> {
-
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT doc_type, payload_json FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
@@ -279,8 +278,7 @@ pub async fn derive_closing_cash(
     shift_id: ShiftId,
     opening_kop: i64,
 ) -> sqlx::Result<i64> {
-    let (sell, ret, svc_in, svc_out) =
-        aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
+    let (sell, ret, svc_in, svc_out) = aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
     Ok(derive_cash_on_hand(opening_kop, sell, ret, svc_in, svc_out))
 }
 
