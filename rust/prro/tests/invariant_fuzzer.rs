@@ -3689,3 +3689,135 @@ fn harness_crash_reboot_enforces_no_resend_postcond() {
     drive(&[Op::Crash(Stage::Send), Op::Reboot], false);
     drive(&[Op::Crash(Stage::Kvt1), Op::Reboot], false);
 }
+
+// ─── EPZ — видача готівки за ЕПЗ (cash advance) fuzzer ops ───────────────────
+
+/// EPZ happy-path differential: an online EPZ on a funded drawer (built by a
+/// prior SELL) issues `<C T='8'>` and matches the model.  EPZ is a genuine
+/// fuzzer op driven through the production inline path, not a side test.
+#[tokio::test]
+async fn differential_online_epz_issues_and_matches_model() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    // Fund the drawer with a SELL (CASH_AMOUNT_KOP) so guard-3c admits the EPZ.
+    let sell = Op::OnlineSell(DpsScript::ack_path());
+    let _ = model.apply(&sell);
+    let _ = interp::run_op(&mut ctx, &sell).await;
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineEpz(DpsScript::ack_path());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online EPZ must match model: {d:?}"));
+    let epz_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'CASH_ADVANCE_EPZ' AND state = 'ACK'",
+    )
+    .bind(ctx.fn_id())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        epz_count, 1,
+        "interpreter must drive a real CASH_ADVANCE_EPZ doc to ACK"
+    );
+}
+
+/// ★TEETH — guard-3c (INV-21 готівка≥0).  An online EPZ on an EMPTY drawer is
+/// REFUSED in-lease (pre-mint, no fiscal_documents row); the model predicts
+/// NoMutation and the cash oracle stays at 0.  A SELL then funds the drawer and
+/// the EPZ issues, dropping cash to 0 (`− epz_out`).
+///
+/// REVERT TARGET: remove `DocType::CashAdvanceEpz` from the in-lease guard-3c
+/// cash-out set in `stage_acquire` → the empty-drawer EPZ mints + drives cash
+/// negative → the cash oracle diverges (prod < 0, model 0) → RED.
+#[tokio::test]
+async fn teeth_epz_guard_3c_over_drawer_refused() {
+    use interp::RealOutcome;
+    use model::CASH_AMOUNT_KOP;
+    use oracle::check_cash_on_hand;
+
+    // ── (a) empty drawer → EPZ refused in-lease, cash stays 0 ────────────────
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let out = interp::run_op(&mut ctx, &Op::OnlineEpz(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out, RealOutcome::Refused(_)),
+        "EPZ on empty drawer must be refused by in-lease guard-3c; got {out:?}"
+    );
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
+        .await
+        .expect("refused EPZ must leave cash at 0");
+
+    // ── (b) funded drawer (SELL) → EPZ issues, cash drops by CASH_AMOUNT_KOP ──
+    let out_sell = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_sell, RealOutcome::Doc(_)),
+        "SELL must issue to fund the drawer; got {out_sell:?}"
+    );
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), CASH_AMOUNT_KOP)
+        .await
+        .expect("cash after SELL == CASH_AMOUNT_KOP");
+    let out_epz = interp::run_op(&mut ctx, &Op::OnlineEpz(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_epz, RealOutcome::Doc(_)),
+        "EPZ within drawer must issue; got {out_epz:?}"
+    );
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
+        .await
+        .expect("EPZ cash-out drops cash to 0 (− epz_out)");
+}
+
+/// ★TEETH — z-quiescence (#192/P1 class).  A non-terminal EPZ (an online EPZ
+/// held at SENT via `Ack, NotFound` — issued at SEND but not yet KVT1/ACK) MUST
+/// block an online Z-close: prod's `list_shift_pending_receipts_for_z_quiescence`
+/// counts the in-flight EPZ (SQL set includes `'CASH_ADVANCE_EPZ'`), so the Z is
+/// refused (`Z_QUIESCENCE_PENDING`), matching the model's `has_z_quiescence_blocker`.
+///
+/// REVERT TARGET: remove `'CASH_ADVANCE_EPZ'` from the z-quiescence SQL set in
+/// `fiscal_documents::list_shift_pending_receipts_for_z_quiescence` → prod closes
+/// the shift over the in-flight EPZ (mints a Z doc, shift → Closed) while the
+/// model still blocks (NoMutation) → the differential diverges → RED.
+#[tokio::test]
+async fn teeth_epz_z_quiescence_blocks_close() {
+    use interp::RealOutcome;
+
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    // Fund the drawer so the EPZ is admitted by guard-3c.
+    let sell = Op::OnlineSell(DpsScript::ack_path());
+    let _ = model.apply(&sell);
+    let _ = interp::run_op(&mut ctx, &sell).await;
+
+    // EPZ held at SENT (issued at SEND, no KVT1/ACK) → a non-terminal blocker.
+    let epz = Op::OnlineEpz(DpsScript::send_ack_then_last_not_found());
+    let _ = model.apply(&epz);
+    let _ = interp::run_op(&mut ctx, &epz).await;
+
+    // Attempt an online Z-close.  The in-flight EPZ must block quiescence:
+    // model predicts NoMutation; prod refuses (Z_QUIESCENCE_PENDING) and does
+    // NOT close the shift.
+    let prior_tip = ctx.read_seed().await;
+    let z = Op::OnlineZReport(DpsScript::ack_path());
+    let expected = model.apply(&z);
+    let real = interp::run_op(&mut ctx, &z).await;
+
+    assert!(
+        matches!(expected, ExpectedOutcome::NoMutation),
+        "model must classify Z-over-in-flight-EPZ as NoMutation (quiescence blocked)"
+    );
+    assert!(
+        matches!(real, RealOutcome::Refused(_)),
+        "prod must refuse the Z-close while an in-flight EPZ blocks quiescence; got {real:?}"
+    );
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("EPZ z-quiescence block must match model: {d:?}"));
+    assert_ne!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "the shift must NOT close over an in-flight EPZ (z-quiescence)"
+    );
+}

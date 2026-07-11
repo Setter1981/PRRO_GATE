@@ -76,6 +76,10 @@ const SERVICE_IN_PAYLOAD: &str =
 /// L3 — service cash-out signer payload.  Same amount so guard-3b symmetry holds.
 const SERVICE_OUT_PAYLOAD: &str =
     r#"{"schema_version":"1.0","amount_kop":15000,"name":"SERVICE_OUT"}"#;
+/// EPZ — видача готівки за ЕПЗ signer payload (stage_sign parses as `EpzJson`).
+/// `sum_kop = CASH_AMOUNT_KOP` so the cash oracle stays in sync with the model
+/// (EPZ drives `− epz_out`).  Card leg carries a paymentid ≥ 2 + slip requisites.
+const EPZ_PAYLOAD: &str = r#"{"schema_version":"1.0","sum_kop":15000,"code":"0","name":"EPZ","paymentid":2,"pay_name":"Card","pa":"M","pb":"T","pc":"P","pd":"****","pe":"A","psnm":"Visa","rrn":"R"}"#;
 
 // ─── Observed result (read back from the ledger after each op) ──────────────
 
@@ -513,6 +517,13 @@ impl FuzzCtx {
         seed_inbox_keyed_payload(&self.pool, &idem, "SERVICE_OUT", SERVICE_OUT_PAYLOAD, None).await
     }
 
+    /// EPZ — seed a `CASH_ADVANCE_EPZ` inbox row (already-converted signer
+    /// format; stage_sign parses `EpzJson`).  `sum_kop = CASH_AMOUNT_KOP`.
+    async fn seed_inbox_epz(&mut self) -> InboxRow {
+        let idem = self.next_idem();
+        seed_inbox_keyed_payload(&self.pool, &idem, "CASH_ADVANCE_EPZ", EPZ_PAYLOAD, None).await
+    }
+
     pub async fn observed_doc_count(&self) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
             .bind(self.fn_id.as_str())
@@ -635,9 +646,10 @@ impl FuzzCtx {
             // interpose before a SHIFT_OPEN / Z_REPORT too, with identical
             // chain semantics (business chains OFF the BEGIN).
             // L3: SERVICE_IN / SERVICE_OUT also share the same chain semantics.
+            // EPZ: CASH_ADVANCE_EPZ (видача готівки за ЕПЗ) likewise.
             "SELECT previous_hash, unsigned_xml_sha256 FROM fiscal_documents \
              WHERE fiscal_number = ? \
-             AND doc_type IN ('SELL','RETURN','SHIFT_OPEN','Z_REPORT','SERVICE_IN','SERVICE_OUT') \
+             AND doc_type IN ('SELL','RETURN','SHIFT_OPEN','Z_REPORT','SERVICE_IN','SERVICE_OUT','CASH_ADVANCE_EPZ') \
              AND fs_mode = 'OFFLINE' \
              ORDER BY lnd DESC LIMIT 1",
         )
@@ -822,6 +834,10 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         Op::OfflineShiftOpen => offline_shift_open(ctx).await,
         Op::OnlineZReport(script) => online_z_report(ctx, script).await,
         Op::OfflineZReport => offline_z_report(ctx).await,
+        // EPZ — bimodal (online wire-hitting `<C T='8'>` + offline local-ack).
+        // Drain is generic (no doc_type filter) so offline EPZ drains for free.
+        Op::OnlineEpz(script) => online_epz(ctx, script).await,
+        Op::OfflineEpz => offline_epz(ctx).await,
         Op::GoOnline(script) => go_online(ctx, script).await,
         Op::Drain(script) => drain_op(ctx, script).await,
         Op::Reboot => reboot(ctx).await,
@@ -1382,6 +1398,81 @@ async fn offline_service_out(ctx: &mut FuzzCtx) -> RealOutcome {
     }
     let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_service_out().await;
+    let dps = ctx.new_dps(); // offline branch never touches the wire
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => {
+            ctx.last_row = Some(row.clone());
+            if begin_doc_count(ctx).await > begin_before {
+                return RealOutcome::Recovered {
+                    branch: "b10_lazy_begin_interposed".into(),
+                };
+            }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// EPZ `OnlineEpz` → `inline::run` on an Online node with a `CASH_ADVANCE_EPZ`
+/// inbox row.  Wire-hitting (`<C T='8'>`); same seam as [`online_service_out`].
+/// Guard-3c (in-lease cash-floor) applies: an EPZ on an insufficient drawer is
+/// refused in-lease (pre-mint, `Refused`, no fiscal_documents row).
+///
+/// Mode-guard: EPZ online lane is online-only.
+async fn online_epz(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Online {
+        return RealOutcome::Refused("OnlineEpz: node not Online".into());
+    }
+    let row = ctx.seed_inbox_epz().await;
+    let dps = ctx.new_dps();
+    load_script(&dps, script);
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => {
+            ctx.last_row = Some(row.clone());
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// EPZ `OfflineEpz` → `inline::run` on an Offline node with a `CASH_ADVANCE_EPZ`
+/// inbox row.  Local issuance (OFFLINE_LOCAL_ACK); same seam as
+/// [`offline_service_out`].  Guard-3c is ONLINE-only in-lease; the offline lane
+/// relies on the pre-inbox guard + durable local ledger (fixture ensures cash).
+///
+/// Mode-guard: offline-only op.
+async fn offline_epz(ctx: &mut FuzzCtx) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Offline {
+        return RealOutcome::Refused("OfflineEpz: node not Offline".into());
+    }
+    let begin_before = begin_doc_count(ctx).await;
+    let row = ctx.seed_inbox_epz().await;
     let dps = ctx.new_dps(); // offline branch never touches the wire
     let guard = ctx.gate.clone().lock_owned().await;
     let result = inline::run(

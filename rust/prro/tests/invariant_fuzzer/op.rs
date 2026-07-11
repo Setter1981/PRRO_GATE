@@ -120,6 +120,13 @@ pub enum Op {
     /// Offline close-shift / Z-report path.  Issuance is local; later wire
     /// interaction is driven by the existing Drain/GoOnline ops.
     OfflineZReport,
+    /// Online EPZ — видача готівки за ЕПЗ (cash advance against a card).
+    /// Wire-hitting (`<C T='8'>`); carries a script.  Cash-OUT (`− epz_out`);
+    /// guard-3c refuses (NoMutation) when the card sum exceeds cash-on-hand.
+    OnlineEpz(DpsScript),
+    /// Offline EPZ.  Issuance is local (OFFLINE_LOCAL_ACK + code consumed);
+    /// drain/GoOnline submits it.  Mirrors `OfflineServiceOut`.
+    OfflineEpz,
     Drain(DpsScript),
     Crash(Stage),
     Reboot,

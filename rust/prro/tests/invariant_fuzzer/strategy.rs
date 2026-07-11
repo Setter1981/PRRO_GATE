@@ -98,6 +98,12 @@ fn op() -> impl Strategy<Value = Op> {
         dps_script().prop_map(Op::OnlineServiceOut),
         Just(Op::OfflineServiceIn),
         Just(Op::OfflineServiceOut),
+        // EPZ — видача готівки за ЕПЗ.  APPENDED AFTER service-io (same
+        // seed-index-preservation rule).  guard-3c cash-floor fires on online
+        // EPZ with an insufficient drawer (model predicts NoMutation; the
+        // differential detects any mismatch); a non-terminal EPZ blocks Z-close.
+        dps_script().prop_map(Op::OnlineEpz),
+        Just(Op::OfflineEpz),
     ]
 }
 

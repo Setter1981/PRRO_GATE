@@ -314,6 +314,11 @@ impl RefModel {
             Op::OfflineShiftOpen => self.apply_offline_shift_open(),
             Op::OnlineZReport(script) => self.apply_online_z_report(script),
             Op::OfflineZReport => self.apply_offline_z_report(),
+            // EPZ — видача готівки за ЕПЗ.  Online: wire-hitting cash-OUT (same
+            // lnd/seed bookkeeping as ServiceOut, minus epz_out).  Offline:
+            // local-ack (mirror OfflineServiceOut).
+            Op::OnlineEpz(script) => self.apply_epz(script),
+            Op::OfflineEpz => self.apply_offline_epz(),
             // The advancing transition / drain ops predict a real ledger
             // mutation (PredictableMutating, NOT Fault).
             Op::GoOnline(script) => self.apply_go_online(script),
@@ -564,6 +569,79 @@ impl RefModel {
             code_consumed: self.code_consumed_observable(),
             shift_state_after: None,
         })
+    }
+
+    /// EPZ — видача готівки за ЕПЗ (online, wire-hitting).
+    ///
+    /// Chain-wise IDENTICAL to the online `apply_service_io(is_out=true)` arm
+    /// (same lnd/seed bookkeeping, D5 gate, advance-at-SEND, Rejected→NoIssuanceRow).
+    ///
+    /// **Cash accounting (`− epz_out`):** counted at ACK (mirrors
+    /// `aggregate_shift_epz` which filters `state IN ('ACK','OFFLINE_LOCAL_ACK')`):
+    ///   EPZ ACK → `cash_on_hand -= CASH_AMOUNT_KOP`.
+    /// EPZ is a CARD payform for turnover (no cash `<M>`); the drawer decrement
+    /// is a LEDGER effect only.  The model tracks only the drawer (`cash_on_hand`),
+    /// so card-turnover is not separately accumulated here.
+    ///
+    /// **Guard-3c (INV-21):** refused fail-closed PRE-MINT (NoMutation) when
+    /// `cash_on_hand < CASH_AMOUNT_KOP` — mirrors the in-lease check added in
+    /// `stage_acquire` for EPZ (online-only; the fuzzer enters at `inline::run`
+    /// downstream of `convert.rs`, so only the in-lease arm is in-lane here).
+    fn apply_epz(&mut self, script: &DpsScript) -> ExpectedOutcome {
+        // EPZ online lane is online-only.
+        if self.mode != NodeMode::Online {
+            return ExpectedOutcome::NoMutation;
+        }
+        if !self.shift_is_open() {
+            return ExpectedOutcome::NoMutation;
+        }
+        // Guard-3c (in-lease): EPZ refused pre-mint when the drawer is insufficient.
+        if self.cash_on_hand < CASH_AMOUNT_KOP {
+            return ExpectedOutcome::NoMutation;
+        }
+        // D5 gate: refused pre-mint while a non-issued sibling rests.
+        if self.has_write_gate_blocker() {
+            return ExpectedOutcome::NoMutation;
+        }
+        if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
+            return ExpectedOutcome::Fault;
+        }
+        let lnd = self.next_lnd;
+        let previous_hash = self.seed;
+        let unsigned_hash = synth_unsigned_hash(lnd);
+        let doc_state = online_outcome_state(script);
+        self.docs.insert(lnd, doc_state);
+        self.next_lnd += 1;
+        if Self::online_origin_advances_seed(doc_state) {
+            self.seed = Some(unsigned_hash);
+        }
+        if doc_state == DocState::Rejected {
+            return ExpectedOutcome::NoIssuanceRow;
+        }
+        // Cash-OUT only at ACK (matches aggregate_shift_epz filter).
+        if doc_state == DocState::Ack {
+            self.cash_on_hand -= CASH_AMOUNT_KOP;
+        }
+        ExpectedOutcome::Mutated(Mutation {
+            lnd,
+            doc_state,
+            seed_after: self.seed,
+            previous_hash,
+            code_consumed: self.code_consumed_observable(),
+            shift_state_after: None,
+        })
+    }
+
+    /// EPZ — видача готівки за ЕПЗ (offline).  Mirrors `apply_offline_service_io`
+    /// (is_out semantics): local issuance (OFFLINE_LOCAL_ACK + code consumed +
+    /// seed advance), no wire; cash-OUT at OLA.  Guard-3c is ONLINE-ONLY in-lease
+    /// (like guard-3b), so the offline lane relies on the pre-inbox guard +
+    /// the durable local ledger — the fixture ensures sufficient cash.
+    fn apply_offline_epz(&mut self) -> ExpectedOutcome {
+        // Delegate to the offline service-io lane with is_out=true; it applies
+        // the identical local-ack / code-consume / seed-advance bookkeeping and
+        // subtracts CASH_AMOUNT_KOP at OLA — the same drawer decrement EPZ needs.
+        self.apply_offline_service_io(true)
     }
 
     /// Online SHIFT_OPEN.  Closed → Opening at acquire, then Opening → Opened
