@@ -528,13 +528,13 @@ fn pin_stop_s2_coupling() {
 
 #[test]
 fn pin_derive_cash_on_hand_with_service_terms() {
-    // cash_on_hand = opening + sell - return + service_in - service_out
-    // opening=0, sell=0, return=0, service_in=10000, service_out=3000 → 7000
-    assert_eq!(derive_cash_on_hand(0, 0, 0, 10000, 3000), 7000);
+    // cash_on_hand = opening + sell - return + service_in - service_out - epz_out
+    // opening=0, sell=0, return=0, service_in=10000, service_out=3000, epz=0 → 7000
+    assert_eq!(derive_cash_on_hand(0, 0, 0, 10000, 3000, 0), 7000);
     // service_in alone
-    assert_eq!(derive_cash_on_hand(0, 0, 0, 5000, 0), 5000);
+    assert_eq!(derive_cash_on_hand(0, 0, 0, 5000, 0, 0), 5000);
     // service_out alone (would go negative, allowed in pure fn — guard at convert)
-    assert_eq!(derive_cash_on_hand(0, 0, 0, 0, 1000), -1000);
+    assert_eq!(derive_cash_on_hand(0, 0, 0, 0, 1000, 0), -1000);
     // mixed
-    assert_eq!(derive_cash_on_hand(1000, 2000, 500, 300, 100), 2700);
+    assert_eq!(derive_cash_on_hand(1000, 2000, 500, 300, 100, 0), 2700);
 }

@@ -105,6 +105,12 @@ str_enum!(DocType {
     ServiceIn      => "SERVICE_IN",
     ServiceOut     => "SERVICE_OUT",
     CashWithdrawal => "CASH_WITHDRAWAL",
+    // EPZ — видача готівки за ЕПЗ (cash advance / cashback against a card).
+    // Distinct from CashWithdrawal (the fail-closed placeholder) so the
+    // ledger / z-quiescence / aggregation filters stay unambiguous.  DPS wire
+    // = compact `<C T='8'>` (StringXML.cs num17=abs(-8)=8), NOT verbose
+    // operationtype='-8' (that is WebCheck's COM-input form).
+    CashAdvanceEpz => "CASH_ADVANCE_EPZ",
     XReport        => "X_REPORT",
     ZReport        => "Z_REPORT",
     // B10 — offline-session drain-handshake boundary docs.  Gateway-INTERNAL

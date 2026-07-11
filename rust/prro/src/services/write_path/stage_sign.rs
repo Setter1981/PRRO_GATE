@@ -72,6 +72,8 @@ pub enum WireArtifactKind {
     /// L3 — service cash-out (`<C T="2">…<O N='1' T='0' SM=…/>`).
     /// WebCheck `DealCheck` / `SubmitCheck` code 3 (shared type with ServiceIn).
     ServiceOut,
+    /// EPZ — видача готівки за ЕПЗ (`<C T="8">` + good + card `<M>`).
+    CashAdvanceEpz,
 }
 
 pub struct SigningContext {
@@ -172,7 +174,9 @@ pub fn derive_wire_artifact_kind(doc_type: DocType) -> Result<WireArtifactKind, 
         // L3 — service cash-in/out wired:
         DocType::ServiceIn => Ok(WireArtifactKind::ServiceIn),
         DocType::ServiceOut => Ok(WireArtifactKind::ServiceOut),
-        // EPZ stays fail-closed (STOP-S2 — EPZ Z-half not built).
+        // EPZ — видача готівки за ЕПЗ wired (`<C T='8'>`):
+        DocType::CashAdvanceEpz => Ok(WireArtifactKind::CashAdvanceEpz),
+        // CashWithdrawal is the fail-closed placeholder; XReport is read-only.
         DocType::CashWithdrawal | DocType::XReport => {
             Err(SignError::UnsupportedDocType { doc_type })
         }
@@ -1195,8 +1199,21 @@ struct ZReportJson {
     /// so pre-L3 Z payloads (no `service_sums` key) still parse.
     #[serde(default)]
     service_sums: Vec<ZReportServiceIoJson>,
+    /// EPZ — aggregated `<EPZ EPC EPCS EPSM>` card-advance totals.
+    /// `#[serde(default)]` so pre-EPZ Z payloads (no `epz` key) still parse.
+    #[serde(default)]
+    epz: Option<ZReportEpzJson>,
     sell_count: u32,
     return_count: u32,
+}
+
+/// EPZ Z-section totals in the Z JSON.  Mirrors `xml::ZReportEpzTotals`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ZReportEpzJson {
+    epc: i64,
+    epcs: i64,
+    epsm: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1241,6 +1258,28 @@ struct ServiceIoJson {
     name: String,
 }
 
+/// EPZ — видача готівки за ЕПЗ signer payload.  Produced by `convert.rs`
+/// CashAdvanceEpz arm.  Carries the cash-out `sum_kop`, the fixed good
+/// (`code`/`name`), and the card requisites (`paymentid`/`pay_name`/`pa..rrn`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct EpzJson {
+    #[allow(dead_code)]
+    schema_version: String,
+    sum_kop: i64,
+    code: String,
+    name: String,
+    paymentid: i64,
+    pay_name: String,
+    pa: String,
+    pb: String,
+    pc: String,
+    pd: String,
+    pe: String,
+    psnm: String,
+    rrn: String,
+}
+
 enum TypedPayload {
     ShiftOpen(ShiftOpenJson),
     Check {
@@ -1255,6 +1294,8 @@ enum TypedPayload {
     OfflineBoundary,
     /// L3 — service cash-in/out.
     ServiceIo(ServiceIoJson),
+    /// EPZ — видача готівки за ЕПЗ.
+    Epz(EpzJson),
 }
 
 fn parse_payload(
@@ -1298,6 +1339,12 @@ fn parse_payload(
                     detail: format!("ServiceIo: {e}"),
                 })
         }
+        // EPZ — видача готівки за ЕПЗ.
+        WireArtifactKind::CashAdvanceEpz => serde_json::from_str::<EpzJson>(payload_json)
+            .map(TypedPayload::Epz)
+            .map_err(|e| SignError::PayloadSchema {
+                detail: format!("Epz: {e}"),
+            }),
     }
 }
 
@@ -1415,7 +1462,15 @@ fn build_canonical_doc(
                     sell_count: p.sell_count,
                     return_count: p.return_count,
                 },
-                epz: None,
+                // EPZ — thread the aggregated <EPZ> totals through so the
+                // xml/mod.rs emitter sees the card-advance turnover (STOP-S2).
+                // `#[serde(default)]` on ZReportJson.epz keeps pre-EPZ payloads
+                // (no `epz` key) parsing to None.
+                epz: p.epz.map(|e| crate::xml::ZReportEpzTotals {
+                    epc: e.epc,
+                    epcs: e.epcs,
+                    epsm: e.epsm,
+                }),
             }))
         }
         // L3 — service cash-in: <C T='2'><I N='1' T='0' SM=…/><E N='2'/></C>
@@ -1432,6 +1487,25 @@ fn build_canonical_doc(
                 header,
                 local_number,
                 amount_kop: p.amount_kop,
+            }))
+        }
+        // EPZ — видача готівки за ЕПЗ: <C T='8'> + good + card <M> + <E>.
+        (WireArtifactKind::CashAdvanceEpz, TypedPayload::Epz(p)) => {
+            Ok(CanonicalDoc::CashAdvanceEpz(crate::xml::EpzCheckPayload {
+                header,
+                local_number,
+                sum_kop: p.sum_kop,
+                code: p.code,
+                name: p.name,
+                paymentid: p.paymentid,
+                pay_name: p.pay_name,
+                pa: p.pa,
+                pb: p.pb,
+                pc: p.pc,
+                pd: p.pd,
+                pe: p.pe,
+                psnm: p.psnm,
+                rrn: p.rrn,
             }))
         }
         // (kind, payload) mismatch is unreachable: parse_payload
@@ -1531,6 +1605,32 @@ pub fn z_report_xml_from_json_for_testing(
         parse_payload(WireArtifactKind::ZReport, payload_json, None).map_err(|e| e.to_string())?;
     let doc = build_canonical_doc(
         WireArtifactKind::ZReport,
+        header,
+        local_number,
+        payload,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    build_canonical_xml(&doc).map_err(|e| e.to_string())
+}
+
+/// EPZ — test seam: drive a converted EPZ `payload_json` through the SAME
+/// private `parse_payload` + `build_canonical_doc` the signer uses, then emit
+/// the unsigned canonical XML (`<C T='8'>` + good + card `<M>`).  Lets the EPZ
+/// wire pin assert the full `convert → build_canonical_doc → XML` path WITHOUT
+/// CMS signing.  `parse_payload` / `build_canonical_doc` stay private.
+///
+/// **Use**: tests / `test-support` only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn epz_check_xml_from_json_for_testing(
+    header: DocumentHeader,
+    local_number: u32,
+    payload_json: &str,
+) -> Result<Vec<u8>, String> {
+    let payload = parse_payload(WireArtifactKind::CashAdvanceEpz, payload_json, None)
+        .map_err(|e| e.to_string())?;
+    let doc = build_canonical_doc(
+        WireArtifactKind::CashAdvanceEpz,
         header,
         local_number,
         payload,

@@ -227,6 +227,10 @@ pub enum CommandType {
     ServiceIn,
     ServiceOut,
     CashWithdrawal,
+    /// EPZ — видача готівки за ЕПЗ (cash advance against a card).  Maps to
+    /// `DocType::CashAdvanceEpz` (distinct from the fail-closed
+    /// `CashWithdrawal` placeholder).
+    CashAdvanceEpz,
     PeriodicReport,
 }
 
@@ -384,6 +388,7 @@ pub fn to_canonical_fiscal_command(
         CommandType::ServiceIn => DocType::ServiceIn,
         CommandType::ServiceOut => DocType::ServiceOut,
         CommandType::CashWithdrawal => DocType::CashWithdrawal,
+        CommandType::CashAdvanceEpz => DocType::CashAdvanceEpz,
         CommandType::PeriodicReport => {
             return Err(MappingError::UnsupportedCommandType(
                 CommandType::PeriodicReport,
@@ -409,6 +414,9 @@ pub fn to_canonical_fiscal_command(
         CommandType::Sell => Some(cmd.payload.totals.sale_kopecks as i64),
         CommandType::Return => Some(cmd.payload.totals.return_kopecks as i64),
         CommandType::ServiceIn | CommandType::ServiceOut | CommandType::CashWithdrawal => None, // M5: parse from raw_frames
+        // EPZ carries its cash-out sum in the card payment leg, not `Totals`;
+        // the amount is derived in `convert.rs` (like service-io).  None here.
+        CommandType::CashAdvanceEpz => None,
         CommandType::ShiftOpen
         | CommandType::ShiftClose
         | CommandType::XReport

@@ -236,33 +236,33 @@ async fn wire_node_state(pool: &SqlitePool, shift: ShiftId) {
 #[test]
 fn pin_l0_empty_shift_zero() {
     // First shift, no docs: derive_cash_on_hand(0, 0, 0) = 0.
-    // L3: service_in=0, service_out=0 (no service ops in this shift)
-    assert_eq!(derive_cash_on_hand(0, 0, 0, 0, 0), 0);
+    // L3: service_in=0, service_out=0, epz=0 (no service/EPZ ops in this shift)
+    assert_eq!(derive_cash_on_hand(0, 0, 0, 0, 0, 0), 0);
 }
 
 #[test]
 fn pin_l0_cash_sales_sum() {
     // Two cash SELLs: 100.00 + 25.00 = 125.00 = 12500 kop.
-    assert_eq!(derive_cash_on_hand(0, 12500, 0, 0, 0), 12500);
+    assert_eq!(derive_cash_on_hand(0, 12500, 0, 0, 0, 0), 12500);
 }
 
 #[test]
 fn pin_l0_cash_return_subtracts() {
     // SELL 100.00 then RETURN 30.00 → 70.00 = 7000 kop.
-    assert_eq!(derive_cash_on_hand(0, 10000, 3000, 0, 0), 7000);
+    assert_eq!(derive_cash_on_hand(0, 10000, 3000, 0, 0, 0), 7000);
 }
 
 #[test]
 fn pin_l0_noncash_excluded() {
     // Card SELL does NOT count — cash_sell stays 0.
-    assert_eq!(derive_cash_on_hand(0, 0, 0, 0, 0), 0);
+    assert_eq!(derive_cash_on_hand(0, 0, 0, 0, 0, 0), 0);
 }
 
 #[test]
 fn pin_l0_mixed_receipt() {
     // One receipt: cash 40.00 + card 60.00 → cash_on_hand += 4000 only.
     // The card leg is excluded; only type_code "0" matters.
-    assert_eq!(derive_cash_on_hand(0, 4000, 0, 0, 0), 4000);
+    assert_eq!(derive_cash_on_hand(0, 4000, 0, 0, 0, 0), 4000);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -278,11 +278,13 @@ async fn pin_l0_aggregate_shift_cash_two_sells() {
     // 100.00 + 25.00 cash SELLs.
     seed_issued_receipt(&pool, shift, 1, DocType::Sell, DocState::Ack, &cash(10000)).await;
     seed_issued_receipt(&pool, shift, 2, DocType::Sell, DocState::Ack, &cash(2500)).await;
-    let (sell, ret, svc_in, svc_out) = aggregate_shift_cash(&pool, FN, shift).await.unwrap();
+    let (sell, ret, svc_in, svc_out, epz_out) =
+        aggregate_shift_cash(&pool, FN, shift).await.unwrap();
     assert_eq!(sell, 12500, "sell sum");
     assert_eq!(ret, 0, "no returns");
     assert_eq!(svc_in, 0, "no service-in");
     assert_eq!(svc_out, 0, "no service-out");
+    assert_eq!(epz_out, 0, "no EPZ");
 }
 
 #[tokio::test]
@@ -293,7 +295,7 @@ async fn pin_l0_aggregate_excludes_card() {
     seed_shift(&pool, shift, ShiftState::Opened, 0).await;
     // Card SELL only — type_code "1", must not count.
     seed_issued_receipt(&pool, shift, 1, DocType::Sell, DocState::Ack, &card(5000)).await;
-    let (sell, ret, _, _) = aggregate_shift_cash(&pool, FN, shift).await.unwrap();
+    let (sell, ret, _, _, _) = aggregate_shift_cash(&pool, FN, shift).await.unwrap();
     assert_eq!(sell, 0, "card excluded from cash sell");
     assert_eq!(ret, 0, "card excluded from cash ret");
 }
@@ -307,7 +309,7 @@ async fn pin_l0_aggregate_mixed_receipt() {
     // One receipt: cash 40.00 + card 60.00.
     let payments = format!("{},{}", cash(4000), card(6000));
     seed_issued_receipt(&pool, shift, 1, DocType::Sell, DocState::Ack, &payments).await;
-    let (sell, _, _, _) = aggregate_shift_cash(&pool, FN, shift).await.unwrap();
+    let (sell, _, _, _, _) = aggregate_shift_cash(&pool, FN, shift).await.unwrap();
     assert_eq!(sell, 4000, "only cash leg counted");
 }
 

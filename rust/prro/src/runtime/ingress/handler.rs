@@ -147,7 +147,10 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         | "CASH_INSUFFICIENT"
         // HOLE 2 — in-lease re-check (closes the TOCTOU after concurrent RETURNs).
         // Same 422 class as CASH_INSUFFICIENT: the RETURN is refused fail-closed.
-        | "CASH_INSUFFICIENT_IN_LEASE" => 422,
+        | "CASH_INSUFFICIENT_IN_LEASE"
+        // EPZ — client-payload faults (paymentid<2 / malformed card leg).
+        | "EPZ_PAYMENT_ID_TOO_LOW"
+        | "EPZ_MALFORMED_CARD_LEG" => 422,
         "INVALID_CASHIER_ID" | "MALFORMED_JSON" => 400,
         // Adapter-shell codes (server.rs `adapter_error`) carry their own
         // hard-coded status; listed here so the map stays TOTAL over the
@@ -235,6 +238,7 @@ fn command_type_wire(ct: CommandType) -> &'static str {
         CommandType::ServiceIn => "SERVICE_IN",
         CommandType::ServiceOut => "SERVICE_OUT",
         CommandType::CashWithdrawal => "CASH_WITHDRAWAL",
+        CommandType::CashAdvanceEpz => "CASH_ADVANCE_EPZ",
         CommandType::PeriodicReport => "PERIODIC_REPORT",
     }
 }
@@ -301,6 +305,9 @@ fn convert_error_code(e: &ConvertError) -> &'static str {
         ConvertError::ReturnCheckNumberNotSupported => "RETURN_CHECK_NUMBER_NOT_SUPPORTED",
         // L1 INV-21 — pre-inbox refuse, row-less.
         ConvertError::CashInsufficient { .. } => "CASH_INSUFFICIENT",
+        // EPZ — client-payload faults (paymentid<2 / malformed card leg).
+        ConvertError::EpzPaymentIdTooLow { .. } => "EPZ_PAYMENT_ID_TOO_LOW",
+        ConvertError::EpzMalformedCardLeg { .. } => "EPZ_MALFORMED_CARD_LEG",
         ConvertError::NoOpenShiftForZReport { .. } => "NO_OPEN_SHIFT",
         ConvertError::NegativeStoredPaymentSum { .. } => "LEDGER_CORRUPTION",
         ConvertError::ZReportSumOverflow { .. } => "LEDGER_CORRUPTION",

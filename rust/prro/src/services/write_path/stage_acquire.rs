@@ -755,23 +755,28 @@ pub async fn run(
             // **Invariant #1**: this is a pure SELECT (no network/crypto),
             // so running it inside BEGIN IMMEDIATE does NOT violate INV-1.
             // The serialized section allows DB reads; it forbids I/O.
-            // INV-21 guard-3a (RETURN cash leg) + guard-3b (SERVICE_OUT).
-            // Both are ONLINE-only in-lease re-checks.  Offline RETURNs are
-            // protected by the pre-inbox L1 guard (convert.rs).
+            // INV-21 guard-3a (RETURN cash leg) + guard-3b (SERVICE_OUT) +
+            // guard-3c (EPZ / CASH_ADVANCE_EPZ — видача готівки за ЕПЗ).
+            // All ONLINE-only in-lease re-checks.  Offline RETURNs / EPZ are
+            // protected by the pre-inbox L1 / guard-3c (convert.rs).
             // **Invariant #1**: pure SELECT — no network/crypto inside tx.
             if channel == Channel::Online
                 && (command.doc_type == DocType::Return
-                    || command.doc_type == DocType::ServiceOut)
+                    || command.doc_type == DocType::ServiceOut
+                    || command.doc_type == DocType::CashAdvanceEpz)
             {
                 // Derive the outgoing-cash amount for this doc:
                 // - RETURN: sum of cash legs (type_code "0") from converted payload.
                 // - SERVICE_OUT: amount_kop from the service-io payload.
+                // - EPZ: sum_kop from the EPZ payload (cash-out ledger effect).
                 #[derive(serde::Deserialize)]
                 struct ReturnPayment { type_code: String, sum_kop: i64 }
                 #[derive(serde::Deserialize)]
                 struct ReturnPayload { payments: Vec<ReturnPayment> }
                 #[derive(serde::Deserialize)]
                 struct ServiceIoPayload { amount_kop: i64 }
+                #[derive(serde::Deserialize)]
+                struct EpzPayload { sum_kop: i64 }
 
                 let outgoing_cash_kop: i64 = if command.doc_type == DocType::Return {
                     if let Ok(rp) = serde_json::from_str::<ReturnPayload>(&command.payload_json) {
@@ -783,6 +788,11 @@ pub async fn run(
                     } else {
                         0
                     }
+                } else if command.doc_type == DocType::CashAdvanceEpz {
+                    // EPZ — the cash-out sum drives the drawer down.
+                    serde_json::from_str::<EpzPayload>(&command.payload_json)
+                        .map(|p| p.sum_kop.max(0))
+                        .unwrap_or(0)
                 } else {
                     // SERVICE_OUT
                     serde_json::from_str::<ServiceIoPayload>(&command.payload_json)
@@ -794,13 +804,13 @@ pub async fn run(
                     // Re-derive cash-on-hand under the write-lease tx snapshot.
                     // active_shift is Some (Opened* verified at Step 5).
                     let cash_on_hand_kop: i64 = if let Some(ref shift) = active_shift {
-                        let (sell, ret, svc_in, svc_out) =
+                        let (sell, ret, svc_in, svc_out, epz_out) =
                             crate::services::cash_ledger::aggregate_shift_cash_tx(
                                 tx, &fn_id, shift.shift_id,
                             )
                             .await?;
                         crate::services::cash_ledger::derive_cash_on_hand(
-                            shift.cash_balance_kop, sell, ret, svc_in, svc_out,
+                            shift.cash_balance_kop, sell, ret, svc_in, svc_out, epz_out,
                         )
                     } else {
                         0 // no open shift → 0; shift guard (Step 4) handles no-shift refusal
@@ -1349,26 +1359,33 @@ fn check_shift_guard(
         }
 
         // ── Regular fiscal ops in Opened — channel-irrelevant happy.
-        (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Opened, _) => None,
+        // EPZ (CashAdvanceEpz) rides the same admission arms as ServiceOut.
+        (
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
+            Opened,
+            _,
+        ) => None,
 
         // ── Regular fiscal ops in Closed — channel-irrelevant refusal.
-        (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Closed, _) => {
-            Some(RejectionReason::ShiftNotOpen {
-                current: shift_state,
-            })
-        }
+        (
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
+            Closed,
+            _,
+        ) => Some(RejectionReason::ShiftNotOpen {
+            current: shift_state,
+        }),
 
         // ── W14a-2b channel-aware OpenedLocalPendingDrain ──
         // Offline channel: Pattern C resilience surface — allowed.
         (
-            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
             OpenedLocalPendingDrain,
             Offline,
         ) => None,
         // Online channel: operator should reissue offline or wait
         // for drain — refused with typed audit shape.
         (
-            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
             OpenedLocalPendingDrain,
             Online,
         ) => Some(RejectionReason::ShiftOpenPendingDrainOpRefused),
@@ -1378,7 +1395,7 @@ fn check_shift_guard(
         // irrelevant — once a Z-report has been locally acked, no
         // further sale-flavour ops accepted regardless of channel.
         (
-            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
             ClosingLocalPendingDrain,
             _,
         ) => Some(RejectionReason::PostLocalCloseSaleRefused),
@@ -1419,6 +1436,7 @@ mod channel_aware_matrix_tests {
         DocType::ServiceIn,
         DocType::ServiceOut,
         DocType::CashWithdrawal,
+        DocType::CashAdvanceEpz,
         DocType::XReport,
         DocType::ZReport,
     ];
@@ -1479,22 +1497,28 @@ mod channel_aware_matrix_tests {
         }
         // Regular fiscal ops.
         match (doc, state, ch) {
-            (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Opened, _) => None,
-            (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Closed, _) => {
-                Some(RejectionReason::ShiftNotOpen { current: state })
-            }
             (
-                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
+                Opened,
+                _,
+            ) => None,
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
+                Closed,
+                _,
+            ) => Some(RejectionReason::ShiftNotOpen { current: state }),
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
                 OpenedLocalPendingDrain,
                 Offline,
             ) => None,
             (
-                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
                 OpenedLocalPendingDrain,
                 Online,
             ) => Some(RejectionReason::ShiftOpenPendingDrainOpRefused),
             (
-                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
                 ClosingLocalPendingDrain,
                 _,
             ) => Some(RejectionReason::PostLocalCloseSaleRefused),
@@ -1532,8 +1556,8 @@ mod channel_aware_matrix_tests {
             }
         }
         assert_eq!(
-            total, 162,
-            "matrix MUST cover 9 doc_types × 9 shift_states × 2 channels = 162"
+            total, 180,
+            "matrix MUST cover 10 doc_types × 9 shift_states × 2 channels = 180"
         );
         // Drift-guard: pin the absolute None vs Some split to catch
         // accidental matrix widening / narrowing.
@@ -1541,18 +1565,18 @@ mod channel_aware_matrix_tests {
         // - (ShiftOpen, Closed, _) → 2
         // - (ShiftClose, Opened, _) → 2
         // - (ZReport, Opened, _) → 2
-        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, Opened, _) → 6×2 = 12
-        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, OpenedLocalPendingDrain, Offline) → 6×1 = 6
+        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|CashAdvanceEpz|XReport, Opened, _) → 7×2 = 14
+        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|CashAdvanceEpz|XReport, OpenedLocalPendingDrain, Offline) → 7×1 = 7
         // - (ShiftClose, OpenedLocalPendingDrain, Offline) → 1  (A′.3 PR-O3 slice 3 edge 7)
         // - (ZReport, OpenedLocalPendingDrain, Offline) → 1     (A′.3 PR-O3 slice 3 edge 7)
-        // Total None = 26; Some = 162 - 26 = 136.
+        // Total None = 29; Some = 180 - 29 = 151.
         assert_eq!(
-            none_count, 26,
-            "spec §3.4 + PR-O3 edge 7: 26 happy-path None cells"
+            none_count, 29,
+            "spec §3.4 + PR-O3 edge 7 + EPZ: 29 happy-path None cells"
         );
         assert_eq!(
-            some_count, 136,
-            "spec §3.4 + PR-O3 edge 7: 136 refusal cells"
+            some_count, 151,
+            "spec §3.4 + PR-O3 edge 7 + EPZ: 151 refusal cells"
         );
     }
 
@@ -1561,7 +1585,7 @@ mod channel_aware_matrix_tests {
         // Drift guard: if a new DocType / ShiftState lands, the
         // matrix above MUST be updated.  Pinning arity here breaks
         // the matrix test loud + early.
-        assert_eq!(ALL_DOC_TYPES.len(), 9, "M3b W14a-1: 9 doc types");
+        assert_eq!(ALL_DOC_TYPES.len(), 10, "M3b W14a-1 + EPZ: 10 doc types");
         assert_eq!(ALL_SHIFT_STATES.len(), 9, "M3b W14a-1: 9 shift states");
         assert_eq!(ALL_CHANNELS.len(), 2, "W14a-2b Commit 4: Online / Offline");
     }
