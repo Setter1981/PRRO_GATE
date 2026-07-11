@@ -508,17 +508,9 @@ impl RefModel {
             return ExpectedOutcome::NoMutation;
         }
 
-        // T2 close-reserve gate — mirrors apply_sell's offline arm.
-        // An Opened shift still owes a Z, so reserve = (BEGIN missing ? 1 : 0) + 1.
-        let free_codes = self.codes_issued - self.codes_consumed;
-        if free_codes == 0 && !self.session_has_begin {
-            // Falls through to lazy-BEGIN arm below → NoMutation on 0-code path.
-        } else {
-            let reserve = i64::from(!self.session_has_begin) + 1;
-            if free_codes < 1 + reserve {
-                return ExpectedOutcome::NoMutation;
-            }
-        }
+        // NOTE: T2 close-reserve (enforce_offline_close_reserve, inline.rs:1257) is
+        // scoped to DocType::Sell | DocType::Return only.  ServiceIn/Out bypass it
+        // unconditionally — do NOT apply the reserve gate here.
 
         // B10 — lazy DocType=9 BEGIN interposition, mirrored from apply_sell's
         // offline arm.  On the FIRST offline doc of a session the impl mints+OLAs

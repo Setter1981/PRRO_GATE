@@ -634,9 +634,10 @@ impl FuzzCtx {
             // Tier-1 widened the offline business-doc set: the lazy BEGIN can
             // interpose before a SHIFT_OPEN / Z_REPORT too, with identical
             // chain semantics (business chains OFF the BEGIN).
+            // L3: SERVICE_IN / SERVICE_OUT also share the same chain semantics.
             "SELECT previous_hash, unsigned_xml_sha256 FROM fiscal_documents \
              WHERE fiscal_number = ? \
-             AND doc_type IN ('SELL','RETURN','SHIFT_OPEN','Z_REPORT') \
+             AND doc_type IN ('SELL','RETURN','SHIFT_OPEN','Z_REPORT','SERVICE_IN','SERVICE_OUT') \
              AND fs_mode = 'OFFLINE' \
              ORDER BY lnd DESC LIMIT 1",
         )
@@ -1332,7 +1333,13 @@ async fn offline_return(ctx: &mut FuzzCtx) -> RealOutcome {
 /// B10: first offline doc of a session interposes a lazy BEGIN (same as
 /// [`offline_sell`]); report `Recovered` so the differential uses the two-doc
 /// ledger-delta path.
+///
+/// Mode-guard: offline-only op.  If node is not Offline, return Refused
+/// (model returns NoMutation — both agree: no row minted).
 async fn offline_service_in(ctx: &mut FuzzCtx) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Offline {
+        return RealOutcome::Refused("OfflineServiceIn: node not Offline".into());
+    }
     let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_service_in().await;
     let dps = ctx.new_dps(); // offline branch never touches the wire
@@ -1367,7 +1374,12 @@ async fn offline_service_in(ctx: &mut FuzzCtx) -> RealOutcome {
 /// inbox row.  Local issuance (OFFLINE_LOCAL_ACK); same as [`offline_service_in`].
 /// Guard-3b (in-lease cash-floor) does NOT apply in the offline lane; only the
 /// pre-inbox L1 guard (convert.rs) fires, which is upstream of `inline::run`.
+///
+/// Mode-guard: offline-only op.  Same rationale as [`offline_service_in`].
 async fn offline_service_out(ctx: &mut FuzzCtx) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Offline {
+        return RealOutcome::Refused("OfflineServiceOut: node not Offline".into());
+    }
     let begin_before = begin_doc_count(ctx).await;
     let row = ctx.seed_inbox_service_out().await;
     let dps = ctx.new_dps(); // offline branch never touches the wire
@@ -1401,7 +1413,14 @@ async fn offline_service_out(ctx: &mut FuzzCtx) -> RealOutcome {
 /// L3 `OnlineServiceIn` → `inline::run` on an Online node with a `SERVICE_IN`
 /// inbox row.  Wire-hitting; same seam as [`online_sell`] — only the
 /// `operation_type` differs (→ `DocType::ServiceIn`).
+///
+/// Mode-guard: service-io is online-only.  If the node is offline the op is a
+/// no-op (real Refused, model NoMutation); offline service-io uses
+/// [`offline_service_in`] via `Op::OfflineServiceIn`.
 async fn online_service_in(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Online {
+        return RealOutcome::Refused("OnlineServiceIn: node not Online".into());
+    }
     let row = ctx.seed_inbox_service_in().await;
     let dps = ctx.new_dps();
     load_script(&dps, script);
@@ -1431,7 +1450,12 @@ async fn online_service_in(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome
 /// inbox row.  Same seam as [`online_service_in`].  Guard-3b (in-lease
 /// cash-floor) applies: a `SERVICE_OUT` on an empty drawer is refused in-lease
 /// (pre-mint, `Refused` outcome, no fiscal_documents row).
+///
+/// Mode-guard: same as [`online_service_in`] — online-only op.
 async fn online_service_out(ctx: &mut FuzzCtx, script: &DpsScript) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Online {
+        return RealOutcome::Refused("OnlineServiceOut: node not Online".into());
+    }
     let row = ctx.seed_inbox_service_out().await;
     let dps = ctx.new_dps();
     load_script(&dps, script);
