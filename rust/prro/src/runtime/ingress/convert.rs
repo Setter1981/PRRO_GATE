@@ -333,6 +333,14 @@ struct CheckPaymentOut {
 
 // ─── ZReport (piece-2b) — ledger-derived shift summary ───────────────
 
+/// L3 — one service-io row in the Z JSON (`<IO NM SMI SMO T="0">`).
+#[derive(Serialize)]
+struct ZReportServiceIoOut {
+    name: String,
+    sum_in_kop: i64,
+    sum_out_kop: i64,
+}
+
 #[derive(Serialize)]
 struct ZReportOut {
     payments: Vec<ZReportPaymentOut>,
@@ -343,6 +351,10 @@ struct ZReportOut {
     // unit tests.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tax_summaries: Vec<ZReportTaxSumOut>,
+    /// L3 — service cash-in/out `<IO>` rows.  Empty → OMITTED (absent-when-empty
+    /// is the DPS-accepted form — a shift with no service ops emits no `<IO>`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    service_sums: Vec<ZReportServiceIoOut>,
     sell_count: u32,
     return_count: u32,
 }
@@ -480,6 +492,9 @@ fn aggregate_zreport(receipts: &[(DocType, String)]) -> Result<ZReportOut, Conve
         // shift-aggregation caller, which has the per-doc tax snapshots; the
         // pure payments aggregator leaves it empty.
         tax_summaries: Vec::new(),
+        // service_sums is populated by aggregate_z_payload_for_shift after
+        // this call (it reads service docs separately via aggregate_shift_service_io).
+        service_sums: Vec::new(),
         sell_count,
         return_count,
     })
@@ -878,6 +893,52 @@ pub async fn convert_to_signer_payload(
         CommandType::ShiftClose | CommandType::ZReport => {
             aggregate_z_payload(main_pool, fiscal_number).await
         }
+        // L3 — service cash-in (службове внесення) / cash-out (службова видача).
+        // Amount from `payload.totals.sale_kopecks` (ServiceIn) /
+        // `payload.totals.return_kopecks` (ServiceOut).
+        // Name is the constant label used in the Z `<IO>` section.
+        // Schema_version carries invariant #7.
+        CommandType::ServiceIn | CommandType::ServiceOut => {
+            let (amount_kop, name) = if cmd.command_type == CommandType::ServiceIn {
+                (
+                    cmd.payload.totals.sale_kopecks as i64,
+                    "SERVICE_IN".to_string(),
+                )
+            } else {
+                (
+                    cmd.payload.totals.return_kopecks as i64,
+                    "SERVICE_OUT".to_string(),
+                )
+            };
+
+            // ── INV-21 guard-3b — ServiceOut over cash-on-hand is refused ──
+            // Pre-inbox, row-less.  Mirrors guard-3a (RETURN cash leg).
+            // Guard #1 (invariant #1): pure pool read outside any write-tx.
+            if cmd.command_type == CommandType::ServiceOut && amount_kop > 0 {
+                let cash_on_hand_kop =
+                    crate::services::cash_ledger::cash_on_hand_for_fn(main_pool, fiscal_number)
+                        .await
+                        .map_err(ConvertError::LedgerRead)?;
+                if cash_on_hand_kop < amount_kop {
+                    return Err(ConvertError::CashInsufficient {
+                        cash_on_hand_kop,
+                        return_cash_kop: amount_kop,
+                    });
+                }
+            }
+
+            #[derive(serde::Serialize)]
+            struct ServiceIoOut {
+                schema_version: &'static str,
+                amount_kop: i64,
+                name: String,
+            }
+            finalize(&ServiceIoOut {
+                schema_version: "1.0",
+                amount_kop,
+                name,
+            })
+        }
         other => Err(ConvertError::NotSignable(other)),
     }
 }
@@ -928,6 +989,33 @@ pub async fn aggregate_z_payload_for_shift(
     let two: Vec<(DocType, String)> = receipts.into_iter().map(|(d, p, _)| (d, p)).collect();
     let mut out = aggregate_zreport(&two)?;
     out.tax_summaries = tax_summaries;
+
+    // L3 — aggregate service-in/out docs into Z `<IO>` rows.
+    // Reads SERVICE_IN/OUT ACK docs for this shift, accumulates by name.
+    // Invariant #1: pool-bound SELECT, no write-tx, no network.
+    let (svc_in_kop, svc_out_kop) = crate::services::cash_ledger::aggregate_shift_service_io(
+        main_pool,
+        fiscal_number,
+        shift_id,
+    )
+    .await
+    .map_err(ConvertError::LedgerRead)?;
+    // Only emit rows for non-zero totals (absent-when-empty, mirrors Python parity).
+    if svc_in_kop > 0 {
+        out.service_sums.push(ZReportServiceIoOut {
+            name: "SERVICE_IN".to_string(),
+            sum_in_kop: svc_in_kop,
+            sum_out_kop: 0,
+        });
+    }
+    if svc_out_kop > 0 {
+        out.service_sums.push(ZReportServiceIoOut {
+            name: "SERVICE_OUT".to_string(),
+            sum_in_kop: 0,
+            sum_out_kop: svc_out_kop,
+        });
+    }
+
     finalize(&out)
 }
 

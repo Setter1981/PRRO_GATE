@@ -47,7 +47,8 @@ use crate::db::tx::with_immediate;
 use crate::xml::{
     build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckLevelAdjustment,
     CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader, LineAdjustment,
-    LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum, ZReportTaxSummary,
+    LineAdjustmentKind, ServiceCheckPayload, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
+    ZReportServiceSum, ZReportTaxSummary,
 };
 
 use super::tax_summary::{derive_check_tax_summaries, TaxResolutionSnapshot};
@@ -65,6 +66,12 @@ pub enum WireArtifactKind {
     OfflineSessionBegin,
     /// B10 — offline-session END (`<C T="110">`) service receipt.
     OfflineSessionEnd,
+    /// L3 — service cash-in (`<C T="2">…<I N='1' T='0' SM=…/>`).
+    /// WebCheck `DealCheck` / `SubmitCheck` code 3.
+    ServiceIn,
+    /// L3 — service cash-out (`<C T="2">…<O N='1' T='0' SM=…/>`).
+    /// WebCheck `DealCheck` / `SubmitCheck` code 3 (shared type with ServiceIn).
+    ServiceOut,
 }
 
 pub struct SigningContext {
@@ -162,10 +169,11 @@ pub fn derive_wire_artifact_kind(doc_type: DocType) -> Result<WireArtifactKind, 
         // sign path (code acquire + `<MAC ID>` stamp) as any offline doc.
         DocType::OfflineSessionBegin => Ok(WireArtifactKind::OfflineSessionBegin),
         DocType::OfflineSessionEnd => Ok(WireArtifactKind::OfflineSessionEnd),
-        // W4 builder ships ShiftOpen/Sell/Return/ZReport only.  Other
-        // op-types are not signable in W6: fail-closed BEFORE any
-        // pin / Z allocation / state mutation occurs.
-        DocType::ServiceIn | DocType::ServiceOut | DocType::CashWithdrawal | DocType::XReport => {
+        // L3 — service cash-in/out wired:
+        DocType::ServiceIn => Ok(WireArtifactKind::ServiceIn),
+        DocType::ServiceOut => Ok(WireArtifactKind::ServiceOut),
+        // EPZ stays fail-closed (STOP-S2 — EPZ Z-half not built).
+        DocType::CashWithdrawal | DocType::XReport => {
             Err(SignError::UnsupportedDocType { doc_type })
         }
     }
@@ -1164,6 +1172,17 @@ struct CheckPaymentJson {
     smp: Option<i64>,
 }
 
+/// L3 — one service-io `<IO>` row in the Z JSON.
+/// Mirrors `xml::ZReportServiceSum` MINUS the split by direction
+/// (direction is encoded in `sum_in_kop` vs `sum_out_kop`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ZReportServiceIoJson {
+    name: String,
+    sum_in_kop: i64,
+    sum_out_kop: i64,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct ZReportJson {
@@ -1172,6 +1191,10 @@ struct ZReportJson {
     /// so a pre-W4-Z2 minimal Z payload (no `tax_summaries` key) still parses.
     #[serde(default)]
     tax_summaries: Vec<ZReportTaxSumJson>,
+    /// L3 — aggregated `<IO>` service cash-in/out rows.  `#[serde(default)]`
+    /// so pre-L3 Z payloads (no `service_sums` key) still parse.
+    #[serde(default)]
+    service_sums: Vec<ZReportServiceIoJson>,
     sell_count: u32,
     return_count: u32,
 }
@@ -1203,6 +1226,21 @@ struct ZReportTaxSumJson {
     txo: i64,
 }
 
+/// L3 — service cash-in/out payload.
+/// Produced by `convert.rs` ServiceIn/Out arm.  Carries `schema_version`
+/// (invariant #7).  `name` is the service-op label stored in Z `<IO NM>`.
+/// The fields are deserialized for `deny_unknown_fields` validation;
+/// only `amount_kop` is read structurally in `build_canonical_doc`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ServiceIoJson {
+    #[allow(dead_code)]
+    schema_version: String,
+    amount_kop: i64,
+    #[allow(dead_code)]
+    name: String,
+}
+
 enum TypedPayload {
     ShiftOpen(ShiftOpenJson),
     Check {
@@ -1215,6 +1253,8 @@ enum TypedPayload {
     /// (header + `<TS>` + `<MAC>` only).  The payload_json is an inert
     /// marker (`{}`), so no fields are parsed.
     OfflineBoundary,
+    /// L3 — service cash-in/out.
+    ServiceIo(ServiceIoJson),
 }
 
 fn parse_payload(
@@ -1249,6 +1289,14 @@ fn parse_payload(
         // B10 — boundary docs carry no body; the JSON is an inert marker.
         WireArtifactKind::OfflineSessionBegin | WireArtifactKind::OfflineSessionEnd => {
             Ok(TypedPayload::OfflineBoundary)
+        }
+        // L3 — service cash-in/out.
+        WireArtifactKind::ServiceIn | WireArtifactKind::ServiceOut => {
+            serde_json::from_str::<ServiceIoJson>(payload_json)
+                .map(TypedPayload::ServiceIo)
+                .map_err(|e| SignError::PayloadSchema {
+                    detail: format!("ServiceIo: {e}"),
+                })
         }
     }
 }
@@ -1350,12 +1398,40 @@ fn build_canonical_doc(
                         type_code: m.type_code,
                     })
                     .collect(),
-                service_sums: Vec::new(),
+                // ★ L3 — ZReportJson handoff: thread service_sums through to ZReportPayload
+                // so the existing xml/mod.rs IO emitter at :1313 sees the data.
+                // `#[serde(default)]` on ZReportJson.service_sums ensures pre-L3
+                // payloads (no `service_sums` key) continue to parse correctly.
+                service_sums: p
+                    .service_sums
+                    .into_iter()
+                    .map(|s| ZReportServiceSum {
+                        name: s.name,
+                        sum_in: s.sum_in_kop,
+                        sum_out: s.sum_out_kop,
+                    })
+                    .collect(),
                 check_count: ZReportCheckCount {
                     sell_count: p.sell_count,
                     return_count: p.return_count,
                 },
                 epz: None,
+            }))
+        }
+        // L3 — service cash-in: <C T='2'><I N='1' T='0' SM=…/><E N='2'/></C>
+        (WireArtifactKind::ServiceIn, TypedPayload::ServiceIo(p)) => {
+            Ok(CanonicalDoc::ServiceIn(ServiceCheckPayload {
+                header,
+                local_number,
+                amount_kop: p.amount_kop,
+            }))
+        }
+        // L3 — service cash-out: <C T='2'><O N='1' T='0' SM=…/><E N='2'/></C>
+        (WireArtifactKind::ServiceOut, TypedPayload::ServiceIo(p)) => {
+            Ok(CanonicalDoc::ServiceOut(ServiceCheckPayload {
+                header,
+                local_number,
+                amount_kop: p.amount_kop,
             }))
         }
         // (kind, payload) mismatch is unreachable: parse_payload

@@ -842,9 +842,13 @@ fn drive_sequence(ops: &[Op]) {
                         .await
                         .unwrap_or(0);
                 skip_next_cash_oracle = true;
-            } else if matches!(op, Op::OfflineSell | Op::OfflineReturn) {
-                // Cross-mode fence: OfflineSell/Return on Online ctx leaves an
+            } else if matches!(
+                op,
+                Op::OfflineSell | Op::OfflineReturn | Op::OfflineServiceIn | Op::OfflineServiceOut
+            ) {
+                // Cross-mode fence: Offline* on Online ctx leaves an
                 // ErrorRetryable sibling; the D5 gate may refuse the next sell.
+                // Same applies to OfflineServiceIn/Out (same offline lane).
                 model.cash_on_hand =
                     prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, ctx.fn_id())
                         .await
@@ -2214,15 +2218,25 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                         "MH: exotic drain {op:?} send-delta {send_delta} exceeds \
                          2×cohort({cohort_before})+1 — unbounded re-drive"
                     );
-                    // 5. Shift unchanged OR escalated to RMR — a drain either makes
-                    //    progress (shift unchanged) or halts-manual (RMR); never
-                    //    some other shift transition.
+                    // 5. Shift unchanged, escalated to RMR, OR legitimately
+                    //    resolved from a pending-drain state.
+                    //    A drain either makes progress (shift unchanged or pending-drain
+                    //    resolved to terminal) or halts-manual (RMR); never some other
+                    //    shift transition.
+                    //    OpenedLocalPendingDrain → Opened: drain re-drove a SENT doc
+                    //    (held from a prior interrupted online attempt) to ACK, resolving
+                    //    the pending-drain state (spec §6.3 edge 6 success path).
+                    //    ClosingLocalPendingDrain → Closed: same resolution for closing.
                     let shift_after = ctx.read_shift_state().await;
                     assert!(
                         shift_after == shift_before
-                            || shift_after == ShiftState::RequiresManualReconciliation,
+                            || shift_after == ShiftState::RequiresManualReconciliation
+                            || (shift_before == ShiftState::OpenedLocalPendingDrain
+                                && shift_after == ShiftState::Opened)
+                            || (shift_before == ShiftState::ClosingLocalPendingDrain
+                                && shift_after == ShiftState::Closed),
                         "MH: exotic drain {op:?} moved shift {shift_before:?} -> {shift_after:?} \
-                         (neither unchanged nor RMR)"
+                         (neither unchanged nor RMR nor legitimate pending-drain resolution)"
                     );
                 }
                 // U1 D4 — a BadHashPrev online sell routes to the bounded W10.4

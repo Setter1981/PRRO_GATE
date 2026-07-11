@@ -540,9 +540,11 @@ async fn stage3_unsupported_doc_type_rejects_before_pin_no_z_no_sign() {
     seed_fn(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(&pool, Some(shift_id), None).await;
+    // NOTE (L3): ServiceIn/Out are now wired (Signable). Use CashWithdrawal
+    // which remains permanently UnsupportedDocType in stage_sign (STOP-S2 EPZ).
     let (doc_id, req_bytes) = seed_prepared_doc(
         &pool,
-        DocType::ServiceIn,
+        DocType::CashWithdrawal,
         r#"{"x":1}"#,
         dummy_payload_sha256(),
         1,
@@ -554,7 +556,7 @@ async fn stage3_unsupported_doc_type_rejects_before_pin_no_z_no_sign() {
     let stale_ctx = make_worker_context(
         doc_id,
         req_bytes,
-        DocType::ServiceIn,
+        DocType::CashWithdrawal,
         DocState::Prepared,
         r#"{"x":1}"#,
         None,
@@ -565,9 +567,9 @@ async fn stage3_unsupported_doc_type_rejects_before_pin_no_z_no_sign() {
 
     match result {
         Err(SignError::UnsupportedDocType { doc_type }) => {
-            assert_eq!(doc_type, DocType::ServiceIn);
+            assert_eq!(doc_type, DocType::CashWithdrawal);
         }
-        other => panic!("expected UnsupportedDocType(ServiceIn), got {other:?}"),
+        other => panic!("expected UnsupportedDocType(CashWithdrawal), got {other:?}"),
     }
 
     // No Z allocator advance.

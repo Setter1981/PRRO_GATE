@@ -98,6 +98,18 @@ pub enum Op {
     /// LOCAL so `OfflineReturn` carries none.
     OnlineReturn(DpsScript),
     OfflineReturn,
+    /// Online service cash-in (службове внесення).  Wire-hitting; carries a script.
+    OnlineServiceIn(DpsScript),
+    /// Online service cash-out (службова видача).  Wire-hitting; carries a script.
+    OnlineServiceOut(DpsScript),
+    /// Offline service cash-in.  Issuance is local (OFFLINE_LOCAL_ACK + code
+    /// consumed); drain/GoOnline submits it.  Mirrors `OfflineSell`/`OfflineReturn`.
+    OfflineServiceIn,
+    /// Offline service cash-out.  Issuance is local; drain/GoOnline submits it.
+    /// Guard-3b (cash-floor) is NOT checked in-lease for offline — only
+    /// pre-inbox L1 guard fires.  The fuzzer fixture always has sufficient
+    /// cash after a prior `OfflineServiceIn`.
+    OfflineServiceOut,
     /// Online shift-open path.  The script drives send/last.
     OnlineShiftOpen(DpsScript),
     /// Offline shift-open path.  Issuance is local; Drain/GoOnline submits it.

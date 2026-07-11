@@ -43,19 +43,26 @@ pub enum CommandClass {
 /// **Exhaustive match (no wildcard):** adding a `CommandType` variant is
 /// a compile error here, forcing an explicit policy decision rather than
 /// a silent default into one bucket.
+///
+/// L3: `ServiceIn` / `ServiceOut` are now `Signable` (fully wired end-to-end).
+/// `CashWithdrawal` (EPZ) remains `Unsupported` — STOP-S2 fail-closed guard
+/// (EPZ Z-half is NOT built in this PR).
 pub fn classify_command(cmd: CommandType) -> CommandClass {
     match cmd {
         CommandType::Sell
         | CommandType::Return
         | CommandType::ShiftOpen
         | CommandType::ShiftClose
-        | CommandType::ZReport => CommandClass::Signable,
+        | CommandType::ZReport
+        // L3 — service cash-in/out wired (policy gate relaxed, IO half built):
+        | CommandType::ServiceIn
+        | CommandType::ServiceOut => CommandClass::Signable,
 
         CommandType::XReport => CommandClass::ReadOnly,
 
-        CommandType::ServiceIn
-        | CommandType::ServiceOut
-        | CommandType::CashWithdrawal
+        // EPZ stays fail-closed (STOP-S2 — EPZ Z-half not yet built).
+        // PeriodicReport is CommandType-only (never reaches DocType stage).
+        CommandType::CashWithdrawal
         | CommandType::PeriodicReport => CommandClass::Unsupported,
     }
 }
@@ -64,8 +71,7 @@ pub fn classify_command(cmd: CommandType) -> CommandClass {
 mod tests {
     use super::*;
 
-    /// The signable bucket is exactly `stage_sign::derive_wire_artifact_kind`'s
-    /// signable set — these proceed to convert → inbox → seam.
+    /// The signable bucket includes L3 service-io ops.
     #[test]
     fn signable_set_matches_signer() {
         for c in [
@@ -74,6 +80,9 @@ mod tests {
             CommandType::ShiftOpen,
             CommandType::ShiftClose,
             CommandType::ZReport,
+            // L3 — service cash-in/out:
+            CommandType::ServiceIn,
+            CommandType::ServiceOut,
         ] {
             assert_eq!(classify_command(c), CommandClass::Signable, "{c:?}");
         }
@@ -88,16 +97,11 @@ mod tests {
         );
     }
 
-    /// Cash-movement ops + `PERIODIC_REPORT` are typed-unsupported and
-    /// must be rejected BEFORE any inbox write.
+    /// EPZ + `PERIODIC_REPORT` remain typed-unsupported.
+    /// `ServiceIn`/`ServiceOut` are now Signable (L3) — removed from this list.
     #[test]
     fn cash_movement_and_periodic_are_unsupported() {
-        for c in [
-            CommandType::ServiceIn,
-            CommandType::ServiceOut,
-            CommandType::CashWithdrawal,
-            CommandType::PeriodicReport,
-        ] {
+        for c in [CommandType::CashWithdrawal, CommandType::PeriodicReport] {
             assert_eq!(classify_command(c), CommandClass::Unsupported, "{c:?}");
         }
     }

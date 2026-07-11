@@ -1,13 +1,13 @@
 //! L0 — cash-on-hand ledger.
 //!
-//! ## Formula (§1.2 full form, forward-compatible)
+//! ## Formula (§1.2 full form, L3 wired)
 //! ```text
 //! cash_on_hand = opening_cash
 //!              + Σcash(SELL)
 //!              − Σcash(RETURN)
-//!              + Σ(service-in)    ← 0 until L3 wired
-//!              − Σ(service-out)   ← 0 until L3 wired
-//!              − Σ(EPZ-out)       ← 0 until L3 wired
+//!              + Σ(service-in)    ← L3 wired
+//!              − Σ(service-out)   ← L3 wired
+//!              − Σ(EPZ-out)       ← 0 until L4/EPZ wired (stays fail-closed)
 //! ```
 //!
 //! ## Carry semantics (default, operator decision 2026-07-10)
@@ -27,6 +27,11 @@
 //!     construction — the D1 invariant makes positional == semantic for cash.
 //!   - Boot preflight verifies D1.
 //!     Pure main-pool SQL — no secure_pool cross-dependency on the close/derive path.
+//!
+//! ## Service-in/out (L3): `amount_kop` field in stored service doc payloads.
+//! SERVICE_IN docs carry `{amount_kop, name, schema_version}` as their payload.
+//! SERVICE_OUT docs carry the same shape. The cash formula adds service_in and
+//! subtracts service_out (symmetric to how SELL adds and RETURN subtracts cash).
 //!
 //! ## Fidelity: mirrors aggregate_zreport grouping
 //! `aggregate_zreport` groups by `(type_code, name)`; this module extracts
@@ -48,14 +53,24 @@ use sqlx::SqlitePool;
 ///
 /// Pure — no I/O, no `async`.  All values in kopecks.
 ///
-/// `cash_sell_kop`   = Σ sum_kop for type_code="0" payments on SELL receipts.
-/// `cash_return_kop` = Σ sum_kop for type_code="0" payments on RETURN receipts.
+/// Formula (§1.2 full):
+///   cash_in_drawer = opening + cash_sell − cash_return + service_in − service_out
 ///
-/// TODO(L3): caller extends with service_in_kop, service_out_kop, epz_out_kop
-/// and applies: balance += service_in − service_out − epz_out.
-pub fn derive_cash_on_hand(opening_cash_kop: i64, cash_sell_kop: i64, cash_return_kop: i64) -> i64 {
-    opening_cash_kop + cash_sell_kop - cash_return_kop
-    // TODO(L3): + service_in_kop − service_out_kop − epz_out_kop
+/// `cash_sell_kop`    = Σ sum_kop for type_code="0" payments on SELL receipts.
+/// `cash_return_kop`  = Σ sum_kop for type_code="0" payments on RETURN receipts.
+/// `service_in_kop`   = Σ amount_kop for SERVICE_IN docs (L3, issued ACK).
+/// `service_out_kop`  = Σ amount_kop for SERVICE_OUT docs (L3, issued ACK).
+///
+/// EPZ (cash withdrawal) stays fail-closed at ingress; its term (−epz_out)
+/// is 0 for the current contour (STOP-S2 guard).
+pub fn derive_cash_on_hand(
+    opening_cash_kop: i64,
+    cash_sell_kop: i64,
+    cash_return_kop: i64,
+    service_in_kop: i64,
+    service_out_kop: i64,
+) -> i64 {
+    opening_cash_kop + cash_sell_kop - cash_return_kop + service_in_kop - service_out_kop
 }
 
 /// Serde-minimal view of a stored CheckJson payment.
@@ -70,16 +85,26 @@ struct StoredCheckPayments {
     payments: Vec<StoredPayment>,
 }
 
-/// Aggregate SELL/RETURN issued receipts for one shift into
-/// `(cash_sell_kop, cash_return_kop)` — type_code="0" legs only.
+/// Serde-minimal view of a stored ServiceIo payload — `{amount_kop}`.
+/// Does NOT use `deny_unknown_fields` so it remains forward-compatible with
+/// the `name` and `schema_version` fields the signer also stores.
+#[derive(serde::Deserialize)]
+struct StoredServiceIoPayload {
+    amount_kop: i64,
+}
+
+/// Aggregate SELL/RETURN issued receipts + SERVICE_IN/OUT docs for one shift
+/// into `(cash_sell_kop, cash_return_kop, service_in_kop, service_out_kop)`.
 ///
-/// D1 frozen invariant: type_code "0" ↔ cash payment by construction.
+/// SELL/RETURN: type_code="0" legs only (D1 frozen invariant).
+/// SERVICE_IN/OUT: `amount_kop` from the stored service-io payload (L3).
+///
 /// Pure main-pool SELECT; no network/crypto (invariant #1).
 pub async fn aggregate_shift_cash(
     pool: &SqlitePool,
     fiscal_number: &str,
     shift_id: ShiftId,
-) -> sqlx::Result<(i64, i64)> {
+) -> sqlx::Result<(i64, i64, i64, i64)> {
     use crate::db::models::enums::DocType;
 
     let receipts = crate::db::repositories::fiscal_documents::list_shift_issued_receipts(
@@ -108,7 +133,55 @@ pub async fn aggregate_shift_cash(
         }
     }
 
-    Ok((cash_sell, cash_return))
+    // SERVICE_IN / SERVICE_OUT: read amount_kop from service docs.
+    let (service_in, service_out) =
+        aggregate_shift_service_io(pool, fiscal_number, shift_id).await?;
+
+    Ok((cash_sell, cash_return, service_in, service_out))
+}
+
+/// Aggregate SERVICE_IN and SERVICE_OUT docs for a shift.
+///
+/// Returns `(service_in_kop, service_out_kop)`.
+/// Reads from `fiscal_documents` with `doc_type IN ('SERVICE_IN','SERVICE_OUT')`
+/// and `state IN ('ACK','OFFLINE_LOCAL_ACK')` (same issued-set as SELL/RETURN).
+///
+/// Pure main-pool SELECT; no network/crypto (invariant #1).
+pub async fn aggregate_shift_service_io(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+) -> sqlx::Result<(i64, i64)> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT doc_type, payload_json FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? \
+           AND doc_type IN ('SERVICE_IN','SERVICE_OUT') \
+           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY lnd",
+    )
+    .bind(fiscal_number)
+    .bind(shift_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut service_in: i64 = 0;
+    let mut service_out: i64 = 0;
+
+    for (doc_type_str, payload_json) in &rows {
+        let Ok(parsed) = serde_json::from_str::<StoredServiceIoPayload>(payload_json) else {
+            continue; // malformed: skip
+        };
+        if parsed.amount_kop <= 0 {
+            continue;
+        }
+        match doc_type_str.as_str() {
+            "SERVICE_IN" => service_in = service_in.saturating_add(parsed.amount_kop),
+            "SERVICE_OUT" => service_out = service_out.saturating_add(parsed.amount_kop),
+            _ => {}
+        }
+    }
+
+    Ok((service_in, service_out))
 }
 
 /// Tx-based variant of [`aggregate_shift_cash`] — runs INSIDE a `with_immediate`
@@ -126,11 +199,16 @@ pub async fn aggregate_shift_cash_tx(
     tx: &mut WriteTxConn<'_>,
     fiscal_number: &str,
     shift_id: ShiftId,
-) -> sqlx::Result<(i64, i64)> {
+) -> sqlx::Result<(i64, i64, i64, i64)> {
     use crate::db::models::enums::DocType;
 
+    // SELL / RETURN cash legs.
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT doc_type, payload_json FROM fiscal_documents          WHERE fiscal_number = ? AND shift_id = ?            AND doc_type IN ('SELL','RETURN')            AND state IN ('ACK','OFFLINE_LOCAL_ACK')          ORDER BY lnd",
+        "SELECT doc_type, payload_json FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? \
+           AND doc_type IN ('SELL','RETURN') \
+           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY lnd",
     )
     .bind(fiscal_number)
     .bind(shift_id)
@@ -160,7 +238,36 @@ pub async fn aggregate_shift_cash_tx(
         }
     }
 
-    Ok((cash_sell, cash_return))
+    // SERVICE_IN / SERVICE_OUT — in the same tx snapshot.
+    let svc_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT doc_type, payload_json FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? \
+           AND doc_type IN ('SERVICE_IN','SERVICE_OUT') \
+           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY lnd",
+    )
+    .bind(fiscal_number)
+    .bind(shift_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut service_in: i64 = 0;
+    let mut service_out: i64 = 0;
+    for (doc_type_str, payload_json) in &svc_rows {
+        let Ok(parsed) = serde_json::from_str::<StoredServiceIoPayload>(payload_json) else {
+            continue;
+        };
+        if parsed.amount_kop <= 0 {
+            continue;
+        }
+        match doc_type_str.as_str() {
+            "SERVICE_IN" => service_in = service_in.saturating_add(parsed.amount_kop),
+            "SERVICE_OUT" => service_out = service_out.saturating_add(parsed.amount_kop),
+            _ => {}
+        }
+    }
+
+    Ok((cash_sell, cash_return, service_in, service_out))
 }
 
 /// Derive the closing cash-on-hand for a shift from its DB receipts.
@@ -171,8 +278,8 @@ pub async fn derive_closing_cash(
     shift_id: ShiftId,
     opening_kop: i64,
 ) -> sqlx::Result<i64> {
-    let (sell, ret) = aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
-    Ok(derive_cash_on_hand(opening_kop, sell, ret))
+    let (sell, ret, svc_in, svc_out) = aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
+    Ok(derive_cash_on_hand(opening_kop, sell, ret, svc_in, svc_out))
 }
 
 /// Look up the opening carry for a NEW shift being opened on `fiscal_number`:
@@ -261,23 +368,6 @@ pub async fn reconcile_opening_anchor(
     };
 
     // Walk closed shifts in serial order to accumulate carry.
-    //
-    // Schema note: for CLOSED shifts, `cash_balance_kop` holds the CLOSING
-    // balance (updated atomically by stage_send at the Closing→Closed CAS,
-    // L0 §1.3).  For OPEN shifts it holds the OPENING carry (the value set
-    // at shift-create time from the prior closed shift's closing balance).
-    //
-    // Therefore we must NOT use `cash_balance_kop` of a closed shift as its
-    // opening anchor — that would double-count (opening=15000 + SELL=15000 →
-    // re_derived=30000 when the true opening was 0).
-    //
-    // Algorithm: use the accumulated `carry` from the PREVIOUS iteration as
-    // the opening anchor for the CURRENT shift.  For the very first shift
-    // the carry starts at 0 (no prior shift).  `cash_balance_kop` on closed
-    // shifts is ignored during the walk — it equals the re_derived closing
-    // cash which we compute here independently, and comparing them would be
-    // a per-shift check (not done here; the key invariant is that the OPEN
-    // shift's opening matches what the chain re-derives as its carry).
     let closed: Vec<(Vec<u8>,)> = sqlx::query_as(
         "SELECT shift_id FROM shifts \
          WHERE fiscal_number = ? AND state = 'CLOSED' \
@@ -293,9 +383,10 @@ pub async fn reconcile_opening_anchor(
             .try_into()
             .map_err(|_| sqlx::Error::Decode("shift_id not 16 bytes".into()))?;
         let shift_id = ShiftId::from_bytes(arr);
-        let (sell, ret) = aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
+        let (sell, ret, svc_in, svc_out) =
+            aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
         // carry-in = the prior carry (opening of this shift); carry-out = closing.
-        carry = derive_cash_on_hand(carry, sell, ret);
+        carry = derive_cash_on_hand(carry, sell, ret, svc_in, svc_out);
     }
 
     Ok(Some((carry, stored_opening)))
