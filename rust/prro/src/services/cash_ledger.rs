@@ -262,8 +262,25 @@ pub async fn reconcile_opening_anchor(
     };
 
     // Walk closed shifts in serial order to accumulate carry.
-    let closed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT shift_id, cash_balance_kop FROM shifts \
+    //
+    // Schema note: for CLOSED shifts, `cash_balance_kop` holds the CLOSING
+    // balance (updated atomically by stage_send at the Closing→Closed CAS,
+    // L0 §1.3).  For OPEN shifts it holds the OPENING carry (the value set
+    // at shift-create time from the prior closed shift's closing balance).
+    //
+    // Therefore we must NOT use `cash_balance_kop` of a closed shift as its
+    // opening anchor — that would double-count (opening=15000 + SELL=15000 →
+    // re_derived=30000 when the true opening was 0).
+    //
+    // Algorithm: use the accumulated `carry` from the PREVIOUS iteration as
+    // the opening anchor for the CURRENT shift.  For the very first shift
+    // the carry starts at 0 (no prior shift).  `cash_balance_kop` on closed
+    // shifts is ignored during the walk — it equals the re_derived closing
+    // cash which we compute here independently, and comparing them would be
+    // a per-shift check (not done here; the key invariant is that the OPEN
+    // shift's opening matches what the chain re-derives as its carry).
+    let closed: Vec<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT shift_id FROM shifts \
          WHERE fiscal_number = ? AND state = 'CLOSED' \
          ORDER BY serial ASC",
     )
@@ -272,13 +289,14 @@ pub async fn reconcile_opening_anchor(
     .await?;
 
     let mut carry: i64 = 0;
-    for (shift_id_bytes, opening_of_that_shift) in closed {
+    for (shift_id_bytes,) in closed {
         let arr: [u8; 16] = shift_id_bytes
             .try_into()
             .map_err(|_| sqlx::Error::Decode("shift_id not 16 bytes".into()))?;
         let shift_id = ShiftId::from_bytes(arr);
         let (sell, ret) = aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
-        carry = derive_cash_on_hand(opening_of_that_shift, sell, ret);
+        // carry-in = the prior carry (opening of this shift); carry-out = closing.
+        carry = derive_cash_on_hand(carry, sell, ret);
     }
 
     Ok(Some((carry, stored_opening)))

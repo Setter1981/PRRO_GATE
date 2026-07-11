@@ -288,6 +288,41 @@ async fn seed_inbox_op(pool: &SqlitePool, operation_type: &str) -> InboxRow {
     }
 }
 
+/// Seed a committed ACK SELL row directly into `fiscal_documents` for the given
+/// shift, then advance `node_state.next_lnd` past it.
+///
+/// Used to build cash-on-hand before a RETURN test (the in-lease INV-21
+/// guard reads from `state IN ('ACK','OFFLINE_LOCAL_ACK')`).
+///
+/// The seeded sell takes lnd=1; after inserting it we bump next_lnd to 2 so
+/// the subsequent `inline::run` can allocate lnd=2 without a unique-constraint
+/// conflict.
+async fn seed_committed_sell_ack(pool: &SqlitePool, shift_id: ShiftId) {
+    sqlx::query(
+        "INSERT INTO fiscal_documents( \
+            document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+            backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, server_fiscal_no, first_kvt1_at, \
+            total_sum_kop \
+         ) VALUES (?, randomblob(16), ?, ?, 1, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
+            '2026-06-09T12:00:00Z', ?, randomblob(32), 'DPS-SEED-1', '2026-06-09T12:00:05Z', ?)",
+    )
+    .bind(prro::db::models::ids::DocumentId::new())
+    .bind(FN)
+    .bind(shift_id)
+    .bind(SELL_PAYLOAD)
+    .bind(TOTAL_KOP)
+    .execute(pool)
+    .await
+    .unwrap();
+    // Advance next_lnd past the seeded doc so inline::run can allocate lnd=2.
+    sqlx::query("UPDATE node_state SET next_lnd = 2 WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 /// Seed a NEW SHIFT_OPEN inbox row (the live write-path shape: `ShiftOpenJson`
 /// payload, `total_sum_kop = None`) + return the matching [`InboxRow`].
 async fn seed_inbox_shift_open(pool: &SqlitePool) -> InboxRow {
@@ -1673,6 +1708,10 @@ async fn build_reject_terminalises_pre_acquire() {
 
 /// **Review A24-4 — RETURN is in the signed scope and flows to ACK** exactly
 /// like SELL (same CheckJson shape, total required).
+///
+/// HOLE 2 update: the in-lease INV-21 guard refuses a RETURN on an empty
+/// drawer.  Seed a committed ACK SELL row first to build 15000 kop cash, then
+/// the RETURN passes the guard (15000 >= 15000).
 #[tokio::test]
 async fn online_return_reaches_ack() {
     let pool = fresh_pool().await;
@@ -1680,6 +1719,8 @@ async fn online_return_reaches_ack() {
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_online(&pool, shift_id).await;
+    // Build cash: seed a committed ACK SELL so the in-lease guard passes.
+    seed_committed_sell_ack(&pool, shift_id).await;
     let row = seed_inbox_op(&pool, DocType::Return.as_str()).await;
 
     let dps = DualStub::new(

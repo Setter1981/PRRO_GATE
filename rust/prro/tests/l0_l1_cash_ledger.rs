@@ -347,19 +347,25 @@ async fn pin_l0_boot_reconcile_detects_drift() {
     let (_dir, pool) = fresh_main().await;
     seed_fn(&pool).await;
 
-    // Shift A closed with 100.00 cash.
+    // Shift A: opening=0, one SELL of 100.00 (10000 kop) → closing carry = 10000.
+    // Note: `reconcile_opening_anchor` re-derives carry from docs (not from the
+    // stored closing `cash_balance_kop`), so shift A must have an ACK SELL that
+    // totals 10000 kop to produce carry=10000 via `derive_cash_on_hand(0, 10000, 0)`.
     let shift_a = ShiftId::new();
     seed_closed_shift_with_closing_cash(&pool, shift_a, 0, 10000).await;
+    seed_issued_receipt(&pool, shift_a, 1, DocType::Sell, DocState::Ack, &cash(10000)).await;
 
     // Shift B: opens with correct carry 10000, has one SELL 20.00.
     let shift_b = ShiftId::new();
     seed_shift(&pool, shift_b, ShiftState::Opened, 10000).await;
-    seed_issued_receipt(&pool, shift_b, 1, DocType::Sell, DocState::Ack, &cash(2000)).await;
+    seed_issued_receipt(&pool, shift_b, 2, DocType::Sell, DocState::Ack, &cash(2000)).await;
 
-    // reconcile_opening_anchor should return (re_derived=10000, stored=10000) → no drift.
+    // reconcile_opening_anchor re-derives: carry-after-A = 0 + 10000 = 10000.
+    // Shift B's stored opening = 10000 → no drift.
     let result = reconcile_opening_anchor(&pool, FN).await.unwrap();
     let (re_derived, stored) = result.expect("open shift found");
     assert_eq!(re_derived, stored, "no drift with correct anchor");
+    assert_eq!(re_derived, 10000, "re-derived carry = 10000 (shift A SELL)");
 
     // Corrupt the stored opening anchor of shift B.
     sqlx::query("UPDATE shifts SET cash_balance_kop = 999 WHERE shift_id = ?")
@@ -368,7 +374,7 @@ async fn pin_l0_boot_reconcile_detects_drift() {
         .await
         .unwrap();
 
-    // Now reconcile should detect drift.
+    // Now reconcile should detect drift: re_derived=10000 but stored=999.
     let result = reconcile_opening_anchor(&pool, FN).await.unwrap();
     let (re_derived, stored) = result.expect("open shift found");
     assert_ne!(

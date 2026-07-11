@@ -745,9 +745,20 @@ impl RefModel {
                 if doc_state == DocState::Rejected {
                     return ExpectedOutcome::NoIssuanceRow;
                 }
-                // L0 cash-on-hand update: only on an issued doc (seed advanced →
-                // issued; Rejected was already returned above).
-                if Self::online_origin_advances_seed(doc_state) {
+                // L0 cash-on-hand update: only when the doc reaches ACK state.
+                //
+                // Prod `aggregate_shift_cash` / `aggregate_shift_cash_tx` filter
+                // `state IN ('ACK','OFFLINE_LOCAL_ACK')`.  Docs at SENT/KVT1/KVT2
+                // have crossed the issuance boundary (seed advanced) but are NOT yet
+                // counted in cash-on-hand — they sit probe-pending until they reach
+                // ACK.  The in-lease guard also reads from that same aggregate, so
+                // cash availability reflects ONLY ack'd receipts, not in-flight ones.
+                // This matches Z aggregation (Z counts ACK docs) — consistent.
+                //
+                // NOTE (follow-up, not blocking): cash-on-hand counts at ACK, not at
+                // SENT.  The deep question of "should SENT docs pre-book cash capacity"
+                // is a policy question separate from INV-21 correctness.
+                if doc_state == DocState::Ack {
                     if is_return {
                         self.cash_on_hand -= CASH_AMOUNT_KOP;
                     } else {
