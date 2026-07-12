@@ -56,12 +56,16 @@ pub fn classify_command(cmd: CommandType) -> CommandClass {
         | CommandType::ZReport
         // L3 — service cash-in/out wired (policy gate relaxed, IO half built):
         | CommandType::ServiceIn
-        | CommandType::ServiceOut => CommandClass::Signable,
+        | CommandType::ServiceOut
+        // EPZ — видача готівки за ЕПЗ wired (policy gate relaxed, EPZ Z-half
+        // built in the SAME PR — STOP-S2).  Card `<M>` leg + `<C T='8'>` wire.
+        | CommandType::CashAdvanceEpz => CommandClass::Signable,
 
         CommandType::XReport => CommandClass::ReadOnly,
 
-        // EPZ stays fail-closed (STOP-S2 — EPZ Z-half not yet built).
-        // PeriodicReport is CommandType-only (never reaches DocType stage).
+        // CashWithdrawal is the fail-closed placeholder (superseded by
+        // CashAdvanceEpz — EPZ is now Signable).  PeriodicReport is
+        // CommandType-only (never reaches DocType stage).
         CommandType::CashWithdrawal
         | CommandType::PeriodicReport => CommandClass::Unsupported,
     }

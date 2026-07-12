@@ -209,6 +209,57 @@ pub enum ConvertError {
         return_cash_kop: i64,
     },
 
+    /// EPZ (видача готівки за ЕПЗ) — the card payment-form index is `< 2`.
+    /// EPZ is a CARD operation (WebCheck `ClassFiscal.cs:1377` — «Тип
+    /// paymentid не может быть меньше 2», errCode 94); a cash form (index 1)
+    /// is not a valid EPZ leg.  Fail-closed at ingress (HTTP 422).
+    #[error(
+        "EPZ: paymentid {payment_form_index} < 2 — EPZ requires a card payment form \
+         (errCode-94 analog; cash forms are not EPZ legs)"
+    )]
+    EpzPaymentIdTooLow { payment_form_index: u8 },
+
+    /// EPZ with a missing / malformed card leg — an EPZ must carry EXACTLY one
+    /// card `CanonicalPayment` (with an `acquirer_slip`) whose amount is the
+    /// cash-out sum.  Fail-closed (HTTP 422).
+    #[error("EPZ: expected exactly one card payment leg with an acquirer_slip; got {count}")]
+    EpzMalformedCardLeg { count: usize },
+
+    /// **L5 G1** — the SELL's CASH portion (`type_code == "0"` legs) exceeds the
+    /// legal cash cap (49 999.99 UAH = 4 999 999 kop; WebCheck `DopNal`/
+    /// `AllowableCash` clamp, `All.cs:875-886`).  Caps the CASH leg sum, NOT the
+    /// receipt total (a card-heavy receipt may exceed 50 000 legally).
+    /// Fail-closed pre-inbox (row-less, HTTP 422).
+    #[error(
+        "L5 G1: cash legs Σ {cash_kop} kop exceed the cash cap {cap_kop} kop \
+         (49 999.99 UAH) — fail-closed pre-inbox"
+    )]
+    CashCapExceeded { cash_kop: i64, cap_kop: i64 },
+
+    /// **L5 G2** — a good resolves to `item_sum_kop == 0` (a zero-price line).
+    /// Distinct from `ZeroQuantityLine` (quantity may be non-zero here — a
+    /// zero-PRICE good).  A fiscal line must carry a positive amount.
+    /// Fail-closed pre-inbox (row-less, HTTP 422).
+    #[error("L5 G2: item {item_name:?} has a zero line sum (zero-price line is not fiscalizable)")]
+    ZeroPriceLine { item_name: String },
+
+    /// **L5 G3** — a declared payment leg carries `sum_kop == 0`.  A zero-value
+    /// payment is malformed input (a real payment leg has a positive amount).
+    /// Fail-closed pre-inbox (row-less, HTTP 422).
+    #[error("L5 G3: payment leg #{pay_index} has a zero sum (zero-value payment is not valid)")]
+    ZeroPaymentAmount { pay_index: usize },
+
+    /// **L5 G4** — a SELL whose declared payments (when present) sum to LESS than
+    /// its goods total (an underpaid receipt).  SELL-only (a RETURN is a refund;
+    /// underpayment semantics do not apply).  Fires only when ≥1 payment leg is
+    /// present — a SELL with NO payment legs is the pre-existing "cash implied"
+    /// shape convert already tolerates.  Fail-closed pre-inbox (row-less,
+    /// HTTP 422); `stage_sign`'s later total cross-check is defense-in-depth.
+    #[error(
+        "L5 G4: SELL paid {paid_kop} kop < goods {goods_kop} kop (underpayment) — fail-closed"
+    )]
+    UnderpaymentRefused { goods_kop: i64, paid_kop: i64 },
+
     /// `ZReport` / `ShiftClose` with no open shift — a Z closes the open
     /// shift; closing when none is open is a state-machine breach.
     #[error(
@@ -355,8 +406,25 @@ struct ZReportOut {
     /// is the DPS-accepted form — a shift with no service ops emits no `<IO>`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     service_sums: Vec<ZReportServiceIoOut>,
+    /// EPZ — `<EPZ EPC EPCS='0' EPSM>` card-advance totals.  `None` → OMITTED
+    /// (a shift with no EPZ ops emits no `<EPZ>`).  STOP-S2: populated here so a
+    /// live Z close reports card-advance turnover in the SAME PR as the ingress
+    /// relaxation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epz: Option<ZReportEpzOut>,
     sell_count: u32,
     return_count: u32,
+}
+
+/// EPZ Z-section totals (`<EPZ EPC EPCS EPSM>`).  Mirrors `xml::ZReportEpzTotals`.
+#[derive(Serialize)]
+struct ZReportEpzOut {
+    /// `<EPZ EPC=>` — count of EPZ operations in the shift.
+    epc: i64,
+    /// `<EPZ EPCS=>` — hardcoded 0 (byte-parity, WebCheck `FormDate.cs:436`).
+    epcs: i64,
+    /// `<EPZ EPSM=>` — total EPZ sum (kopecks).
+    epsm: i64,
 }
 
 #[derive(Serialize)]
@@ -495,6 +563,9 @@ fn aggregate_zreport(receipts: &[(DocType, String)]) -> Result<ZReportOut, Conve
         // service_sums is populated by aggregate_z_payload_for_shift after
         // this call (it reads service docs separately via aggregate_shift_service_io).
         service_sums: Vec::new(),
+        // epz is populated by aggregate_z_payload_for_shift (reads EPZ docs
+        // separately via aggregate_shift_epz).
+        epz: None,
         sell_count,
         return_count,
     })
@@ -855,6 +926,63 @@ pub async fn convert_to_signer_payload(
                 payments.push(convert_payment(p, fiscal_number, secure_pool).await?);
             }
 
+            // ── L5 G2 — ZeroPriceLine (a good with item_sum_kop == 0) ──────────
+            // Pure in-memory scan over the converted items (SELL + RETURN).
+            // Distinct from ZeroQuantityLine (a zero-PRICE good keeps qty > 0).
+            if let Some(zero) = items.iter().find(|it| it.sum_kop == 0) {
+                return Err(ConvertError::ZeroPriceLine {
+                    item_name: zero.name.clone(),
+                });
+            }
+
+            // ── L5 G3 — ZeroPaymentAmount (a declared payment leg == 0) ────────
+            // Pure in-memory scan over the converted payments (SELL + RETURN).
+            if let Some((idx, _)) = payments.iter().enumerate().find(|(_, p)| p.sum_kop == 0) {
+                return Err(ConvertError::ZeroPaymentAmount { pay_index: idx });
+            }
+
+            // ── L5 G1 — CashCapExceeded (SELL cash legs Σ > 4_999_999 kop) ─────
+            // Caps the CASH portion (WebCheck DopNal/AllowableCash, All.cs:875-886),
+            // NOT the receipt total.  SELL-only (a RETURN pays cash OUT).  Pure
+            // in-memory sum over the type_code=="0" legs.
+            const CASH_CAP_KOP: i64 = 4_999_999;
+            if cmd.command_type == CommandType::Sell {
+                let cash_kop: i64 = payments
+                    .iter()
+                    .filter(|p| p.type_code == "0")
+                    .map(|p| p.sum_kop)
+                    .fold(0i64, |a, b| a.saturating_add(b));
+                if cash_kop > CASH_CAP_KOP {
+                    return Err(ConvertError::CashCapExceeded {
+                        cash_kop,
+                        cap_kop: CASH_CAP_KOP,
+                    });
+                }
+            }
+
+            // ── L5 G4 — UnderpaymentRefused (SELL Σpayments < Σgoods) ──────────
+            // SELL-only (a RETURN is a refund; underpayment semantics don't apply).
+            // Fires only when ≥1 payment leg is declared — a SELL with NO payment
+            // legs is the pre-existing "cash implied" shape convert tolerates.
+            // Pure in-memory sums.  `stage_sign`'s later total cross-check stays
+            // as defense-in-depth (L5 adds the earlier fail-closed gate).
+            if cmd.command_type == CommandType::Sell && !payments.is_empty() {
+                let goods_kop: i64 = items
+                    .iter()
+                    .map(|it| it.sum_kop)
+                    .fold(0i64, |a, b| a.saturating_add(b));
+                let paid_kop: i64 = payments
+                    .iter()
+                    .map(|p| p.sum_kop)
+                    .fold(0i64, |a, b| a.saturating_add(b));
+                if paid_kop < goods_kop {
+                    return Err(ConvertError::UnderpaymentRefused {
+                        goods_kop,
+                        paid_kop,
+                    });
+                }
+            }
+
             // ── INV-21 guard — L1 cash-on-hand floor (pre-inbox, row-less) ─────
             // RETURN only: refuse if the cash leg exceeds current cash-on-hand.
             // SELL is excluded (cash in = always safe for this invariant).
@@ -939,6 +1067,103 @@ pub async fn convert_to_signer_payload(
                 name,
             })
         }
+        // EPZ — видача готівки за ЕПЗ (cash advance against a card).  The
+        // cash-out sum + card requisites ride on the SINGLE card payment leg
+        // (`CanonicalPayment.acquirer_slip`).  DPS wire = compact `<C T='8'>`
+        // (`stage_sign` builds it); NO tax on the good; the cash-out is a
+        // LEDGER effect, not a `<payments>` cash line.
+        CommandType::CashAdvanceEpz => {
+            // Exactly one card payment leg carrying an acquirer_slip.
+            let slip_legs: Vec<&super::dto::CanonicalPayment> = cmd
+                .payload
+                .payments
+                .iter()
+                .filter(|p| p.acquirer_slip.is_some())
+                .collect();
+            if cmd.payload.payments.len() != 1 || slip_legs.len() != 1 {
+                return Err(ConvertError::EpzMalformedCardLeg {
+                    count: cmd.payload.payments.len(),
+                });
+            }
+            let leg = slip_legs[0];
+            let slip = leg.acquirer_slip.as_ref().expect("filtered to Some above");
+            // paymentid ≥ 2 (card form only; errCode-94 analog).
+            if slip.payment_form_index < 2 {
+                return Err(ConvertError::EpzPaymentIdTooLow {
+                    payment_form_index: slip.payment_form_index,
+                });
+            }
+            let sum_kop = to_i64(leg.amount_kopecks, "epz.amount_kopecks")?;
+
+            // ── INV-21 guard-3c — EPZ over cash-on-hand is refused ──
+            // Pre-inbox, row-less (WebCheck `ClassFiscal.cs:1385-1391`, errCode
+            // 47).  Mirrors guard-3a (RETURN) / guard-3b (ServiceOut).
+            // Invariant #1: pure pool read outside any write-tx.
+            if sum_kop > 0 {
+                let cash_on_hand_kop =
+                    crate::services::cash_ledger::cash_on_hand_for_fn(main_pool, fiscal_number)
+                        .await
+                        .map_err(ConvertError::LedgerRead)?;
+                if cash_on_hand_kop < sum_kop {
+                    return Err(ConvertError::CashInsufficient {
+                        cash_on_hand_kop,
+                        return_cash_kop: sum_kop,
+                    });
+                }
+            }
+
+            // Resolve the card payment-form display name from `payment_methods`
+            // (INV-6: carry the full card requisites, not a summary).
+            let pay_index = slip.payment_form_index as i64;
+            let pm = payment_methods::find(secure_pool, fiscal_number, pay_index)
+                .await?
+                .ok_or_else(|| ConvertError::MissingPaymentMethod {
+                    fiscal_number: fiscal_number.to_string(),
+                    pay_index,
+                })?;
+
+            #[derive(serde::Serialize)]
+            struct EpzOut {
+                schema_version: &'static str,
+                sum_kop: i64,
+                /// Fixed good code (`<P C='0'>`, WebCheck `code='0'`).
+                code: String,
+                /// Fixed cash-advance good label.
+                name: String,
+                /// Card payment-form index (`paymentid` ≥ 2 → `<M T='0'>`).
+                paymentid: i64,
+                /// Card payment-form display name (`<M NM=>`).
+                pay_name: String,
+                // Card / acquirer requisites (`<M PA..RRN>`).
+                pa: String,
+                pb: String,
+                pc: String,
+                pd: String,
+                pe: String,
+                psnm: String,
+                rrn: String,
+            }
+            finalize(&EpzOut {
+                schema_version: "1.0",
+                sum_kop,
+                code: "0".to_string(),
+                name:
+                    "ОПЕРАЦІЯ З ВИДАЧІ ГОТІВКОВИХ КОШТІВ ДЕРЖАТЕЛЮ ЕЛЕКТРОННОГО ПЛАТІЖНОГО ЗАСОБУ"
+                        .to_string(),
+                paymentid: pay_index,
+                pay_name: pm.name,
+                // WebCheck EPZ `<L>`/`<M>` slip attrs (ClassFiscal.cs:1395-1396):
+                //   PA=acquirer, PB=terminal, PC=op-type, PD=masked PAN,
+                //   PE=approval code, PSNM=payment-system, RRN=reference.
+                pa: slip.merchant_id.clone(),
+                pb: slip.terminal_id.clone(),
+                pc: slip.operation_type.clone(),
+                pd: slip.pan.clone(),
+                pe: slip.approval_code.clone(),
+                psnm: slip.payment_system.clone(),
+                rrn: slip.transaction_code.clone(),
+            })
+        }
         other => Err(ConvertError::NotSignable(other)),
     }
 }
@@ -1013,6 +1238,33 @@ pub async fn aggregate_z_payload_for_shift(
             name: "SERVICE_OUT".to_string(),
             sum_in_kop: 0,
             sum_out_kop: svc_out_kop,
+        });
+    }
+
+    // EPZ — aggregate card-advance docs into the Z `<EPZ EPC EPCS='0' EPSM>`
+    // section (STOP-S2).  Count the issued EPZ docs (EPC) + their total sum
+    // (EPSM); EPCS is hardcoded 0 for byte-parity (WebCheck FormDate.cs:436).
+    // Invariant #1: pool-bound SELECTs, no write-tx, no network.
+    let epz_sum_kop =
+        crate::services::cash_ledger::aggregate_shift_epz(main_pool, fiscal_number, shift_id)
+            .await
+            .map_err(ConvertError::LedgerRead)?;
+    if epz_sum_kop > 0 {
+        let epz_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fiscal_documents \
+             WHERE fiscal_number = ? AND shift_id = ? \
+               AND doc_type = 'CASH_ADVANCE_EPZ' \
+               AND state IN ('ACK','OFFLINE_LOCAL_ACK')",
+        )
+        .bind(fiscal_number)
+        .bind(shift_id)
+        .fetch_one(main_pool)
+        .await
+        .map_err(ConvertError::LedgerRead)?;
+        out.epz = Some(ZReportEpzOut {
+            epc: epz_count,
+            epcs: 0,
+            epsm: epz_sum_kop,
         });
     }
 

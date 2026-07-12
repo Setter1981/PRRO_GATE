@@ -403,6 +403,10 @@ fn wire_artifact_to_check_type(k: WireArtifactKind) -> DpsCheckType {
         // L3 — service cash-in/out: DPS SubmitCheck code 3 = ServiceChk.
         // WebCheck `DealCheck` sends to the same endpoint with `typCheck=3`.
         WireArtifactKind::ServiceIn | WireArtifactKind::ServiceOut => DpsCheckType::ServiceChk,
+        // EPZ — видача готівки за ЕПЗ is a FISCAL receipt (`<C T='8'>`, has a
+        // good + fiscal number), sent via the CHK path like SELL/RETURN
+        // (WebCheck `EPZtoCash` → `FiscalReceipt`, not the DealCheck service path).
+        WireArtifactKind::CashAdvanceEpz => DpsCheckType::Chk,
     }
 }
 
