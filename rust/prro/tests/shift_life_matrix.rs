@@ -42,6 +42,7 @@ mod common;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 
@@ -505,6 +506,7 @@ async fn run(
 ) {
     eprintln!("\n════════ SCENARIO: {name} ════════");
     for (i, act) in steps.iter().enumerate() {
+        let t0 = Instant::now();
         let outcome: String = match act {
             Action::Open => {
                 let (status, state) = drive_ingress(
@@ -618,10 +620,11 @@ async fn run(
             }
         };
 
+        let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let (mode, node_shift) = node_row(app.db()).await;
         let wire = dps.drain_calls();
         eprintln!(
-            "[{name}][step {i:>2}] {outcome:<48} | mode={mode:<12} shift={:<10} node_shift={node_shift:<10} cash={} | dps{:?}",
+            "[{name}][step {i:>2}] {outcome:<48} {dt_ms:>6.1}ms | mode={mode:<12} shift={:<10} node_shift={node_shift:<10} cash={} | dps{:?}",
             shift_state(app.db()).await,
             cash_on_hand(app.db()).await,
             wire,
@@ -781,4 +784,55 @@ async fn matrix_s3_dps_reject_corpus() {
         prro::db::invariant_scan::assert_clean(app.db()).await;
     }
     eprintln!("════════ DPS REJECT CORPUS: PASS ════════\n");
+}
+
+/// (fiscal_documents count, sqlite page_count) — coarse DB-growth probe.
+async fn db_stats(pool: &SqlitePool) -> (i64, i64) {
+    let docs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(-1);
+    (docs, pages)
+}
+
+/// S4 — THROUGHPUT + DB behavior ("посмотрим как база работает, померяем
+/// скорості full-end"). Drive a large batch of VARIED SELLs through the real
+/// ingress on one open shift, then a Z, measuring per-op latency + throughput +
+/// DB growth. CAVEAT: signing here is the DetCrypto STUB (constant CMS), so this
+/// measures the DB + ingress + staged-pipeline + orchestration cost per receipt,
+/// NOT real DSTU-4145 crypto cost (that is a separate live/bench concern).
+#[tokio::test]
+async fn matrix_s4_throughput_and_db() {
+    let (app, _dps, wp) = fresh_harness().await;
+    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "perf-OPEN")).await;
+    assert_eq!(st, 200, "perf setup: SHIFT_OPEN must ACK");
+
+    let n: u64 = 200;
+    let t0 = Instant::now();
+    for i in 0..n {
+        let (body, _) = sell_body(i, &format!("perf-SELL-{i}"));
+        let (status, _state) = drive_ingress(&app, &*wp, &body).await;
+        assert_eq!(status, 200, "SELL {i} must ACK");
+    }
+    let elapsed = t0.elapsed();
+    let (dz, _) = drive_ingress(&app, &*wp, &simple_body("Z_REPORT", "perf-Z")).await;
+    assert_eq!(dz, 200, "perf: Z must close the shift");
+
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let per_ms = total_ms / n as f64;
+    let ops = n as f64 / elapsed.as_secs_f64();
+    let (docs, pages) = db_stats(app.db()).await;
+    eprintln!("\n════════ THROUGHPUT (sign=STUB) ════════");
+    eprintln!(
+        "  {n} SELLs in {total_ms:.0}ms  →  {per_ms:.2} ms/sell, {ops:.0} sells/sec  (pipeline+DB, crypto stubbed)"
+    );
+    eprintln!("  DB after Z: fiscal_documents={docs}, sqlite page_count={pages}");
+    eprintln!("════════════════════════════════════════\n");
+    prro::db::invariant_scan::assert_clean(app.db()).await;
 }
