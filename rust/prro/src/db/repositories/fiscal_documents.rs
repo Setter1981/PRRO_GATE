@@ -820,7 +820,7 @@ pub async fn list_shift_pending_receipts_for_z_quiescence(
         "SELECT document_id, state \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
-           AND doc_type IN ('SELL','RETURN','SERVICE_IN','SERVICE_OUT') \
+           AND doc_type IN ('SELL','RETURN','SERVICE_IN','SERVICE_OUT','CASH_ADVANCE_EPZ') \
            AND ( \
                  state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT', \
                            'KVT1','KVT2','ERROR_RETRYABLE') \

@@ -120,6 +120,24 @@ pub enum Op {
     /// Offline close-shift / Z-report path.  Issuance is local; later wire
     /// interaction is driven by the existing Drain/GoOnline ops.
     OfflineZReport,
+    /// Online EPZ — видача готівки за ЕПЗ (cash advance against a card).
+    /// Wire-hitting (`<C T='8'>`); carries a script.  Cash-OUT (`− epz_out`);
+    /// guard-3c refuses (NoMutation) when the card sum exceeds cash-on-hand.
+    OnlineEpz(DpsScript),
+    /// Offline EPZ.  Issuance is local (OFFLINE_LOCAL_ACK + code consumed);
+    /// drain/GoOnline submits it.  Mirrors `OfflineServiceOut`.
+    OfflineEpz,
+    /// L5 — a SELL whose AMOUNT-SHAPE deliberately spans the four fail-closed
+    /// pre-inbox input guards (`convert.rs`).  Unlike every other SELL op — which
+    /// seeds an already-CONVERTED signer payload directly and enters at
+    /// `inline::run` — this op drives the SELL THROUGH `convert_to_signer_payload`
+    /// (the layer the L5 guards live in), so an over-cap / zero-price /
+    /// zero-payment / underpaid shape is actually REFUSED pre-inbox (no row) and a
+    /// `Valid` shape converts + issues.  Carries the violation `kind`; the wire
+    /// script (for `Valid`) is fixed to `ack_path` (issuance-shape is orthogonal
+    /// to the amount guard).  This is the "equivalent bounded strategy spanning
+    /// the guard boundaries" the L5 fuzzer mandate asks for.
+    L5Probe(L5Kind),
     Drain(DpsScript),
     Crash(Stage),
     Reboot,
@@ -130,4 +148,22 @@ pub enum Op {
     GoOnlineWithoutBacklog,
     OfflineSellDuringGoingOnline,
     SellWithClosedShift,
+}
+
+/// L5 amount-shape for an [`Op::L5Probe`].  Each violation kind targets exactly
+/// one of the four fail-closed pre-inbox guards in `convert.rs`; `Valid` is the
+/// admit-and-issue control.  The interpreter builds a `CanonicalCommand` with the
+/// matching amount shape and drives it through `convert_to_signer_payload`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L5Kind {
+    /// G1 — a single cash payment of 5_000_000 kop (Σ cash > 4_999_999 cap).
+    OverCap,
+    /// G2 — a good priced 0 (item_sum_kop == 0).
+    ZeroPrice,
+    /// G3 — a card leg that covers the good + a zero-amount cash leg.
+    ZeroPayment,
+    /// G4 — a good of 1000 kop paid by a 900-kop cash leg (underpaid).
+    Underpaid,
+    /// Control — a good of 15_000 kop paid in full by cash (converts + issues).
+    Valid,
 }

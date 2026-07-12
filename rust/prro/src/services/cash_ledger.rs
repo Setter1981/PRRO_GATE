@@ -53,24 +53,29 @@ use sqlx::SqlitePool;
 ///
 /// Pure — no I/O, no `async`.  All values in kopecks.
 ///
-/// Formula (§1.2 full):
-///   cash_in_drawer = opening + cash_sell − cash_return + service_in − service_out
+/// Formula (§1.2 full, EPZ wired):
+///   cash_in_drawer = opening + cash_sell − cash_return + service_in
+///                    − service_out − epz_out
 ///
 /// `cash_sell_kop`    = Σ sum_kop for type_code="0" payments on SELL receipts.
 /// `cash_return_kop`  = Σ sum_kop for type_code="0" payments on RETURN receipts.
 /// `service_in_kop`   = Σ amount_kop for SERVICE_IN docs (L3, issued ACK).
 /// `service_out_kop`  = Σ amount_kop for SERVICE_OUT docs (L3, issued ACK).
+/// `epz_out_kop`      = Σ sum for EPZ (cash-advance) docs (issued ACK / OLA).
 ///
-/// EPZ (cash withdrawal) stays fail-closed at ingress; its term (−epz_out)
-/// is 0 for the current contour (STOP-S2 guard).
+/// EPZ (видача готівки за ЕПЗ) drives cash OUT of the drawer against a card
+/// charge — WebCheck `Nal()` (`All.cs:431-462`) carries the `− num5` EPZ term.
 pub fn derive_cash_on_hand(
     opening_cash_kop: i64,
     cash_sell_kop: i64,
     cash_return_kop: i64,
     service_in_kop: i64,
     service_out_kop: i64,
+    epz_out_kop: i64,
 ) -> i64 {
-    opening_cash_kop + cash_sell_kop - cash_return_kop + service_in_kop - service_out_kop
+    opening_cash_kop + cash_sell_kop - cash_return_kop + service_in_kop
+        - service_out_kop
+        - epz_out_kop
 }
 
 /// Serde-minimal view of a stored CheckJson payment.
@@ -93,18 +98,28 @@ struct StoredServiceIoPayload {
     amount_kop: i64,
 }
 
-/// Aggregate SELL/RETURN issued receipts + SERVICE_IN/OUT docs for one shift
-/// into `(cash_sell_kop, cash_return_kop, service_in_kop, service_out_kop)`.
+/// Serde-minimal view of a stored EPZ payload — `{sum_kop}`.
+/// Forward-compatible (no `deny_unknown_fields`) with the card requisites the
+/// signer also stores (paymentid / pa..rrn / name).
+#[derive(serde::Deserialize)]
+struct StoredEpzPayload {
+    sum_kop: i64,
+}
+
+/// Aggregate SELL/RETURN issued receipts + SERVICE_IN/OUT + EPZ docs for one
+/// shift into `(cash_sell_kop, cash_return_kop, service_in_kop, service_out_kop,
+/// epz_out_kop)`.
 ///
 /// SELL/RETURN: type_code="0" legs only (D1 frozen invariant).
 /// SERVICE_IN/OUT: `amount_kop` from the stored service-io payload (L3).
+/// EPZ: `sum_kop` from the stored EPZ payload (drives cash out).
 ///
 /// Pure main-pool SELECT; no network/crypto (invariant #1).
 pub async fn aggregate_shift_cash(
     pool: &SqlitePool,
     fiscal_number: &str,
     shift_id: ShiftId,
-) -> sqlx::Result<(i64, i64, i64, i64)> {
+) -> sqlx::Result<(i64, i64, i64, i64, i64)> {
     use crate::db::models::enums::DocType;
 
     let receipts = crate::db::repositories::fiscal_documents::list_shift_issued_receipts(
@@ -137,7 +152,48 @@ pub async fn aggregate_shift_cash(
     let (service_in, service_out) =
         aggregate_shift_service_io(pool, fiscal_number, shift_id).await?;
 
-    Ok((cash_sell, cash_return, service_in, service_out))
+    // EPZ: read sum_kop from EPZ docs (drives cash OUT of the drawer).
+    let epz_out = aggregate_shift_epz(pool, fiscal_number, shift_id).await?;
+
+    Ok((cash_sell, cash_return, service_in, service_out, epz_out))
+}
+
+/// Aggregate EPZ (видача готівки за ЕПЗ) docs for a shift into `epz_out_kop`.
+///
+/// Reads `fiscal_documents` with `doc_type = 'CASH_ADVANCE_EPZ'` and
+/// `state IN ('ACK','OFFLINE_LOCAL_ACK')` (same issued-set as SELL/RETURN /
+/// service-io).  `sum_kop` from the stored EPZ payload.  Mirrors
+/// [`aggregate_shift_service_io`].
+///
+/// Pure main-pool SELECT; no network/crypto (invariant #1).
+pub async fn aggregate_shift_epz(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+) -> sqlx::Result<i64> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload_json FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? \
+           AND doc_type = 'CASH_ADVANCE_EPZ' \
+           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY lnd",
+    )
+    .bind(fiscal_number)
+    .bind(shift_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut epz_out: i64 = 0;
+    for (payload_json,) in &rows {
+        let Ok(parsed) = serde_json::from_str::<StoredEpzPayload>(payload_json) else {
+            continue; // malformed: skip
+        };
+        if parsed.sum_kop <= 0 {
+            continue;
+        }
+        epz_out = epz_out.saturating_add(parsed.sum_kop);
+    }
+    Ok(epz_out)
 }
 
 /// Aggregate SERVICE_IN and SERVICE_OUT docs for a shift.
@@ -199,7 +255,7 @@ pub async fn aggregate_shift_cash_tx(
     tx: &mut WriteTxConn<'_>,
     fiscal_number: &str,
     shift_id: ShiftId,
-) -> sqlx::Result<(i64, i64, i64, i64)> {
+) -> sqlx::Result<(i64, i64, i64, i64, i64)> {
     use crate::db::models::enums::DocType;
 
     // SELL / RETURN cash legs.
@@ -267,7 +323,30 @@ pub async fn aggregate_shift_cash_tx(
         }
     }
 
-    Ok((cash_sell, cash_return, service_in, service_out))
+    // EPZ (CASH_ADVANCE_EPZ) — in the same tx snapshot.  Drives cash OUT.
+    let epz_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload_json FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? \
+           AND doc_type = 'CASH_ADVANCE_EPZ' \
+           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY lnd",
+    )
+    .bind(fiscal_number)
+    .bind(shift_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut epz_out: i64 = 0;
+    for (payload_json,) in &epz_rows {
+        let Ok(parsed) = serde_json::from_str::<StoredEpzPayload>(payload_json) else {
+            continue;
+        };
+        if parsed.sum_kop <= 0 {
+            continue;
+        }
+        epz_out = epz_out.saturating_add(parsed.sum_kop);
+    }
+
+    Ok((cash_sell, cash_return, service_in, service_out, epz_out))
 }
 
 /// Derive the closing cash-on-hand for a shift from its DB receipts.
@@ -278,8 +357,16 @@ pub async fn derive_closing_cash(
     shift_id: ShiftId,
     opening_kop: i64,
 ) -> sqlx::Result<i64> {
-    let (sell, ret, svc_in, svc_out) = aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
-    Ok(derive_cash_on_hand(opening_kop, sell, ret, svc_in, svc_out))
+    let (sell, ret, svc_in, svc_out, epz_out) =
+        aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
+    Ok(derive_cash_on_hand(
+        opening_kop,
+        sell,
+        ret,
+        svc_in,
+        svc_out,
+        epz_out,
+    ))
 }
 
 /// Look up the opening carry for a NEW shift being opened on `fiscal_number`:
@@ -383,10 +470,10 @@ pub async fn reconcile_opening_anchor(
             .try_into()
             .map_err(|_| sqlx::Error::Decode("shift_id not 16 bytes".into()))?;
         let shift_id = ShiftId::from_bytes(arr);
-        let (sell, ret, svc_in, svc_out) =
+        let (sell, ret, svc_in, svc_out, epz_out) =
             aggregate_shift_cash(pool, fiscal_number, shift_id).await?;
         // carry-in = the prior carry (opening of this shift); carry-out = closing.
-        carry = derive_cash_on_hand(carry, sell, ret, svc_in, svc_out);
+        carry = derive_cash_on_hand(carry, sell, ret, svc_in, svc_out, epz_out);
     }
 
     Ok(Some((carry, stored_opening)))

@@ -39,7 +39,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{FileFailurePersistence, TestRunner};
 
 use model::{ExpectedOutcome, RefModel};
-use op::{DpsScript, Op, Stage, WireResponse};
+use op::{DpsScript, L5Kind, Op, Stage, WireResponse};
 
 /// Every `DocState` variant — the test enumerates the domain to prove the
 /// model's issued predicate mirrors the SSOT const for ALL states (the
@@ -2393,9 +2393,27 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             }
             // B2 — NoIssuanceRowAllowed: a refusal that mints a LEGAL non-issued
             // row (online-reject Rejected / offline-ack Aborted).  The row IS
-            // allowed (the lnd is consumed → next_lnd may bump), but it is NOT
-            // issued: the row matches the model's predicted non-issued state
-            // (ledger-delta) AND the seed + codes do NOT move.
+            // allowed (the lnd is consumed → next_lnd may bump), but the REFUSED
+            // doc itself is NOT issued: the row matches the model's predicted
+            // non-issued state (ledger-delta) AND the refused doc neither advances
+            // the seed nor consumes a code.
+            //
+            // B10 correction — a co-interposed lazy DocType=9 BEGIN.  When the
+            // refused business doc is the FIRST offline doc of a session, prod
+            // (and the model) FIRST interpose an issued OFFLINE_SESSION_BEGIN
+            // (its own committed OLA envelope: consumes ONE code + advances the
+            // seed, stage_offline_ack.rs:495 / stage_sign.rs:992), THEN the
+            // business doc aborts on pool exhaustion.  That BEGIN is a legitimate
+            // issuance, so within such an op the seed DOES advance and ONE code
+            // IS consumed — a hard `seed == prior_tip` / `codes == codes_before`
+            // freeze is wrong here (both prod AND the model advance).  Assert
+            // STRUCTURALLY against the MODEL instead (mirrors the B3 recovered-
+            // drain pattern): the real seed-advance must equal the model's, and
+            // the real consumed-codes must equal the model's `codes_consumed`.
+            // TEETH PRESERVED: for the pure online-reject case (no BEGIN) the
+            // model advances NOTHING → the real seed must NOT move and NO code
+            // may be consumed — a prod that wrongly advanced/consumed on a refused
+            // doc still REDs (model_advanced=false ≠ real_advanced=true).
             oracle::OpClass::ExpectedNoIssuanceRow => {
                 if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
                     panic!("no-issuance-row differential on {op:?}: {d:?}");
@@ -2404,15 +2422,29 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
                     panic!("no-issuance-row ledger-delta on {op:?}: {d:?}");
                 }
+                // Seed advance is compared STRUCTURALLY (model synthetic hashes vs
+                // real crypto hashes never value-match): the real seed must CHANGE
+                // iff the model's did.  A refused doc with NO interposed BEGIN
+                // leaves both unmoved; a BEGIN interposition advances both.
+                let real_seed_after = ctx.read_seed().await;
+                let real_seed_advanced = real_seed_after.as_deref() != prior_tip.as_deref();
+                let model_seed_advanced = model.seed != seed_at_op_start;
                 assert_eq!(
-                    ctx.read_seed().await,
-                    prior_tip,
-                    "ExpectedNoIssuanceRow {op:?} advanced the seed (a refused row is NOT issued)"
+                    real_seed_advanced, model_seed_advanced,
+                    "ExpectedNoIssuanceRow {op:?} — real seed-advance ({real_seed_advanced}) \
+                     must match the model's ({model_seed_advanced}): a refused doc must not \
+                     advance the seed, but a co-interposed BEGIN legitimately does"
                 );
                 assert_eq!(
                     ctx.consumed_codes_count().await,
-                    codes_before,
-                    "ExpectedNoIssuanceRow {op:?} consumed a code (a refused row is NOT issued)"
+                    model.codes_consumed,
+                    "ExpectedNoIssuanceRow {op:?} — real consumed-codes must equal the model's \
+                     ({}): a refused doc consumes no code, but a co-interposed BEGIN consumes one",
+                    model.codes_consumed
+                );
+                assert!(
+                    model.codes_consumed >= codes_before as i64,
+                    "ExpectedNoIssuanceRow {op:?} sanity: model codes_consumed never decreases"
                 );
             }
         }
@@ -3680,4 +3712,257 @@ fn a3_assert_no_resend_catches_a_resend() {
 fn harness_crash_reboot_enforces_no_resend_postcond() {
     drive(&[Op::Crash(Stage::Send), Op::Reboot], false);
     drive(&[Op::Crash(Stage::Kvt1), Op::Reboot], false);
+}
+
+// ─── EPZ — видача готівки за ЕПЗ (cash advance) fuzzer ops ───────────────────
+
+/// EPZ happy-path differential: an online EPZ on a funded drawer (built by a
+/// prior SELL) issues `<C T='8'>` and matches the model.  EPZ is a genuine
+/// fuzzer op driven through the production inline path, not a side test.
+#[tokio::test]
+async fn differential_online_epz_issues_and_matches_model() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    // Fund the drawer with a SELL (CASH_AMOUNT_KOP) so guard-3c admits the EPZ.
+    let sell = Op::OnlineSell(DpsScript::ack_path());
+    let _ = model.apply(&sell);
+    let _ = interp::run_op(&mut ctx, &sell).await;
+
+    let prior_tip = ctx.read_seed().await;
+    let op = Op::OnlineEpz(DpsScript::ack_path());
+    let expected = model.apply(&op);
+    let real = interp::run_op(&mut ctx, &op).await;
+
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("online EPZ must match model: {d:?}"));
+    let epz_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'CASH_ADVANCE_EPZ' AND state = 'ACK'",
+    )
+    .bind(ctx.fn_id())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        epz_count, 1,
+        "interpreter must drive a real CASH_ADVANCE_EPZ doc to ACK"
+    );
+}
+
+/// ★TEETH — guard-3c (INV-21 готівка≥0).  An online EPZ on an EMPTY drawer is
+/// REFUSED in-lease (pre-mint, no fiscal_documents row); the model predicts
+/// NoMutation and the cash oracle stays at 0.  A SELL then funds the drawer and
+/// the EPZ issues, dropping cash to 0 (`− epz_out`).
+///
+/// REVERT TARGET: remove `DocType::CashAdvanceEpz` from the in-lease guard-3c
+/// cash-out set in `stage_acquire` → the empty-drawer EPZ mints + drives cash
+/// negative → the cash oracle diverges (prod < 0, model 0) → RED.
+#[tokio::test]
+async fn teeth_epz_guard_3c_over_drawer_refused() {
+    use interp::RealOutcome;
+    use model::CASH_AMOUNT_KOP;
+    use oracle::check_cash_on_hand;
+
+    // ── (a) empty drawer → EPZ refused in-lease, cash stays 0 ────────────────
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let out = interp::run_op(&mut ctx, &Op::OnlineEpz(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out, RealOutcome::Refused(_)),
+        "EPZ on empty drawer must be refused by in-lease guard-3c; got {out:?}"
+    );
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
+        .await
+        .expect("refused EPZ must leave cash at 0");
+
+    // ── (b) funded drawer (SELL) → EPZ issues, cash drops by CASH_AMOUNT_KOP ──
+    let out_sell = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_sell, RealOutcome::Doc(_)),
+        "SELL must issue to fund the drawer; got {out_sell:?}"
+    );
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), CASH_AMOUNT_KOP)
+        .await
+        .expect("cash after SELL == CASH_AMOUNT_KOP");
+    let out_epz = interp::run_op(&mut ctx, &Op::OnlineEpz(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out_epz, RealOutcome::Doc(_)),
+        "EPZ within drawer must issue; got {out_epz:?}"
+    );
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
+        .await
+        .expect("EPZ cash-out drops cash to 0 (− epz_out)");
+}
+
+/// ★TEETH — z-quiescence (#192/P1 class).  A non-terminal EPZ (an online EPZ
+/// held at SENT via `Ack, NotFound` — issued at SEND but not yet KVT1/ACK) MUST
+/// block an online Z-close: prod's `list_shift_pending_receipts_for_z_quiescence`
+/// counts the in-flight EPZ (SQL set includes `'CASH_ADVANCE_EPZ'`), so the Z is
+/// refused (`Z_QUIESCENCE_PENDING`), matching the model's `has_z_quiescence_blocker`.
+///
+/// REVERT TARGET: remove `'CASH_ADVANCE_EPZ'` from the z-quiescence SQL set in
+/// `fiscal_documents::list_shift_pending_receipts_for_z_quiescence` → prod closes
+/// the shift over the in-flight EPZ (mints a Z doc, shift → Closed) while the
+/// model still blocks (NoMutation) → the differential diverges → RED.
+#[tokio::test]
+async fn teeth_epz_z_quiescence_blocks_close() {
+    use interp::RealOutcome;
+
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let mut model = RefModel::new_online_open_shift();
+
+    // Fund the drawer so the EPZ is admitted by guard-3c.
+    let sell = Op::OnlineSell(DpsScript::ack_path());
+    let _ = model.apply(&sell);
+    let _ = interp::run_op(&mut ctx, &sell).await;
+
+    // EPZ held at SENT (issued at SEND, no KVT1/ACK) → a non-terminal blocker.
+    let epz = Op::OnlineEpz(DpsScript::send_ack_then_last_not_found());
+    let _ = model.apply(&epz);
+    let _ = interp::run_op(&mut ctx, &epz).await;
+
+    // Attempt an online Z-close.  The in-flight EPZ must block quiescence:
+    // model predicts NoMutation; prod refuses (Z_QUIESCENCE_PENDING) and does
+    // NOT close the shift.
+    let prior_tip = ctx.read_seed().await;
+    let z = Op::OnlineZReport(DpsScript::ack_path());
+    let expected = model.apply(&z);
+    let real = interp::run_op(&mut ctx, &z).await;
+
+    assert!(
+        matches!(expected, ExpectedOutcome::NoMutation),
+        "model must classify Z-over-in-flight-EPZ as NoMutation (quiescence blocked)"
+    );
+    assert!(
+        matches!(real, RealOutcome::Refused(_)),
+        "prod must refuse the Z-close while an in-flight EPZ blocks quiescence; got {real:?}"
+    );
+    oracle::check_differential(&real, &expected, prior_tip.as_deref())
+        .unwrap_or_else(|d| panic!("EPZ z-quiescence block must match model: {d:?}"));
+    assert_ne!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "the shift must NOT close over an in-flight EPZ (z-quiescence)"
+    );
+}
+
+/// ★TEETH — B10 lazy-BEGIN interposition inside a refused (NoIssuanceRow) op.
+/// This is the deterministic analog of the seeded divergence the fuzzer surfaced
+/// (`harness_offline_seeded`, seed `[Crash(Sign), RepeatReboot, Crash(Sign),
+/// RepeatReboot, OfflineEpz]`): an OFFLINE cash-out (`OfflineEpz`) that is the
+/// FIRST offline doc of a session over a pool with EXACTLY ONE free code.  Prod
+/// (and the model) FIRST interpose an issued DocType=9 OFFLINE_SESSION_BEGIN —
+/// its own committed OLA envelope consumes the last code + advances the MAC seed
+/// (stage_offline_ack.rs:495 / stage_sign.rs:992) — THEN the business doc aborts
+/// on `CodePoolExhausted` → a non-issued `Aborted` row.  The op is classified
+/// `ExpectedNoIssuanceRow` (its business doc is refused), yet the seed DID move
+/// and ONE code WAS consumed by the legitimate BEGIN.  `run_harness` drives the
+/// corrected `ExpectedNoIssuanceRow` arm, which compares the real seed-advance /
+/// consumed-codes STRUCTURALLY against the model (both advance) rather than
+/// hard-freezing them — so this completes without panicking.
+///
+/// REVERT TARGET (proven RED): in the `ExpectedNoIssuanceRow` arm of
+/// `run_harness`, restore the old hard freeze
+///   `assert_eq!(ctx.read_seed().await, prior_tip, ...)`
+///   `assert_eq!(ctx.consumed_codes_count().await, codes_before, ...)`
+/// (replacing the structural model-referenced checks).  The interposed BEGIN's
+/// legitimate seed-advance + code-consume then trip both asserts → this test
+/// REDs.  Restoring the structural checks makes it GREEN — the model+prod agree
+/// on every durable fact, so the refusal oracle must credit the BEGIN's issuance.
+#[tokio::test]
+async fn teeth_offline_begin_interposition_in_refused_op_is_structurally_oracle_checked() {
+    // Exactly ONE offline code: the BEGIN consumes it, leaving the business doc
+    // pool-exhausted → Aborted.
+    let ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    let model = RefModel::new_offline_open_shift(1);
+    // `OfflineEpz` (offline cash-out) as the FIRST offline doc → BEGIN interposed,
+    // business doc aborts.  A pre-fix hard-freeze NoIssuanceRow arm panics on the
+    // BEGIN's seed-advance / code-consume; the structural arm accepts it.
+    let _ = run_harness(&[Op::OfflineEpz], ctx, model).await;
+}
+
+// ─── L5 — fail-closed pre-inbox input guards (G1..G4) fuzzer ops ─────────────
+//
+// The L5 guards live in `convert.rs` (pre-inbox), UPSTREAM of `inline::run`
+// where every other SELL op enters.  `Op::L5Probe` is the ONE op that drives a
+// SELL through `convert_to_signer_payload`, so the guards actually fire.  The
+// model predicts `NoMutation` for each violation (INDEPENDENT of prod — it
+// follows from the guard's fail-closed contract), and `run_harness`'s
+// `ExpectedNoMutation` machinery asserts prod minted NO fiscal_documents row.
+//
+// ★TEETH (empirical, per guard — proven revert→RED→restore, run by the
+// implementer): reverting a prod guard makes `convert` ADMIT the violation ⇒
+// the probe seeds the inbox + `inline::run` ISSUES a row ⇒ prod mints a row the
+// model says must not exist ⇒ the harness's `ExpectedNoMutation {op} minted a
+// fiscal_documents row` assertion RED.  Each test names its REVERT TARGET.
+
+/// ★TEETH G1 — CashCapExceeded.  A SELL with a single cash leg of 5_000_000 kop
+/// (Σ cash > the 4_999_999 cap) is refused pre-inbox by G1 (no row).
+///
+/// REVERT TARGET: delete the `CashCapExceeded` check in convert.rs's Sell arm →
+/// convert admits the over-cap SELL → the probe issues a row → the model's
+/// NoMutation vs the minted row → RED.
+#[test]
+fn teeth_l5_g1_cash_over_cap_refused_pre_inbox() {
+    drive(&[Op::L5Probe(L5Kind::OverCap)], false);
+}
+
+/// ★TEETH G2 — ZeroPriceLine.  A SELL good priced 0 (item_sum_kop == 0) is
+/// refused pre-inbox by G2 (no row).
+///
+/// REVERT TARGET: delete the `ZeroPriceLine` check in convert.rs's Sell|Return
+/// arm → convert admits the zero-price line → the probe issues a row → RED.
+#[test]
+fn teeth_l5_g2_zero_price_line_refused_pre_inbox() {
+    drive(&[Op::L5Probe(L5Kind::ZeroPrice)], false);
+}
+
+/// ★TEETH G3 — ZeroPaymentAmount.  A SELL with a zero-amount cash leg (alongside
+/// a card leg that covers the good) is refused pre-inbox by G3 (no row).
+///
+/// REVERT TARGET: delete the `ZeroPaymentAmount` check in convert.rs's Sell|Return
+/// arm → convert admits the zero-value payment → the probe issues a row → RED.
+#[test]
+fn teeth_l5_g3_zero_payment_amount_refused_pre_inbox() {
+    drive(&[Op::L5Probe(L5Kind::ZeroPayment)], false);
+}
+
+/// ★TEETH G4 — UnderpaymentRefused.  A SELL of a 1000-kop good paid by a 900-kop
+/// cash leg (Σpayments < Σgoods, payments present) is refused pre-inbox by G4
+/// (no row).
+///
+/// REVERT TARGET: delete the `UnderpaymentRefused` check in convert.rs's Sell arm
+/// → convert admits the underpaid SELL → the probe issues a row → RED.
+#[test]
+fn teeth_l5_g4_underpayment_refused_pre_inbox() {
+    drive(&[Op::L5Probe(L5Kind::Underpaid)], false);
+}
+
+/// L5 control — a VALID SELL (good 15_000 kop paid in full by cash) converts
+/// through `convert_to_signer_payload` and ISSUES via `inline::run`, matching the
+/// model's ordinary online-SELL mutation.  Proves the probe lane is not
+/// vacuously always-refusing (the guards admit a well-formed SELL).
+#[test]
+fn l5_probe_valid_sell_converts_and_issues() {
+    let count = drive_counting(&[Op::L5Probe(L5Kind::Valid)], false);
+    assert_eq!(count, 1, "a valid L5 probe SELL must issue exactly one doc");
+}
+
+/// L5 — a SELL through the probe lane then a subsequent ordinary op stays in
+/// sync: the Valid probe funds the drawer (issued cash SELL) and a following
+/// ordinary online SELL issues on top, so the probe lane composes with the rest
+/// of the alphabet (the harness model/differential/scans all run).
+#[test]
+fn l5_probe_valid_then_ordinary_sell_composes() {
+    let count = drive_counting(
+        &[
+            Op::L5Probe(L5Kind::Valid),
+            Op::OnlineSell(DpsScript::ack_path()),
+        ],
+        false,
+    );
+    assert_eq!(
+        count, 2,
+        "valid probe SELL + ordinary SELL → two issued docs"
+    );
 }

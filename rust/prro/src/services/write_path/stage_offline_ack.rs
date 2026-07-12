@@ -296,6 +296,9 @@ pub async fn run(
                 | DocType::ServiceIn
                 | DocType::ServiceOut
                 | DocType::CashWithdrawal
+                // EPZ — видача готівки за ЕПЗ rides the regular-fiscal offline
+                // shift-state surface (Opened | OpenedLocalPendingDrain).
+                | DocType::CashAdvanceEpz
                 | DocType::XReport => matches!(
                     ns.shift_state,
                     ShiftState::Opened | ShiftState::OpenedLocalPendingDrain,

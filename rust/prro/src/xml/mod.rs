@@ -810,6 +810,43 @@ pub struct ServiceCheckPayload {
     pub amount_kop: i64,
 }
 
+/// EPZ — видача готівки за ЕПЗ (cash advance against a card).
+///
+/// DPS wire (compact `<C T='8'>`, from WebCheck `StringXML` — the DealCheck
+/// transform of `ClassFiscal.EPZtoCash`'s verbose `operationtype='-8'`, where
+/// `num17 = Math.Abs(-8) = 8`).  Body:
+///   `<C T='8'><P N='1' C='0' NM='{label}' SM='{sum}' Q='1000' PRC='{sum}'/>`
+///   (NO `TX` — StringXML.cs:1424-1427 skips tax for -8)
+///   `<M N='2' T='0' NM='{card}' SM='{sum}' PA.. RRN/>` (card leg)
+///   `<E N='3' .../>`
+/// The cash-out is a LEDGER effect (`− epz_out`), NOT a cash `<M>` line.
+#[derive(Debug, Clone)]
+pub struct EpzCheckPayload {
+    pub header: DocumentHeader,
+    /// Per-FN local document number (`<DAT DI=...>`).
+    pub local_number: u32,
+    /// Operation sum (kopecks) — good SM/PRC + card `<M>` SM.
+    pub sum_kop: i64,
+    /// Fixed good code (`<P C=>`).
+    pub code: String,
+    /// Fixed cash-advance good label (`<P NM=>`).
+    pub name: String,
+    /// Card payment-form index — the `<M T=>` code is `paymentid − 1` (WebCheck
+    /// PayForms ordering); WebCheck forces `T='0'` on the -8 `<M>` (StringXML
+    /// :998).  We carry the real slot so the wire is faithful.
+    pub paymentid: i64,
+    /// Card payment-form display name (`<M NM=>`).
+    pub pay_name: String,
+    /// Card / acquirer requisites (`<M PA..RRN>`); empty → attr omitted.
+    pub pa: String,
+    pub pb: String,
+    pub pc: String,
+    pub pd: String,
+    pub pe: String,
+    pub psnm: String,
+    pub rrn: String,
+}
+
 /// Top-level discriminated wrapper consumed by `build_canonical_xml`.
 #[derive(Debug, Clone)]
 pub enum CanonicalDoc {
@@ -830,6 +867,8 @@ pub enum CanonicalDoc {
     ServiceIn(ServiceCheckPayload),
     /// L3 — service cash-out (`<C T='2'>…<O N='1' T='0' SM=…/>…`).
     ServiceOut(ServiceCheckPayload),
+    /// EPZ — видача готівки за ЕПЗ (`<C T='8'>` + good + card `<M>`).
+    CashAdvanceEpz(EpzCheckPayload),
 }
 
 // ─── Build entry point ────────────────────────────────────────────────
@@ -867,6 +906,7 @@ pub fn build_canonical_xml(doc: &CanonicalDoc) -> Result<Vec<u8>, XmlBuildError>
         CanonicalDoc::OfflineSessionEnd(p) => emit_offline_session_boundary(p, "110", &mut out),
         CanonicalDoc::ServiceIn(p) => emit_service_check(p, true, &mut out),
         CanonicalDoc::ServiceOut(p) => emit_service_check(p, false, &mut out),
+        CanonicalDoc::CashAdvanceEpz(p) => emit_epz_check(p, &mut out),
     }
     cp1251::encode(&out)
 }
@@ -940,6 +980,95 @@ fn emit_service_check(p: &ServiceCheckPayload, is_in: bool, out: &mut String) {
     // <E N='2'/> — closing element (WebCheck :2642)
     tag_attrs(out, "E", &[("N", "2")]);
     close(out, "E");
+    close(out, "C");
+    tag_text(out, "TS", &h.ts_str);
+    close(out, "DAT");
+    emit_mac(out, h);
+    close(out, "RQ");
+}
+
+/// EPZ — видача готівки за ЕПЗ (cash advance against a card).
+///
+/// DPS wire = compact `<C T='8'>` (WebCheck `StringXML` DealCheck-transform of
+/// `ClassFiscal.EPZtoCash`'s verbose `operationtype='-8'`, `num17=abs(-8)=8`).
+/// Body (StringXML.cs:931-1035, opertyp=-8 branch):
+///   `<C T='8'>`
+///   `<P N='1' C='{code}' NM='{label}' SM='{sum}' Q='1000' PRC='{sum}'/>`
+///     — NO `TX` (tax is SKIPPED for -8, StringXML.cs:1424-1427)
+///   `<M N='2' T='0' NM='{card}' SM='{sum}' PA.. RRN/>` — card leg, T='0'
+///   `<E N='3' FN=.. NO=.. SM=.. TS=..>`
+/// The cash-out is a LEDGER effect (`− epz_out`), NOT a cash `<M>` line.
+fn emit_epz_check(p: &EpzCheckPayload, out: &mut String) {
+    let h = &p.header;
+    open_rq(out, h);
+    let di = p.local_number.to_string();
+    open_dat(out, h, &di);
+    // <C T='8'> — EPZ check type (num17 = abs(operationtype -8) = 8).
+    tag_attrs(out, "C", &[("T", "8")]);
+
+    let sm = p.sum_kop.to_string();
+    // <P> good — fixed cash-advance line, quantity 1 (thousandths = 1000),
+    // price == sum.  NO `TX` attribute (EPZ is not a VAT good).
+    tag_attrs(
+        out,
+        "P",
+        &[
+            ("C", &p.code),
+            ("N", "1"),
+            ("NM", &p.name),
+            ("PRC", &sm),
+            ("Q", "1000"),
+            ("SM", &sm),
+        ],
+    );
+    close(out, "P");
+
+    // <M> card leg — T='0' (WebCheck forces T='0' on the -8 <M>, StringXML:998).
+    // Slip attrs emitted only when non-empty (mirror Python skip-falsy).
+    let mut m_attrs: Vec<(&str, &str)> = Vec::with_capacity(12);
+    m_attrs.push(("N", "2"));
+    m_attrs.push(("NM", &p.pay_name));
+    m_attrs.push(("SM", &sm));
+    m_attrs.push(("T", "0"));
+    if !p.pa.is_empty() {
+        m_attrs.push(("PA", &p.pa));
+    }
+    if !p.pb.is_empty() {
+        m_attrs.push(("PB", &p.pb));
+    }
+    if !p.pc.is_empty() {
+        m_attrs.push(("PC", &p.pc));
+    }
+    if !p.pd.is_empty() {
+        m_attrs.push(("PD", &p.pd));
+    }
+    if !p.pe.is_empty() {
+        m_attrs.push(("PE", &p.pe));
+    }
+    if !p.psnm.is_empty() {
+        m_attrs.push(("PSNM", &p.psnm));
+    }
+    if !p.rrn.is_empty() {
+        m_attrs.push(("RRN", &p.rrn));
+    }
+    tag_attrs(out, "M", &m_attrs);
+    close(out, "M");
+
+    // <E> closing — FN / N / NO / SM / TS (ФСКО Table 23, like SELL/RETURN).
+    let e_no = p.local_number.to_string();
+    tag_attrs(
+        out,
+        "E",
+        &[
+            ("FN", &h.fiscal_number),
+            ("N", "3"),
+            ("NO", &e_no),
+            ("SM", &sm),
+            ("TS", &h.ts_str),
+        ],
+    );
+    close(out, "E");
+
     close(out, "C");
     tag_text(out, "TS", &h.ts_str);
     close(out, "DAT");
