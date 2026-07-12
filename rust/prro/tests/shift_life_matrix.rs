@@ -1,32 +1,37 @@
-//! SHIFT-LIFE MATRIX — full-stack scenario harness through the LIVE binding.
+//! SHIFT-LIFE MATRIX — full-stack scenario harness through the REAL INGRESS.
 //!
 //! Operator's directive (2026-07-12): stop verifying the online↔offline
 //! transition matrix cell-by-cell with isolated unit tests. Instead **stand the
 //! product up**, feed it GENERATED packets of receipts under different shift
-//! variants, run each through the WHOLE real path (ingress → write-path →
-//! transport) with legible logging, and **halt on the first divergence**. The
-//! only thing faked is the network (`MatrixDps` — a stateful, fault-injectable
-//! `DpsChannel` whose `online` flag models a real net drop).
+//! variants, run each through the WHOLE real path with legible logging, and
+//! **halt on the first divergence**. The only thing faked is the network
+//! (`MatrixDps` — a stateful, fault-injectable `DpsChannel` whose `online` flag
+//! models a real net drop).
 //!
-//! WHAT IS REAL: `App::boot` (real SQLite, real migrations), the real per-FN
-//! signing context, the real registry, the real `production_write_path` /
-//! `InlineWritePath` binding, the real ingress seam (`WritePathEntry::fiscalize`
-//! — every command enters exactly as the ingress handler drives it), the real
-//! staged pipeline, the real offline lane, the real live GO_OFFLINE / GO_ONLINE
-//! doors, and the real drain. ONLY the DPS transport is a stub.
+//! INGRESS IS UNDER TEST (Increment 2): scenarios drive WIRE-shape
+//! `CanonicalCommand`s (the `maria304`/WebCheck wire dialect — `price_kopecks`,
+//! `quantity_milli`, `type:"CASH"`) through the REAL ingress core
+//! `handler::handle_command` → command-class classify → wire→signer `convert`
+//! → idempotent inbox insert → the live `production_write_path` binding →
+//! staged pipeline. So convert + classify + inbox are exercised, not bypassed.
+//! (`handle_command` is the axum-free core the REST `/v1/ingress/webcheck` route
+//! wraps — the same seam a future WebCheck-XML adapter will feed.)
+//!
+//! WHAT IS REAL: `App::boot` (real SQLite + migrations), the real per-FN signing
+//! context, the real registry, the real ingress core, the real staged pipeline,
+//! the real offline lane, the real live GO_OFFLINE / GO_ONLINE doors, and the
+//! real drain. ONLY the DPS transport is a stub.
 //!
 //! WHY in-process (not a spawned OS process over HTTP): the transition-matrix
-//! goal is state correctness across online↔offline↔drain, which is faster,
-//! deterministic, and directly assertable in-process. The OS-process / HTTP-
-//! adapter-wire layer is an orthogonal concern (does the REST adapter translate
-//! bytes correctly) — a candidate follow-up harness, not this one.
+//! goal is state correctness across online↔offline↔drain — faster, determin-
+//! istic, and directly assertable in-process. The axum HTTP wire (routing +
+//! source-allowlist + JSON deser) is thin and already unit-tested in `server.rs`;
+//! a full-socket harness is a candidate follow-up, not this one.
 //!
-//! HOW IT DIFFERS from the pilot e2e tests (`pilot_online_half_e2e`,
-//! `pilot_offline_full_drill_e2e`): those replay THREE hardcoded receipts. This
-//! harness GENERATES varied packets (`gen_sell` — varied item counts, prices,
-//! cash/card payforms) so genuinely diverse documents flow through the path
-//! under scripted shift compositions. "Они без новых документов" — this one is
-//! not.
+//! HOW IT DIFFERS from the pilot e2e tests: those replay THREE hardcoded
+//! receipts. This harness GENERATES varied packets (`gen_line_and_pay` — varied
+//! item counts, prices, cash/card payforms). "Они без новых документов" — this
+//! one is not.
 //!
 //! HALT-ON-ERROR: `invariant_scan::assert_clean` runs after EVERY step; any
 //! illegal non-terminal doc at a quiescent boundary (the #192 / P1 ledger-pin)
@@ -39,21 +44,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 
 use prro::app::App;
 use prro::config::AppConfig;
 use prro::crypto::session::SigningSession;
 use prro::db::models::enums::{DocState, FiscalMode, NodeMode, Protocol, ShiftState};
-use prro::db::models::ids::RequestId;
-use prro::db::repositories::ingress_inbox::{
-    self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
-};
+use prro::db::models::ids::DriverId;
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
+use prro::runtime::ingress::dto::CanonicalCommand;
+use prro::runtime::ingress::handler::{handle_command, IngressBody};
 use prro::runtime::ingress::inline_binding::production_write_path;
-use prro::runtime::ingress::seam::{FiscalError, FiscalOutcome, WritePathEntry};
+use prro::runtime::ingress::seam::WritePathEntry;
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
@@ -67,9 +70,6 @@ use sqlx::SqlitePool;
 use common::{det_signing_ctx, det_signing_ctx_for};
 
 const FN: &str = "4000000042";
-const CASHIER: &str = "test-cashier";
-const DRIVER: &str = "drv-test";
-const SHIFT_OPEN_PAYLOAD: &str = r#"{"opening_sum_kop":0}"#;
 const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
 
 // ════════════════════════════════════════════════════════════════════════
@@ -203,35 +203,59 @@ impl DpsChannel for MatrixDps {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Packet generator — varied receipts (NOT one canned check)
+// Packet generator — varied WIRE-shape receipts (NOT one canned check)
 // ════════════════════════════════════════════════════════════════════════
 
-/// Deterministic-from-`seed` SELL payload with varied item count (1–3),
-/// varied per-item prices, and alternating cash/card payform. Returns
-/// `(payload_json, total_kop)`. Reproducible: same seed → same packet.
-fn gen_sell(seed: u64) -> (String, i64) {
+/// Deterministic-from-`seed` line + payment set: varied item count (1–3),
+/// varied per-item prices, alternating cash/card payform. Returns the WIRE
+/// `goods` + `payments` JSON fragments and the total. Reproducible.
+fn gen_line_and_pay(seed: u64) -> (String, String, i64) {
     let n_items = 1 + (seed % 3) as usize;
-    let mut items = String::new();
+    let mut goods = String::new();
     let mut total: i64 = 0;
     for k in 0..n_items {
         let price = 1000 + (((seed >> (k * 3)) % 90) as i64 + 1) * 100; // 1100..=10000
         total += price;
         if k > 0 {
-            items.push(',');
+            goods.push(',');
         }
-        items.push_str(&format!(
-            r#"{{"code":"item-{k}","name":"Item {k}","price_kop":{price},"quantity_thousandths":1000,"sum_kop":{price}}}"#
+        goods.push_str(&format!(
+            r#"{{"name":"Item {k}","quantity_milli":1000,"price_kopecks":{price},"tax_group_1":1,"tax_group_2":0,"article_code":{}}}"#,
+            k + 1
         ));
     }
-    let (name, type_code) = if seed % 2 == 0 {
-        ("Cash", "0")
+    let kind = if seed.is_multiple_of(2) {
+        "CASH"
     } else {
-        ("Card", "1")
+        "CASHLESS_1"
     };
-    let payload = format!(
-        r#"{{"items":[{items}],"payments":[{{"name":"{name}","sum_kop":{total},"type_code":"{type_code}"}}]}}"#
+    let payments = format!(r#"[{{"type":"{kind}","amount_kopecks":{total}}}]"#);
+    (goods, payments, total)
+}
+
+/// A wire `CanonicalCommand` for a SELL keyed by `seed`.
+fn sell_body(seed: u64, idem: &str) -> (String, i64) {
+    let (goods, payments, total) = gen_line_and_pay(seed);
+    let body = format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SELL","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[{goods}],"payments":{payments},"totals":{{"sale_kopecks":{total},"return_kopecks":0}}}}}}"#
     );
-    (payload, total)
+    (body, total)
+}
+
+/// A wire `CanonicalCommand` for a RETURN keyed by `seed`.
+fn return_body(seed: u64, idem: &str) -> (String, i64) {
+    let (goods, payments, total) = gen_line_and_pay(seed);
+    let body = format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"RETURN","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"RETURN","goods":[{goods}],"payments":{payments},"totals":{{"sale_kopecks":0,"return_kopecks":{total}}}}}}}"#
+    );
+    (body, total)
+}
+
+/// A wire `CanonicalCommand` for a payload-less op (SHIFT_OPEN / Z_REPORT).
+fn simple_body(command_type: &str, idem: &str) -> String {
+    format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"{command_type}","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+    )
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -316,6 +340,13 @@ async fn build_registry(app: &App, dps: Arc<dyn DpsChannel>) -> BindingsRegistry
     )
     .await
     .expect("seed operator");
+    // Real per-FN default provisioning (tax_groups 1..11 + payment_methods
+    // cash=1/card=2 + outgress profile + integration flags) — the SAME
+    // production path `admin::register_fn` runs. The ingress `convert` needs
+    // these (tax-group + payment-method lookups) or it breaches / rejects.
+    prro::runtime::bootstrap::bootstrap_fn_defaults(app.db_secure(), FN)
+        .await
+        .expect("bootstrap FN defaults");
     BindingsRegistry::build_from_db(app.db_secure(), app.db(), dps, &FixtureLoader)
         .await
         .expect("build_from_db")
@@ -337,38 +368,31 @@ async fn seed_boot_baseline(pool: &SqlitePool) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Ingress driver + probes
+// Ingress driver (through the REAL ingress core) + probes
 // ════════════════════════════════════════════════════════════════════════
 
-fn entry(op: &str, payload: &str, idem: &str, total: Option<i64>) -> NewInboxEntry {
-    let request_id: [u8; 16] = *RequestId::new().as_bytes();
-    let payload_sha256_canonical: [u8; 32] = Sha256::digest(payload.as_bytes()).into();
-    NewInboxEntry {
-        request_id,
-        fiscal_number: FN.into(),
-        protocol: Protocol::Rest,
-        operation_type: op.into(),
-        idempotency_key: idem.into(),
-        payload_json: payload.into(),
-        payload_sha256_canonical,
-        correlation_id: None,
-        signed_by_cashier_id: Some(CASHIER.into()),
-        driver_id: Some(DRIVER.into()),
-        business_ts: Some("2026-07-12T12:00:00Z".into()),
-        total_sum_kop: total,
+/// Drive one wire `CanonicalCommand` (JSON body) through the REAL ingress core:
+/// `handle_command` → classify → convert → inbox → live binding → pipeline.
+/// Returns `(http_status, document_state | "ERR:<code>")`.
+async fn drive_ingress(app: &App, wp: &dyn WritePathEntry, body: &str) -> (u16, String) {
+    let cmd: CanonicalCommand = serde_json::from_str(body).expect("parse wire CanonicalCommand");
+    let resp = handle_command(
+        &cmd,
+        FN,
+        DriverId::new("drv-test").unwrap(),
+        Protocol::Rest,
+        app.db(),
+        app.db_secure(),
+        wp,
+    )
+    .await;
+    match resp.body {
+        IngressBody::Success(cr) => (resp.http_status, cr.document_state),
+        IngressBody::Error(er) => (
+            resp.http_status,
+            format!("ERR:{} ({})", er.error_code, er.error_message),
+        ),
     }
-}
-
-async fn drive(
-    wp: &dyn WritePathEntry,
-    pool: &SqlitePool,
-    entry: NewInboxEntry,
-) -> Result<FiscalOutcome, FiscalError> {
-    let row: InboxRow = match inbox::insert(pool, &entry).await.unwrap() {
-        InboxInsertOutcome::Created(row) => row,
-        other => panic!("expected a fresh Created inbox row, got {other:?}"),
-    };
-    wp.fiscalize(&row).await
 }
 
 async fn node_row(pool: &SqlitePool) -> (String, String) {
@@ -457,7 +481,7 @@ enum Action {
     GoOnlineDrain,
 }
 
-/// Run a scenario end-to-end through the live binding, logging every step and
+/// Run a scenario end-to-end through the real ingress, logging every step and
 /// asserting the ledger invariant scan after each. HALTS (panics with the log
 /// printed above) on the first divergence.
 async fn run(
@@ -471,90 +495,58 @@ async fn run(
     for (i, act) in steps.iter().enumerate() {
         let outcome: String = match act {
             Action::Open => {
-                let out = drive(
+                let (status, state) = drive_ingress(
+                    app,
                     wp,
-                    app.db(),
-                    entry(
-                        "SHIFT_OPEN",
-                        SHIFT_OPEN_PAYLOAD,
-                        &format!("mx-{name}-OPEN-{i}"),
-                        None,
-                    ),
+                    &simple_body("SHIFT_OPEN", &format!("mx-{name}-OPEN-{i}")),
                 )
-                .await
-                .expect("SHIFT_OPEN must reach terminal ACK (net up)");
-                assert_eq!(out.document_state, DocState::Ack, "SHIFT_OPEN → ACK");
+                .await;
+                assert_eq!(state, DocState::Ack.as_str(), "SHIFT_OPEN → ACK [{status}]");
                 assert_eq!(
                     shift_state(app.db()).await,
                     "OPENED",
                     "shift OPENED after open"
                 );
-                format!("SHIFT_OPEN → {:?}", out.document_state)
+                format!("SHIFT_OPEN → {state} [{status}]")
             }
             Action::Sell(seed) => {
-                let (payload, total) = gen_sell(*seed);
-                let out = drive(
-                    wp,
-                    app.db(),
-                    entry(
-                        "SELL",
-                        &payload,
-                        &format!("mx-{name}-SELL-{i}"),
-                        Some(total),
-                    ),
-                )
-                .await
-                .unwrap_or_else(|e| panic!("SELL step {i} (seed {seed}) errored: {e:?}"));
+                let (body, total) = sell_body(*seed, &format!("mx-{name}-SELL-{i}"));
+                let (status, state) = drive_ingress(app, wp, &body).await;
                 let mode = node_row(app.db()).await.0;
                 let want = if mode == "OFFLINE" {
-                    DocState::OfflineLocalAck
+                    DocState::OfflineLocalAck.as_str()
                 } else {
-                    DocState::Ack
+                    DocState::Ack.as_str()
                 };
-                assert_eq!(
-                    out.document_state, want,
-                    "SELL step {i}: mode={mode} → expected {want:?}"
-                );
-                format!("SELL(seed={seed},total={total}) → {:?}", out.document_state)
+                assert_eq!(state, want, "SELL step {i}: mode={mode} status={status}");
+                format!("SELL(seed={seed},total={total}) → {state} [{status}]")
             }
             Action::Return(seed) => {
-                let (payload, total) = gen_sell(*seed);
-                let out = drive(
-                    wp,
-                    app.db(),
-                    entry(
-                        "RETURN",
-                        &payload,
-                        &format!("mx-{name}-RET-{i}"),
-                        Some(total),
-                    ),
-                )
-                .await
-                .unwrap_or_else(|e| panic!("RETURN step {i} (seed {seed}) errored: {e:?}"));
+                let (body, total) = return_body(*seed, &format!("mx-{name}-RET-{i}"));
+                let (status, state) = drive_ingress(app, wp, &body).await;
                 let mode = node_row(app.db()).await.0;
                 let want = if mode == "OFFLINE" {
-                    DocState::OfflineLocalAck
+                    DocState::OfflineLocalAck.as_str()
                 } else {
-                    DocState::Ack
+                    DocState::Ack.as_str()
                 };
-                assert_eq!(out.document_state, want, "RETURN step {i}: mode={mode}");
-                format!("RETURN(seed={seed}) → {:?}", out.document_state)
+                assert_eq!(state, want, "RETURN step {i}: mode={mode} status={status}");
+                format!("RETURN(seed={seed},total={total}) → {state} [{status}]")
             }
             Action::ZClose => {
-                let out = drive(
+                let (status, state) = drive_ingress(
+                    app,
                     wp,
-                    app.db(),
-                    entry("Z_REPORT", "{}", &format!("mx-{name}-Z-{i}"), None),
+                    &simple_body("Z_REPORT", &format!("mx-{name}-Z-{i}")),
                 )
-                .await
-                .expect("Z_REPORT must close the shift and reach terminal ACK");
-                assert_eq!(out.document_state, DocState::Ack, "Z → ACK");
+                .await;
+                assert_eq!(state, DocState::Ack.as_str(), "Z → ACK [{status}]");
                 assert_eq!(
                     shift_state(app.db()).await,
                     "CLOSED",
                     "shift CLOSED after Z"
                 );
-                format!("Z_REPORT → {:?} (shift CLOSED)", out.document_state)
+                format!("Z_REPORT → {state} [{status}] (shift CLOSED)")
             }
             Action::NetDown => {
                 dps.set_online(false);
@@ -600,7 +592,6 @@ async fn run(
                         panic!("drain must run, not skip-backoff")
                     }
                 }
-                // Convergence: no OLA left, node back ONLINE.
                 assert_eq!(
                     doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await,
                     0,
@@ -641,12 +632,12 @@ async fn fresh_harness() -> (App, Arc<MatrixDps>, Arc<dyn WritePathEntry>) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Increment 1 scenarios — harness self-proof on KNOWN-GREEN paths
+// Increment 1/2 scenarios — harness self-proof on KNOWN-GREEN paths
 // ════════════════════════════════════════════════════════════════════════
 
 /// S1 — online happy life: open, three VARIED sells, one return, close.
-/// Proves the harness drives varied generated packets through the real path to
-/// terminal ACK on a clean scan at every step.
+/// Proves the harness drives varied generated packets through the REAL ingress
+/// to terminal ACK on a clean scan at every step.
 #[tokio::test]
 async fn matrix_s1_online_happy_varied_packets() {
     let (app, dps, wp) = fresh_harness().await;
@@ -664,7 +655,8 @@ async fn matrix_s1_online_happy_varied_packets() {
 /// S2 — offline lifecycle: open online, sell online, DROP the net, go offline,
 /// sell/return offline (OLA), restore the net, go online + drain (converge),
 /// then close with a Z. This is the core online↔offline↔drain transition the
-/// operator flagged as "only think it works" — now watched end-to-end.
+/// operator flagged as "only think it works" — now watched end-to-end through
+/// the real ingress.
 #[tokio::test]
 async fn matrix_s2_offline_lifecycle_drain_close() {
     let (app, dps, wp) = fresh_harness().await;
