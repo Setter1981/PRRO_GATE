@@ -27,5 +27,6 @@ cc 8c6453e4ea6cd684a2358f872cb4efbde0b1970213b5900dbcb69175bacf0ac3 # shrinks to
 cc 5685661535fcdd2f2417f531d7dd8454a61552d32cbff19724cdb718d9826ef8 # shrinks to ops = [SellWithClosedShift, OfflineShiftOpen, GoOnline(DpsScript([Ack, NotFound])), Drain(DpsScript([Ack, Ack]))]
 cc e742fddcc901fb4722076f9b1f28b49ce2ecd9fca576b084c7a759a04a587626 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), SellWithClosedShift, OnlineShiftOpen(DpsScript([Ack, Ack])), OnlineReturn(DpsScript([Ack, Ack]))]
 cc c551252847528ea6eb9bbd690b60ed939fc40157e7daddf5b1abc0f438937266 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), GoOnline(DpsScript([Ack, Ack])), OfflineServiceIn]
+cc b6e0a374dcdcd7e319180382e53ff72ae5d3689a2b9ba218293e64892277c450 # shrinks to ops = [OnlineSell(DpsScript([Ack, Ack])), GoOnline(DpsScript([Ack, Ack])), OnlineZReport(DpsScript([Superseded]))]
 cc 339c70fee74cc696b33b43f2f0521a576fb7e3d5292d2d6eb364de0fb702a7cf # shrinks to ops = [L5Probe(Valid)]
 cc c4e3d972ba0e328c66fb78fd0e6eb56511f15fef89bf097e31289e9affb575ed # shrinks to ops = [Crash(Sign), RepeatReboot, Crash(Sign), RepeatReboot, OfflineEpz]

@@ -28,13 +28,29 @@ fn dps_script() -> impl Strategy<Value = DpsScript> {
 
 /// Tier-1 shift/Z generator slice.  ACK is the happy path; `Ack, NotFound`
 /// covers the D5 held-at-SENT path; Reject exercises the shift RMR lane.
-/// `Superseded` stays held out as the PRRO_GATE-eid known-red until the
-/// production/model contract is resolved.
+///
+/// RAGE W1 (PRRO_GATE-eid resolved): `Superseded` is now exercised on live
+/// SHIFT_OPEN / Z_REPORT sends.  Contract adjudicated (prod=correct, model=gap):
+/// prod routes `ServerFiscalIdMismatch` doc-type-agnostically to
+/// `ErrorRetryable` (`error_routing.rs:350`, `WrapperBug`, CRITICAL — W9
+/// escalates to RMR downstream, NOT at send).  The doc-state prediction was
+/// already right — `online_outcome_state`'s `_` arm returns `ErrorRetryable`
+/// (`model.rs:1464`), no seed advance, no `Rejected` RMR escalation.  The gap
+/// was `shift_state`: prod stamps the mid-lifecycle state at ACQUIRE
+/// (SHIFT_OPEN → `Opening`, `stage_acquire.rs:883-910`; Z_REPORT → `Closing`,
+/// `stage_acquire.rs:917-935`) and the confirm edge runs ONLY on
+/// `WireDecision::Sent` (`stage_send.rs:1758`), so a retryable send leaves the
+/// shift resting at `Opening` / `Closing` (no rollback).  The model's
+/// `apply_online_shift_open` / `apply_online_z_report` previously left the
+/// shift at its PRE-op state (`Closed` / `Opened`) on the `ErrorRetryable`
+/// fall-through — fixed to persist the acquire-time mid-state (TEST-ONLY model
+/// change; the Ack / [Ack,NotFound] / Reject arms are unchanged).
 fn shift_dps_script() -> impl Strategy<Value = DpsScript> {
     prop_oneof![
         Just(DpsScript::ack_path()),
         Just(DpsScript::send_ack_then_last_not_found()),
         Just(DpsScript::send_then_reject()),
+        Just(DpsScript::superseded_tip()),
     ]
 }
 
