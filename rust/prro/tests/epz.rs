@@ -323,6 +323,36 @@ async fn pin_epz_wire_c_type_8() {
         "EPZ good/payment SM must be the sum 5000; got:\n{xml}"
     );
 
+    // ── Card <M> requisites (INV-6 payload): present-when-set ──
+    // Each acquirer-slip field maps (convert.rs:1158-1164) to a card <M> attr:
+    //   merchant_id       "M-1"       → PA
+    //   terminal_id       "T-1"       → PB
+    //   operation_type    "PURCHASE"  → PC
+    //   pan               "**** 4242" → PD
+    //   approval_code     "APPR1"     → PE
+    //   payment_system    "Visa"      → PSNM
+    //   transaction_code  "RRN-1"     → RRN
+    // The `epz_cmd` fixture populates all seven with non-empty ASCII values, so
+    // every attr MUST appear name+value in the signed <M> (tag_attrs emits
+    // double-quoted, ASCII survives cp1251).  Pinning each value KILLS the
+    // `delete !` mutants on the `if !p.<attr>.is_empty()` emit guards — flipping
+    // the guard would omit the set attr (or emit an empty one), failing here.
+    for (attr, value) in [
+        ("PA", "M-1"),
+        ("PB", "T-1"),
+        ("PC", "PURCHASE"),
+        ("PD", "**** 4242"),
+        ("PE", "APPR1"),
+        ("PSNM", "Visa"),
+        ("RRN", "RRN-1"),
+    ] {
+        assert!(
+            xml.contains(&format!("{attr}='{value}'"))
+                || xml.contains(&format!("{attr}=\"{value}\"")),
+            "EPZ card <M> must carry {attr}='{value}' (present-when-set); got:\n{xml}"
+        );
+    }
+
     // The fixed cash-advance good label — asserted on the UTF-8 converted
     // payload_json (the cp1251-encoded wire mangles Cyrillic under from_utf8).
     assert!(
@@ -332,6 +362,79 @@ async fn pin_epz_wire_c_type_8() {
         "EPZ good NM must be the fixed cash-advance label; got:\n{}",
         converted.payload_json
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Pin 1b ★: EPZ card <M> OMITS empty slip requisites (no `PA=''` on the wire)
+//
+// The inverse of pin 1's present-when-set: when an acquirer-slip field is EMPTY
+// the corresponding <M> attr must NOT appear at all (`emit_epz_check` only
+// pushes it under `if !p.<attr>.is_empty()`).  This kills the OTHER half of the
+// `delete !` mutants — flipping the guard would emit `PA=''` for the empty
+// field (and drop it for a set one).  We drive the signer seam directly with an
+// EpzJson-shaped payload whose PA/PC/RRN are empty and PB/PD/PE/PSNM set, so we
+// pin BOTH the absent-empty AND the present-set directions in one wire.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pin_epz_wire_omits_empty_slip_attrs() {
+    use prro::xml::DocumentHeader;
+
+    // EpzJson-shaped payload (stage_sign::EpzJson, snake_case, deny_unknown):
+    // PA/PC/RRN empty → attr absent; PB/PD/PE/PSNM set → attr present.
+    let payload_json = serde_json::json!({
+        "schema_version": "1.0",
+        "sum_kop": 5000,
+        "code": "0",
+        "name": "EPZ",
+        "paymentid": 2,
+        "pay_name": "Card",
+        "pa": "",
+        "pb": "T-1",
+        "pc": "",
+        "pd": "**** 4242",
+        "pe": "APPR1",
+        "psnm": "Visa",
+        "rrn": ""
+    })
+    .to_string();
+
+    let header = DocumentHeader::with_defaults(FN, "12345678", 1_u32, "20260711100000", "");
+    let xml_bytes = prro::services::write_path::stage_sign::epz_check_xml_from_json_for_testing(
+        header,
+        99,
+        &payload_json,
+    )
+    .expect("EPZ xml build must succeed");
+    let xml = String::from_utf8_lossy(&xml_bytes);
+
+    // Empty slip fields → attr ABSENT (no empty-valued attr on the card leg).
+    for attr in ["PA", "PC", "RRN"] {
+        assert!(
+            !xml.contains(&format!("{attr}=''")) && !xml.contains(&format!("{attr}=\"\"")),
+            "EPZ card <M> must OMIT empty {attr} (no {attr}=''); got:\n{xml}"
+        );
+        // Belt-and-suspenders: the attr name must not appear on the <M> line at
+        // all when its slip field is empty (guards against a bare `PA=` form).
+        assert!(
+            !xml.contains(&format!(" {attr}=")),
+            "EPZ card <M> must not emit the {attr} attribute when its slip field is empty; got:\n{xml}"
+        );
+    }
+    // The set fields MUST still be present (guards the mutation that would drop
+    // a set attr while emitting the empty ones).
+    for (attr, value) in [
+        ("PB", "T-1"),
+        ("PD", "**** 4242"),
+        ("PE", "APPR1"),
+        ("PSNM", "Visa"),
+    ] {
+        assert!(
+            xml.contains(&format!("{attr}='{value}'"))
+                || xml.contains(&format!("{attr}=\"{value}\"")),
+            "EPZ card <M> must carry set {attr}='{value}'; got:\n{xml}"
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
