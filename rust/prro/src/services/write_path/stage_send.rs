@@ -71,7 +71,7 @@
 //!     for `DocType -> DpsCheckType` and the `SHIFT_OPEN -> local_number = 0`
 //!     override.
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use chrono_tz::Europe::Kiev;
 use prost::Message as _;
 use sha2::{Digest, Sha256};
@@ -476,15 +476,16 @@ pub fn build_send_envelope(
     // `offline_fiscal_no.is_some()` is the durable discriminator for an
     // offline-origin document on the drain. The two boundary doc types use
     // the same raw-TS rule even when END is minted as an online issuance.
-    let date_time = if inputs.offline_fiscal_no.is_some()
-        || matches!(
-            inputs.doc_type,
-            DocType::OfflineSessionBegin | DocType::OfflineSessionEnd
-        ) {
-        kyiv_comp_date(&inputs.business_ts)?
-    } else {
-        kyiv_local_epoch(&inputs.business_ts)?
-    };
+    // DPS `-8` FIX (live-proven 2026-07-12; WebCheck-verified): `Check.date_time`
+    // MUST equal the signed `<TS>` = `kyiv_comp_date` (Kyiv-local `YYYYMMDDHHMMSS`
+    // int) for EVERY doc — online AND offline. WebCheck sends exactly this
+    // (`dd = СurrentCompDate()`) as `Check.date` for all check types (CHK / Z /
+    // SERVICE). The old ONLINE `kyiv_local_epoch` produced a Kyiv-wall-clock-as-
+    // UTC epoch = +3h ahead of DPS's UTC clock → envelope ≠ `<TS>` → DPS `-8`
+    // "дата не відповідає Check.date" on online shift-close. B10 fixed only the
+    // offline branch; this aligns online → the same encoding.
+    // docs/DPS_MINUS8_DATE_AND_SHIFT_RECOVERY.md
+    let date_time = kyiv_comp_date(&inputs.business_ts)?;
 
     // M3b W9a (2026-05-16): `id_offline` carries the offline-acquired
     // fiscal-no for W9 backlog-drain replays.  W7a writes
@@ -511,54 +512,16 @@ pub fn build_send_envelope(
     })
 }
 
-/// Convert UTC ISO-8601 `business_ts` to the DPS Kyiv-local-as-epoch
-/// shape.  See `transports/dps/dto.rs:35-42` for the protocol-side
-/// rationale.  Mirrors the Sprint-7-proven Python helper
-/// `_kyiv_local_epoch` in `dps_fiscal_server.py:55-81` — chrono-tz
-/// handles Europe/Kiev DST transitions; manual offset is a footgun.
-fn kyiv_local_epoch(business_ts: &str) -> Result<i64, StageSendError> {
-    let dt: DateTime<Utc> =
-        business_ts
-            .parse::<DateTime<Utc>>()
-            .map_err(|e| StageSendError::TimestampConversion {
-                detail: format!("parse {business_ts:?}: {e}"),
-            })?;
-    let kyiv = dt.with_timezone(&Kiev);
-    // Re-interpret the Kyiv-local digits as if they were UTC — the
-    // resulting epoch is the value DPS expects on the wire.
-    let fake = Utc
-        .with_ymd_and_hms(
-            kyiv.year(),
-            kyiv.month(),
-            kyiv.day(),
-            kyiv.hour(),
-            kyiv.minute(),
-            kyiv.second(),
-        )
-        .single()
-        .ok_or_else(|| StageSendError::TimestampConversion {
-            detail: format!(
-                "ambiguous Kyiv-local components for {business_ts:?}: \
-                 Y={} M={} D={} h={} m={} s={}",
-                kyiv.year(),
-                kyiv.month(),
-                kyiv.day(),
-                kyiv.hour(),
-                kyiv.minute(),
-                kyiv.second(),
-            ),
-        })?;
-    Ok(fake.timestamp())
-}
-
-/// Convert UTC ISO-8601 `business_ts` to the signed XML `<TS>` form:
-/// Kyiv-local `YYYYMMDDHHMMSS` parsed as an integer.
+/// Convert UTC ISO-8601 `business_ts` to the DPS `Check.date` / signed `<TS>`
+/// form: Kyiv-local `YYYYMMDDHHMMSS` parsed as an integer.
 ///
-/// WebCheck sends this exact value as `Check.date` while replaying an
-/// offline document and while submitting the offline-session BEGIN/END
-/// service documents. Keep this separate from [`kyiv_local_epoch`]: both
-/// encode the same wall-clock instant, but DPS treats them as distinct wire
-/// representations.
+/// This is the SINGLE encoding for BOTH the envelope `Check.date_time` and the
+/// XML `<TS>` — WebCheck sends exactly this (`dd = СurrentCompDate()`) as
+/// `Check.date` for every check type (CHK / Z / SERVICE), online and offline.
+/// A prior online `kyiv_local_epoch` (Kyiv-wall-clock re-interpreted as a UTC
+/// epoch) was WRONG: it read +3h into the future vs the DPS UTC clock →
+/// envelope ≠ `<TS>` → DPS `-8` "дата не відповідає Check.date"; removed
+/// 2026-07-12 (docs/DPS_MINUS8_DATE_AND_SHIFT_RECOVERY.md).
 fn kyiv_comp_date(business_ts: &str) -> Result<i64, StageSendError> {
     let dt: DateTime<Utc> =
         business_ts
@@ -2369,39 +2332,41 @@ mod tests {
         }
     }
 
+    // DPS `-8` FIX (live-proven 2026-07-12, docs/DPS_MINUS8_DATE_AND_SHIFT_RECOVERY.md):
+    // the ONLINE envelope `Check.date_time` MUST equal the signed `<TS>`
+    // (`kyiv_comp_date` = Kyiv-local `YYYYMMDDHHMMSS` int) — NOT a Unix epoch.
+    // The old `kyiv_local_epoch` produced a Kyiv-wall-clock-as-UTC epoch = +3h
+    // future vs the DPS UTC clock → envelope-date ≠ `<TS>` → DPS `-8`
+    // "дата не відповідає Check.date" on online shift-close. WebCheck sends the
+    // 14-digit `<TS>` int for `Check.date` (offline AND online). These pins
+    // encode the correct (comp_date) contract; they RED against the pre-fix
+    // epoch code.
     #[test]
-    fn build_envelope_kyiv_local_epoch_summer_dst_offset_3h() {
-        // 2026-07-15T10:00:00Z is summer (DST active) in Kyiv: local
-        // = 13:00 EEST (UTC+3).  Kyiv-local-as-epoch fakes 13:00 as
-        // UTC, so the value is `2026-07-15T13:00:00Z.timestamp()`.
+    fn build_envelope_online_date_time_equals_ts_summer_dst() {
+        // 2026-07-15T10:00:00Z → Kyiv 13:00:00 (EEST, UTC+3) → <TS> 20260715130000.
         let env = build_send_envelope(
             &inputs(DocType::Sell, 1, "2026-07-15T10:00:00Z"),
             b"PAY".to_vec(),
         )
         .expect("summer build must succeed");
-        let expected = Utc
-            .with_ymd_and_hms(2026, 7, 15, 13, 0, 0)
-            .single()
-            .unwrap()
-            .timestamp();
-        assert_eq!(env.date_time, expected, "summer DST offset must be +3h");
+        assert_eq!(
+            env.date_time, 20_260_715_130_000,
+            "online date_time must equal the <TS> YYYYMMDDHHMMSS (comp_date), NOT an epoch"
+        );
     }
 
     #[test]
-    fn build_envelope_kyiv_local_epoch_winter_offset_2h() {
-        // 2026-01-15T10:00:00Z is winter (no DST): local = 12:00 EET
-        // (UTC+2).  Faked-as-UTC epoch is `2026-01-15T12:00:00Z.timestamp()`.
+    fn build_envelope_online_date_time_equals_ts_winter() {
+        // 2026-01-15T10:00:00Z → Kyiv 12:00:00 (EET, UTC+2) → <TS> 20260115120000.
         let env = build_send_envelope(
             &inputs(DocType::Sell, 1, "2026-01-15T10:00:00Z"),
             b"PAY".to_vec(),
         )
         .expect("winter build must succeed");
-        let expected = Utc
-            .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
-            .single()
-            .unwrap()
-            .timestamp();
-        assert_eq!(env.date_time, expected, "winter offset must be +2h");
+        assert_eq!(
+            env.date_time, 20_260_115_120_000,
+            "online date_time must equal the <TS> YYYYMMDDHHMMSS (comp_date), NOT an epoch"
+        );
     }
 
     // ─── compute_envelope_hash ──────────────────────────────────────
