@@ -32,10 +32,13 @@ use prro::db::models::enums::{
 };
 use prro::db::models::ids::{CashierId, OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
+use prro::db::repositories::payment_methods::{insert as pm_insert, NewPaymentMethod};
 use prro::db::repositories::tax_groups::NewTaxGroup;
 use prro::db::repositories::{fiscal_documents, offline_sessions, tax_groups};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::{open_pool, open_secure_pool};
+use prro::runtime::ingress::convert::convert_to_signer_payload;
+use prro::runtime::ingress::dto::CanonicalCommand;
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
 use prro::services::reconciliation::{boot_phase, online_convergence, RuntimeView};
 use prro::services::write_path::inline;
@@ -48,7 +51,7 @@ use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
 use crate::common::scripted_dps::ScriptedDps;
 use crate::common::{det_signing_ctx, drain_test_guard};
-use crate::op::{DpsScript, Op, Stage, WireResponse};
+use crate::op::{DpsScript, L5Kind, Op, Stage, WireResponse};
 
 /// A `(previous_hash, unsigned_xml_sha256)` chain-hash pair as read from a
 /// `fiscal_documents` row — both columns nullable.  Named to satisfy
@@ -838,6 +841,10 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         // Drain is generic (no doc_type filter) so offline EPZ drains for free.
         Op::OnlineEpz(script) => online_epz(ctx, script).await,
         Op::OfflineEpz => offline_epz(ctx).await,
+        // L5 — drive a SELL THROUGH convert_to_signer_payload (the pre-inbox guard
+        // layer).  A violation kind is refused pre-inbox (Refused, no row); Valid
+        // converts + issues via inline::run.
+        Op::L5Probe(kind) => l5_probe(ctx, *kind).await,
         Op::GoOnline(script) => go_online(ctx, script).await,
         Op::Drain(script) => drain_op(ctx, script).await,
         Op::Reboot => reboot(ctx).await,
@@ -1495,6 +1502,160 @@ async fn offline_epz(ctx: &mut FuzzCtx) -> RealOutcome {
                     branch: "b10_lazy_begin_interposed".into(),
                 };
             }
+            RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// Ensure the D1 frozen payment slots (cash #1, card #2) exist on the secure
+/// pool.  Idempotent: the fuzzer fixture does NOT seed payment_methods, and an
+/// L5 probe converts a SELL that references the cash / card slots by name.
+async fn ensure_payment_methods(ctx: &FuzzCtx) {
+    for (idx, name, iscash) in [(1i64, "Готівка", true), (2i64, "Картка", false)] {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM payment_methods WHERE fn = ? AND pay_index = ?",
+        )
+        .bind(ctx.fn_id())
+        .bind(idx)
+        .fetch_one(&ctx.pool_secure)
+        .await
+        .unwrap();
+        if exists == 0 {
+            pm_insert(
+                &ctx.pool_secure,
+                &NewPaymentMethod {
+                    fn_id: ctx.fn_id().to_string(),
+                    pay_index: idx,
+                    name: name.to_string(),
+                    iscash,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// Ensure tax group 1 (20% VAT-included) exists on the secure pool.  Idempotent:
+/// the L5 probe's good carries `tax_group_1:1` (convert always emits a tax group),
+/// so stage_acquire needs the group seeded to build the signing snapshot.
+async fn ensure_tax_group_1(ctx: &FuzzCtx) {
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tax_groups WHERE fn = ? AND tx_num = ?")
+            .bind(ctx.fn_id())
+            .bind(1i64)
+            .fetch_one(&ctx.pool_secure)
+            .await
+            .unwrap();
+    if exists == 0 {
+        ctx.seed_tax_group_20_percent().await;
+    }
+}
+
+/// L5 — drive a SELL of the given amount-shape THROUGH `convert_to_signer_payload`
+/// (the pre-inbox guard layer).  This is the ONLY fuzzer op that enters ABOVE
+/// `inline::run` — every other SELL op seeds an already-converted payload — so it
+/// is the only lane where the four L5 input guards (G1..G4) can actually fire.
+///
+/// A violation kind (`OverCap`/`ZeroPrice`/`ZeroPayment`/`Underpaid`) is REFUSED
+/// by convert BEFORE any inbox / fiscal_documents row is minted → `Refused` (the
+/// model predicts `NoMutation`; the harness's ExpectedNoMutation "minted no row"
+/// assertion is the durable teeth — revert a prod guard ⇒ convert admits ⇒ prod
+/// mints a row ⇒ RED).  `Valid` converts and then issues via `inline::run` like
+/// an ordinary online SELL (differential-checked as `Mutated`).
+///
+/// Mode-guard: online-only.  On an offline node the op is a no-op (model
+/// NoMutation) — the amount guards are ingress-layer input validation.
+async fn l5_probe(ctx: &mut FuzzCtx, kind: L5Kind) -> RealOutcome {
+    if ctx.read_node_mode().await != NodeMode::Online {
+        return RealOutcome::Refused("L5Probe: node not Online".into());
+    }
+    ensure_payment_methods(ctx).await;
+    // The probe's good carries `tax_group_1:1` (convert always emits a tax group),
+    // so signing needs the group seeded (stage_acquire builds the snapshot from
+    // `tax_groups`).  Idempotent: seed only if absent.  Harmless for the refusal
+    // kinds (they never reach signing).
+    ensure_tax_group_1(ctx).await;
+
+    // Amount-shape per kind: (good_price_kop, payments_json_array, total_sale_kop).
+    let (good_price_kop, payments_json, total_sale_kop): (i64, &str, i64) = match kind {
+        L5Kind::OverCap => (
+            5_000_000,
+            r#"[{"type":"CASH","amount_kopecks":5000000}]"#,
+            5_000_000,
+        ),
+        // Zero-price good but a NON-zero, non-underpaying cash leg → ONLY G2 can
+        // refuse (isolates the ZeroPriceLine teeth from G3/G4).
+        L5Kind::ZeroPrice => (0, r#"[{"type":"CASH","amount_kopecks":100}]"#, 100),
+        L5Kind::ZeroPayment => (
+            10000,
+            r#"[{"type":"CASHLESS_1","amount_kopecks":10000},{"type":"CASH","amount_kopecks":0}]"#,
+            10000,
+        ),
+        L5Kind::Underpaid => (1000, r#"[{"type":"CASH","amount_kopecks":900}]"#, 1000),
+        L5Kind::Valid => (
+            15000,
+            r#"[{"type":"CASH","amount_kopecks":15000}]"#,
+            15000,
+        ),
+    };
+
+    let idem = format!("l5-{}", ctx.next_idem());
+    let cmd_json = format!(
+        r#"{{
+            "schema_version": "1.0",
+            "fiscal_number": "{fn}",
+            "command_type": "SELL",
+            "idempotency_key": "{idem}",
+            "cashier_id": null,
+            "department": null,
+            "return_check_number": null,
+            "payload": {{
+                "direction": "SALE",
+                "goods": [{{"name":"Item","quantity_milli":1000,"price_kopecks":{good_price_kop},"tax_group_1":1,"tax_group_2":0,"article_code":1}}],
+                "payments": {payments_json},
+                "totals": {{"sale_kopecks":{total_sale_kop},"return_kopecks":0}}
+            }}
+        }}"#,
+        fn = ctx.fn_id(),
+    );
+    let cmd: CanonicalCommand = serde_json::from_str(&cmd_json).expect("parse L5 SELL cmd");
+
+    // THE guard layer: convert refuses a violation pre-inbox (no row).
+    let converted =
+        match convert_to_signer_payload(&cmd, ctx.fn_id(), &ctx.pool, &ctx.pool_secure).await {
+            Ok(cp) => cp,
+            Err(e) => return RealOutcome::Refused(format!("convert refused: {e:?}")),
+        };
+
+    // Valid path: seed the CONVERTED payload into the inbox and issue via inline.
+    let row = seed_inbox_keyed_payload(
+        &ctx.pool,
+        &idem,
+        "SELL",
+        &converted.payload_json,
+        Some(total_sale_kop),
+    )
+    .await;
+    let dps = ctx.new_dps();
+    load_script(&dps, &DpsScript::ack_path());
+    let guard = ctx.gate.clone().lock_owned().await;
+    let result = inline::run(
+        &ctx.pool,
+        &ctx.pool_secure,
+        &dps,
+        &ctx.sign_ctx,
+        &ctx.fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(_) => {
+            ctx.last_row = Some(row.clone());
             RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),

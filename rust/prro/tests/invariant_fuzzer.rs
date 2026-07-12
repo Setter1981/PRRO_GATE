@@ -39,7 +39,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{FileFailurePersistence, TestRunner};
 
 use model::{ExpectedOutcome, RefModel};
-use op::{DpsScript, Op, Stage, WireResponse};
+use op::{DpsScript, L5Kind, Op, Stage, WireResponse};
 
 /// Every `DocState` variant — the test enumerates the domain to prove the
 /// model's issued predicate mirrors the SSOT const for ALL states (the
@@ -3820,4 +3820,87 @@ async fn teeth_epz_z_quiescence_blocks_close() {
         ShiftState::Closed,
         "the shift must NOT close over an in-flight EPZ (z-quiescence)"
     );
+}
+
+// ─── L5 — fail-closed pre-inbox input guards (G1..G4) fuzzer ops ─────────────
+//
+// The L5 guards live in `convert.rs` (pre-inbox), UPSTREAM of `inline::run`
+// where every other SELL op enters.  `Op::L5Probe` is the ONE op that drives a
+// SELL through `convert_to_signer_payload`, so the guards actually fire.  The
+// model predicts `NoMutation` for each violation (INDEPENDENT of prod — it
+// follows from the guard's fail-closed contract), and `run_harness`'s
+// `ExpectedNoMutation` machinery asserts prod minted NO fiscal_documents row.
+//
+// ★TEETH (empirical, per guard — proven revert→RED→restore, run by the
+// implementer): reverting a prod guard makes `convert` ADMIT the violation ⇒
+// the probe seeds the inbox + `inline::run` ISSUES a row ⇒ prod mints a row the
+// model says must not exist ⇒ the harness's `ExpectedNoMutation {op} minted a
+// fiscal_documents row` assertion RED.  Each test names its REVERT TARGET.
+
+/// ★TEETH G1 — CashCapExceeded.  A SELL with a single cash leg of 5_000_000 kop
+/// (Σ cash > the 4_999_999 cap) is refused pre-inbox by G1 (no row).
+///
+/// REVERT TARGET: delete the `CashCapExceeded` check in convert.rs's Sell arm →
+/// convert admits the over-cap SELL → the probe issues a row → the model's
+/// NoMutation vs the minted row → RED.
+#[test]
+fn teeth_l5_g1_cash_over_cap_refused_pre_inbox() {
+    drive(&[Op::L5Probe(L5Kind::OverCap)], false);
+}
+
+/// ★TEETH G2 — ZeroPriceLine.  A SELL good priced 0 (item_sum_kop == 0) is
+/// refused pre-inbox by G2 (no row).
+///
+/// REVERT TARGET: delete the `ZeroPriceLine` check in convert.rs's Sell|Return
+/// arm → convert admits the zero-price line → the probe issues a row → RED.
+#[test]
+fn teeth_l5_g2_zero_price_line_refused_pre_inbox() {
+    drive(&[Op::L5Probe(L5Kind::ZeroPrice)], false);
+}
+
+/// ★TEETH G3 — ZeroPaymentAmount.  A SELL with a zero-amount cash leg (alongside
+/// a card leg that covers the good) is refused pre-inbox by G3 (no row).
+///
+/// REVERT TARGET: delete the `ZeroPaymentAmount` check in convert.rs's Sell|Return
+/// arm → convert admits the zero-value payment → the probe issues a row → RED.
+#[test]
+fn teeth_l5_g3_zero_payment_amount_refused_pre_inbox() {
+    drive(&[Op::L5Probe(L5Kind::ZeroPayment)], false);
+}
+
+/// ★TEETH G4 — UnderpaymentRefused.  A SELL of a 1000-kop good paid by a 900-kop
+/// cash leg (Σpayments < Σgoods, payments present) is refused pre-inbox by G4
+/// (no row).
+///
+/// REVERT TARGET: delete the `UnderpaymentRefused` check in convert.rs's Sell arm
+/// → convert admits the underpaid SELL → the probe issues a row → RED.
+#[test]
+fn teeth_l5_g4_underpayment_refused_pre_inbox() {
+    drive(&[Op::L5Probe(L5Kind::Underpaid)], false);
+}
+
+/// L5 control — a VALID SELL (good 15_000 kop paid in full by cash) converts
+/// through `convert_to_signer_payload` and ISSUES via `inline::run`, matching the
+/// model's ordinary online-SELL mutation.  Proves the probe lane is not
+/// vacuously always-refusing (the guards admit a well-formed SELL).
+#[test]
+fn l5_probe_valid_sell_converts_and_issues() {
+    let count = drive_counting(&[Op::L5Probe(L5Kind::Valid)], false);
+    assert_eq!(count, 1, "a valid L5 probe SELL must issue exactly one doc");
+}
+
+/// L5 — a SELL through the probe lane then a subsequent ordinary op stays in
+/// sync: the Valid probe funds the drawer (issued cash SELL) and a following
+/// ordinary online SELL issues on top, so the probe lane composes with the rest
+/// of the alphabet (the harness model/differential/scans all run).
+#[test]
+fn l5_probe_valid_then_ordinary_sell_composes() {
+    let count = drive_counting(
+        &[
+            Op::L5Probe(L5Kind::Valid),
+            Op::OnlineSell(DpsScript::ack_path()),
+        ],
+        false,
+    );
+    assert_eq!(count, 2, "valid probe SELL + ordinary SELL → two issued docs");
 }

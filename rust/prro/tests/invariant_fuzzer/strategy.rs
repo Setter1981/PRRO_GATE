@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use crate::op::{DpsScript, Op, Stage};
+use crate::op::{DpsScript, L5Kind, Op, Stage};
 
 /// The result-able wire-response shapes for a wire op.  `timeout_at_call` is
 /// intentionally EXCLUDED — the timeout SCENARIO is realized via `Crash`
@@ -104,6 +104,19 @@ fn op() -> impl Strategy<Value = Op> {
         // differential detects any mismatch); a non-terminal EPZ blocks Z-close.
         dps_script().prop_map(Op::OnlineEpz),
         Just(Op::OfflineEpz),
+        // L5 — input-guard probe.  APPENDED LAST (same seed-index-preservation
+        // rule).  Each violation kind drives a SELL through convert_to_signer_payload
+        // so the pre-inbox guard actually fires (model → NoMutation; the harness's
+        // ExpectedNoMutation "minted no row" assertion is the durable teeth); the
+        // Valid kind converts + issues (model → Mutated, differential-checked).
+        prop_oneof![
+            Just(L5Kind::OverCap),
+            Just(L5Kind::ZeroPrice),
+            Just(L5Kind::ZeroPayment),
+            Just(L5Kind::Underpaid),
+            Just(L5Kind::Valid),
+        ]
+        .prop_map(Op::L5Probe),
     ]
 }
 

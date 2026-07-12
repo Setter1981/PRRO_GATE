@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::SqlitePool;
 
-use crate::op::{DpsScript, Op, WireResponse};
+use crate::op::{DpsScript, L5Kind, Op, WireResponse};
 use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
 
 /// U1 D3 — model-local FORK of the offline-origin "issued" set.  Deliberately a
@@ -319,6 +319,28 @@ impl RefModel {
             // local-ack (mirror OfflineServiceOut).
             Op::OnlineEpz(script) => self.apply_epz(script),
             Op::OfflineEpz => self.apply_offline_epz(),
+            // L5 — input-guard probe.  ONLINE-ONLY: the L5 guards are ingress-layer
+            // input validation and the interpreter refuses the probe on any
+            // non-online node (the amount guards are orthogonal to offline
+            // issuance) → NoMutation off-line, for EVERY kind.  On an online node:
+            // the FOUR violation kinds are refused fail-closed PRE-INBOX by
+            // `convert.rs` (G1..G4) — no inbox row, no fiscal_documents row, no
+            // lnd/seed/code → NoMutation.  This prediction is INDEPENDENT of prod
+            // (it follows from the guard's fail-closed contract, not from mirroring
+            // the impl): reverting a prod guard makes convert admit + issue → prod
+            // mints a row the model says must not exist → the harness's
+            // ExpectedNoMutation "minted no row" assertion RED (the real teeth).
+            // `Valid` (online) converts successfully and issues like an ordinary
+            // online SELL (ack_path).
+            Op::L5Probe(kind) => {
+                if self.mode != NodeMode::Online {
+                    ExpectedOutcome::NoMutation
+                } else if *kind == L5Kind::Valid {
+                    self.apply_sell(&DpsScript::ack_path(), false)
+                } else {
+                    ExpectedOutcome::NoMutation
+                }
+            }
             // The advancing transition / drain ops predict a real ledger
             // mutation (PredictableMutating, NOT Fault).
             Op::GoOnline(script) => self.apply_go_online(script),
