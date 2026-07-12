@@ -225,6 +225,39 @@ pub enum ConvertError {
     #[error("EPZ: expected exactly one card payment leg with an acquirer_slip; got {count}")]
     EpzMalformedCardLeg { count: usize },
 
+    /// **L5 G1** — the SELL's CASH portion (`type_code == "0"` legs) exceeds the
+    /// legal cash cap (49 999.99 UAH = 4 999 999 kop; WebCheck `DopNal`/
+    /// `AllowableCash` clamp, `All.cs:875-886`).  Caps the CASH leg sum, NOT the
+    /// receipt total (a card-heavy receipt may exceed 50 000 legally).
+    /// Fail-closed pre-inbox (row-less, HTTP 422).
+    #[error(
+        "L5 G1: cash legs Σ {cash_kop} kop exceed the cash cap {cap_kop} kop \
+         (49 999.99 UAH) — fail-closed pre-inbox"
+    )]
+    CashCapExceeded { cash_kop: i64, cap_kop: i64 },
+
+    /// **L5 G2** — a good resolves to `item_sum_kop == 0` (a zero-price line).
+    /// Distinct from `ZeroQuantityLine` (quantity may be non-zero here — a
+    /// zero-PRICE good).  A fiscal line must carry a positive amount.
+    /// Fail-closed pre-inbox (row-less, HTTP 422).
+    #[error("L5 G2: item {item_name:?} has a zero line sum (zero-price line is not fiscalizable)")]
+    ZeroPriceLine { item_name: String },
+
+    /// **L5 G3** — a declared payment leg carries `sum_kop == 0`.  A zero-value
+    /// payment is malformed input (a real payment leg has a positive amount).
+    /// Fail-closed pre-inbox (row-less, HTTP 422).
+    #[error("L5 G3: payment leg #{pay_index} has a zero sum (zero-value payment is not valid)")]
+    ZeroPaymentAmount { pay_index: usize },
+
+    /// **L5 G4** — a SELL whose declared payments (when present) sum to LESS than
+    /// its goods total (an underpaid receipt).  SELL-only (a RETURN is a refund;
+    /// underpayment semantics do not apply).  Fires only when ≥1 payment leg is
+    /// present — a SELL with NO payment legs is the pre-existing "cash implied"
+    /// shape convert already tolerates.  Fail-closed pre-inbox (row-less,
+    /// HTTP 422); `stage_sign`'s later total cross-check is defense-in-depth.
+    #[error("L5 G4: SELL paid {paid_kop} kop < goods {goods_kop} kop (underpayment) — fail-closed")]
+    UnderpaymentRefused { goods_kop: i64, paid_kop: i64 },
+
     /// `ZReport` / `ShiftClose` with no open shift — a Z closes the open
     /// shift; closing when none is open is a state-machine breach.
     #[error(
@@ -889,6 +922,63 @@ pub async fn convert_to_signer_payload(
             let mut payments = Vec::with_capacity(cmd.payload.payments.len());
             for p in &cmd.payload.payments {
                 payments.push(convert_payment(p, fiscal_number, secure_pool).await?);
+            }
+
+            // ── L5 G2 — ZeroPriceLine (a good with item_sum_kop == 0) ──────────
+            // Pure in-memory scan over the converted items (SELL + RETURN).
+            // Distinct from ZeroQuantityLine (a zero-PRICE good keeps qty > 0).
+            if let Some(zero) = items.iter().find(|it| it.sum_kop == 0) {
+                return Err(ConvertError::ZeroPriceLine {
+                    item_name: zero.name.clone(),
+                });
+            }
+
+            // ── L5 G3 — ZeroPaymentAmount (a declared payment leg == 0) ────────
+            // Pure in-memory scan over the converted payments (SELL + RETURN).
+            if let Some((idx, _)) = payments.iter().enumerate().find(|(_, p)| p.sum_kop == 0) {
+                return Err(ConvertError::ZeroPaymentAmount { pay_index: idx });
+            }
+
+            // ── L5 G1 — CashCapExceeded (SELL cash legs Σ > 4_999_999 kop) ─────
+            // Caps the CASH portion (WebCheck DopNal/AllowableCash, All.cs:875-886),
+            // NOT the receipt total.  SELL-only (a RETURN pays cash OUT).  Pure
+            // in-memory sum over the type_code=="0" legs.
+            const CASH_CAP_KOP: i64 = 4_999_999;
+            if cmd.command_type == CommandType::Sell {
+                let cash_kop: i64 = payments
+                    .iter()
+                    .filter(|p| p.type_code == "0")
+                    .map(|p| p.sum_kop)
+                    .fold(0i64, |a, b| a.saturating_add(b));
+                if cash_kop > CASH_CAP_KOP {
+                    return Err(ConvertError::CashCapExceeded {
+                        cash_kop,
+                        cap_kop: CASH_CAP_KOP,
+                    });
+                }
+            }
+
+            // ── L5 G4 — UnderpaymentRefused (SELL Σpayments < Σgoods) ──────────
+            // SELL-only (a RETURN is a refund; underpayment semantics don't apply).
+            // Fires only when ≥1 payment leg is declared — a SELL with NO payment
+            // legs is the pre-existing "cash implied" shape convert tolerates.
+            // Pure in-memory sums.  `stage_sign`'s later total cross-check stays
+            // as defense-in-depth (L5 adds the earlier fail-closed gate).
+            if cmd.command_type == CommandType::Sell && !payments.is_empty() {
+                let goods_kop: i64 = items
+                    .iter()
+                    .map(|it| it.sum_kop)
+                    .fold(0i64, |a, b| a.saturating_add(b));
+                let paid_kop: i64 = payments
+                    .iter()
+                    .map(|p| p.sum_kop)
+                    .fold(0i64, |a, b| a.saturating_add(b));
+                if paid_kop < goods_kop {
+                    return Err(ConvertError::UnderpaymentRefused {
+                        goods_kop,
+                        paid_kop,
+                    });
+                }
             }
 
             // ── INV-21 guard — L1 cash-on-hand floor (pre-inbox, row-less) ─────

@@ -150,7 +150,12 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         | "CASH_INSUFFICIENT_IN_LEASE"
         // EPZ — client-payload faults (paymentid<2 / malformed card leg).
         | "EPZ_PAYMENT_ID_TOO_LOW"
-        | "EPZ_MALFORMED_CARD_LEG" => 422,
+        | "EPZ_MALFORMED_CARD_LEG"
+        // L5 — fail-closed pre-inbox input guards (row-less client-payload faults).
+        | "CASH_CAP_EXCEEDED"
+        | "ZERO_PRICE_LINE"
+        | "ZERO_PAYMENT_AMOUNT"
+        | "UNDERPAYMENT_REFUSED" => 422,
         "INVALID_CASHIER_ID" | "MALFORMED_JSON" => 400,
         // Adapter-shell codes (server.rs `adapter_error`) carry their own
         // hard-coded status; listed here so the map stays TOTAL over the
@@ -308,6 +313,11 @@ fn convert_error_code(e: &ConvertError) -> &'static str {
         // EPZ — client-payload faults (paymentid<2 / malformed card leg).
         ConvertError::EpzPaymentIdTooLow { .. } => "EPZ_PAYMENT_ID_TOO_LOW",
         ConvertError::EpzMalformedCardLeg { .. } => "EPZ_MALFORMED_CARD_LEG",
+        // L5 — fail-closed pre-inbox input guards (all row-less 422 client faults).
+        ConvertError::CashCapExceeded { .. } => "CASH_CAP_EXCEEDED",
+        ConvertError::ZeroPriceLine { .. } => "ZERO_PRICE_LINE",
+        ConvertError::ZeroPaymentAmount { .. } => "ZERO_PAYMENT_AMOUNT",
+        ConvertError::UnderpaymentRefused { .. } => "UNDERPAYMENT_REFUSED",
         ConvertError::NoOpenShiftForZReport { .. } => "NO_OPEN_SHIFT",
         ConvertError::NegativeStoredPaymentSum { .. } => "LEDGER_CORRUPTION",
         ConvertError::ZReportSumOverflow { .. } => "LEDGER_CORRUPTION",
