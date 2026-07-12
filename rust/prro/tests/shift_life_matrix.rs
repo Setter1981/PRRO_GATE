@@ -512,6 +512,9 @@ enum Action {
     SellRetryable(u64),
     /// Reconciliation tick — re-drive pending `ERROR_RETRYABLE` docs to terminal.
     Reconcile,
+    /// Online-convergence tick — actively finalise KVT1 → ACK (the mechanism
+    /// SEPARATE from `Reconcile`'s passive KVT1-hold; the supervisor drives both).
+    OnlineConverge,
 }
 
 /// Run a scenario end-to-end through the real ingress, logging every step and
@@ -678,6 +681,28 @@ async fn run(
                 );
                 let st = last_doc_state(app.db()).await;
                 format!("RECONCILE (re-drive) → ErrorRetryable cleared, doc now {st}")
+            }
+            Action::OnlineConverge => {
+                let carriers = drain_carriers(dps.clone());
+                // Active KVT1 → ACK finalisation (the M3b online-convergence tick,
+                // distinct from Reconcile's passive KVT1-hold). Tick to terminal.
+                let mut ticks = 0;
+                loop {
+                    let view = drain_view(&carriers);
+                    app.converge_online_for_fn(FN, &view)
+                        .await
+                        .expect("converge_online_for_fn must run");
+                    ticks += 1;
+                    if non_terminal_doc_count(app.db()).await == 0 || ticks >= 8 {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    non_terminal_doc_count(app.db()).await,
+                    0,
+                    "online-convergence must finalise KVT1 → ACK ({ticks} ticks)"
+                );
+                format!("ONLINE-CONVERGE ({ticks} ticks) → KVT1 finalised to ACK")
             }
         };
 
@@ -915,11 +940,15 @@ async fn matrix_s5_net_drop_mid_online_retry() {
         Action::NetDown,          // physical net drop; mode STAYS online
         Action::SellRetryable(8), // SELL → ERROR_RETRYABLE (retryable, not lost)
         Action::NetUp,            // net restored
-        Action::Reconcile,        // real reconciliation re-drives it forward
+        Action::Reconcile,        // reconcile re-drives ErrorRetryable → KVT1 (holds)
+        Action::OnlineConverge,   // online-convergence finalises KVT1 → ACK
+        Action::ZClose,           // now quiescent → shift closes cleanly
     ];
-    // Ends at the proven cells: NET_DOWN online SELL → ERROR_RETRYABLE (stays
-    // online, not lost); reconciliation re-drives it forward. A Z here is
-    // CORRECTLY blocked (`Z_QUIESCENCE_PENDING`/503) while the re-driven doc
-    // rests non-terminal at KVT1 — the z-quiescence guard, observed live.
+    // Full net-drop-mid-online lifecycle: NET_DOWN online SELL → ERROR_RETRYABLE
+    // (stays online, not lost) → reconcile re-drives → KVT1 (passive hold) →
+    // online-convergence finalises → ACK → Z closes. The TWO-mechanism online
+    // convergence (reconcile re-drive + convergence KVT2-finalise) is exactly
+    // what the supervisor loop runs; a Z before quiescence is correctly blocked
+    // (Z_QUIESCENCE_PENDING/503, observed live).
     run("S5-net-drop-online", &steps, &app, &*wp, &dps).await;
 }
