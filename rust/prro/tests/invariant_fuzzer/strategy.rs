@@ -133,6 +133,13 @@ fn op() -> impl Strategy<Value = Op> {
             Just(L5Kind::Valid),
         ]
         .prop_map(Op::L5Probe),
+        // L6 — X-report (поточний звіт).  APPENDED LAST (same seed-index-
+        // preservation rule).  A pure read carrying no DpsScript, insertable at
+        // ANY point: the model predicts NoMutation and the harness asserts the
+        // side-effect-free set + turnover snapshot == model totals.  Reverting
+        // the side-effect-free property (making X consume an lnd / write a row)
+        // makes a seeded harness with Op::XReport go RED — the durable teeth.
+        Just(Op::XReport),
     ]
 }
 

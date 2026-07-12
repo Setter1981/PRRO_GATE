@@ -319,6 +319,13 @@ impl RefModel {
             // local-ack (mirror OfflineServiceOut).
             Op::OnlineEpz(script) => self.apply_epz(script),
             Op::OfflineEpz => self.apply_offline_epz(),
+            // L6 — X-report: a pure read.  Predicts NoMutation UNCONDITIONALLY
+            // (nothing changes: no lnd, no seed, no code, no doc, no shift state)
+            // — the model DELIBERATELY does not branch on shift/mode: even with
+            // no open shift the prod read is a row-less 422, still a NoMutation.
+            // The turnover-snapshot equality (cash-on-hand == self.cash_on_hand)
+            // is asserted by the harness via `check_x_report_turnover`.
+            Op::XReport => self.apply_x_report(),
             // L5 — input-guard probe.  ONLINE-ONLY: the L5 guards are ingress-layer
             // input validation and the interpreter refuses the probe on any
             // non-online node (the amount guards are orthogonal to offline
@@ -369,6 +376,15 @@ impl RefModel {
             // A true replay (re-runs an already-DONE row) — no fiscal mutation.
             Op::DuplicateIdemKey => ExpectedOutcome::NoMutation,
         }
+    }
+
+    /// L6 — X-report (поточний звіт): a pure read.  ALWAYS `NoMutation` — the
+    /// snapshot never allocates an lnd, advances the seed, consumes a code, mints
+    /// a doc/inbox row, or transitions the shift.  The turnover-snapshot equality
+    /// (`self.cash_on_hand`) is checked by the harness against the real
+    /// `XReportPayload.cash_on_hand_kop`; the model itself does not mutate.
+    fn apply_x_report(&self) -> ExpectedOutcome {
+        ExpectedOutcome::NoMutation
     }
 
     /// A POST-SIGN refusal: reality reaches `SIGNED` (the lnd IS allocated), then

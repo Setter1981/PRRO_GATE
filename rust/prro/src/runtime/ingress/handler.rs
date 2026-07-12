@@ -446,6 +446,50 @@ async fn handle_x_report(
     fiscal_number: &str,
     main_pool: &SqlitePool,
 ) -> IngressResponse {
+    // Open-shift gate — the X-report is valid ONLY on a genuinely OPEN shift.
+    // A normal Z-close PINS `node_state.current_shift_id` at the now-`Closed`
+    // shift (it is NOT cleared — `terminal_close_pins_current_shift_id_behavior`
+    // in shift/transition.rs), so `aggregate_z_payload` (which resolves via
+    // `current_shift_id`, state-agnostic) would happily aggregate a CLOSED
+    // shift's turnover — while `cash_on_hand_for_fn` (which JOINs on an OPEN
+    // shift state) returns 0, an internally-INCONSISTENT snapshot.  Gate on the
+    // SAME open-shift definition `cash_on_hand_for_fn` uses (exclude CLOSED /
+    // RMR / ERROR / CREATED) so both halves of the snapshot agree, and a
+    // closed/no-shift FN gets the row-less NO_OPEN_SHIFT the contract mandates.
+    let shift_state = match crate::db::repositories::node_state::get(main_pool, fiscal_number).await
+    {
+        Ok(Some(ns)) => ns.shift_state,
+        Ok(None) => {
+            return err(
+                request_id_hex,
+                "NO_OPEN_SHIFT",
+                format!("x-report: no node_state for fn {fiscal_number} (no open shift)"),
+            )
+        }
+        Err(_) => {
+            return err(
+                request_id_hex,
+                "LEDGER_READ_FAILED",
+                "x-report: node_state read failed".to_string(),
+            )
+        }
+    };
+    use crate::db::models::enums::ShiftState;
+    let shift_is_open = !matches!(
+        shift_state,
+        ShiftState::Created
+            | ShiftState::Closed
+            | ShiftState::RequiresManualReconciliation
+            | ShiftState::Error
+    );
+    if !shift_is_open {
+        return err(
+            request_id_hex,
+            "NO_OPEN_SHIFT",
+            format!("x-report: shift is {shift_state:?}, not open"),
+        );
+    }
+
     // SSOT aggregation — resolves the open shift + reads the durable ledger.
     // A NoOpenShiftForZReport is the row-less NO_OPEN_SHIFT refusal (422).
     let converted = match aggregate_z_payload(main_pool, fiscal_number).await {

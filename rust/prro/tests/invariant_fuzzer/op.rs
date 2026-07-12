@@ -127,6 +127,14 @@ pub enum Op {
     /// Offline EPZ.  Issuance is local (OFFLINE_LOCAL_ACK + code consumed);
     /// drain/GoOnline submits it.  Mirrors `OfflineServiceOut`.
     OfflineEpz,
+    /// L6 — X-report (поточний звіт): a LOCAL-ONLY, SIDE-EFFECT-FREE read of the
+    /// current open shift's turnover.  Carries NO `DpsScript` (never hits the
+    /// wire) and can be inserted at ANY point in a sequence.  The whole point is
+    /// that it mutates NOTHING: no lnd, no seed, no code, no doc row, no inbox
+    /// row, no shift transition — the model predicts `NoMutation` and the oracle
+    /// asserts the six-point no-mutation set PLUS that the returned turnover
+    /// snapshot (cash-on-hand) matches the model's tracked total.
+    XReport,
     /// L5 — a SELL whose AMOUNT-SHAPE deliberately spans the four fail-closed
     /// pre-inbox input guards (`convert.rs`).  Unlike every other SELL op — which
     /// seeds an already-CONVERTED signer payload directly and enters at

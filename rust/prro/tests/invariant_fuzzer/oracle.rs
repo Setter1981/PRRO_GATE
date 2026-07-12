@@ -113,6 +113,10 @@ pub fn check_differential(
             // A replay-resolve (DuplicateIdemKey) returns the EXISTING doc; the
             // "no NEW issuance" assertion (no seed/code advance) is the test's.
             RealOutcome::Doc(_) => Ok(()),
+            // L6 — an X-report read is inherently a no-op for the differential
+            // (no doc, no lnd, no seed, no code).  The turnover-snapshot equality
+            // is the harness's extra assertion (`check_x_report_turnover`).
+            RealOutcome::XReport { .. } => Ok(()),
             RealOutcome::Crashed { .. } => Err(Divergence(
                 "ExpectedNoMutation/NoIssuanceRow but the real op crashed".to_string(),
             )),
@@ -234,6 +238,32 @@ pub async fn check_cash_on_hand(
         return Err(Divergence(format!(
             "cash oracle: real cash_on_hand {real_cash} != model {model_cash} \
              (INV-21 differential breach — cash ledger diverged)"
+        )));
+    }
+    Ok(())
+}
+
+/// L6 — X-report turnover-snapshot oracle.
+///
+/// The X-report is a SIDE-EFFECT-FREE read, so the differential (no doc / lnd /
+/// seed / code) already passes.  This adds the "turnover snapshot == model
+/// totals" check: the `cash_on_hand_kop` the real X-report returned must equal
+/// the model's independently-tracked `cash_on_hand`.
+///
+/// **Independence:** `model_cash` is the RefModel's own accumulator (built from
+/// first principles per op — SELL `+`, RETURN `−`, ServiceIn `+`, ServiceOut
+/// `−`, EPZ `−`); `real_cash` is what the prod `handle_x_report` derived from the
+/// durable ledger via `cash_on_hand_for_fn`.  A divergence signals a prod X-report
+/// aggregation bug (or a side-effect that changed the ledger under it).
+///
+/// **Teeth:** reverting the side-effect-free property (making X consume an lnd /
+/// write a row) is caught by the harness's six-point no-mutation set FIRST; this
+/// oracle additionally catches a turnover that silently under/over-reports.
+pub fn check_x_report_turnover(real_cash: i64, model_cash: i64) -> Result<(), Divergence> {
+    if real_cash != model_cash {
+        return Err(Divergence(format!(
+            "x-report oracle: real snapshot cash_on_hand {real_cash} != model {model_cash} \
+             (turnover snapshot diverged from the model totals)"
         )));
     }
     Ok(())
