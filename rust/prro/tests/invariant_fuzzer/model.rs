@@ -319,6 +319,13 @@ impl RefModel {
             // local-ack (mirror OfflineServiceOut).
             Op::OnlineEpz(script) => self.apply_epz(script),
             Op::OfflineEpz => self.apply_offline_epz(),
+            // L6 — X-report: a pure read.  Predicts NoMutation UNCONDITIONALLY
+            // (nothing changes: no lnd, no seed, no code, no doc, no shift state)
+            // — the model DELIBERATELY does not branch on shift/mode: even with
+            // no open shift the prod read is a row-less 422, still a NoMutation.
+            // The turnover-snapshot equality (cash-on-hand == self.cash_on_hand)
+            // is asserted by the harness via `check_x_report_turnover`.
+            Op::XReport => self.apply_x_report(),
             // L5 — input-guard probe.  ONLINE-ONLY: the L5 guards are ingress-layer
             // input validation and the interpreter refuses the probe on any
             // non-online node (the amount guards are orthogonal to offline
@@ -369,6 +376,15 @@ impl RefModel {
             // A true replay (re-runs an already-DONE row) — no fiscal mutation.
             Op::DuplicateIdemKey => ExpectedOutcome::NoMutation,
         }
+    }
+
+    /// L6 — X-report (поточний звіт): a pure read.  ALWAYS `NoMutation` — the
+    /// snapshot never allocates an lnd, advances the seed, consumes a code, mints
+    /// a doc/inbox row, or transitions the shift.  The turnover-snapshot equality
+    /// (`self.cash_on_hand`) is checked by the harness against the real
+    /// `XReportPayload.cash_on_hand_kop`; the model itself does not mutate.
+    fn apply_x_report(&self) -> ExpectedOutcome {
+        ExpectedOutcome::NoMutation
     }
 
     /// A POST-SIGN refusal: reality reaches `SIGNED` (the lnd IS allocated), then
@@ -1525,6 +1541,25 @@ impl RefModel {
         self.session_has_end = issued_boundaries
             .iter()
             .any(|(dt,)| dt == "OFFLINE_SESSION_END");
+
+        // L6 — cash_on_hand ← the real ledger.  A crash-completed offline sell /
+        // return / service-io issues a real cash-moving doc the model does NOT
+        // predict across the crash window (it is a Fault op, adopted not
+        // predicted); without this the model's cash accumulator drifts from
+        // reality, and a subsequent Op::XReport snapshot check would spuriously
+        // RED (real cash reflects the crash-completed doc; model still at its
+        // pre-fault value).  Adopt reality's cash — same discipline as docs /
+        // codes / seed above — via the prod SSOT `cash_on_hand_for_fn`.  For a
+        // NON-fault X-report the model still tracks cash INDEPENDENTLY through
+        // `apply_*`, so the snapshot check retains its teeth there.
+        let fiscal_number: String =
+            sqlx::query_scalar("SELECT fiscal_number FROM node_state LIMIT 1")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        self.cash_on_hand = prro::services::cash_ledger::cash_on_hand_for_fn(pool, &fiscal_number)
+            .await
+            .unwrap();
     }
 
     /// **U1 A1 funnel wrapper — `read_seed_fixture`.**  The tagged primitive for

@@ -39,6 +39,8 @@ use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_conf
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::convert::convert_to_signer_payload;
 use prro::runtime::ingress::dto::CanonicalCommand;
+use prro::runtime::ingress::handler::{handle_command, IngressBody};
+use prro::runtime::ingress::seam::UnimplementedWritePath;
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
 use prro::services::reconciliation::{boot_phase, online_convergence, RuntimeView};
 use prro::services::write_path::inline;
@@ -119,6 +121,15 @@ pub enum RealOutcome {
     Recovered { branch: String },
     /// The seam returned a typed refusal / error (no issued doc).
     Refused(String),
+    /// L6 — an X-report (поточний звіт) read completed: a SIDE-EFFECT-FREE
+    /// snapshot.  Carries the observed turnover snapshot so the harness can
+    /// assert it matches the model (`cash_on_hand`).  A `NoMutation` outcome for
+    /// the differential (no doc, no lnd, no seed, no code) — the turnover
+    /// equality is the harness's extra assertion.
+    XReport {
+        cash_on_hand_kop: i64,
+        turnover_json: String,
+    },
 }
 
 // ─── Race state threaded through `run_op` ───────────────────────────────────
@@ -841,6 +852,9 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         // Drain is generic (no doc_type filter) so offline EPZ drains for free.
         Op::OnlineEpz(script) => online_epz(ctx, script).await,
         Op::OfflineEpz => offline_epz(ctx).await,
+        // L6 — X-report (поточний звіт): a side-effect-free read through the REAL
+        // ingress dispatch (`handle_command` → the ReadOnly arm → `handle_x_report`).
+        Op::XReport => x_report(ctx).await,
         // L5 — drive a SELL THROUGH convert_to_signer_payload (the pre-inbox guard
         // layer).  A violation kind is refused pre-inbox (Refused, no row); Valid
         // converts + issues via inline::run.
@@ -1655,6 +1669,59 @@ async fn l5_probe(ctx: &mut FuzzCtx, kind: L5Kind) -> RealOutcome {
             RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// L6 — X-report (поточний звіт) through the REAL ingress dispatch.
+///
+/// Drives `handle_command` with a `CommandType::XReport` command, exactly like
+/// production — so the ReadOnly arm routes to `handle_x_report`, which is a pure
+/// SELECT (no inbox row, no fiscal_documents row, no lnd/seed/code, no shift
+/// transition).  Returns `RealOutcome::XReport` carrying the observed turnover
+/// snapshot (cash-on-hand + aggregated payload JSON) so the harness can assert
+/// it matches the model's tracked `cash_on_hand`.  A no-open-shift 422 (the
+/// forced-Closed-shift / no-current-shift window) is a row-less `Refused` — also
+/// a NoMutation, so the differential is satisfied either way.
+async fn x_report(ctx: &mut FuzzCtx) -> RealOutcome {
+    let idem = format!("x-report-{}", ctx.next_idem());
+    let cmd_json = format!(
+        r#"{{
+            "schema_version": "1.0",
+            "fiscal_number": "{fn}",
+            "command_type": "X_REPORT",
+            "idempotency_key": "{idem}",
+            "cashier_id": null,
+            "department": null,
+            "return_check_number": null,
+            "payload": {{"direction": "SALE", "totals": {{"sale_kopecks": 0, "return_kopecks": 0}}}}
+        }}"#,
+        fn = ctx.fn_id(),
+    );
+    let cmd: CanonicalCommand = serde_json::from_str(&cmd_json).expect("parse X_REPORT cmd");
+    let drv = prro::db::models::ids::DriverId::new(DRIVER).expect("driver id");
+    let wp = UnimplementedWritePath;
+    let resp = handle_command(
+        &cmd,
+        ctx.fn_id(),
+        drv,
+        Protocol::Rest,
+        &ctx.pool,
+        &ctx.pool_secure,
+        &wp,
+    )
+    .await;
+    match resp.body {
+        IngressBody::XReport(x) => RealOutcome::XReport {
+            cash_on_hand_kop: x.cash_on_hand_kop,
+            turnover_json: x.turnover.to_string(),
+        },
+        // A no-open-shift / closed-shift window → row-less 422 NO_OPEN_SHIFT.
+        IngressBody::Error(e) => {
+            RealOutcome::Refused(format!("x-report refused: {}", e.error_code))
+        }
+        IngressBody::Success(_) => {
+            unreachable!("X-report must never return a fiscal Success envelope")
+        }
     }
 }
 

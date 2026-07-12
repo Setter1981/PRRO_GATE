@@ -302,6 +302,8 @@ fn into_axum_response(resp: IngressResponse) -> Response {
     match resp.body {
         IngressBody::Success(r) => (status, Json(r)).into_response(),
         IngressBody::Error(e) => (status, Json(e)).into_response(),
+        // L6 — X-report snapshot (read-only 200 body).
+        IngressBody::XReport(x) => (status, Json(x)).into_response(),
     }
 }
 

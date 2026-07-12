@@ -394,6 +394,13 @@ async fn drive_ingress(app: &App, wp: &dyn WritePathEntry, body: &str) -> (u16, 
             resp.http_status,
             format!("ERR:{} ({})", er.error_code, er.error_message),
         ),
+        // The matrix harness has no `Action::XReport`, so the ingress core never
+        // returns an X-report body here. If an X-report action is ever added,
+        // this panic forces the driver to grow a real arm rather than silently
+        // mis-mapping the read snapshot to a "document_state".
+        IngressBody::XReport(_) => {
+            unreachable!("matrix harness issues no X-report; add an Action::XReport arm first")
+        }
     }
 }
 

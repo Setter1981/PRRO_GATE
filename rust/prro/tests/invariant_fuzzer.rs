@@ -2390,6 +2390,22 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     codes_before,
                     "ExpectedNoMutation {op:?} consumed an offline code (issuance leaked)"
                 );
+                // L6 — X-report turnover snapshot must equal the model totals.
+                // The real X-report returns the ledger-derived cash-on-hand; the
+                // model tracks it independently (`cash_on_hand`).  A divergence
+                // is a turnover-aggregation bug (or a side-effect that mutated
+                // the ledger under the read).  Only the XReport RealOutcome
+                // carries a snapshot; a no-open-shift Refused has none to check.
+                if let interp::RealOutcome::XReport {
+                    cash_on_hand_kop, ..
+                } = &real
+                {
+                    if let Err(d) =
+                        oracle::check_x_report_turnover(*cash_on_hand_kop, model.cash_on_hand)
+                    {
+                        panic!("x-report turnover on {op:?}: {d:?}");
+                    }
+                }
             }
             // B2 — NoIssuanceRowAllowed: a refusal that mints a LEGAL non-issued
             // row (online-reject Rejected / offline-ack Aborted).  The row IS
@@ -3843,6 +3859,92 @@ async fn teeth_epz_z_quiescence_blocks_close() {
         ctx.read_shift_state().await,
         ShiftState::Closed,
         "the shift must NOT close over an in-flight EPZ (z-quiescence)"
+    );
+}
+
+/// L6 ★TEETH — X-report (поточний звіт) is SIDE-EFFECT-FREE + snapshots the
+/// model totals.  A seeded harness interleaves `Op::XReport` between issuing ops
+/// (SELL / RETURN / ServiceIn), all through the real ingress dispatch.  The
+/// harness's `ExpectedNoMutation` arm enforces, per X-report:
+///   1. no new `fiscal_documents` row (`observed_doc_count` unchanged),
+///   2. no lnd consumed (`node_state.next_lnd` unchanged),
+///   3. no MAC seed advance (`node_state.last_known...` unchanged),
+///   4. no offline code consumed (`consumed_codes_count` unchanged),
+///   5. no shift-state transition (U1 D2 model-vs-DB shift check),
+///   6. the returned turnover snapshot (cash-on-hand) == the model's tracked
+///      total (`check_x_report_turnover`).
+/// (The "no ingress_inbox row" leg is pinned in `tests/l6_xreport.rs`; here the
+/// U1 D1 allocator + no-doc checks cover the durable-ledger side-effects.)
+///
+/// This IS the side-effect-free probe the alphabet lacked.
+///
+/// REVERT TARGET (proven RED): break the side-effect-free property in prod —
+/// e.g. in `handle_x_report` (`handler.rs`), consume an lnd BEFORE the read:
+/// ```ignore
+///   // teeth-revert: X-report must NOT allocate — this makes the harness RED
+///   let _ = prro::db::repositories::node_state::allocate_next_lnd(main_pool, fiscal_number).await;
+/// ```
+/// The seeded `Op::XReport` then bumps `node_state.next_lnd`, tripping the
+/// `ExpectedNoMutation {op:?} allocated an lnd` assert → this test REDs.  A
+/// simpler revert (make X return the WRONG cash) trips `check_x_report_turnover`.
+#[tokio::test]
+async fn teeth_x_report_side_effect_free_and_snapshots_model() {
+    // Interleave X-report reads between issuing ops.  Every X must be a no-op
+    // and its snapshot must equal the running model cash-on-hand.
+    let ops = vec![
+        Op::XReport,                                // empty shift → cash 0
+        Op::OnlineSell(DpsScript::ack_path()),      // cash += 15000
+        Op::XReport,                                // cash 15000
+        Op::XReport,                                // idempotent: still 15000, still no-op
+        Op::OnlineServiceIn(DpsScript::ack_path()), // cash += 15000 → 30000
+        Op::XReport,                                // cash 30000
+        Op::OnlineReturn(DpsScript::ack_path()),    // cash -= 15000 → 15000
+        Op::XReport,                                // cash 15000
+    ];
+    // run_harness runs model.apply + interp::run_op + the full oracle/assertion
+    // set per op (including the L6 turnover snapshot check we wired into the
+    // ExpectedNoMutation arm).  A panic here is a real teeth bite.
+    let _ctx = run_harness(
+        &ops,
+        interp::FuzzCtx::new_online_open_shift().await,
+        RefModel::new_online_open_shift(),
+    )
+    .await;
+
+    // Explicit directed assertion (belt-and-braces): a standalone X-report on a
+    // funded drawer returns the ledger cash AND mints no row.
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let docs_before = ctx.observed_doc_count().await;
+    let lnd_before = ctx.read_next_lnd().await;
+    let seed_before = ctx.read_seed().await;
+    let real = interp::run_op(&mut ctx, &Op::XReport).await;
+    match real {
+        interp::RealOutcome::XReport {
+            cash_on_hand_kop, ..
+        } => {
+            assert_eq!(
+                cash_on_hand_kop,
+                model::CASH_AMOUNT_KOP,
+                "X-report snapshot must equal the funded drawer"
+            );
+        }
+        other => panic!("X-report on a funded open shift must return a snapshot; got {other:?}"),
+    }
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        docs_before,
+        "X-report minted a fiscal_documents row (must be side-effect-free)"
+    );
+    assert_eq!(
+        ctx.read_next_lnd().await,
+        lnd_before,
+        "X-report consumed an lnd (must be side-effect-free)"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "X-report advanced the MAC seed (must be side-effect-free)"
     );
 }
 
