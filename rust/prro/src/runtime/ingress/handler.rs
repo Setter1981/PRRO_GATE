@@ -58,10 +58,11 @@
 //! [`convert`]: super::convert
 //! [`convert::convert_to_signer_payload`]: super::convert::convert_to_signer_payload
 
-use super::convert::{convert_to_signer_payload, ConvertError};
+use super::convert::{aggregate_z_payload, convert_to_signer_payload, ConvertError};
 use super::dto::{
     request_id_to_string, to_canonical_fiscal_command_with_context, CanonicalCommand,
-    CanonicalErrorResponse, CanonicalResponse, CommandType, MappingError, Totals, SCHEMA_VERSION,
+    CanonicalErrorResponse, CanonicalResponse, CommandType, MappingError, Totals, XReportPayload,
+    SCHEMA_VERSION,
 };
 use super::policy::{classify_command, CommandClass};
 use super::replay::{conflict_response, resolve_replay, ReplayResolution};
@@ -81,12 +82,15 @@ pub struct IngressResponse {
     pub body: IngressBody,
 }
 
-/// Either a success envelope ([`CanonicalResponse`], `ok:true`) or a typed
-/// error envelope ([`CanonicalErrorResponse`], `ok:false`).
+/// Either a success envelope ([`CanonicalResponse`], `ok:true`), a typed error
+/// envelope ([`CanonicalErrorResponse`], `ok:false`), or the L6 X-report
+/// snapshot ([`XReportPayload`], `ok:true`) — a read-only body that is NOT a
+/// fiscal `CanonicalResponse` (it carries no `document_id` / chain fields).
 #[derive(Debug, Clone, PartialEq)]
 pub enum IngressBody {
     Success(CanonicalResponse),
     Error(CanonicalErrorResponse),
+    XReport(XReportPayload),
 }
 
 /// Single source of truth: a stable machine `error_code` → HTTP status.
@@ -417,6 +421,75 @@ fn build_success(
     }
 }
 
+/// L6 — build the X-report (поточний звіт) snapshot: a local-only,
+/// SIDE-EFFECT-FREE read of the current open shift's turnover.
+///
+/// **Side-effect-free (the whole point):** this is a pure SELECT.  It does NOT
+/// enter `ingress_inbox`, create a `fiscal_documents` row, consume an lnd,
+/// advance the MAC seed, transition shift state, sign anything (no
+/// sidecar/crypto), or call DPS (no network).  Invariant #1 is held VACUOUSLY —
+/// there is no write transaction at all.
+///
+/// **SSOT:** turnover is [`aggregate_z_payload`] (the same ledger aggregation a
+/// live Z uses — payforms / `<IO>` / `<EPZ>` / `<TXS>` / `<NC>`), reused
+/// verbatim, NOT re-implemented.  It resolves the open shift itself (via
+/// `node_state.current_shift_id`); a `NoOpenShiftForZReport` error is the
+/// NO_OPEN_SHIFT gate → 422, row-less.  Cash-on-hand comes from
+/// [`cash_on_hand_for_fn`](crate::services::cash_ledger::cash_on_hand_for_fn)
+/// (0 when no open shift, but the aggregate has already gated that case).
+///
+/// **Bimodal for free:** the aggregation reads the durable ledger
+/// (`ACK` + `OFFLINE_LOCAL_ACK`), so an `OpenedLocalPendingDrain` (offline)
+/// shift returns the same turnover with no special-casing.
+async fn handle_x_report(
+    request_id_hex: &str,
+    fiscal_number: &str,
+    main_pool: &SqlitePool,
+) -> IngressResponse {
+    // SSOT aggregation — resolves the open shift + reads the durable ledger.
+    // A NoOpenShiftForZReport is the row-less NO_OPEN_SHIFT refusal (422).
+    let converted = match aggregate_z_payload(main_pool, fiscal_number).await {
+        Ok(cp) => cp,
+        Err(e) => return err(request_id_hex, convert_error_code(&e), e.to_string()),
+    };
+    // Parse the aggregated turnover into a JSON value for the flat response body
+    // (aggregate_z_payload serialises the ZReportOut shape).  A parse failure is
+    // an internal fault (the aggregator always emits valid JSON).
+    let turnover: serde_json::Value = match serde_json::from_str(&converted.payload_json) {
+        Ok(v) => v,
+        Err(_) => {
+            return err(
+                request_id_hex,
+                "INTERNAL",
+                "x-report: aggregated turnover was not valid JSON".to_string(),
+            )
+        }
+    };
+    // Running cash-on-hand for the open shift (the drawer balance).
+    let cash_on_hand_kop =
+        match crate::services::cash_ledger::cash_on_hand_for_fn(main_pool, fiscal_number).await {
+            Ok(c) => c,
+            Err(_) => {
+                return err(
+                    request_id_hex,
+                    "LEDGER_READ_FAILED",
+                    "x-report: cash-on-hand read failed".to_string(),
+                )
+            }
+        };
+    IngressResponse {
+        http_status: 200,
+        body: IngressBody::XReport(XReportPayload {
+            ok: true,
+            request_id: request_id_hex.to_string(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            fiscal_number: fiscal_number.to_string(),
+            turnover,
+            cash_on_hand_kop,
+        }),
+    }
+}
+
 /// Handle one ingress command end-to-end (accept → seam → response).
 ///
 /// `listener_fn` / `listener_driver_id` / `protocol` are the per-listener
@@ -445,6 +518,15 @@ pub async fn handle_command(
     match classify_command(cmd.command_type) {
         CommandClass::Signable => {}
         CommandClass::ReadOnly => {
+            // L6 — X-report (поточний звіт) is the ONE read-only command with a
+            // real read path: a local-only, SIDE-EFFECT-FREE snapshot of the
+            // open shift's turnover.  It is dispatched HERE (before any inbox
+            // write) so it never mints a row / lnd / seed / shift transition.
+            // Any OTHER read-only command (none today; classify_command maps
+            // only XReport to ReadOnly) keeps the hard 422 fallback.
+            if cmd.command_type == CommandType::XReport {
+                return handle_x_report(&rid_hex, listener_fn, main_pool).await;
+            }
             return err(
                 &rid_hex,
                 "READ_ONLY_COMMAND",
@@ -1426,10 +1508,14 @@ mod tests {
         }
     }
 
-    /// A read-only command (`X_REPORT`) is rejected 422 and NEVER enters
-    /// the fiscal inbox.
+    /// L6 — the read-only command (`X_REPORT`) is now DISPATCHED to the
+    /// side-effect-free read path, NOT hard-refused.  With no open shift (the
+    /// `fresh_pools` fixture has no `node_state.current_shift_id`) it returns a
+    /// row-less 422 `NO_OPEN_SHIFT` and STILL never enters the fiscal inbox.
+    /// (The positive / turnover / bimodal pins live in `tests/l6_xreport.rs`,
+    /// which seeds an open shift + receipts.)
     #[tokio::test]
-    async fn read_only_command_is_rejected_422() {
+    async fn x_report_no_open_shift_is_422_row_less() {
         let (_d, main, secure) = fresh_pools().await;
         let wp = UnimplementedWritePath;
         let r = handle_command(
@@ -1444,8 +1530,8 @@ mod tests {
         .await;
         assert_eq!(r.http_status, 422);
         match r.body {
-            IngressBody::Error(e) => assert_eq!(e.error_code, "READ_ONLY_COMMAND"),
-            other => panic!("expected Error, got {other:?}"),
+            IngressBody::Error(e) => assert_eq!(e.error_code, "NO_OPEN_SHIFT"),
+            other => panic!("expected NO_OPEN_SHIFT error, got {other:?}"),
         }
         let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
             .fetch_one(&main)
