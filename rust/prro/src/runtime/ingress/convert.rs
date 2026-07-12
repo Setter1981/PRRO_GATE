@@ -255,7 +255,9 @@ pub enum ConvertError {
     /// present — a SELL with NO payment legs is the pre-existing "cash implied"
     /// shape convert already tolerates.  Fail-closed pre-inbox (row-less,
     /// HTTP 422); `stage_sign`'s later total cross-check is defense-in-depth.
-    #[error("L5 G4: SELL paid {paid_kop} kop < goods {goods_kop} kop (underpayment) — fail-closed")]
+    #[error(
+        "L5 G4: SELL paid {paid_kop} kop < goods {goods_kop} kop (underpayment) — fail-closed"
+    )]
     UnderpaymentRefused { goods_kop: i64, paid_kop: i64 },
 
     /// `ZReport` / `ShiftClose` with no open shift — a Z closes the open

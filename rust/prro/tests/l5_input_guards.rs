@@ -139,7 +139,12 @@ async fn doc_count(main: &SqlitePool) -> i64 {
 /// Build a SELL command with one good (price/qty) + a chosen payment list.
 /// `good_price_kop` is the per-unit price; qty is 1.000 so item_sum == price.
 /// `payments_json` is the raw JSON array body of the `payments` field.
-fn sell_cmd(idem: &str, good_price_kop: i64, payments_json: &str, total_sale_kop: i64) -> CanonicalCommand {
+fn sell_cmd(
+    idem: &str,
+    good_price_kop: i64,
+    payments_json: &str,
+    total_sale_kop: i64,
+) -> CanonicalCommand {
     let json = format!(
         r#"{{
             "schema_version": "1.0",

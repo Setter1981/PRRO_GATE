@@ -1594,11 +1594,7 @@ async fn l5_probe(ctx: &mut FuzzCtx, kind: L5Kind) -> RealOutcome {
             10000,
         ),
         L5Kind::Underpaid => (1000, r#"[{"type":"CASH","amount_kopecks":900}]"#, 1000),
-        L5Kind::Valid => (
-            15000,
-            r#"[{"type":"CASH","amount_kopecks":15000}]"#,
-            15000,
-        ),
+        L5Kind::Valid => (15000, r#"[{"type":"CASH","amount_kopecks":15000}]"#, 15000),
     };
 
     let idem = format!("l5-{}", ctx.next_idem());

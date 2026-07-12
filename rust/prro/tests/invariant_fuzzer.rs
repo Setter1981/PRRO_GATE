@@ -3902,5 +3902,8 @@ fn l5_probe_valid_then_ordinary_sell_composes() {
         ],
         false,
     );
-    assert_eq!(count, 2, "valid probe SELL + ordinary SELL → two issued docs");
+    assert_eq!(
+        count, 2,
+        "valid probe SELL + ordinary SELL → two issued docs"
+    );
 }
