@@ -2401,9 +2401,27 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             }
             // B2 — NoIssuanceRowAllowed: a refusal that mints a LEGAL non-issued
             // row (online-reject Rejected / offline-ack Aborted).  The row IS
-            // allowed (the lnd is consumed → next_lnd may bump), but it is NOT
-            // issued: the row matches the model's predicted non-issued state
-            // (ledger-delta) AND the seed + codes do NOT move.
+            // allowed (the lnd is consumed → next_lnd may bump), but the REFUSED
+            // doc itself is NOT issued: the row matches the model's predicted
+            // non-issued state (ledger-delta) AND the refused doc neither advances
+            // the seed nor consumes a code.
+            //
+            // B10 correction — a co-interposed lazy DocType=9 BEGIN.  When the
+            // refused business doc is the FIRST offline doc of a session, prod
+            // (and the model) FIRST interpose an issued OFFLINE_SESSION_BEGIN
+            // (its own committed OLA envelope: consumes ONE code + advances the
+            // seed, stage_offline_ack.rs:495 / stage_sign.rs:992), THEN the
+            // business doc aborts on pool exhaustion.  That BEGIN is a legitimate
+            // issuance, so within such an op the seed DOES advance and ONE code
+            // IS consumed — a hard `seed == prior_tip` / `codes == codes_before`
+            // freeze is wrong here (both prod AND the model advance).  Assert
+            // STRUCTURALLY against the MODEL instead (mirrors the B3 recovered-
+            // drain pattern): the real seed-advance must equal the model's, and
+            // the real consumed-codes must equal the model's `codes_consumed`.
+            // TEETH PRESERVED: for the pure online-reject case (no BEGIN) the
+            // model advances NOTHING → the real seed must NOT move and NO code
+            // may be consumed — a prod that wrongly advanced/consumed on a refused
+            // doc still REDs (model_advanced=false ≠ real_advanced=true).
             oracle::OpClass::ExpectedNoIssuanceRow => {
                 if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
                     panic!("no-issuance-row differential on {op:?}: {d:?}");
@@ -2412,15 +2430,29 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
                     panic!("no-issuance-row ledger-delta on {op:?}: {d:?}");
                 }
+                // Seed advance is compared STRUCTURALLY (model synthetic hashes vs
+                // real crypto hashes never value-match): the real seed must CHANGE
+                // iff the model's did.  A refused doc with NO interposed BEGIN
+                // leaves both unmoved; a BEGIN interposition advances both.
+                let real_seed_after = ctx.read_seed().await;
+                let real_seed_advanced = real_seed_after.as_deref() != prior_tip.as_deref();
+                let model_seed_advanced = model.seed != seed_at_op_start;
                 assert_eq!(
-                    ctx.read_seed().await,
-                    prior_tip,
-                    "ExpectedNoIssuanceRow {op:?} advanced the seed (a refused row is NOT issued)"
+                    real_seed_advanced, model_seed_advanced,
+                    "ExpectedNoIssuanceRow {op:?} — real seed-advance ({real_seed_advanced}) \
+                     must match the model's ({model_seed_advanced}): a refused doc must not \
+                     advance the seed, but a co-interposed BEGIN legitimately does"
                 );
                 assert_eq!(
                     ctx.consumed_codes_count().await,
-                    codes_before,
-                    "ExpectedNoIssuanceRow {op:?} consumed a code (a refused row is NOT issued)"
+                    model.codes_consumed,
+                    "ExpectedNoIssuanceRow {op:?} — real consumed-codes must equal the model's \
+                     ({}): a refused doc consumes no code, but a co-interposed BEGIN consumes one",
+                    model.codes_consumed
+                );
+                assert!(
+                    model.codes_consumed >= codes_before as i64,
+                    "ExpectedNoIssuanceRow {op:?} sanity: model codes_consumed never decreases"
                 );
             }
         }
@@ -3820,6 +3852,41 @@ async fn teeth_epz_z_quiescence_blocks_close() {
         ShiftState::Closed,
         "the shift must NOT close over an in-flight EPZ (z-quiescence)"
     );
+}
+
+/// ★TEETH — B10 lazy-BEGIN interposition inside a refused (NoIssuanceRow) op.
+/// This is the deterministic analog of the seeded divergence the fuzzer surfaced
+/// (`harness_offline_seeded`, seed `[Crash(Sign), RepeatReboot, Crash(Sign),
+/// RepeatReboot, OfflineEpz]`): an OFFLINE cash-out (`OfflineEpz`) that is the
+/// FIRST offline doc of a session over a pool with EXACTLY ONE free code.  Prod
+/// (and the model) FIRST interpose an issued DocType=9 OFFLINE_SESSION_BEGIN —
+/// its own committed OLA envelope consumes the last code + advances the MAC seed
+/// (stage_offline_ack.rs:495 / stage_sign.rs:992) — THEN the business doc aborts
+/// on `CodePoolExhausted` → a non-issued `Aborted` row.  The op is classified
+/// `ExpectedNoIssuanceRow` (its business doc is refused), yet the seed DID move
+/// and ONE code WAS consumed by the legitimate BEGIN.  `run_harness` drives the
+/// corrected `ExpectedNoIssuanceRow` arm, which compares the real seed-advance /
+/// consumed-codes STRUCTURALLY against the model (both advance) rather than
+/// hard-freezing them — so this completes without panicking.
+///
+/// REVERT TARGET (proven RED): in the `ExpectedNoIssuanceRow` arm of
+/// `run_harness`, restore the old hard freeze
+///   `assert_eq!(ctx.read_seed().await, prior_tip, ...)`
+///   `assert_eq!(ctx.consumed_codes_count().await, codes_before, ...)`
+/// (replacing the structural model-referenced checks).  The interposed BEGIN's
+/// legitimate seed-advance + code-consume then trip both asserts → this test
+/// REDs.  Restoring the structural checks makes it GREEN — the model+prod agree
+/// on every durable fact, so the refusal oracle must credit the BEGIN's issuance.
+#[tokio::test]
+async fn teeth_offline_begin_interposition_in_refused_op_is_structurally_oracle_checked() {
+    // Exactly ONE offline code: the BEGIN consumes it, leaving the business doc
+    // pool-exhausted → Aborted.
+    let ctx = interp::FuzzCtx::new_offline_open_shift(1).await;
+    let model = RefModel::new_offline_open_shift(1);
+    // `OfflineEpz` (offline cash-out) as the FIRST offline doc → BEGIN interposed,
+    // business doc aborts.  A pre-fix hard-freeze NoIssuanceRow arm panics on the
+    // BEGIN's seed-advance / code-consume; the structural arm accepts it.
+    let _ = run_harness(&[Op::OfflineEpz], ctx, model).await;
 }
 
 // ─── L5 — fail-closed pre-inbox input guards (G1..G4) fuzzer ops ─────────────
