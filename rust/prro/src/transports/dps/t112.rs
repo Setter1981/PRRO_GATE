@@ -18,9 +18,9 @@
 //! `comp_date` format is `yyyyMMddHHmmss` as a bare 14-digit `i64`
 //! (e.g. `20260707224141`).  This is the Kyiv wall-clock, NOT a Unix
 //! epoch.  [`kyiv_comp_date`] converts a `DateTime<Utc>` to this format
-//! using the same DST logic as `stage_send::kyiv_local_epoch` (both
-//! convert to `Europe/Kiev` via `chrono-tz`), but returns the formatted
-//! digits rather than a fake epoch.
+//! (`Europe/Kiev` via `chrono-tz`) — the SAME 14-digit encoding every
+//! DPS document now uses for `<TS>` and `CheckEnvelope::date_time` (mirror
+//! of `stage_send::kyiv_comp_date`).
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Europe::Kiev;
@@ -118,10 +118,11 @@ pub fn build_t112_request(
 /// Convert a `DateTime<Utc>` to the `yyyyMMddHHmmss` Kyiv-wall-clock
 /// digit-integer that DPS expects in `<TS>` and `CheckEnvelope::date_time`.
 ///
-/// Uses the same `Europe/Kiev` DST logic as `stage_send::kyiv_local_epoch`
-/// but returns `yyyyMMddHHmmss` digit-integer rather than a fake epoch.
-/// Do NOT substitute `kyiv_local_epoch` for this: receipt documents use
-/// that fake-epoch convention; T=112 ask-code requests use this one.
+/// This is the DPS `Check.date` encoding — the same 14-digit form used by
+/// EVERY receipt / Z / service document (mirror of
+/// `stage_send::kyiv_comp_date`). A prior fake-epoch encoding for ONLINE
+/// receipts was WRONG (DPS `-8` "дата не відповідає Check.date") and was
+/// removed 2026-07-12 (docs/DPS_MINUS8_DATE_AND_SHIFT_RECOVERY.md).
 pub fn kyiv_comp_date(utc: DateTime<Utc>) -> i64 {
     let kyiv = utc.with_timezone(&Kiev);
     let y = kyiv.year() as i64;
