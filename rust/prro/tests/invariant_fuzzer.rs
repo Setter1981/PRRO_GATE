@@ -336,69 +336,61 @@ async fn teeth_d5_send_ack_notfound_drain_predicts_sent_held() {
     .await;
 }
 
-/// U1 D5 (KNOWN-RED tooth, PRRO_GATE-eid) — online shift-management docs with
-/// D5 `Superseded` currently leave production/model without an agreed legal
-/// terminal: the doc is routed to a non-issued retry/error shape after
-/// stage_acquire has already moved the shift into `Opening` / `Closing`.
+/// U1 D5 (RESOLVED tooth, PRRO_GATE-eid, RAGE W1) — online shift-management
+/// docs with D5 `Superseded` route to a non-issued `ErrorRetryable` shape AFTER
+/// stage_acquire has already moved the shift into `Opening` / `Closing`.  That
+/// acquire-time shift transition PERSISTS: the confirm edge that would advance
+/// `Opening → Opened` / `Closing → Closed` runs ONLY on `WireDecision::Sent`
+/// (`stage_send.rs:1758`), so a retryable send leaves the shift resting at the
+/// mid-lifecycle state (prod does NOT roll back).
 ///
-/// We do NOT normalize that behavior in the model and we do NOT generate these
-/// scripts yet.  This test proves the fuzzer bites: the directed sequence must
-/// panic until PRRO_GATE-eid resolves the production/model contract and promotes
-/// these scripts into `shift_dps_script()`.
-#[test]
-fn teeth_d5_shift_doc_superseded_known_red() {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let ctx = interp::FuzzCtx::new_online_open_shift().await;
-            let model = RefModel::new_online_open_shift();
-            run_harness(
-                &[Op::OnlineZReport(DpsScript::superseded_tip())],
-                ctx,
-                model,
-            )
-            .await;
-        });
-    }))
-    .is_err();
-    std::panic::set_hook(prev);
-    assert!(
-        panicked,
-        "PRRO_GATE-eid: OnlineZReport(Superseded) returned cleanly. That means \
-         the D5 shift-doc gap was silently adopted or normalized instead of being \
-         resolved with an explicit production/model contract."
+/// Contract adjudicated prod=correct / model=gap: the model now persists the
+/// acquire-time mid-state on the `ErrorRetryable` fall-through
+/// (`apply_online_z_report` / `apply_online_shift_open`), so `run_harness`
+/// converges cleanly instead of diverging.  These scripts are now GENERATED
+/// (`shift_dps_script()`), and this directed tooth pins the resolved terminal:
+///   - `OnlineZReport(Superseded)` on an `Opened` shift → shift rests `Closing`;
+///   - `OnlineShiftOpen(Superseded)` on a `Closed` shift → shift rests `Opening`.
+///
+/// TEETH: `run_harness` runs the full differential (shift_state included), so a
+/// model regression that reverted the shift to its PRE-op state (`Opened` /
+/// `Closed`) — or over-escalated it to RMR — REDs on the differential; the
+/// explicit post-run assert pins the exact converged mid-state as a second gate.
+#[tokio::test]
+async fn teeth_d5_shift_doc_superseded_resolved() {
+    // Z_REPORT on an OPEN shift: acquire drove Opened → Closing; the retryable
+    // Superseded send does not confirm and does not roll back → rests `Closing`.
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let ctx = run_harness(
+        &[Op::OnlineZReport(DpsScript::superseded_tip())],
+        ctx,
+        model,
+    )
+    .await;
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Closing,
+        "PRRO_GATE-eid resolved: OnlineZReport(Superseded) must leave the shift \
+         resting at the acquire-time mid-close state (Closing), not reverted or RMR"
     );
 
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let ctx = interp::FuzzCtx::new_online_closed_shift().await;
-            let model = RefModel::new_online_closed_shift();
-            run_harness(
-                &[Op::OnlineShiftOpen(DpsScript::superseded_tip())],
-                ctx,
-                model,
-            )
-            .await;
-        });
-    }))
-    .is_err();
-    std::panic::set_hook(prev);
-    assert!(
-        panicked,
-        "PRRO_GATE-eid: OnlineShiftOpen(Superseded) returned cleanly. That means \
-         the D5 shift-doc gap was silently adopted or normalized instead of being \
-         resolved with an explicit production/model contract."
+    // SHIFT_OPEN on a CLOSED shift: acquire drove Created → Opening; the
+    // retryable Superseded send does not confirm and does not roll back →
+    // rests `Opening`.
+    let ctx = interp::FuzzCtx::new_online_closed_shift().await;
+    let model = RefModel::new_online_closed_shift();
+    let ctx = run_harness(
+        &[Op::OnlineShiftOpen(DpsScript::superseded_tip())],
+        ctx,
+        model,
+    )
+    .await;
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Opening,
+        "PRRO_GATE-eid resolved: OnlineShiftOpen(Superseded) must leave the shift \
+         resting at the acquire-time mid-open state (Opening), not reverted or RMR"
     );
 }
 

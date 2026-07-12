@@ -568,6 +568,19 @@ impl RefModel {
 
     /// Online SHIFT_OPEN.  Closed → Opening at acquire, then Opening → Opened
     /// once the doc crosses SEND.  ACK only confirms.
+    ///
+    /// RAGE W1 — the acquire-time `Closed → Opening` transition PERSISTS under
+    /// an `ErrorRetryable` send outcome (e.g. `Superseded` →
+    /// `ServerFiscalIdMismatch` → `WrapperBug` → `ErrorRetryable`,
+    /// `error_routing.rs:350`, doc-type-agnostic).  Prod stamps `Opening` at
+    /// acquire (`stage_acquire.rs:883-910`) and the confirm edge that would
+    /// drive `Opening → Opened` runs ONLY inside `if let WireDecision::Sent`
+    /// (`stage_send.rs:1758`), so a retryable send does NOT confirm and does
+    /// NOT roll back — the shift rests at `Opening`.  The model must mirror
+    /// that: the `ErrorRetryable` fall-through leaves the shift at `Opening`
+    /// (mid-open), NOT reverted to `Closed` and NOT escalated to RMR (that is
+    /// the `Rejected` arm only), with NO seed advance (advance-at-SEND / D2:
+    /// `ErrorRetryable` has no sfn and never crosses the SEND boundary).
     fn apply_online_shift_open(&mut self, script: &DpsScript) -> ExpectedOutcome {
         if self.mode != NodeMode::Online || self.shift_state != ShiftState::Closed {
             return ExpectedOutcome::NoMutation;
@@ -599,6 +612,12 @@ impl RefModel {
         } else if doc_state == DocState::Rejected {
             self.shift_state = ShiftState::RequiresManualReconciliation;
             return ExpectedOutcome::NoIssuanceRow;
+        } else {
+            // RAGE W1 — `ErrorRetryable` (Superseded / WrapperBug): the
+            // acquire-time `Closed → Opening` transition PERSISTS (prod does
+            // not confirm and does not roll back a retryable send).  No seed
+            // advance (D2 / advance-at-SEND), no RMR escalation.
+            self.shift_state = ShiftState::Opening;
         }
 
         ExpectedOutcome::Mutated(Mutation {
@@ -700,6 +719,19 @@ impl RefModel {
     /// Online Z_REPORT / close-shift.  This is the first Tier-1 shift-machine
     /// slice: Opened → Closing at acquire, then Closing → Closed once the doc
     /// crosses SEND.  ACK is confirmation; issuance is the SEND crossing.
+    ///
+    /// RAGE W1 — the acquire-time `Opened → Closing` transition PERSISTS under
+    /// an `ErrorRetryable` send outcome (e.g. `Superseded` →
+    /// `ServerFiscalIdMismatch` → `WrapperBug` → `ErrorRetryable`,
+    /// `error_routing.rs:350`, doc-type-agnostic).  Prod stamps `Closing` at
+    /// acquire (`stage_acquire.rs:917-935`) and the confirm edge that would
+    /// drive `Closing → Closed` runs ONLY inside `if let WireDecision::Sent`
+    /// (`stage_send.rs:1758`), so a retryable send does NOT confirm and does
+    /// NOT roll back — the shift rests at `Closing`.  The model must mirror
+    /// that: the `ErrorRetryable` fall-through leaves the shift at `Closing`
+    /// (mid-close), NOT reverted to `Opened` and NOT escalated to RMR (that is
+    /// the `Rejected` arm only), with NO seed advance (advance-at-SEND / D2:
+    /// `ErrorRetryable` has no sfn and never crosses the SEND boundary).
     fn apply_online_z_report(&mut self, script: &DpsScript) -> ExpectedOutcome {
         if self.mode != NodeMode::Online || self.shift_state != ShiftState::Opened {
             return ExpectedOutcome::NoMutation;
@@ -728,6 +760,12 @@ impl RefModel {
             // the document itself rests as non-issued Rejected.
             self.shift_state = ShiftState::RequiresManualReconciliation;
             return ExpectedOutcome::NoIssuanceRow;
+        } else {
+            // RAGE W1 — `ErrorRetryable` (Superseded / WrapperBug): the
+            // acquire-time `Opened → Closing` transition PERSISTS (prod does
+            // not confirm and does not roll back a retryable send).  No seed
+            // advance (D2 / advance-at-SEND), no RMR escalation.
+            self.shift_state = ShiftState::Closing;
         }
 
         ExpectedOutcome::Mutated(Mutation {
