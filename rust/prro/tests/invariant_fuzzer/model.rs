@@ -1541,6 +1541,25 @@ impl RefModel {
         self.session_has_end = issued_boundaries
             .iter()
             .any(|(dt,)| dt == "OFFLINE_SESSION_END");
+
+        // L6 — cash_on_hand ← the real ledger.  A crash-completed offline sell /
+        // return / service-io issues a real cash-moving doc the model does NOT
+        // predict across the crash window (it is a Fault op, adopted not
+        // predicted); without this the model's cash accumulator drifts from
+        // reality, and a subsequent Op::XReport snapshot check would spuriously
+        // RED (real cash reflects the crash-completed doc; model still at its
+        // pre-fault value).  Adopt reality's cash — same discipline as docs /
+        // codes / seed above — via the prod SSOT `cash_on_hand_for_fn`.  For a
+        // NON-fault X-report the model still tracks cash INDEPENDENTLY through
+        // `apply_*`, so the snapshot check retains its teeth there.
+        let fiscal_number: String =
+            sqlx::query_scalar("SELECT fiscal_number FROM node_state LIMIT 1")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        self.cash_on_hand = prro::services::cash_ledger::cash_on_hand_for_fn(pool, &fiscal_number)
+            .await
+            .unwrap();
     }
 
     /// **U1 A1 funnel wrapper — `read_seed_fixture`.**  The tagged primitive for

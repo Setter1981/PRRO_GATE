@@ -32,3 +32,4 @@ cc 339c70fee74cc696b33b43f2f0521a576fb7e3d5292d2d6eb364de0fb702a7cf # shrinks to
 cc c4e3d972ba0e328c66fb78fd0e6eb56511f15fef89bf097e31289e9affb575ed # shrinks to ops = [Crash(Sign), RepeatReboot, Crash(Sign), RepeatReboot, OfflineEpz]
 cc ee48269e9b8c9f5280e22139b177f62a43453209c7f92d2c581618697b565e94 # shrinks to ops = [OfflineServiceIn, GoOnline(DpsScript([Reject])), XReport]
 cc 2e82f11da8283ec8019e8881be8ca080b8941e2e43adb71cc52cde4da5fc185a # shrinks to ops = [OnlineServiceIn(DpsScript([Ack, Ack])), SellWithClosedShift, XReport]
+cc 34ac8efc83d3acadbb6a84d98291438e70c23174aac34d543a013fb0e8362c41 # shrinks to ops = [Crash(Sign), Reboot, XReport]
