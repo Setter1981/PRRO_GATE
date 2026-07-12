@@ -431,6 +431,18 @@ async fn cash_on_hand(pool: &SqlitePool) -> i64 {
         .unwrap_or(-1)
 }
 
+/// The durable DB state of the most-recently-minted fiscal document — the doc
+/// under test after a scripted DPS reject.
+async fn last_doc_state(pool: &SqlitePool) -> String {
+    sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Drain wiring (mirrors pilot_offline_full_drill_e2e)
 // ════════════════════════════════════════════════════════════════════════
@@ -673,4 +685,100 @@ async fn matrix_s2_offline_lifecycle_drain_close() {
         Action::ZClose,
     ];
     run("S2-offline-lifecycle", &steps, &app, &*wp, &dps).await;
+}
+
+/// S3 — DPS REJECT CORPUS ("соберём ошибки ДПС"). For a representative DPS
+/// reject code per routing class (`error_routing.rs`), inject it at the SELL's
+/// send, then record the product's END-TO-END reaction (ingress response + the
+/// durable doc state + node mode) and ASSERT it matches the routing spec. This
+/// is the byzantine-DPS empirical groundwork + the transition matrix UNDER
+/// DPS-reject, proven through the real ingress. `assert_clean` is the universal
+/// oracle after every reject. Each code runs on a FRESH harness (a `-11` BLOCK
+/// would poison a shared node).
+#[tokio::test]
+async fn matrix_s3_dps_reject_corpus() {
+    // (DPS code, meaning, expected durable doc state, expected node mode after)
+    let corpus: &[(i32, &str, DocState, &str)] = &[
+        (
+            -2,
+            "ERROR_CHECK (terminal reject)",
+            DocState::Rejected,
+            "ONLINE",
+        ),
+        (
+            -3,
+            "ERROR_SAVE (transient retry)",
+            DocState::ErrorRetryable,
+            "ONLINE",
+        ),
+        (
+            -5,
+            "ERROR_TYPE (builder-bug reject)",
+            DocState::Rejected,
+            "ONLINE",
+        ),
+        (
+            -6,
+            "ERROR_NOT_PREV_ZREPORT (escalate)",
+            DocState::ErrorRetryable,
+            "ONLINE",
+        ),
+        (
+            -11,
+            "ERROR_OFFLINE_168 (reject + BLOCK)",
+            DocState::Rejected,
+            "BLOCKED",
+        ),
+        // NOTE: -12 (ERROR_BAD_HASH_PREV) is intentionally NOT in this simple-
+        // reject corpus. It triggers the multi-step W10.4 MAC-recovery subsystem
+        // (status_rro + re-seed + re-sign + re-send), NOT a terminal routing — a
+        // one-shot reject leaves the recovery unable to complete, so the doc
+        // terminalises to Rejected here. MAC recovery deserves a dedicated
+        // scenario (faithful re-seed modeling); tracked as a matrix follow-up.
+        (
+            -15,
+            "ERROR_NOT_OPEN_SHIFT (reject)",
+            DocState::Rejected,
+            "ONLINE",
+        ),
+        (
+            -16,
+            "ERROR_OFFLINE_ID (reject)",
+            DocState::Rejected,
+            "ONLINE",
+        ),
+        (
+            -99,
+            "unknown code (byzantine fallback)",
+            DocState::ErrorRetryable,
+            "ONLINE",
+        ),
+    ];
+    eprintln!("\n════════ DPS REJECT CORPUS ════════");
+    for (code, meaning, exp_state, exp_mode) in corpus {
+        let (app, dps, wp) = fresh_harness().await;
+        // Open a shift online (this send succeeds).
+        let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "corpus-OPEN")).await;
+        assert_eq!(
+            st, 200,
+            "corpus setup: SHIFT_OPEN must ACK before the reject (code {code})"
+        );
+        // Inject the DPS reject onto the SELL's send.
+        dps.reject_next(*code);
+        let (body, _total) = sell_body(1, "corpus-SELL");
+        let (status, resp) = drive_ingress(&app, &*wp, &body).await;
+        let doc = last_doc_state(app.db()).await;
+        let mode = node_row(app.db()).await.0;
+        eprintln!(
+            "[corpus] DPS {code:>4} {meaning:<38} → ingress[{status} {resp:<34.34}] doc={doc:<15} node={mode}"
+        );
+        assert_eq!(
+            doc,
+            exp_state.as_str(),
+            "DPS {code}: durable doc state must match routing spec"
+        );
+        assert_eq!(mode, *exp_mode, "DPS {code}: node mode after reject");
+        prro::db::invariant_scan::assert_clean(app.db()).await;
+    }
+    eprintln!("════════ DPS REJECT CORPUS: PASS ════════\n");
 }
