@@ -253,6 +253,32 @@ fn return_body(seed: u64, idem: &str) -> (String, i64) {
     (body, total)
 }
 
+/// A wire `CanonicalCommand` for a SERVICE_IN (службове внесення — cash INTO the
+/// drawer). Amount rides on `totals.sale_kopecks`; goods/payments empty.
+fn service_in_body(kop: i64, idem: &str) -> String {
+    format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SERVICE_IN","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[],"totals":{{"sale_kopecks":{kop},"return_kopecks":0}}}}}}"#
+    )
+}
+
+/// A wire `CanonicalCommand` for a SERVICE_OUT (службова видача — cash OUT of the
+/// drawer). Amount rides on `totals.return_kopecks` (ASYMMETRIC vs SERVICE_IN).
+fn service_out_body(kop: i64, idem: &str) -> String {
+    format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SERVICE_OUT","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[],"totals":{{"sale_kopecks":0,"return_kopecks":{kop}}}}}}}"#
+    )
+}
+
+/// A wire `CanonicalCommand` for an EPZ cash advance (видача готівки за ЕПЗ —
+/// card-funded cash handed to the cardholder). One CASHLESS card leg with an
+/// acquirer slip at `pay_form_index` (must be ≥ 2 = a card slot); amount rides on
+/// `payments[0].amount_kopecks`; totals zero, goods empty.
+fn epz_body(kop: i64, pay_form_index: i64, idem: &str) -> String {
+    format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"CASH_ADVANCE_EPZ","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[{{"type":"CASHLESS_1","amount_kopecks":{kop},"acquirer_slip":{{"payment_form_index":{pay_form_index},"merchant_id":"M-1","terminal_id":"T-1","operation_type":"PURCHASE","pan":"**** 4242","approval_code":"APPR1","payment_system":"Visa","transaction_code":"RRN-1","fee_kopecks":0,"cashier_signature_placeholder":false,"cardholder_signature_placeholder":false}}}}],"totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+    )
+}
+
 /// A wire `CanonicalCommand` for a payload-less op (SHIFT_OPEN / Z_REPORT).
 fn simple_body(command_type: &str, idem: &str) -> String {
     format!(
@@ -522,6 +548,14 @@ enum Action {
     /// Online-convergence tick — actively finalise KVT1 → ACK (the mechanism
     /// SEPARATE from `Reconcile`'s passive KVT1-hold; the supervisor drives both).
     OnlineConverge,
+    /// Службове внесення — cash INTO the drawer, `kop` kopecks.
+    ServiceIn(i64),
+    /// Службова видача — cash OUT of the drawer, `kop` kopecks. The drawer must
+    /// hold ≥ `kop` (guard-3b), else the op refuses (use a bespoke test for that).
+    ServiceOut(i64),
+    /// EPZ cash advance (видача готівки за ЕПЗ) — `kop` kopecks, card-funded (pay
+    /// form index 2). Drawer must hold ≥ `kop` (guard-3c).
+    Epz(i64),
 }
 
 /// Run a scenario end-to-end through the real ingress, logging every step and
@@ -710,6 +744,59 @@ async fn run(
                     "online-convergence must finalise KVT1 → ACK ({ticks} ticks)"
                 );
                 format!("ONLINE-CONVERGE ({ticks} ticks) → KVT1 finalised to ACK")
+            }
+            Action::ServiceIn(kop) => {
+                let (status, state) = drive_ingress(
+                    app,
+                    wp,
+                    &service_in_body(*kop, &format!("mx-{name}-SVCIN-{i}")),
+                )
+                .await;
+                let mode = node_row(app.db()).await.0;
+                let want = if mode == "OFFLINE" {
+                    DocState::OfflineLocalAck.as_str()
+                } else {
+                    DocState::Ack.as_str()
+                };
+                assert_eq!(
+                    state, want,
+                    "SERVICE_IN step {i}: mode={mode} status={status}"
+                );
+                format!("SERVICE_IN(+{kop}) → {state} [{status}]")
+            }
+            Action::ServiceOut(kop) => {
+                let (status, state) = drive_ingress(
+                    app,
+                    wp,
+                    &service_out_body(*kop, &format!("mx-{name}-SVCOUT-{i}")),
+                )
+                .await;
+                let mode = node_row(app.db()).await.0;
+                let want = if mode == "OFFLINE" {
+                    DocState::OfflineLocalAck.as_str()
+                } else {
+                    DocState::Ack.as_str()
+                };
+                assert_eq!(
+                    state, want,
+                    "SERVICE_OUT step {i}: mode={mode} status={status} (drawer must cover {kop})"
+                );
+                format!("SERVICE_OUT(-{kop}) → {state} [{status}]")
+            }
+            Action::Epz(kop) => {
+                let (status, state) =
+                    drive_ingress(app, wp, &epz_body(*kop, 2, &format!("mx-{name}-EPZ-{i}"))).await;
+                let mode = node_row(app.db()).await.0;
+                let want = if mode == "OFFLINE" {
+                    DocState::OfflineLocalAck.as_str()
+                } else {
+                    DocState::Ack.as_str()
+                };
+                assert_eq!(
+                    state, want,
+                    "EPZ step {i}: mode={mode} status={status} (drawer must cover {kop})"
+                );
+                format!("EPZ(-{kop} card-funded) → {state} [{status}]")
             }
         };
 
@@ -1090,4 +1177,184 @@ async fn matrix_s8_cross_shift_cash_carryover() {
         "════════ S8-carryover: PASS — drawer {close_drawer_1} carried across Z \
          (sentinel 0 during closed window) ════════"
     );
+}
+
+/// S9 — SERVICE-IO LIFECYCLE (службові внесення/видача through the real path).
+/// Open → внесення (+50.00) → a CASH sell → видача (−20.00, covered) → Z. Proves
+/// the drawer tracks service cash-in/out and that a shift holding service-io docs
+/// still reaches a CLEAN Z (the `<IO>` aggregation + z-quiescence include
+/// service-io — the #192 z-quiescence class L3 fixed). The per-step log shows the
+/// drawer move.
+#[tokio::test]
+async fn matrix_s9_service_io_lifecycle() {
+    let (app, dps, wp) = fresh_harness().await;
+    let steps = vec![
+        Action::Open,
+        Action::ServiceIn(5000),  // +50.00 into the drawer
+        Action::Sell(2),          // even seed = CASH sell → drawer grows
+        Action::ServiceOut(2000), // -20.00 out of the drawer (covered)
+        Action::ZClose,
+    ];
+    run("S9-service-io", &steps, &app, &*wp, &dps).await;
+}
+
+/// S10 — SERVICE-OUT guard-3b teeth (fail-closed видача over an empty drawer). A
+/// службова видача larger than the drawer must be REFUSED at the canonical
+/// boundary (CASH_INSUFFICIENT / HTTP 422) and mint ZERO fiscal rows — the drawer
+/// can never go negative (INV-21). Then a видача of EXACTLY the funded drawer
+/// proceeds to ACK and drains it to 0, proving the guard is a floor, not a wall.
+#[tokio::test]
+async fn matrix_s10_service_out_guard_3b() {
+    let (app, _dps, wp) = fresh_harness().await;
+    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s10-OPEN")).await;
+    assert_eq!(st, 200, "S10 setup: SHIFT_OPEN must ACK");
+    let rows_before = db_stats(app.db()).await.0;
+
+    // over-drawer видача on an EMPTY drawer → fail-closed, row-less
+    let (status, state) =
+        drive_ingress(&app, &*wp, &service_out_body(5000, "s10-SVCOUT-over")).await;
+    assert_eq!(
+        status, 422,
+        "S10: over-drawer SERVICE_OUT must be HTTP 422 (got {status}: {state})"
+    );
+    assert!(
+        state.contains("CASH_INSUFFICIENT"),
+        "S10: refusal must be CASH_INSUFFICIENT, got {state}"
+    );
+    assert_eq!(
+        db_stats(app.db()).await.0,
+        rows_before,
+        "S10: refused SERVICE_OUT must mint ZERO fiscal rows (row-less guard)"
+    );
+
+    // fund with a CASH sell, then видача the FULL drawer → ACK, cash 0
+    let (body, _t) = sell_body(2, "s10-SELL"); // even = cash
+    let (ss, sstate) = drive_ingress(&app, &*wp, &body).await;
+    assert_eq!(sstate, DocState::Ack.as_str(), "S10 fund sell → ACK [{ss}]");
+    let drawer = cash_on_hand(app.db()).await;
+    assert!(drawer > 0, "S10: drawer funded (got {drawer})");
+    let (cs, cstate) =
+        drive_ingress(&app, &*wp, &service_out_body(drawer, "s10-SVCOUT-covered")).await;
+    assert_eq!(
+        cstate,
+        DocState::Ack.as_str(),
+        "S10: covered SERVICE_OUT (exactly the drawer) → ACK [{cs}]"
+    );
+    assert_eq!(
+        cash_on_hand(app.db()).await,
+        0,
+        "S10: видача of the full drawer → cash 0"
+    );
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S10-guard-3b: PASS — over-drawer видача refused row-less; covered видача drains drawer to 0 ════════"
+    );
+}
+
+/// S11 — EPZ LEDGER (видача готівки за ЕПЗ subtracts the drawer). Fund the drawer
+/// with a службове внесення, read it, then an EPZ cash advance ≤ drawer, and
+/// assert the drawer dropped by EXACTLY the EPZ sum (card-funded cash handed out).
+/// Close with a Z (the `<EPZ>` aggregation + z-quiescence include EPZ).
+#[tokio::test]
+async fn matrix_s11_epz_cash_advance_ledger() {
+    let (app, _dps, wp) = fresh_harness().await;
+    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s11-OPEN")).await;
+    assert_eq!(st, 200, "S11 setup: SHIFT_OPEN must ACK");
+    // fund the drawer (+80.00)
+    let (fi, fstate) = drive_ingress(&app, &*wp, &service_in_body(8000, "s11-SVCIN")).await;
+    assert_eq!(
+        fstate,
+        DocState::Ack.as_str(),
+        "S11 fund внесення → ACK [{fi}]"
+    );
+    let before = cash_on_hand(app.db()).await;
+    assert!(before >= 3000, "S11: drawer funded ≥ 30.00 (got {before})");
+
+    // EPZ cash advance of 30.00 (card-funded) → drawer -= 30.00
+    let (es, estate) = drive_ingress(&app, &*wp, &epz_body(3000, 2, "s11-EPZ")).await;
+    assert_eq!(estate, DocState::Ack.as_str(), "S11: EPZ → ACK [{es}]");
+    let after = cash_on_hand(app.db()).await;
+    assert_eq!(
+        after,
+        before - 3000,
+        "S11: EPZ must subtract 30.00 from the drawer ({before} → {after})"
+    );
+
+    let (zs, zstate) = drive_ingress(&app, &*wp, &simple_body("Z_REPORT", "s11-Z")).await;
+    assert_eq!(zstate, DocState::Ack.as_str(), "S11: Z → ACK [{zs}]");
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S11-epz: PASS — EPZ 30.00 subtracted drawer {before}→{after}, Z clean ════════"
+    );
+}
+
+/// S12 — EPZ guard teeth (two fail-closed refusals, both row-less / HTTP 422).
+/// (a) EPZ over an EMPTY drawer → CASH_INSUFFICIENT (guard-3c, WebCheck errCode-47
+/// analog). (b) EPZ with payment_form_index < 2 (a cash slot) → EPZ_PAYMENT_ID_
+/// TOO_LOW (WebCheck «paymentid не может быть меньше 2»). Neither mints a row.
+#[tokio::test]
+async fn matrix_s12_epz_guards() {
+    let (app, _dps, wp) = fresh_harness().await;
+    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s12-OPEN")).await;
+    assert_eq!(st, 200, "S12 setup: SHIFT_OPEN must ACK");
+    let rows0 = db_stats(app.db()).await.0;
+
+    // (a) over-drawer EPZ on an empty drawer → guard-3c
+    let (s1, st1) = drive_ingress(&app, &*wp, &epz_body(5000, 2, "s12-EPZ-over")).await;
+    assert_eq!(
+        s1, 422,
+        "S12(a): over-drawer EPZ must be 422 (got {s1}: {st1})"
+    );
+    assert!(
+        st1.contains("CASH_INSUFFICIENT"),
+        "S12(a): must be CASH_INSUFFICIENT, got {st1}"
+    );
+
+    // (b) paymentid < 2 (cash slot) → EPZ_PAYMENT_ID_TOO_LOW (checked before the
+    // cash guard, so it fires even on an empty drawer)
+    let (s2, st2) = drive_ingress(&app, &*wp, &epz_body(1000, 1, "s12-EPZ-payid")).await;
+    assert_eq!(
+        s2, 422,
+        "S12(b): paymentid<2 EPZ must be 422 (got {s2}: {st2})"
+    );
+    assert!(
+        st2.contains("EPZ_PAYMENT_ID_TOO_LOW"),
+        "S12(b): must be EPZ_PAYMENT_ID_TOO_LOW, got {st2}"
+    );
+
+    assert_eq!(
+        db_stats(app.db()).await.0,
+        rows0,
+        "S12: both refused EPZ mint ZERO fiscal rows"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S12-epz-guards: PASS — over-drawer→CASH_INSUFFICIENT, paymentid<2→EPZ_PAYMENT_ID_TOO_LOW, row-less ════════"
+    );
+}
+
+/// S13 — OFFLINE BIMODAL service-io + EPZ (the path the L3/EPZ unit suites do NOT
+/// drive — researcher-flagged gap: внесення/видача/EPZ through the OFFLINE lane →
+/// OFFLINE_LOCAL_ACK → drain). Fund the drawer online, drop the net, GO_OFFLINE,
+/// then run внесення / видача / EPZ OFFLINE (each must land OFFLINE_LOCAL_ACK, the
+/// guards reading the OLA-inclusive drawer), restore + drain (all converge to
+/// terminal), then Z. End-to-end coverage of the offline branch for all three ops.
+#[tokio::test]
+async fn matrix_s13_offline_service_io_epz_bimodal() {
+    let (app, dps, wp) = fresh_harness().await;
+    let steps = vec![
+        Action::Open,
+        Action::Sell(4),          // even = CASH sell → fund the drawer online
+        Action::ServiceIn(10000), // +100.00 online (headroom for offline out/epz)
+        Action::NetDown,
+        Action::GoOffline,
+        Action::ServiceIn(3000),  // offline внесення → OLA
+        Action::ServiceOut(2000), // offline видача → OLA (drawer covers)
+        Action::Epz(1000),        // offline EPZ → OLA (drawer covers)
+        Action::NetUp,
+        Action::GoOnlineDrain, // all OLA docs drain to terminal
+        Action::ZClose,
+    ];
+    run("S13-offline-svc-epz", &steps, &app, &*wp, &dps).await;
 }
