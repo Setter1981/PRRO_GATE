@@ -331,8 +331,8 @@ async fn c6_eligible_completed_when_all_docs_reach_ack_via_w12() {
     let c = carriers_with_last_chk(
         vec![Ok(ack("A")), Ok(ack("B"))],
         vec![
-            Ok(last_chk_ack("A", vec![0xAAu8; 32])),
-            Ok(last_chk_ack("B", vec![0xBBu8; 32])),
+            Ok(last_chk_ack("A", vec![0xAAu8; 64])),
+            Ok(last_chk_ack("B", vec![0xBBu8; 64])),
         ],
     );
     let view = view_for(&c);

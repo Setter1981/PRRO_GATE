@@ -71,6 +71,17 @@ pub struct CheckAck {
     pub data_sign: Vec<u8>,
 }
 
+/// The minimum plausible length of a real KVT1 `data_sign` quittance. A genuine
+/// KVT1 evidence is a DSTU-4145 CMS SignedData blob — hundreds to thousands of
+/// bytes (a bare DSTU-4145-256 signature alone is 64 bytes; a live-observed KVT1
+/// was ~2500 bytes). Anything shorter is not a signature, so it is NOT a valid
+/// KVT1 quittance and must NOT advance a doc to KVT1/ACK — RISK 1 fail-closed
+/// harden against a byzantine-but-alive DPS returning non-empty garbage evidence.
+/// The bound is deliberately conservative (a bare-signature floor) so it can never
+/// false-reject a real quittance. Callers already reject the empty case; this
+/// subsumes it (`0 < MIN_KVT1_DATA_SIGN_LEN`).
+pub const MIN_KVT1_DATA_SIGN_LEN: usize = 64;
+
 /// Successful `StatusResponse` payload (status == OK).
 #[derive(Debug, Clone)]
 pub struct StatusSnapshot {

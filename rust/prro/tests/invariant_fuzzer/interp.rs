@@ -2192,8 +2192,10 @@ fn load_drain_script(dps: &ScriptedDps, script: &DpsScript, backlog: usize) {
 /// (`Timeout` is realized via `Crash` drop-injection, not a queued result.)
 fn wire_to_result(wr: WireResponse) -> Result<CheckAck, DpsError> {
     match wr {
-        // Full ack: send → Sent; lastChk Match → ACK.
-        WireResponse::Ack => Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
+        // Full ack: send → Sent; lastChk Match → ACK. The KVT1 evidence must be
+        // ≥ MIN_KVT1_DATA_SIGN_LEN (64) to pass the plausibility floor (RISK 1
+        // harden); a real DSTU CMS quittance is far larger.
+        WireResponse::Ack => Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])),
         // Empty data_sign on a lastChk → the K4 Hold form (doc rests at SENT).
         WireResponse::NotFound => Ok(ack(SERVER_FISCAL_NO, Vec::new())),
         // Per-document reject → Sending → Rejected (DPS code -1, ERROR_VEREFY).

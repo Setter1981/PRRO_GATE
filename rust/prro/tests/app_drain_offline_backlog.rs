@@ -352,8 +352,8 @@ async fn app_drain_eligible_path_via_w12_sent_fresh_steady_state() {
     let c = carriers_with_last_chk(
         vec![Ok(ack("DPS-FN-A")), Ok(ack("DPS-FN-B"))],
         vec![
-            Ok(last_chk_ack("DPS-FN-A", vec![0xAAu8; 32])),
-            Ok(last_chk_ack("DPS-FN-B", vec![0xBBu8; 32])),
+            Ok(last_chk_ack("DPS-FN-A", vec![0xAAu8; 64])),
+            Ok(last_chk_ack("DPS-FN-B", vec![0xBBu8; 64])),
         ],
     );
     let view = view_for(&c);
@@ -801,7 +801,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     // ── Step 5-6: switch DPS to Acked + drain ──
     let c_recovery = carriers_with_last_chk(
         vec![],
-        vec![Ok(last_chk_ack("DPS-FN-E2E", vec![0xAAu8; 32]))],
+        vec![Ok(last_chk_ack("DPS-FN-E2E", vec![0xAAu8; 64]))],
     );
     let view_recovery = view_for(&c_recovery);
     let summary_recovery = app

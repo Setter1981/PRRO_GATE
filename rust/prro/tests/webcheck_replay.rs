@@ -427,8 +427,8 @@ impl Harness {
         let row = self.seed_inbox_sell(op).await;
         let dps = self.new_dps();
         if online {
-            dps.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-            dps.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+            dps.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+            dps.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
         }
         let guard = self.gate.clone().lock_owned().await;
         let result = inline::run(
@@ -453,8 +453,8 @@ impl Harness {
         let dps = self.new_dps();
         dps.push_status(Ok(online_status()));
         for _ in 0..backlog {
-            dps.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-            dps.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+            dps.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+            dps.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
         }
         return_online_probe::run_tick_for_fn(&self.pool, &dps, HARNESS_FN, &self.fn_sign)
             .await

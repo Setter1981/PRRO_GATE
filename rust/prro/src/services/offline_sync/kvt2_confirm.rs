@@ -307,10 +307,14 @@ pub fn classify_check_result(
     match result {
         Ok(ack) => {
             // `by_server_fiscal_no` has already verified `ack.id ==
-            // expected_id` per `channel.rs:60-69`.  We only need to
-            // check `data_sign` non-empty for W0b §99 conformance.
-            if ack.data_sign.is_empty() {
+            // expected_id` per `channel.rs:60-69`.  We check `data_sign` is a
+            // plausible KVT1 quittance (W0b §99 conformance): empty OR implausibly
+            // short (< a bare DSTU signature) is NOT evidence and holds — RISK 1
+            // fail-closed harden against a byzantine DPS returning garbage bytes.
+            if ack.data_sign.len() < crate::transports::dps::dto::MIN_KVT1_DATA_SIGN_LEN {
                 Kvt2ConfirmOutcome::Hold {
+                    // `LastChkDataSignEmpty` now covers empty AND sub-signature
+                    // lengths (both = "data_sign is not a usable quittance").
                     reason: Kvt2ConfirmHoldReason::LastChkDataSignEmpty,
                     sent_replay_trace_attempt_no,
                 }
@@ -2049,14 +2053,14 @@ mod tests {
 
     #[test]
     fn ok_with_data_sign_returns_acked_sent_fresh() {
-        let result = Ok(ack("FN-001", vec![0xAA, 0xBB, 0xCC]));
+        let result = Ok(ack("FN-001", vec![0xAA; 64]));
         let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false);
         match outcome {
             Kvt2ConfirmOutcome::Acked {
                 kvt1_raw_bytes,
                 sent_replay_trace_attempt_no,
             } => {
-                assert_eq!(kvt1_raw_bytes, vec![0xAA, 0xBB, 0xCC]);
+                assert_eq!(kvt1_raw_bytes, vec![0xAA; 64]);
                 assert_eq!(sent_replay_trace_attempt_no, None);
             }
             other => panic!("expected Acked, got {other:?}"),
@@ -2065,14 +2069,14 @@ mod tests {
 
     #[test]
     fn ok_with_data_sign_returns_acked_sent_replay_threads_trace_attempt_no() {
-        let result = Ok(ack("FN-001", vec![0xDE, 0xAD]));
+        let result = Ok(ack("FN-001", vec![0xDE; 64]));
         let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(7), false);
         match outcome {
             Kvt2ConfirmOutcome::Acked {
                 kvt1_raw_bytes,
                 sent_replay_trace_attempt_no,
             } => {
-                assert_eq!(kvt1_raw_bytes, vec![0xDE, 0xAD]);
+                assert_eq!(kvt1_raw_bytes, vec![0xDE; 64]);
                 assert_eq!(sent_replay_trace_attempt_no, Some(7));
             }
             other => panic!("expected Acked with trace_attempt_no=Some(7), got {other:?}"),
@@ -2081,7 +2085,7 @@ mod tests {
 
     #[test]
     fn ok_with_data_sign_returns_acked_kvt1_reentry() {
-        let result = Ok(ack("FN-001", vec![0xFF]));
+        let result = Ok(ack("FN-001", vec![0xFF; 64]));
         let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None, false);
         assert!(matches!(
             outcome,

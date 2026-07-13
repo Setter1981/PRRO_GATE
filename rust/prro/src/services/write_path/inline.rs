@@ -2002,12 +2002,9 @@ mod tests {
     /// (which the caller feeds into advance_to_ack as kvt1_raw_bytes).
     #[tokio::test]
     async fn acked_returns_data_sign_evidence() {
-        let dps = StubLastChk::new(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+        let dps = StubLastChk::new(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
         let outcome = online_confirm(&dps, &fn_sign(), SERVER_FISCAL_NO).await;
-        assert_eq!(
-            outcome,
-            InlineConfirmOutcome::Acked(vec![0xDE, 0xAD, 0xBE, 0xEF])
-        );
+        assert_eq!(outcome, InlineConfirmOutcome::Acked(vec![0xDE; 64]));
     }
 
     /// Match but EMPTY data_sign → Hold (no KVT1 evidence → 202, NOT a fake ACK).

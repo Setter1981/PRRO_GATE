@@ -186,7 +186,8 @@ impl DpsChannel for MatrixDps {
         Ok(CheckAck {
             id: format!("DPS-SFN-{}", n.saturating_sub(1)),
             id_sign: vec![],
-            data_sign: vec![0xA0u8.wrapping_add(n as u8); 32],
+            // ≥ MIN_KVT1_DATA_SIGN_LEN (64): a plausibly-sized fake KVT1 quittance.
+            data_sign: vec![0xA0u8.wrapping_add(n as u8); 64],
         })
     }
 

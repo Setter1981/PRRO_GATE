@@ -367,8 +367,8 @@ async fn k6_offline_local_ack_drains_to_ack() {
     //    lastChk Match, for BEGIN + SELL + the drain-time END.  Counters SHARED.
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     for _ in 0..3 {
-        phase2.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-        phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+        phase2.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+        phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     }
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
@@ -493,7 +493,7 @@ async fn k5_kvt2_committed_finalizes_to_ack() {
     //    short immediate transaction.  This is state-construction of the
     //    "KVT2 committed, finalize not run" crash point — NOT a production call.
     let doc_id = read_doc_id(&pool).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             let o1 = fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
@@ -612,7 +612,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
 
     // ── Phase 2: boot with deps; lastChk now answers Match.
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -646,7 +646,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
     //    converges it to ACK — without resending.  Counters stay SHARED, so the
     //    "exactly one send_chk EVER" property is proven across crash + boot + tick.
     let phase3 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase3.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // confirm Match
+    phase3.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // confirm Match
     let sign_ctx3 = det_signing_ctx();
     let fn_sign3 = fn_sign_blob();
     let view3 = RuntimeView {
@@ -852,7 +852,7 @@ async fn k1_prepared_boot_redrives_to_sent_exactly_once() {
     //    and advances Sent→KVT1 (as K4).  send_chk MUST stay == 1: this turns
     //    "one send so far" into "exactly one send EVER".  Counters are shared.
     let stub2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view2 = RuntimeView {
@@ -957,7 +957,7 @@ async fn k2_signed_boot_redrives_to_sent_exactly_once() {
     //    and advances Sent→KVT1 (as K4).  send_chk MUST stay == 1: this turns
     //    "one send so far" into "exactly one send EVER".  Counters are shared.
     let stub2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view2 = RuntimeView {
@@ -1260,7 +1260,7 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
     // ── Recovery: boot with a Match stub.  No push_send queued → a resend would
     //    be observable; asserted ZERO below.
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // Match
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // Match
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -1527,8 +1527,8 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let last_calls = Arc::new(AtomicUsize::new(0));
     let phase = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     for _ in 0..4 {
-        phase.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-        phase.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+        phase.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+        phase.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     }
     let sc2 = det_signing_ctx();
     let fs2 = fn_sign_blob();
@@ -1638,7 +1638,7 @@ async fn m2_online_offline_boundary_chain_continuous() {
         assert_eq!(o.document_state, DocState::Sent);
     }
     let doc0 = doc_id_by_req(&pool, &row0.request_id).await;
-    let kvt1 = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1 = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             fiscal_documents::transition_state(tx, doc0, DocState::Sent, DocState::Kvt1)
@@ -1971,13 +1971,13 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     //    DocumentReject (terminal) → strict-sequential HALT + escalate Manual;
     //    doc3 is NEVER sent (no stub response provided for it).
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_send(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF]))); // doc1 send
+    phase2.push_send(Ok(ack("SFN-1", vec![0xDE; 64]))); // doc1 send
     phase2.push_send(Err(DpsError::Authorization {
         code: -1,
         kind: AuthorizationKind::DocumentReject,
         message: "reject_doc2".into(),
     })); // doc2 send
-    phase2.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF]))); // doc1 lastChk Match
+    phase2.push_last(Ok(ack("SFN-1", vec![0xDE; 64]))); // doc1 lastChk Match
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -2154,13 +2154,13 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
     // ── Tick 1: doc1 send OK + lastChk ACK; doc2 send → DocumentReject →
     //    strict-sequential HALT + escalate Manual; doc3 never sent.
     let tick1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    tick1.push_send(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    tick1.push_send(Ok(ack("SFN-1", vec![0xDE; 64])));
     tick1.push_send(Err(DpsError::Authorization {
         code: -1,
         kind: AuthorizationKind::DocumentReject,
         message: "reject_doc2".into(),
     }));
-    tick1.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    tick1.push_last(Ok(ack("SFN-1", vec![0xDE; 64])));
     let sc1 = det_signing_ctx();
     let fs1 = fn_sign_blob();
     let view1 = RuntimeView {
@@ -2512,7 +2512,7 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     //    that supersedes doc1.
     let doc1_id = doc_id_by_lnd(&pool, 1).await;
     let doc2_id = doc_id_by_lnd(&pool, 2).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             // A.3 PR-B step 6 removed the direct (OfflineLocalAck, Sent) M3a
@@ -2671,7 +2671,7 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
     drop(guard);
 
     let doc_id = read_doc_id(&pool).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             let o1 = fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
@@ -2893,7 +2893,7 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
     .expect("online SELL Hold rests at SENT");
     drop(guard);
     let doc_id = read_doc_id(&pool).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
@@ -3034,7 +3034,7 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
 
     // Boot WITH deps + a stub that WOULD answer the SENT probe (Match → advance).
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -3128,7 +3128,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
     // doc1 (lnd=1) → KVT1, doc2 (lnd=2) → SENT; doc2.sfn supersedes doc1.
     let doc1_id = doc_id_by_lnd(&pool, 1).await;
     let doc2_id = doc_id_by_lnd(&pool, 2).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             fiscal_documents::transition_state(

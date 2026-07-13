@@ -179,7 +179,7 @@ async fn advance_sent_to_kvt1_applies_full_envelope() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xB1, "SENT").await;
     let attempt_no = alloc_inflight_trace(&pool, doc).await;
-    let ack = fake_ack("SRV-FISCAL-12345", &[0x11, 0x22, 0x33]);
+    let ack = fake_ack("SRV-FISCAL-12345", &[0x11; 64]);
 
     let ok = boot_phase::advance_sent_to_kvt1_from_probe(
         &pool,
@@ -204,7 +204,7 @@ async fn advance_sent_to_kvt1_applies_full_envelope() {
     .fetch_optional(&pool)
     .await
     .unwrap();
-    assert_eq!(kvt1_raw.as_deref(), Some(&[0x11, 0x22, 0x33][..]));
+    assert_eq!(kvt1_raw.as_deref(), Some(&[0x11; 64][..]));
 
     // (3) Trace completed with OK outcome + server_fiscal_no.
     let (completed_at, outcome, server_id): (Option<String>, Option<String>, Option<String>) =
@@ -232,7 +232,7 @@ async fn advance_sent_to_kvt1_returns_false_when_doc_not_in_sent() {
     // NC-01: non-empty data_sign so the CAS-conflict path is what's exercised
     // here (the empty-data_sign guard would otherwise short-circuit first — that
     // case is pinned separately in kill_point_matrix::k4b_…).
-    let ack = fake_ack("SRV-X", &[0xDE, 0xAD]);
+    let ack = fake_ack("SRV-X", &[0xDE; 64]);
     let ok = boot_phase::advance_sent_to_kvt1_from_probe(
         &pool,
         doc,
@@ -264,7 +264,7 @@ async fn advance_sent_to_kvt1_idempotent_on_repeat_call() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xB4, "SENT").await;
     let attempt_no = alloc_inflight_trace(&pool, doc).await;
-    let ack = fake_ack("SRV-FISCAL-IDEMP", &[0xAB]);
+    let ack = fake_ack("SRV-FISCAL-IDEMP", &[0xAB; 64]);
 
     // First call applies the full envelope.
     let r1 = boot_phase::advance_sent_to_kvt1_from_probe(

@@ -751,12 +751,15 @@ pub async fn advance_sent_to_kvt1_from_probe(
     // this Err via `emit_dispatch_error` → BOOT_DISPATCH_ERROR, "doc stays in
     // source state") and the next probe tick retries.  No state change, no
     // empty KVT1_RAW row.
-    if ack.data_sign.is_empty() {
+    if ack.data_sign.len() < crate::transports::dps::dto::MIN_KVT1_DATA_SIGN_LEN {
         anyhow::bail!(
             "advance_sent_to_kvt1_from_probe: probe Matched on id but ack.data_sign is \
-             EMPTY for doc {doc_id:?} — empty KVT1 evidence must not advance SENT→KVT1 \
-             (mirrors kvt2_advance::advance_to_ack StructuralDrift-on-empty; NC-01). \
-             Doc holds at SENT for re-probe."
+             {} bytes (< {} min) for doc {doc_id:?} — empty/implausibly-short KVT1 evidence \
+             must not advance SENT→KVT1 (mirrors kvt2_advance::advance_to_ack \
+             StructuralDrift-on-empty; NC-01 + RISK 1 byzantine-garbage harden). Doc holds \
+             at SENT for re-probe.",
+            ack.data_sign.len(),
+            crate::transports::dps::dto::MIN_KVT1_DATA_SIGN_LEN,
         );
     }
 
