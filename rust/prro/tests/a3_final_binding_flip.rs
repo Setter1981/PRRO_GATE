@@ -319,7 +319,7 @@ fn kvt1_ack() -> CheckAck {
     CheckAck {
         id: SFN.into(),
         id_sign: vec![],
-        data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        data_sign: vec![0xDE; 64],
     }
 }
 

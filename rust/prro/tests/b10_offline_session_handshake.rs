@@ -221,7 +221,7 @@ fn kvt1(sfn: &str) -> CheckAck {
     CheckAck {
         id: sfn.into(),
         id_sign: vec![],
-        data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        data_sign: vec![0xDE; 64],
     }
 }
 
@@ -281,7 +281,7 @@ fn drain_carriers(n_docs: usize) -> DrainCarriers {
             Ok(CheckAck {
                 id: format!("DPS-DRAIN-{i}"),
                 id_sign: vec![],
-                data_sign: vec![(i as u8).wrapping_add(0xA0); 32],
+                data_sign: vec![(i as u8).wrapping_add(0xA0); 64],
             })
         })
         .collect();

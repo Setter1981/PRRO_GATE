@@ -306,7 +306,7 @@ async fn build_resting_sent(pool: &SqlitePool, pool_secure: &SqlitePool, stub: &
 /// Envelope-1a, stopping at `KVT1`) — state-construction, not a prod call.
 async fn manual_advance_sent_to_kvt1(pool: &SqlitePool) {
     let doc_id = read_doc_id(pool).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(pool, move |tx| {
         Box::pin(async move {
             let o = fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
@@ -344,8 +344,8 @@ async fn tick_converges_resting_sent_to_ack() {
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold
                                                        // Tick cascade: SENT-arm probe Match (→KVT1) + KVT1 confirm Match (→ACK).
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
     assert_eq!(
@@ -409,7 +409,7 @@ async fn tick_converges_resting_kvt1_to_ack() {
     let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1 confirm Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // KVT1 confirm Match
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
     manual_advance_sent_to_kvt1(&pool).await;
@@ -632,6 +632,51 @@ async fn tick_hold_on_empty_data_sign() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Test 5b — KVT1 + lastChk Match with SHORT (sub-signature) data_sign → Hold.
+// RISK 1 harden: a byzantine-but-alive DPS returning a non-empty but implausibly
+// short data_sign (shorter than any real DSTU signature) must NOT be accepted as
+// a KVT1 quittance — those bytes are not evidence. Mirrors the empty-hold guard.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tick_hold_on_short_data_sign() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // construction Hold → SENT
+                                                       // tick confirm: a non-empty but IMPLAUSIBLY SHORT data_sign (4 bytes ≪ any
+                                                       // real DSTU signature) → must Hold, not advance (RISK 1 fail-closed harden).
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+
+    build_resting_sent(&pool, &pool_secure, &stub).await;
+    manual_advance_sent_to_kvt1(&pool).await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let summary = run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "KVT1",
+        "short (sub-signature) data_sign → Hold, stays KVT1 (RISK 1 harden)"
+    );
+    assert_eq!(summary.held_kvt1, 1);
+    assert_eq!(summary.acked_from_kvt1, 0);
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Test 6 — idempotent: a second tick after convergence is a zero-wire no-op.
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -647,8 +692,8 @@ async fn tick_idempotent_after_convergence() {
     let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![])));
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
 
@@ -781,7 +826,7 @@ async fn tick_counts_mismatch_escalation_as_not_converged() {
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold
                                                        // Tick: probe answers a DIFFERENT id → Mismatch → manual escalation.
-    stub.push_last(Ok(ack("DPS-FN-SOMEONE-ELSE", vec![0xDE, 0xAD])));
+    stub.push_last(Ok(ack("DPS-FN-SOMEONE-ELSE", vec![0xDE; 64])));
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
 
@@ -843,7 +888,7 @@ async fn tick_chain_seed_mismatch_escalates_manual() {
     let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1 confirm Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // KVT1 confirm Match
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
     manual_advance_sent_to_kvt1(&pool).await; // online-origin KVT1 (offline_fiscal_no NULL)
@@ -925,8 +970,8 @@ async fn tick_skips_rmr_but_online_fn_no_reprobe() {
                                                        // probe responses the tick WOULD consume if it (wrongly) ran —
                                                        // enough for the SENT→KVT1→ACK cascade so main fails on the
                                                        // assertion below, NOT on an empty-queue stub panic.
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // SENT-probe Match
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1-confirm Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // SENT-probe Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // KVT1-confirm Match
 
     build_resting_sent(&pool, &pool_secure, &stub).await; // doc rests SENT
     assert_eq!(
@@ -1306,7 +1351,7 @@ async fn t1_shift_open_recovers_before_bound_no_escalation() {
     for _ in 0..(N - 1) {
         push_superseded_tick(&stub);
     }
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();

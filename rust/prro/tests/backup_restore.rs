@@ -446,7 +446,7 @@ async fn issue_receipt_to_ack(pool: &SqlitePool, pool_secure: &SqlitePool, n: i6
     let row = seed_inbox_sell(pool, n).await;
     let stub = DpsStub::new();
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
@@ -590,7 +590,7 @@ async fn issue_receipt_to_ack_sfn(
     // send + online-confirm lastChk both carry the same wire id, so the
     // online write-path advances the doc to terminal ACK with this sfn.
     stub.push_send(Ok(ack(server_fiscal_no, vec![])));
-    stub.push_last(Ok(ack(server_fiscal_no, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(server_fiscal_no, vec![0xDE; 64])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
@@ -705,7 +705,7 @@ async fn tip_guard_stale_restore_blocks_node_e2e() {
     // zero wire), then the tip-guard with a stub whose lastChk reports SFN-2
     // (DPS is ahead of our restored tip SFN-1).
     let stub = DpsStub::new();
-    stub.push_last(Ok(ack("SFN-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack("SFN-2", vec![0xDE; 64])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let view = RuntimeView {
@@ -1120,7 +1120,7 @@ async fn tip_guard_malformed_tail_null_sfn_blocks() {
     // lastChk would Match the older valid tip (SFN-1) → without NC-04 the guard
     // returns TIP_GUARD_OK.  The malformed newer tail must block first.
     let stub = DpsStub::new();
-    stub.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD])));
+    stub.push_last(Ok(ack("SFN-1", vec![0xDE; 64])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let view = RuntimeView {

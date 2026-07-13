@@ -484,10 +484,7 @@ async fn c5b2_sent_replay_lastchk_match_advances_to_ack_with_replay_flag() {
     // lastChk Match with non-empty data_sign → REPLAY HIT → bundled
     // Envelope 1a-replay (5-write atomic) + Envelope 2 → ACK.
     // send_chk queue empty — drain MUST NOT wire-resend.
-    let c = carriers(
-        vec![],
-        vec![Ok(ack("DPS-FN-SENT-A", vec![0xAA, 0xBB, 0xCC]))],
-    );
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-SENT-A", vec![0xAA; 64]))]);
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
@@ -587,7 +584,7 @@ async fn c5_kvt1_doc_w12_reentry_advances_to_ack() {
 
     // No send_chk (Kvt1 dispatch skips stage_send).
     // 1 last_chk Acked response — Kvt1Reentry chain.
-    let c = carriers(vec![], vec![Ok(ack("DPS-FN-KVT1", vec![0xAAu8; 32]))]);
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-KVT1", vec![0xAAu8; 64]))]);
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
@@ -643,7 +640,7 @@ async fn c5_kvt1_doc_w12_reentry_advances_to_ack() {
     // (HIGH-C5-2 forensic anchor); audit payload's
     // kvt1_raw_sha256_hex MUST equal SHA256 of those persisted
     // bytes (MED-W12C4A-A plan §62 audit-digest contract).
-    let expected_data_sign = vec![0xAAu8; 32];
+    let expected_data_sign = vec![0xAAu8; 64];
     let persisted_kvt1_raw: Vec<u8> = sqlx::query_scalar(
         "SELECT content FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
@@ -706,7 +703,7 @@ async fn c5_error_retryable_doc_re_driven_via_stage_send_to_ack_via_w12() {
 
     let c = carriers(
         vec![Ok(ack("DPS-FN-RETRIED", vec![1, 2, 3]))],
-        vec![Ok(ack("DPS-FN-RETRIED", vec![0xAA; 32]))],
+        vec![Ok(ack("DPS-FN-RETRIED", vec![0xAA; 64]))],
     );
     let view = view_for(&c);
 
@@ -1371,7 +1368,7 @@ async fn seam_b3_superseded_predecessor_halts_chain_and_escalates_manual() {
     // "DPS-FN-B" IS doc_b's sfn (a newer submitted doc of ours) → genuine
     // supersession.  doc_b is NOT probed (drain halts at doc_a) — only one
     // lastChk response is supplied.
-    let c = carriers(vec![], vec![Ok(ack("DPS-FN-B", vec![0xAA, 0xBB, 0xCC]))]);
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-B", vec![0xAA; 64]))]);
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
@@ -1552,8 +1549,8 @@ async fn c5_walker_scope_excludes_online_cross_session_docs() {
     .unwrap();
 
     let c = carriers(
-        vec![Ok(ack("DPS-OFFLINE", vec![0xCD]))],
-        vec![Ok(ack("DPS-OFFLINE", vec![0xAA; 32]))],
+        vec![Ok(ack("DPS-OFFLINE", vec![0xCD; 64]))],
+        vec![Ok(ack("DPS-OFFLINE", vec![0xAA; 64]))],
     );
     let view = view_for(&c);
 
@@ -1620,7 +1617,7 @@ async fn c5b2_sent_replay_lastchk_match_persists_kvt1_raw_byte_for_byte() {
     .await
     .unwrap();
 
-    let expected_data_sign: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37];
+    let expected_data_sign: Vec<u8> = vec![0xDE; 64];
     let c = carriers(
         vec![],
         vec![Ok(ack("DPS-FN-REPLAY", expected_data_sign.clone()))],
@@ -1868,7 +1865,7 @@ async fn c6_sent_fresh_match_empty_data_sign_holds_drain() {
     // returns OK з matching id but EMPTY data_sign → Hold(LastChkDataSignEmpty)
     // → SentFresh 1c-hold-light → HoldFnDrain { HeldAtSent }.
     let c = carriers(
-        vec![Ok(ack("DPS-FN-FRESH-EMPTY", vec![0xCD]))],
+        vec![Ok(ack("DPS-FN-FRESH-EMPTY", vec![0xCD; 64]))],
         vec![Ok(ack("DPS-FN-FRESH-EMPTY", vec![]))],
     );
     let view = view_for(&c);
@@ -2531,7 +2528,7 @@ async fn w12_kvt1_reentry_mismatch_emits_drift_audit_and_halts_via_boot_error() 
 
     // DPS returns different id → ServerFiscalIdMismatch →
     // StructuralDrift::LastChkIdMismatch → drift audit + BootError.
-    let c = carriers(vec![], vec![Ok(ack("DIFFERENT-KVT1", vec![0xAAu8; 32]))]);
+    let c = carriers(vec![], vec![Ok(ack("DIFFERENT-KVT1", vec![0xAAu8; 64]))]);
     let view = view_for(&c);
 
     let err = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
@@ -2754,7 +2751,7 @@ async fn c6_sent_fresh_hold_emits_hold_audit_and_projects_held_at_sent() {
     // encounters DpsError::Transport -> Hold(DpsTransport).
     // projects Ok(HoldFnDrain { HeldAtSent }).
     let c = carriers(
-        vec![Ok(ack("DPS-FN-HOLD", vec![0xCD]))],
+        vec![Ok(ack("DPS-FN-HOLD", vec![0xCD; 64]))],
         vec![Err(DpsError::Transport(
             "simulated fresh lastChk timeout".into(),
         ))],
@@ -2888,7 +2885,7 @@ async fn c612_consecutive_holds_increment_on_hold_reset_on_advance() {
     // Reset on first Advance: DPS lastChk returns ack з matching id +
     // KVT1 evidence → confirm_drain_doc(Kvt1Reentry, Acked) →
     // Envelope 1b (3-write) → counter resets to 0.
-    let c = carriers(vec![], vec![Ok(ack("DPS-FN-INCR", vec![0xAAu8; 32]))]);
+    let c = carriers(vec![], vec![Ok(ack("DPS-FN-INCR", vec![0xAAu8; 64]))]);
     let view = view_for(&c);
     let _ = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
@@ -3286,7 +3283,7 @@ async fn a2_1a_advance_to_ack_audit_server_fiscal_no_is_handin_not_persisted() {
     .await
     .unwrap();
 
-    let kvt1_raw = vec![0xAAu8; 32];
+    let kvt1_raw = vec![0xAAu8; 64];
     let expected_digest_hex = format!("{:x}", Sha256::digest(&kvt1_raw));
 
     // Direct call into the extracted runtime-neutral confirmer: the
@@ -3713,7 +3710,7 @@ async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
     // send advances cleanly.  Provide its DPS acks.
     let c = carriers(
         vec![Ok(ack("DPS-FN-END", vec![]))],
-        vec![Ok(ack("DPS-FN-END", vec![0xEEu8; 32]))],
+        vec![Ok(ack("DPS-FN-END", vec![0xEEu8; 64]))],
     );
     let view = view_for(&c);
 

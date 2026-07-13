@@ -542,7 +542,7 @@ async fn online_sell_reaches_ack() {
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])), // send_chk: data_sign discarded by stage_send
-        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])), // last_chk: KVT1 evidence
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])), // last_chk: KVT1 evidence
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
@@ -608,7 +608,7 @@ async fn online_sell_transient_send_returns_in_progress() {
     // send_chk transient failure → stage_send routes to ErrorRetryable.
     let dps = DualStub::new(
         Err(DpsError::Transport("net blip".into())),
-        Ok(ack(SERVER_FISCAL_NO, vec![0x01])), // unused on this path
+        Ok(ack(SERVER_FISCAL_NO, vec![0x01; 64])), // unused on this path
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
@@ -875,7 +875,7 @@ async fn online_shift_open_reaches_ack() {
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
-        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])),
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
@@ -970,7 +970,7 @@ async fn online_z_report_closes_shift_reaches_ack() {
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
-        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])),
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
@@ -1517,7 +1517,10 @@ async fn lastchk_drift_terminalises_inbox_and_leaves_doc_sent() {
     let row = seed_inbox_sell(&pool).await;
 
     // send OK; lastChk returns an EMPTY id → by_server_fiscal_no → NotFound → Drift.
-    let dps = DualStub::new(Ok(ack(SERVER_FISCAL_NO, vec![])), Ok(ack("", vec![0x01])));
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack("", vec![0x01; 64])),
+    );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
@@ -1725,7 +1728,7 @@ async fn online_return_reaches_ack() {
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
-        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])),
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);

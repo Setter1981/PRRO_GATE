@@ -1097,7 +1097,7 @@ async fn fixture_4_sent_last_chk_match_advances_to_kvt1() {
     let expected_id = "expected-id-44";
     let doc = seed_doc_sent_with_server_fiscal_no(app.db(), fn_id, 0x44, expected_id).await;
 
-    let ack_data_sign = vec![0xDDu8; 32];
+    let ack_data_sign = vec![0xDDu8; 64];
     let stub = RecoveryDpsStub::for_last_chk(vec![Ok(CheckAck {
         id: expected_id.into(),
         id_sign: vec![],
@@ -1816,12 +1816,12 @@ async fn multi_fn_reconcile_pending_with_resolves_runtime_per_fn() {
     let stub_a = PerFnRecordingDpsStub::new(vec![Ok(CheckAck {
         id: "fiscal-A".into(),
         id_sign: vec![],
-        data_sign: vec![0xAA; 32],
+        data_sign: vec![0xAA; 64],
     })]);
     let stub_b = PerFnRecordingDpsStub::new(vec![Ok(CheckAck {
         id: "fiscal-B".into(),
         id_sign: vec![],
-        data_sign: vec![0xBB; 32],
+        data_sign: vec![0xBB; 64],
     })]);
 
     let signing_ctx = det_signing_ctx();
@@ -2995,7 +2995,7 @@ impl DpsChannel for SequenceProbingDpsStub {
         Ok(CheckAck {
             id: "expected-id-CC".into(),
             id_sign: vec![],
-            data_sign: vec![0xCC; 32],
+            data_sign: vec![0xCC; 64],
         })
     }
     async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
@@ -3233,7 +3233,7 @@ async fn fixture_5b_sent_mismatch_superseded_is_not_terminalised() {
         Ok(CheckAck {
             id: "SFN-B".into(),
             id_sign: vec![],
-            data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            data_sign: vec![0xDE; 64],
         }),
     ]);
     let signing_ctx = det_signing_ctx();
@@ -3324,7 +3324,7 @@ async fn m2_n4_boot_foreign_tip_is_manual_not_superseded() {
         Ok(CheckAck {
             id: "SFN-B".into(),
             id_sign: vec![],
-            data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            data_sign: vec![0xDE; 64],
         }),
     ]);
     let signing_ctx = det_signing_ctx();

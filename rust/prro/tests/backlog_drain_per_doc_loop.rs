@@ -297,7 +297,7 @@ fn last_chk_ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
 }
 
 /// **M3b W12 Commit 4b.3 (2026-05-22)** — deterministic non-empty
-/// KVT1_RAW evidence bytes for lastChk Acked path tests.  Length 32
+/// KVT1_RAW evidence bytes for lastChk Acked path tests.  Length 64
 /// matches real DPS protobuf KVT1_RAW shape closely enough for
 /// SHA256 digest assertions in `OFFLINE_DRAIN_KVT2_ADVANCED`
 /// audit payload.
@@ -306,7 +306,7 @@ fn kvt1_raw_bytes_for(server_fiscal_no: &str) -> Vec<u8> {
     // server_fiscal_no hash-like seed, rest 0xAB padding.  Each FN
     // gets distinguishable bytes so dashboards can cross-correlate
     // `kvt1_raw_sha256_hex` per-doc.
-    let mut bytes = vec![0xABu8; 32];
+    let mut bytes = vec![0xABu8; 64];
     for (i, b) in server_fiscal_no.bytes().take(4).enumerate() {
         bytes[i] = b;
     }
@@ -1315,7 +1315,7 @@ async fn w12_sent_fresh_mismatch_emits_drift_audit_and_halts_via_boot_error() {
     // classify_check_result → StructuralDrift::LastChkIdMismatch.
     let carriers = carriers_with_responses_and_last_chk(
         vec![Ok(ack("EXPECTED-A"))],
-        vec![Ok(last_chk_ack("DIFFERENT-B", vec![0xAAu8; 32]))],
+        vec![Ok(last_chk_ack("DIFFERENT-B", vec![0xAAu8; 64]))],
     );
     let view = view_for(&carriers);
 
