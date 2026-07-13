@@ -39,6 +39,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,50 +99,64 @@ const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.ce
 /// prints, so a human reads exactly what the product asked the network for.
 struct MatrixDps {
     online: AtomicBool,
-    reject_next: Mutex<Option<i32>>,
+    /// All three fault injections are keyed by `fiscal_number` (`CheckEnvelope.rro_fn`)
+    /// so arming a fault on FN-A only hits FN-A's send, never an interleaved FN-B send
+    /// (MF4 per-FN fault isolation). `send_ctr` stays GLOBAL — `last_chk` carries no FN
+    /// (`CheckSignBlob` has no FN field) so its sfn stream can't be per-FN; MF4 asserts
+    /// via schema-keyed state (doc state / node mode), never the stub's sfn.
+    reject_next: Mutex<HashMap<String, i32>>,
     send_ctr: AtomicUsize,
     open_shift: AtomicBool,
     calls: Mutex<Vec<String>>,
-    /// Byzantine injection: the NEXT `send_chk` returns Ok with this NON-EMPTY but
-    /// garbage/malformed `id` (server fiscal number) instead of a clean one.
-    garbage_sfn: Mutex<Option<String>>,
-    /// MAC-recovery injection: the NEXT `send_chk` returns `Err(Server{-12})` with a
-    /// `"store {64hex}"` message (ERROR_BAD_HASH_PREV) carrying this recovered chain
-    /// hash, then reverts to normal Ok — so the inline W10.4 recovery re-signs with
-    /// the DPS-supplied hash and the re-sent attempt #2 succeeds.
-    mac_recovery_hash: Mutex<Option<String>>,
+    /// Byzantine injection (per-FN): FN's NEXT `send_chk` returns Ok with this NON-EMPTY
+    /// but garbage/malformed `id` (server fiscal number) instead of a clean one.
+    garbage_sfn: Mutex<HashMap<String, String>>,
+    /// MAC-recovery injection (per-FN): FN's NEXT `send_chk` returns `Err(Server{-12})`
+    /// with a `"store {64hex}"` message (ERROR_BAD_HASH_PREV) carrying this recovered
+    /// chain hash, then reverts to normal Ok — so the inline W10.4 recovery re-signs
+    /// with the DPS-supplied hash and the re-sent attempt #2 succeeds.
+    mac_recovery_hash: Mutex<HashMap<String, String>>,
 }
 
 impl MatrixDps {
     fn new() -> Self {
         Self {
             online: AtomicBool::new(true),
-            reject_next: Mutex::new(None),
+            reject_next: Mutex::new(HashMap::new()),
             send_ctr: AtomicUsize::new(0),
             open_shift: AtomicBool::new(false),
             calls: Mutex::new(Vec::new()),
-            garbage_sfn: Mutex::new(None),
-            mac_recovery_hash: Mutex::new(None),
+            garbage_sfn: Mutex::new(HashMap::new()),
+            mac_recovery_hash: Mutex::new(HashMap::new()),
         }
     }
-    /// Byzantine: make the NEXT `send_chk` answer Ok with a non-empty but garbage
-    /// server fiscal number (a live-but-lying DPS), not a transport failure.
-    fn inject_garbage_sfn(&self, s: &str) {
-        *self.garbage_sfn.lock().unwrap() = Some(s.to_string());
+    /// Byzantine: make `fiscal_number`'s NEXT `send_chk` answer Ok with a non-empty
+    /// but garbage server fiscal number (a live-but-lying DPS), not a transport failure.
+    fn inject_garbage_sfn(&self, fiscal_number: &str, s: &str) {
+        self.garbage_sfn
+            .lock()
+            .unwrap()
+            .insert(fiscal_number.to_string(), s.to_string());
     }
-    /// Arm the NEXT `send_chk` to return the `-12` ERROR_BAD_HASH_PREV reject with a
-    /// `store {hash_hex}` message (the DPS telling us the real chain head). One-shot:
-    /// after it fires, the following `send_chk` (recovery attempt #2) is a normal Ok.
-    /// `hash_hex` must be exactly 64 hex chars.
-    fn inject_mac_recovery(&self, hash_hex: &str) {
-        *self.mac_recovery_hash.lock().unwrap() = Some(hash_hex.to_string());
+    /// Arm `fiscal_number`'s NEXT `send_chk` to return the `-12` ERROR_BAD_HASH_PREV
+    /// reject with a `store {hash_hex}` message (the DPS telling us the real chain
+    /// head). One-shot: after it fires, that FN's following `send_chk` (recovery
+    /// attempt #2) is a normal Ok. `hash_hex` must be exactly 64 hex chars.
+    fn inject_mac_recovery(&self, fiscal_number: &str, hash_hex: &str) {
+        self.mac_recovery_hash
+            .lock()
+            .unwrap()
+            .insert(fiscal_number.to_string(), hash_hex.to_string());
     }
     fn set_online(&self, up: bool) {
         self.online.store(up, Ordering::SeqCst);
     }
-    #[allow(dead_code)]
-    fn reject_next(&self, code: i32) {
-        *self.reject_next.lock().unwrap() = Some(code);
+    /// Arm `fiscal_number`'s NEXT `send_chk` to return a scripted `Server{code}` reject.
+    fn reject_next(&self, fiscal_number: &str, code: i32) {
+        self.reject_next
+            .lock()
+            .unwrap()
+            .insert(fiscal_number.to_string(), code);
     }
     #[allow(dead_code)]
     fn set_open_shift(&self, o: bool) {
@@ -159,32 +174,35 @@ impl MatrixDps {
 
 #[async_trait]
 impl DpsChannel for MatrixDps {
-    async fn send_chk(&self, _e: CheckEnvelope) -> Result<CheckAck, DpsError> {
+    async fn send_chk(&self, e: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        // Per-FN fault dispatch: every injection is keyed by the sender's fiscal
+        // number, so a fault armed on FN-A never fires for an interleaved FN-B send.
+        let fn_key = e.rro_fn.as_str();
         if !self.online.load(Ordering::SeqCst) {
             self.log("send_chk→NET_DOWN".into());
             return Err(DpsError::Transport("matrix: network down".into()));
         }
-        if let Some(code) = self.reject_next.lock().unwrap().take() {
-            self.log(format!("send_chk→REJECT({code})"));
+        if let Some(code) = self.reject_next.lock().unwrap().remove(fn_key) {
+            self.log(format!("send_chk[{fn_key}]→REJECT({code})"));
             return Err(DpsError::Server {
                 code,
                 message: "matrix: scripted DPS reject".into(),
             });
         }
-        if let Some(g) = self.garbage_sfn.lock().unwrap().take() {
+        if let Some(g) = self.garbage_sfn.lock().unwrap().remove(fn_key) {
             // Byzantine-but-alive DPS: Ok, but a non-empty garbage fiscal number.
             self.send_ctr.fetch_add(1, Ordering::SeqCst);
-            self.log(format!("send_chk→BYZANTINE_SFN({g})"));
+            self.log(format!("send_chk[{fn_key}]→BYZANTINE_SFN({g})"));
             return Ok(CheckAck {
                 id: g,
                 id_sign: vec![],
                 data_sign: vec![],
             });
         }
-        if let Some(h) = self.mac_recovery_hash.lock().unwrap().take() {
+        if let Some(h) = self.mac_recovery_hash.lock().unwrap().remove(fn_key) {
             // One-shot ERROR_BAD_HASH_PREV: DPS rejects with the real chain head so
             // the inline W10.4 recovery re-signs; the NEXT send (attempt #2) is Ok.
-            self.log(format!("send_chk→REJECT(-12 store {}…)", &h[..8]));
+            self.log(format!("send_chk[{fn_key}]→REJECT(-12 store {}…)", &h[..8]));
             return Err(DpsError::Server {
                 code: -12,
                 message: format!("ERROR_BAD_HASH_PREV: store {h}"),
@@ -1158,7 +1176,7 @@ async fn matrix_s3_dps_reject_corpus() {
             "corpus setup: SHIFT_OPEN must ACK before the reject (code {code})"
         );
         // Inject the DPS reject onto the SELL's send.
-        dps.reject_next(*code);
+        dps.reject_next(FN, *code);
         let (body, _total) = sell_body(FN, 1, "corpus-SELL");
         let (status, resp) = drive_ingress(&app, &*wp, FN, &body).await;
         let doc = last_doc_state(app.db(), FN).await;
@@ -1603,7 +1621,7 @@ async fn matrix_b1_byzantine_garbage_server_fiscal_no() {
 
     // Byzantine-but-alive DPS: the NEXT send returns a non-empty GARBAGE fiscal no.
     let garbage = "☠GARBAGE-NOT-A-REAL-SFN☠";
-    dps.inject_garbage_sfn(garbage);
+    dps.inject_garbage_sfn(FN, garbage);
     let (body, _) = sell_body(FN, 3, "b1-garbage");
     let (status, state) = drive_ingress(&app, &*wp, FN, &body).await;
     let doc = last_doc_state(app.db(), FN).await;
@@ -1661,7 +1679,7 @@ async fn matrix_s14_mac_recovery_minus12_resigns_to_ack() {
     assert_eq!(os, 200, "S14 setup: SHIFT_OPEN must ACK");
 
     let recovered_hash = chain_seed_hex(app.db(), FN).await;
-    dps.inject_mac_recovery(&recovered_hash);
+    dps.inject_mac_recovery(FN, &recovered_hash);
     let _ = dps.drain_calls(); // clear the OPEN wire log
 
     let (body, total) = sell_body(FN, 2, "s14-SELL");
@@ -1709,7 +1727,7 @@ async fn matrix_s15_mac_recovery_unextractable_hash_rejects() {
     let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s15-OPEN")).await;
     assert_eq!(os, 200, "S15 setup: SHIFT_OPEN must ACK");
 
-    dps.reject_next(-12); // -12 with "matrix: scripted DPS reject" — NO store {hex}
+    dps.reject_next(FN, -12); // -12 with "matrix: scripted DPS reject" — NO store {hex}
     let (body, _t) = sell_body(FN, 2, "s15-SELL");
     let (status, _resp) = drive_ingress(&app, &*wp, FN, &body).await;
     let doc = last_doc_state(app.db(), FN).await;
@@ -2004,4 +2022,85 @@ async fn matrix_mf3_cash_ledger_isolation() {
 
     prro::db::invariant_scan::assert_clean(app.db()).await;
     eprintln!("════════ MF3-cash-isolation: PASS — A={cash_a} B={cash_b} independent ════════");
+}
+
+/// MF4 — per-FN FAULT isolation. A DPS fault armed on FN-A must fire ONLY for
+/// FN-A's send, never for an interleaved FN-B send — the `MatrixDps` injections are
+/// keyed by `CheckEnvelope.rro_fn`. Arm a `-2` terminal reject on FN-A; a FN-B sell
+/// fired WHILE A's fault is armed must still reach ACK (B untouched); then FN-A's
+/// sell takes the `-2` → Rejected; the fault is one-shot (A's next sell is clean).
+/// Built-in teeth: if the injection were GLOBAL (not FN-keyed) the interleaved B
+/// sell would consume A's armed `-2` → B Rejected → the B-ACK assert goes RED.
+#[tokio::test]
+async fn matrix_mf4_per_fn_fault_isolation() {
+    let (app, dps, wp) = fresh_harness(&[FN_A, FN_B]).await;
+
+    // Open both online.
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_A,
+        &simple_body(FN_A, "SHIFT_OPEN", "mf4-A-OPEN"),
+    )
+    .await;
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_B,
+        &simple_body(FN_B, "SHIFT_OPEN", "mf4-B-OPEN"),
+    )
+    .await;
+
+    // Arm a terminal reject on FN-A's NEXT send only.
+    dps.reject_next(FN_A, -2);
+
+    // FN-B sells FIRST (interleaved, while A's fault is armed) → must be ACK.
+    // A GLOBAL injection would let B consume A's -2 here → this is the isolation teeth.
+    let (body_b, _) = sell_body(FN_B, 5, "mf4-B-SELL");
+    drive_ingress(&app, &*wp, FN_B, &body_b).await;
+    assert_eq!(
+        last_doc_state(app.db(), FN_B).await,
+        DocState::Ack.as_str(),
+        "MF4: FN-B interleaved sell must reach ACK — A's armed fault must NOT leak to B"
+    );
+
+    // Now FN-A sells → takes the armed -2 → Rejected.
+    let (body_a, _) = sell_body(FN_A, 1, "mf4-A-SELL");
+    drive_ingress(&app, &*wp, FN_A, &body_a).await;
+    assert_eq!(
+        last_doc_state(app.db(), FN_A).await,
+        DocState::Rejected.as_str(),
+        "MF4: FN-A sell must take the armed -2 reject → Rejected"
+    );
+
+    // Both nodes stayed ONLINE (a -2 reject doesn't flip mode); B's shift intact.
+    assert_eq!(
+        node_row(app.db(), FN_A).await.0,
+        "ONLINE",
+        "MF4: A stays ONLINE after -2"
+    );
+    assert_eq!(node_row(app.db(), FN_B).await.0, "ONLINE", "MF4: B ONLINE");
+    assert_eq!(
+        shift_state(app.db(), FN_B).await,
+        "OPENED",
+        "MF4: B shift unaffected by A's fault"
+    );
+
+    // The fault was one-shot for A: A's NEXT sell (no fault armed) is a clean ACK.
+    let (body_a2, _) = sell_body(FN_A, 2, "mf4-A-SELL-2");
+    drive_ingress(&app, &*wp, FN_A, &body_a2).await;
+    assert_eq!(
+        last_doc_state(app.db(), FN_A).await,
+        DocState::Ack.as_str(),
+        "MF4: FN-A recovers — the armed fault was one-shot, next A sell is clean ACK"
+    );
+
+    // Z both (Rejected is terminal — doesn't block A's z-quiescence).
+    drive_ingress(&app, &*wp, FN_A, &simple_body(FN_A, "Z_REPORT", "mf4-A-Z")).await;
+    drive_ingress(&app, &*wp, FN_B, &simple_body(FN_B, "Z_REPORT", "mf4-B-Z")).await;
+    assert_eq!(shift_state(app.db(), FN_A).await, "CLOSED", "MF4: A CLOSED");
+    assert_eq!(shift_state(app.db(), FN_B).await, "CLOSED", "MF4: B CLOSED");
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!("════════ MF4-per-fn-fault-isolation: PASS ════════");
 }
