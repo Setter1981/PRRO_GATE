@@ -959,3 +959,135 @@ async fn matrix_s5_net_drop_mid_online_retry() {
     // (Z_QUIESCENCE_PENDING/503, observed live).
     run("S5-net-drop-online", &steps, &app, &*wp, &dps).await;
 }
+
+/// S6 — MIXED ONLINE↔OFFLINE DAY (the realistic degraded day). ONE shift lives
+/// through the whole arc: online sells → net drop → operator GO_OFFLINE →
+/// offline sells + a return (OLA) → net restore → GO_ONLINE + drain (backlog
+/// converges) → MORE online sells AFTER the drain, same shift → Z. This is the
+/// online→offline→online-WITHIN-ONE-SHIFT path the operator flagged as
+/// "only think it works": selling on BOTH sides of an offline window and closing
+/// clean. Every step scanned (`assert_clean`); a stuck non-terminal doc halts.
+#[tokio::test]
+async fn matrix_s6_mixed_online_offline_day() {
+    let (app, dps, wp) = fresh_harness().await;
+    let steps = vec![
+        Action::Open,
+        Action::Sell(11),
+        Action::Sell(12),
+        Action::NetDown,
+        Action::GoOffline,
+        Action::Sell(13),
+        Action::Return(12),
+        Action::Sell(14),
+        Action::NetUp,
+        Action::GoOnlineDrain,
+        Action::Sell(15), // online SELL AFTER the drain, SAME shift
+        Action::Return(11),
+        Action::ZClose,
+    ];
+    run("S6-mixed-day", &steps, &app, &*wp, &dps).await;
+}
+
+/// S7 — MULTI-SHIFT SEQUENCE (reopen after close). Three shifts back-to-back on
+/// the SAME FN: Open→sells→Z, Open→sell→Z, Open→sell→return→Z. Proves the shift
+/// machine REOPENS cleanly after a Z (a Z closes the SHIFT, not the node) and
+/// that chain / seed / lnd continuity holds ACROSS shift boundaries — the fiscal
+/// chain must not fork or reset at a Z. Each Z leaves a clean scan; each reopen
+/// mints a fresh OPENED shift. Return-after-sell keeps drawer cash ≥ 0.
+#[tokio::test]
+async fn matrix_s7_multi_shift_reopen_sequence() {
+    let (app, dps, wp) = fresh_harness().await;
+    let steps = vec![
+        // ── shift 1 ──
+        Action::Open,
+        Action::Sell(21),
+        Action::Sell(22),
+        Action::ZClose,
+        // ── shift 2 ──
+        Action::Open,
+        Action::Sell(23),
+        Action::ZClose,
+        // ── shift 3 ──
+        Action::Open,
+        Action::Sell(24),
+        Action::Return(21),
+        Action::ZClose,
+    ];
+    run("S7-multi-shift", &steps, &app, &*wp, &dps).await;
+}
+
+/// S8 — CROSS-SHIFT CASH CARRY-OVER (pins the behavior S7's log surfaced). A Z
+/// does NOT empty the physical drawer: the залишок готівки carries to the next
+/// shift as its opening anchor (Ukrainian fiscal reality — cash stays in the till
+/// across shifts until a службова видача). S7's log showed cash oscillating
+/// `4600 → 0 (at Z) → 4600 (at reopen)`, which reads alarming but is correct.
+/// This turns that observation into teeth by pinning three facts:
+///   (1) during the CLOSED window `cash_on_hand_for_fn` returns the DOCUMENTED
+///       no-open-shift sentinel (0) — an out-of-contract read; the drawer is not
+///       emptied, just unattributed (X-report is gated to open shifts, so prod
+///       never reads cash here);
+///   (2) the next shift OPENS with an opening drawer == the prior shift's CLOSE
+///       drawer — carry-over is wired, not reset to 0;
+///   (3) the carried cash is strictly > 0 (non-vacuous pin).
+/// Even seeds are CASH payform (`gen_line_and_pay`: `seed.is_multiple_of(2)`), so
+/// the drawer provably moves. A regression that resets the drawer at Z, or that
+/// leaks drawer cash during the closed window, goes RED here.
+#[tokio::test]
+async fn matrix_s8_cross_shift_cash_carryover() {
+    let (app, _dps, wp) = fresh_harness().await;
+
+    // ── shift 1: open + two CASH sells (even seeds) → drawer accumulates ──
+    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s8-OPEN-1")).await;
+    assert_eq!(st, 200, "S8 setup: shift 1 SHIFT_OPEN must ACK");
+    for (idx, seed) in [2u64, 6u64].into_iter().enumerate() {
+        let (body, _t) = sell_body(seed, &format!("s8-SELL1-{idx}"));
+        let (s, state) = drive_ingress(&app, &*wp, &body).await;
+        assert_eq!(
+            state,
+            DocState::Ack.as_str(),
+            "S8 shift-1 CASH sell {idx} (seed={seed}) → ACK [{s}]"
+        );
+    }
+    // Drawer at the END of shift 1 — still OPEN, so this is an IN-contract read.
+    let close_drawer_1 = cash_on_hand(app.db()).await;
+    assert!(
+        close_drawer_1 > 0,
+        "S8 precondition: shift 1 must accumulate CASH to carry (got {close_drawer_1})"
+    );
+
+    // ── Z closes shift 1 ──
+    let (zs, zstate) = drive_ingress(&app, &*wp, &simple_body("Z_REPORT", "s8-Z-1")).await;
+    assert_eq!(zstate, DocState::Ack.as_str(), "S8 Z-1 → ACK [{zs}]");
+    assert_eq!(
+        shift_state(app.db()).await,
+        "CLOSED",
+        "S8 shift 1 CLOSED after Z"
+    );
+
+    // (1) Closed-window read → documented no-open-shift sentinel (0), NOT the drawer.
+    let sentinel = cash_on_hand(app.db()).await;
+    assert_eq!(
+        sentinel, 0,
+        "S8: cash_on_hand during the CLOSED window is the no-open-shift sentinel (0), \
+         not the drawer ({close_drawer_1}) — the drawer is not emptied, just unattributed"
+    );
+
+    // ── shift 2: reopen ──
+    let (os, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s8-OPEN-2")).await;
+    assert_eq!(os, 200, "S8: shift 2 SHIFT_OPEN must ACK");
+    assert_eq!(shift_state(app.db()).await, "OPENED", "S8 shift 2 OPENED");
+
+    // (2)+(3) Opening drawer of shift 2 == closing drawer of shift 1 (carry-over).
+    let open_drawer_2 = cash_on_hand(app.db()).await;
+    assert_eq!(
+        open_drawer_2, close_drawer_1,
+        "S8: drawer cash must CARRY across the Z — shift-2 opening anchor ({open_drawer_2}) \
+         must equal shift-1 closing drawer ({close_drawer_1}), not reset to 0"
+    );
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S8-carryover: PASS — drawer {close_drawer_1} carried across Z \
+         (sentinel 0 during closed window) ════════"
+    );
+}
