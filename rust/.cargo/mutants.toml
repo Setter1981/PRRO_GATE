@@ -1,0 +1,13 @@
+# cargo-mutants configuration.
+#
+# The integration-test suite uses test-only helpers gated behind the
+# `test-support` feature (e.g. `ReconcileGuard::for_integration_test_only`,
+# the `invariant_scan` hooks the fuzzer drives). Without the feature the
+# UNMUTATED baseline build fails to compile the test targets, so cargo-mutants
+# aborts before testing any mutant. Pass the feature to every cargo invocation
+# (build + test), matching the CI gate (`--features test-support`).
+#
+# `test_tool = "nextest"` — the project's gate runner (~2× faster than `cargo
+# test`), which cuts per-mutant wall time.
+additional_cargo_args = ["--features", "test-support"]
+test_tool = "nextest"
