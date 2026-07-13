@@ -1,0 +1,4 @@
+
+# cargo-mutants output (FW-1 mutation testing) — never commit
+mutants.out/
+mutants.out.old/
