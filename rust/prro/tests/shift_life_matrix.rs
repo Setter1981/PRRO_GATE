@@ -102,6 +102,11 @@ struct MatrixDps {
     /// Byzantine injection: the NEXT `send_chk` returns Ok with this NON-EMPTY but
     /// garbage/malformed `id` (server fiscal number) instead of a clean one.
     garbage_sfn: Mutex<Option<String>>,
+    /// MAC-recovery injection: the NEXT `send_chk` returns `Err(Server{-12})` with a
+    /// `"store {64hex}"` message (ERROR_BAD_HASH_PREV) carrying this recovered chain
+    /// hash, then reverts to normal Ok — so the inline W10.4 recovery re-signs with
+    /// the DPS-supplied hash and the re-sent attempt #2 succeeds.
+    mac_recovery_hash: Mutex<Option<String>>,
 }
 
 impl MatrixDps {
@@ -113,12 +118,20 @@ impl MatrixDps {
             open_shift: AtomicBool::new(false),
             calls: Mutex::new(Vec::new()),
             garbage_sfn: Mutex::new(None),
+            mac_recovery_hash: Mutex::new(None),
         }
     }
     /// Byzantine: make the NEXT `send_chk` answer Ok with a non-empty but garbage
     /// server fiscal number (a live-but-lying DPS), not a transport failure.
     fn inject_garbage_sfn(&self, s: &str) {
         *self.garbage_sfn.lock().unwrap() = Some(s.to_string());
+    }
+    /// Arm the NEXT `send_chk` to return the `-12` ERROR_BAD_HASH_PREV reject with a
+    /// `store {hash_hex}` message (the DPS telling us the real chain head). One-shot:
+    /// after it fires, the following `send_chk` (recovery attempt #2) is a normal Ok.
+    /// `hash_hex` must be exactly 64 hex chars.
+    fn inject_mac_recovery(&self, hash_hex: &str) {
+        *self.mac_recovery_hash.lock().unwrap() = Some(hash_hex.to_string());
     }
     fn set_online(&self, up: bool) {
         self.online.store(up, Ordering::SeqCst);
@@ -163,6 +176,15 @@ impl DpsChannel for MatrixDps {
                 id: g,
                 id_sign: vec![],
                 data_sign: vec![],
+            });
+        }
+        if let Some(h) = self.mac_recovery_hash.lock().unwrap().take() {
+            // One-shot ERROR_BAD_HASH_PREV: DPS rejects with the real chain head so
+            // the inline W10.4 recovery re-signs; the NEXT send (attempt #2) is Ok.
+            self.log(format!("send_chk→REJECT(-12 store {}…)", &h[..8]));
+            return Err(DpsError::Server {
+                code: -12,
+                message: format!("ERROR_BAD_HASH_PREV: store {h}"),
             });
         }
         let n = self.send_ctr.fetch_add(1, Ordering::SeqCst);
@@ -524,6 +546,34 @@ async fn last_doc_sfn(pool: &SqlitePool) -> Option<String> {
     .await
     .unwrap();
     row.flatten()
+}
+
+/// The `mac_recovery_attempts` counter of the most-recently-minted doc (single-bit
+/// budget: 0 = never recovered, 1 = W10.4 recovery claimed + re-signed).
+async fn last_doc_mac_recovery_attempts(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT mac_recovery_attempts FROM fiscal_documents WHERE fiscal_number = ? \
+         ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The current online chain seed (`node_state.last_known_unsigned_xml_sha256`) as
+/// 64 lowercase hex chars — the hash the NEXT signed doc must chain from, i.e. what
+/// a REALISTIC DPS `-12` returns in its `store {hex}` message (DPS and local agree
+/// on the tip; the -12 is a transient MAC glitch on this doc's signing).
+async fn chain_seed_hex(pool: &SqlitePool) -> String {
+    sqlx::query_scalar(
+        "SELECT lower(hex(last_known_unsigned_xml_sha256)) FROM node_state \
+         WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1466,5 +1516,97 @@ async fn matrix_b1_byzantine_garbage_server_fiscal_no() {
     eprintln!(
         "════════ B1-byzantine-garbage-sfn: initial durable={doc} → after converge={final_state}, \
          sfn={final_sfn:?}; fail-closed at issuance (500 REPLAY_LEDGER_DRIFT) + converge→RMR, never ACK ════════"
+    );
+}
+
+/// S14 — MAC-RECOVERY happy path (DPS -12 ERROR_BAD_HASH_PREV → inline W10.4
+/// re-seed). The DPS rejects a SELL's send with `-12` carrying the REAL chain head
+/// (`store {64hex}`); the inline W10.4 recovery (`stage_send::run` → run_mac_recovery)
+/// re-signs the doc with the DPS-supplied previous_hash and re-sends — attempt #2
+/// succeeds. The whole choreography runs SYNCHRONOUSLY inside the one drive_ingress
+/// call (no reconcile / converge tick — corrects the earlier "status_rro" spec: the
+/// hash comes from the -12 MESSAGE, not a probe). Pins: the SELL still reaches ACK,
+/// `mac_recovery_attempts=1` (the single-bit budget was claimed), and the wire log
+/// shows the -12 then the clean re-send.
+#[tokio::test]
+async fn matrix_s14_mac_recovery_minus12_resigns_to_ack() {
+    let (app, dps, wp) = fresh_harness().await;
+    let (os, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s14-OPEN")).await;
+    assert_eq!(os, 200, "S14 setup: SHIFT_OPEN must ACK");
+
+    // Arm the next send: -12 whose `store {hex}` carries the REAL current chain
+    // seed (what DPS returns when it and the local tip agree — a transient MAC
+    // glitch on this doc's signing). Re-signing with it keeps the chain consistent.
+    let recovered_hash = chain_seed_hex(app.db()).await;
+    dps.inject_mac_recovery(&recovered_hash);
+    let _ = dps.drain_calls(); // clear the OPEN wire log
+
+    let (body, total) = sell_body(2, "s14-SELL");
+    let (status, _resp) = drive_ingress(&app, &*wp, &body).await;
+    let doc = last_doc_state(app.db()).await;
+    let attempts = last_doc_mac_recovery_attempts(app.db()).await;
+    let wire = dps.drain_calls();
+    eprintln!(
+        "\n[S14] SELL(total={total}) with -12 injected → ingress[{status}] durable={doc} \
+         mac_recovery_attempts={attempts}\n  wire={wire:?}\n"
+    );
+
+    assert_eq!(
+        doc,
+        DocState::Ack.as_str(),
+        "S14: the recovered SELL must reach terminal ACK (durable={doc}, ingress {status})"
+    );
+    assert_eq!(
+        attempts, 1,
+        "S14: W10.4 recovery must have claimed its single-bit budget (attempts=1)"
+    );
+    assert!(
+        wire.iter().any(|c| c.contains("-12")),
+        "S14: the wire must record the -12 reject, got {wire:?}"
+    );
+    assert!(
+        wire.iter().any(|c| c.contains("SENT(")),
+        "S14: the wire must record the successful re-send (attempt #2), got {wire:?}"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S14-mac-recovery: PASS — -12 → inline W10.4 re-seed+re-sign → ACK (attempts=1) ════════"
+    );
+}
+
+/// S15 — MAC-RECOVERY failure (DPS -12 with NO extractable chain head). The DPS
+/// rejects with `-12` but a message LACKING the `store {64hex}` fragment → the
+/// recovery cannot extract a hash (HashNotExtractable) → the doc is overridden to a
+/// terminal `Rejected` (fail-closed: never a false ACK, never a stuck non-terminal,
+/// and the single-bit budget is NOT even claimed). Uses the plain `reject_next(-12)`
+/// whose scripted message has no `store {hex}`.
+#[tokio::test]
+async fn matrix_s15_mac_recovery_unextractable_hash_rejects() {
+    let (app, dps, wp) = fresh_harness().await;
+    let (os, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s15-OPEN")).await;
+    assert_eq!(os, 200, "S15 setup: SHIFT_OPEN must ACK");
+
+    dps.reject_next(-12); // -12 with "matrix: scripted DPS reject" — NO store {hex}
+    let (body, _t) = sell_body(2, "s15-SELL");
+    let (status, _resp) = drive_ingress(&app, &*wp, &body).await;
+    let doc = last_doc_state(app.db()).await;
+    let attempts = last_doc_mac_recovery_attempts(app.db()).await;
+    eprintln!(
+        "\n[S15] SELL with -12 (no extractable hash) → ingress[{status}] durable={doc} \
+         mac_recovery_attempts={attempts}\n"
+    );
+
+    assert_eq!(
+        doc,
+        DocState::Rejected.as_str(),
+        "S15: -12 with no extractable hash → terminal Rejected (durable={doc}, ingress {status})"
+    );
+    assert_eq!(
+        attempts, 0,
+        "S15: HashNotExtractable happens BEFORE the counter CAS → attempts stays 0"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S15-mac-recovery-fail: PASS — -12 unextractable → Rejected fail-closed (attempts=0, clean scan) ════════"
     );
 }
