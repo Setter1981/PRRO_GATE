@@ -99,6 +99,9 @@ struct MatrixDps {
     send_ctr: AtomicUsize,
     open_shift: AtomicBool,
     calls: Mutex<Vec<String>>,
+    /// Byzantine injection: the NEXT `send_chk` returns Ok with this NON-EMPTY but
+    /// garbage/malformed `id` (server fiscal number) instead of a clean one.
+    garbage_sfn: Mutex<Option<String>>,
 }
 
 impl MatrixDps {
@@ -109,7 +112,13 @@ impl MatrixDps {
             send_ctr: AtomicUsize::new(0),
             open_shift: AtomicBool::new(false),
             calls: Mutex::new(Vec::new()),
+            garbage_sfn: Mutex::new(None),
         }
+    }
+    /// Byzantine: make the NEXT `send_chk` answer Ok with a non-empty but garbage
+    /// server fiscal number (a live-but-lying DPS), not a transport failure.
+    fn inject_garbage_sfn(&self, s: &str) {
+        *self.garbage_sfn.lock().unwrap() = Some(s.to_string());
     }
     fn set_online(&self, up: bool) {
         self.online.store(up, Ordering::SeqCst);
@@ -144,6 +153,16 @@ impl DpsChannel for MatrixDps {
             return Err(DpsError::Server {
                 code,
                 message: "matrix: scripted DPS reject".into(),
+            });
+        }
+        if let Some(g) = self.garbage_sfn.lock().unwrap().take() {
+            // Byzantine-but-alive DPS: Ok, but a non-empty garbage fiscal number.
+            self.send_ctr.fetch_add(1, Ordering::SeqCst);
+            self.log(format!("send_chk→BYZANTINE_SFN({g})"));
+            return Ok(CheckAck {
+                id: g,
+                id_sign: vec![],
+                data_sign: vec![],
             });
         }
         let n = self.send_ctr.fetch_add(1, Ordering::SeqCst);
@@ -490,6 +509,20 @@ async fn last_doc_state(pool: &SqlitePool) -> String {
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+/// The `server_fiscal_no` stamped on the most-recently-minted doc — the fiscal
+/// number the product accepted from the DPS `send_chk` ack (None if unstamped).
+async fn last_doc_sfn(pool: &SqlitePool) -> Option<String> {
+    let row: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT server_fiscal_no FROM fiscal_documents WHERE fiscal_number = ? \
+         ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.flatten()
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1357,4 +1390,80 @@ async fn matrix_s13_offline_service_io_epz_bimodal() {
         Action::ZClose,
     ];
     run("S13-offline-svc-epz", &steps, &app, &*wp, &dps).await;
+}
+
+/// B1 (BYZANTINE, CHARACTERIZATION — NOT a green blessing). A byzantine-but-ALIVE
+/// DPS answers `send_chk` with `Ok(CheckAck)` carrying a NON-EMPTY but garbage /
+/// malformed `id` (not a real fiscal number). The product's ONLY guard is
+/// `is_empty()` (`stage_send.rs:1570`), so it stamps the garbage VERBATIM as
+/// `server_fiscal_no` and advances the chain seed — the receipt is "issued" with a
+/// bogus fiscal number (irreversible). This test CHARACTERIZES the current
+/// fail-open so the log shows it empirically; it does NOT bless it. If we rule
+/// "harden", flip the asserts to DEMAND a format-reject (RED-first for the fix).
+///
+/// KNOWN GAP (audit-integrity, requires DPS itself to malfunction; TLS blocks
+/// MITM): no format/length validation of the DPS-returned fiscal number.
+#[tokio::test]
+async fn matrix_b1_byzantine_garbage_server_fiscal_no() {
+    let (app, dps, wp) = fresh_harness().await;
+    let (os, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "b1-OPEN")).await;
+    assert_eq!(os, 200, "B1 setup: SHIFT_OPEN must ACK");
+
+    // Byzantine-but-alive DPS: the NEXT send returns a non-empty GARBAGE fiscal no.
+    let garbage = "☠GARBAGE-NOT-A-REAL-SFN☠";
+    dps.inject_garbage_sfn(garbage);
+    let (body, _) = sell_body(3, "b1-garbage");
+    let (status, state) = drive_ingress(&app, &*wp, &body).await;
+    let doc = last_doc_state(app.db()).await;
+    let sfn = last_doc_sfn(app.db()).await;
+    eprintln!(
+        "\n⚠ BYZANTINE garbage-SFN → ingress[{status} {state}] durable_doc={doc} server_fiscal_no={sfn:?}\n"
+    );
+
+    // SAFETY PINS (the properties that matter regardless of the surface reason):
+    // 1. It must NOT cleanly issue — a byzantine fiscal number must never produce a
+    //    confirmed 200/ACK success handed back to the caller. (Empirically: the
+    //    inline write-path replay-verification catches it → REPLAY_LEDGER_DRIFT/500,
+    //    a fail-closed breach — a SECOND defense layer beyond stage_send's is_empty.)
+    assert_ne!(
+        status, 200,
+        "B1: a garbage fiscal number must NOT yield a 200 success (got {status}: {state})"
+    );
+    assert_ne!(
+        doc,
+        DocState::Ack.as_str(),
+        "B1: garbage SFN must not reach terminal ACK (durable={doc})"
+    );
+    // 2. THE KEY FAIL-CLOSED TEST: the ledger must be left CLEAN — no doc stuck in a
+    //    non-terminal PREPARED/SIGNED/ENCRYPTED state at this quiescent boundary
+    //    (#192 / P1 pin). If the byzantine 500 left a stuck doc, this panics = a bug.
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+
+    // RESIDUAL CHARACTERIZATION: the doc rests at SENT with the garbage sfn stamped
+    // + the seed advanced. Does the normal online-convergence tick (last_chk now
+    // answers clean KVT1) finalise it to ACK — carrying the garbage fiscal number
+    // as a "confirmed" receipt? This decides the audit-integrity severity.
+    let carriers = drain_carriers(dps.clone());
+    for _ in 0..8 {
+        let view = drain_view(&carriers);
+        let _ = app.converge_online_for_fn(FN, &view).await;
+        if last_doc_state(app.db()).await != DocState::Sent.as_str() {
+            break;
+        }
+    }
+    let final_state = last_doc_state(app.db()).await;
+    let final_sfn = last_doc_sfn(app.db()).await;
+    // The deciding fail-closed pin: a byzantine garbage fiscal number must NEVER
+    // converge to a confirmed terminal ACK. Empirically it escalates to
+    // RequiresManualReconciliation (operator intervention) — never a false confirm.
+    assert_ne!(
+        final_state,
+        DocState::Ack.as_str(),
+        "B1: a garbage fiscal number must NEVER converge to a confirmed ACK (got {final_state})"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ B1-byzantine-garbage-sfn: initial durable={doc} → after converge={final_state}, \
+         sfn={final_sfn:?}; fail-closed at issuance (500 REPLAY_LEDGER_DRIFT) + converge→RMR, never ACK ════════"
+    );
 }
