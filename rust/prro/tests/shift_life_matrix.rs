@@ -71,7 +71,10 @@ use sqlx::SqlitePool;
 
 use common::{det_signing_ctx, det_signing_ctx_for};
 
-const FN: &str = "4000000042";
+const FN_A: &str = "4000000042";
+const FN_B: &str = "4000000099";
+/// Alias so single-FN scenarios continue to compile unchanged.
+const FN: &str = FN_A;
 const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
 
 // ════════════════════════════════════════════════════════════════════════
@@ -278,36 +281,36 @@ fn gen_line_and_pay(seed: u64) -> (String, String, i64) {
 }
 
 /// A wire `CanonicalCommand` for a SELL keyed by `seed`.
-fn sell_body(seed: u64, idem: &str) -> (String, i64) {
+fn sell_body(fiscal_number: &str, seed: u64, idem: &str) -> (String, i64) {
     let (goods, payments, total) = gen_line_and_pay(seed);
     let body = format!(
-        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SELL","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[{goods}],"payments":{payments},"totals":{{"sale_kopecks":{total},"return_kopecks":0}}}}}}"#
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"SELL","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[{goods}],"payments":{payments},"totals":{{"sale_kopecks":{total},"return_kopecks":0}}}}}}"#
     );
     (body, total)
 }
 
 /// A wire `CanonicalCommand` for a RETURN keyed by `seed`.
-fn return_body(seed: u64, idem: &str) -> (String, i64) {
+fn return_body(fiscal_number: &str, seed: u64, idem: &str) -> (String, i64) {
     let (goods, payments, total) = gen_line_and_pay(seed);
     let body = format!(
-        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"RETURN","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"RETURN","goods":[{goods}],"payments":{payments},"totals":{{"sale_kopecks":0,"return_kopecks":{total}}}}}}}"#
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"RETURN","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"RETURN","goods":[{goods}],"payments":{payments},"totals":{{"sale_kopecks":0,"return_kopecks":{total}}}}}}}"#
     );
     (body, total)
 }
 
 /// A wire `CanonicalCommand` for a SERVICE_IN (службове внесення — cash INTO the
 /// drawer). Amount rides on `totals.sale_kopecks`; goods/payments empty.
-fn service_in_body(kop: i64, idem: &str) -> String {
+fn service_in_body(fiscal_number: &str, kop: i64, idem: &str) -> String {
     format!(
-        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SERVICE_IN","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[],"totals":{{"sale_kopecks":{kop},"return_kopecks":0}}}}}}"#
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"SERVICE_IN","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[],"totals":{{"sale_kopecks":{kop},"return_kopecks":0}}}}}}"#
     )
 }
 
 /// A wire `CanonicalCommand` for a SERVICE_OUT (службова видача — cash OUT of the
 /// drawer). Amount rides on `totals.return_kopecks` (ASYMMETRIC vs SERVICE_IN).
-fn service_out_body(kop: i64, idem: &str) -> String {
+fn service_out_body(fiscal_number: &str, kop: i64, idem: &str) -> String {
     format!(
-        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SERVICE_OUT","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[],"totals":{{"sale_kopecks":0,"return_kopecks":{kop}}}}}}}"#
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"SERVICE_OUT","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[],"totals":{{"sale_kopecks":0,"return_kopecks":{kop}}}}}}}"#
     )
 }
 
@@ -315,16 +318,16 @@ fn service_out_body(kop: i64, idem: &str) -> String {
 /// card-funded cash handed to the cardholder). One CASHLESS card leg with an
 /// acquirer slip at `pay_form_index` (must be ≥ 2 = a card slot); amount rides on
 /// `payments[0].amount_kopecks`; totals zero, goods empty.
-fn epz_body(kop: i64, pay_form_index: i64, idem: &str) -> String {
+fn epz_body(fiscal_number: &str, kop: i64, pay_form_index: i64, idem: &str) -> String {
     format!(
-        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"CASH_ADVANCE_EPZ","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[{{"type":"CASHLESS_1","amount_kopecks":{kop},"acquirer_slip":{{"payment_form_index":{pay_form_index},"merchant_id":"M-1","terminal_id":"T-1","operation_type":"PURCHASE","pan":"**** 4242","approval_code":"APPR1","payment_system":"Visa","transaction_code":"RRN-1","fee_kopecks":0,"cashier_signature_placeholder":false,"cardholder_signature_placeholder":false}}}}],"totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"CASH_ADVANCE_EPZ","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[{{"type":"CASHLESS_1","amount_kopecks":{kop},"acquirer_slip":{{"payment_form_index":{pay_form_index},"merchant_id":"M-1","terminal_id":"T-1","operation_type":"PURCHASE","pan":"**** 4242","approval_code":"APPR1","payment_system":"Visa","transaction_code":"RRN-1","fee_kopecks":0,"cashier_signature_placeholder":false,"cardholder_signature_placeholder":false}}}}],"totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
     )
 }
 
 /// A wire `CanonicalCommand` for a payload-less op (SHIFT_OPEN / Z_REPORT).
-fn simple_body(command_type: &str, idem: &str) -> String {
+fn simple_body(fiscal_number: &str, command_type: &str, idem: &str) -> String {
     format!(
-        r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"{command_type}","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"{command_type}","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
     )
 }
 
@@ -377,9 +380,9 @@ impl OperatorKeyLoader for FixtureLoader {
     }
 }
 
-fn fn_config() -> fn_cfg::NewFnConfig {
+fn fn_config_for(fiscal_number: &str) -> fn_cfg::NewFnConfig {
     fn_cfg::NewFnConfig {
-        fiscal_number: FN.into(),
+        fiscal_number: fiscal_number.into(),
         tax_number: "12345678".into(),
         vat_payer_inn: None,
         fiscal_mode: FiscalMode::Test,
@@ -394,42 +397,44 @@ fn fn_config() -> fn_cfg::NewFnConfig {
     }
 }
 
-async fn build_registry(app: &App, dps: Arc<dyn DpsChannel>) -> BindingsRegistry {
-    fn_cfg::insert(app.db(), &fn_config())
+async fn build_registry(app: &App, fns: &[&str], dps: Arc<dyn DpsChannel>) -> BindingsRegistry {
+    for fn_num in fns {
+        fn_cfg::insert(app.db(), &fn_config_for(fn_num))
+            .await
+            .expect("seed FN config");
+        ops_repo::insert(
+            app.db_secure(),
+            &ops_repo::NewOperator {
+                operator_id: format!("OP-{fn_num}"),
+                fiscal_number: (*fn_num).into(),
+                name: "Cashier".into(),
+                key_path: format!("/tmp/k-{fn_num}.dat"),
+                key_pass_enc: Coding::encode(b"secret1").expect("encode test password"),
+            },
+        )
         .await
-        .expect("seed FN config");
-    ops_repo::insert(
-        app.db_secure(),
-        &ops_repo::NewOperator {
-            operator_id: "OP-1".into(),
-            fiscal_number: FN.into(),
-            name: "Cashier".into(),
-            key_path: "/tmp/k1.dat".into(),
-            key_pass_enc: Coding::encode(b"secret1").expect("encode test password"),
-        },
-    )
-    .await
-    .expect("seed operator");
-    // Real per-FN default provisioning (tax_groups 1..11 + payment_methods
-    // cash=1/card=2 + outgress profile + integration flags) — the SAME
-    // production path `admin::register_fn` runs. The ingress `convert` needs
-    // these (tax-group + payment-method lookups) or it breaches / rejects.
-    prro::runtime::bootstrap::bootstrap_fn_defaults(app.db_secure(), FN)
-        .await
-        .expect("bootstrap FN defaults");
+        .expect("seed operator");
+        // Real per-FN default provisioning (tax_groups 1..11 + payment_methods
+        // cash=1/card=2 + outgress profile + integration flags) — the SAME
+        // production path `admin::register_fn` runs. The ingress `convert` needs
+        // these (tax-group + payment-method lookups) or it breaches / rejects.
+        prro::runtime::bootstrap::bootstrap_fn_defaults(app.db_secure(), fn_num)
+            .await
+            .expect("bootstrap FN defaults");
+    }
     BindingsRegistry::build_from_db(app.db_secure(), app.db(), dps, &FixtureLoader)
         .await
         .expect("build_from_db")
 }
 
-async fn seed_boot_baseline(pool: &SqlitePool) {
+async fn seed_boot_baseline(pool: &SqlitePool, fiscal_number: &str) {
     sqlx::query(
         "INSERT INTO node_state \
          (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
           backend_profile_id, transport_profile_id) \
          VALUES (?, ?, ?, NULL, 1, 'b', 't')",
     )
-    .bind(FN)
+    .bind(fiscal_number)
     .bind(NodeMode::Online)
     .bind(ShiftState::Closed)
     .execute(pool)
@@ -444,11 +449,16 @@ async fn seed_boot_baseline(pool: &SqlitePool) {
 /// Drive one wire `CanonicalCommand` (JSON body) through the REAL ingress core:
 /// `handle_command` → classify → convert → inbox → live binding → pipeline.
 /// Returns `(http_status, document_state | "ERR:<code>")`.
-async fn drive_ingress(app: &App, wp: &dyn WritePathEntry, body: &str) -> (u16, String) {
+async fn drive_ingress(
+    app: &App,
+    wp: &dyn WritePathEntry,
+    fiscal_number: &str,
+    body: &str,
+) -> (u16, String) {
     let cmd: CanonicalCommand = serde_json::from_str(body).expect("parse wire CanonicalCommand");
     let resp = handle_command(
         &cmd,
-        FN,
+        fiscal_number,
         DriverId::new("drv-test").unwrap(),
         Protocol::Rest,
         app.db(),
@@ -472,38 +482,38 @@ async fn drive_ingress(app: &App, wp: &dyn WritePathEntry, body: &str) -> (u16, 
     }
 }
 
-async fn node_row(pool: &SqlitePool) -> (String, String) {
+async fn node_row(pool: &SqlitePool, fiscal_number: &str) -> (String, String) {
     sqlx::query_as("SELECT mode, shift_state FROM node_state WHERE fiscal_number = ?")
-        .bind(FN)
+        .bind(fiscal_number)
         .fetch_one(pool)
         .await
         .unwrap()
 }
 
-async fn shift_state(pool: &SqlitePool) -> String {
+async fn shift_state(pool: &SqlitePool, fiscal_number: &str) -> String {
     sqlx::query_scalar(
         "SELECT state FROM shifts WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
     )
-    .bind(FN)
+    .bind(fiscal_number)
     .fetch_optional(pool)
     .await
     .unwrap()
     .unwrap_or_else(|| "<none>".into())
 }
 
-async fn doc_count_in_state(pool: &SqlitePool, state: &str) -> i64 {
+async fn doc_count_in_state(pool: &SqlitePool, fiscal_number: &str, state: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND state = ?",
     )
-    .bind(FN)
+    .bind(fiscal_number)
     .bind(state)
     .fetch_one(pool)
     .await
     .unwrap()
 }
 
-async fn cash_on_hand(pool: &SqlitePool) -> i64 {
-    prro::services::cash_ledger::cash_on_hand_for_fn(pool, FN)
+async fn cash_on_hand(pool: &SqlitePool, fiscal_number: &str) -> i64 {
+    prro::services::cash_ledger::cash_on_hand_for_fn(pool, fiscal_number)
         .await
         .unwrap_or(-1)
 }
@@ -511,12 +521,12 @@ async fn cash_on_hand(pool: &SqlitePool) -> i64 {
 /// Count docs NOT in a terminal-rest state — the z-quiescence surface. A Z can
 /// only close when this is 0 (else `Z_QUIESCENCE_PENDING` / 503).
 #[allow(dead_code)]
-async fn non_terminal_doc_count(pool: &SqlitePool) -> i64 {
+async fn non_terminal_doc_count(pool: &SqlitePool, fiscal_number: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? \
          AND state NOT IN ('ACK','REJECTED','OFFLINE_LOCAL_ACK')",
     )
-    .bind(FN)
+    .bind(fiscal_number)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -524,11 +534,11 @@ async fn non_terminal_doc_count(pool: &SqlitePool) -> i64 {
 
 /// The durable DB state of the most-recently-minted fiscal document — the doc
 /// under test after a scripted DPS reject.
-async fn last_doc_state(pool: &SqlitePool) -> String {
+async fn last_doc_state(pool: &SqlitePool, fiscal_number: &str) -> String {
     sqlx::query_scalar(
         "SELECT state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
     )
-    .bind(FN)
+    .bind(fiscal_number)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -536,12 +546,12 @@ async fn last_doc_state(pool: &SqlitePool) -> String {
 
 /// The `server_fiscal_no` stamped on the most-recently-minted doc — the fiscal
 /// number the product accepted from the DPS `send_chk` ack (None if unstamped).
-async fn last_doc_sfn(pool: &SqlitePool) -> Option<String> {
+async fn last_doc_sfn(pool: &SqlitePool, fiscal_number: &str) -> Option<String> {
     let row: Option<Option<String>> = sqlx::query_scalar(
         "SELECT server_fiscal_no FROM fiscal_documents WHERE fiscal_number = ? \
          ORDER BY rowid DESC LIMIT 1",
     )
-    .bind(FN)
+    .bind(fiscal_number)
     .fetch_optional(pool)
     .await
     .unwrap();
@@ -550,12 +560,12 @@ async fn last_doc_sfn(pool: &SqlitePool) -> Option<String> {
 
 /// The `mac_recovery_attempts` counter of the most-recently-minted doc (single-bit
 /// budget: 0 = never recovered, 1 = W10.4 recovery claimed + re-signed).
-async fn last_doc_mac_recovery_attempts(pool: &SqlitePool) -> i64 {
+async fn last_doc_mac_recovery_attempts(pool: &SqlitePool, fiscal_number: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT mac_recovery_attempts FROM fiscal_documents WHERE fiscal_number = ? \
          ORDER BY rowid DESC LIMIT 1",
     )
-    .bind(FN)
+    .bind(fiscal_number)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -565,12 +575,12 @@ async fn last_doc_mac_recovery_attempts(pool: &SqlitePool) -> i64 {
 /// 64 lowercase hex chars — the hash the NEXT signed doc must chain from, i.e. what
 /// a REALISTIC DPS `-12` returns in its `store {hex}` message (DPS and local agree
 /// on the tip; the -12 is a transient MAC glitch on this doc's signing).
-async fn chain_seed_hex(pool: &SqlitePool) -> String {
+async fn chain_seed_hex(pool: &SqlitePool, fiscal_number: &str) -> String {
     sqlx::query_scalar(
         "SELECT lower(hex(last_known_unsigned_xml_sha256)) FROM node_state \
          WHERE fiscal_number = ?",
     )
-    .bind(FN)
+    .bind(fiscal_number)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -642,9 +652,308 @@ enum Action {
     Epz(i64),
 }
 
-/// Run a scenario end-to-end through the real ingress, logging every step and
-/// asserting the ledger invariant scan after each. HALTS (panics with the log
-/// printed above) on the first divergence.
+/// Execute one Action for a given fiscal_number, returning the step outcome string.
+/// Used by both `run` (single-FN) and `run_interleaved` (multi-FN).
+async fn apply_action(
+    name: &str,
+    i: usize,
+    fiscal_number: &str,
+    act: &Action,
+    app: &App,
+    wp: &dyn WritePathEntry,
+    dps: &Arc<MatrixDps>,
+) -> String {
+    match act {
+        Action::Open => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &simple_body(
+                    fiscal_number,
+                    "SHIFT_OPEN",
+                    &format!("mx-{name}-{fiscal_number}-OPEN-{i}"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                state,
+                DocState::Ack.as_str(),
+                "SHIFT_OPEN → ACK [{status}] (fn={fiscal_number})"
+            );
+            assert_eq!(
+                shift_state(app.db(), fiscal_number).await,
+                "OPENED",
+                "shift OPENED after open (fn={fiscal_number})"
+            );
+            format!("SHIFT_OPEN → {state} [{status}]")
+        }
+        Action::Sell(seed) => {
+            let (body, total) = sell_body(
+                fiscal_number,
+                *seed,
+                &format!("mx-{name}-{fiscal_number}-SELL-{i}"),
+            );
+            let (status, state) = drive_ingress(app, wp, fiscal_number, &body).await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "SELL step {i}: fn={fiscal_number} mode={mode} status={status}"
+            );
+            format!("SELL(seed={seed},total={total}) → {state} [{status}]")
+        }
+        Action::Return(seed) => {
+            let (body, total) = return_body(
+                fiscal_number,
+                *seed,
+                &format!("mx-{name}-{fiscal_number}-RET-{i}"),
+            );
+            let (status, state) = drive_ingress(app, wp, fiscal_number, &body).await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "RETURN step {i}: fn={fiscal_number} mode={mode} status={status}"
+            );
+            format!("RETURN(seed={seed},total={total}) → {state} [{status}]")
+        }
+        Action::ZClose => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &simple_body(
+                    fiscal_number,
+                    "Z_REPORT",
+                    &format!("mx-{name}-{fiscal_number}-Z-{i}"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                state,
+                DocState::Ack.as_str(),
+                "Z → ACK [{status}] (fn={fiscal_number})"
+            );
+            assert_eq!(
+                shift_state(app.db(), fiscal_number).await,
+                "CLOSED",
+                "shift CLOSED after Z (fn={fiscal_number})"
+            );
+            format!("Z_REPORT → {state} [{status}] (shift CLOSED)")
+        }
+        Action::NetDown => {
+            dps.set_online(false);
+            "NET_DOWN (DPS unreachable)".into()
+        }
+        Action::NetUp => {
+            dps.set_online(true);
+            "NET_UP (DPS restored)".into()
+        }
+        Action::GoOffline => {
+            prro::admin::go_offline(app.db(), fiscal_number, "matrix: net down")
+                .await
+                .expect("live door: GO_OFFLINE");
+            let codes: Vec<String> = (0..20)
+                .map(|j| format!("MX-{name}-{fiscal_number}-{i}-{j}"))
+                .collect();
+            prro::admin::seed_dps_offline_codes(app.db(), fiscal_number, &codes)
+                .await
+                .expect("seed offline codes");
+            assert_eq!(
+                node_row(app.db(), fiscal_number).await.0,
+                "OFFLINE",
+                "mode OFFLINE after GO_OFFLINE (fn={fiscal_number})"
+            );
+            "GO_OFFLINE (live door) + 20 codes seeded".into()
+        }
+        Action::GoOnlineDrain => {
+            prro::admin::go_online(app.db(), fiscal_number, "matrix: net restored")
+                .await
+                .expect("live door: GO_ONLINE");
+            assert_eq!(
+                node_row(app.db(), fiscal_number).await.0,
+                "GOING_ONLINE",
+                "mode GOING_ONLINE (fn={fiscal_number})"
+            );
+            let carriers = drain_carriers(dps.clone());
+            let view = drain_view(&carriers);
+            let outcome = app
+                .drain_offline_backlog_scheduled(fiscal_number, &view)
+                .await
+                .expect("drain must run for GOING_ONLINE FN");
+            match outcome {
+                ScheduledDrainOutcome::Ran(_) => {}
+                ScheduledDrainOutcome::SkippedBackoff { .. } => {
+                    panic!("drain must run, not skip-backoff (fn={fiscal_number})")
+                }
+            }
+            assert_eq!(
+                doc_count_in_state(app.db(), fiscal_number, "OFFLINE_LOCAL_ACK").await,
+                0,
+                "all OLA docs drained to terminal after GO_ONLINE+drain (fn={fiscal_number})"
+            );
+            assert_eq!(
+                node_row(app.db(), fiscal_number).await.0,
+                "ONLINE",
+                "mode ONLINE after drain converge (fn={fiscal_number})"
+            );
+            "GO_ONLINE (live door) + drain → converged".into()
+        }
+        Action::SellRetryable(seed) => {
+            let (body, total) = sell_body(
+                fiscal_number,
+                *seed,
+                &format!("mx-{name}-{fiscal_number}-SELLR-{i}"),
+            );
+            let (status, _resp) = drive_ingress(app, wp, fiscal_number, &body).await;
+            let doc = last_doc_state(app.db(), fiscal_number).await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            assert_eq!(
+                doc,
+                DocState::ErrorRetryable.as_str(),
+                "net-down online SELL step {i}: doc must rest ERROR_RETRYABLE \
+                 (stays online, retried — NOT OLA, NOT lost) (fn={fiscal_number})"
+            );
+            assert_eq!(
+                mode, "ONLINE",
+                "net-down SELL must NOT flip mode to OFFLINE (fn={fiscal_number})"
+            );
+            format!("SELL(seed={seed},total={total}) NET-DOWN → doc={doc} [{status}]")
+        }
+        Action::Reconcile => {
+            let carriers = drain_carriers(dps.clone());
+            // Re-drive the ErrorRetryable doc (net restored). Several ticks,
+            // exactly as the supervisor loop does.
+            for _ in 0..8 {
+                let deps = ReconciliationRuntime::single_fn(drain_view(&carriers));
+                app.reconcile_pending_with(deps)
+                    .await
+                    .expect("reconcile_pending_with must run");
+            }
+            // PROVEN: reconcile forward-drives the doc OUT of ErrorRetryable
+            // (not lost, not stuck-retryable). NOTE (harness finding): the
+            // re-driven doc rests at KVT1 — the reconcile path does not
+            // finalise KVT1→KVT2→ACK from the same last_chk evidence the
+            // INLINE path finalises with. Asymmetry captured; full KVT2
+            // fidelity (or the real online-convergence tick) is a follow-up.
+            assert_eq!(
+                doc_count_in_state(app.db(), fiscal_number, "ERROR_RETRYABLE").await,
+                0,
+                "reconcile must re-drive the doc FORWARD out of ERROR_RETRYABLE (fn={fiscal_number})"
+            );
+            let st = last_doc_state(app.db(), fiscal_number).await;
+            format!("RECONCILE (re-drive) → ErrorRetryable cleared, doc now {st}")
+        }
+        Action::OnlineConverge => {
+            let carriers = drain_carriers(dps.clone());
+            // Active KVT1 → ACK finalisation (the M3b online-convergence tick,
+            // distinct from Reconcile's passive KVT1-hold). Tick to terminal.
+            let mut ticks = 0;
+            loop {
+                let view = drain_view(&carriers);
+                app.converge_online_for_fn(fiscal_number, &view)
+                    .await
+                    .expect("converge_online_for_fn must run");
+                ticks += 1;
+                if non_terminal_doc_count(app.db(), fiscal_number).await == 0 || ticks >= 8 {
+                    break;
+                }
+            }
+            assert_eq!(
+                non_terminal_doc_count(app.db(), fiscal_number).await,
+                0,
+                "online-convergence must finalise KVT1 → ACK ({ticks} ticks) (fn={fiscal_number})"
+            );
+            format!("ONLINE-CONVERGE ({ticks} ticks) → KVT1 finalised to ACK")
+        }
+        Action::ServiceIn(kop) => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &service_in_body(
+                    fiscal_number,
+                    *kop,
+                    &format!("mx-{name}-{fiscal_number}-SVCIN-{i}"),
+                ),
+            )
+            .await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "SERVICE_IN step {i}: fn={fiscal_number} mode={mode} status={status}"
+            );
+            format!("SERVICE_IN(+{kop}) → {state} [{status}]")
+        }
+        Action::ServiceOut(kop) => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &service_out_body(
+                    fiscal_number,
+                    *kop,
+                    &format!("mx-{name}-{fiscal_number}-SVCOUT-{i}"),
+                ),
+            )
+            .await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "SERVICE_OUT step {i}: fn={fiscal_number} mode={mode} status={status} (drawer must cover {kop})"
+            );
+            format!("SERVICE_OUT(-{kop}) → {state} [{status}]")
+        }
+        Action::Epz(kop) => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &epz_body(
+                    fiscal_number,
+                    *kop,
+                    2,
+                    &format!("mx-{name}-{fiscal_number}-EPZ-{i}"),
+                ),
+            )
+            .await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "EPZ step {i}: fn={fiscal_number} mode={mode} status={status} (drawer must cover {kop})"
+            );
+            format!("EPZ(-{kop} card-funded) → {state} [{status}]")
+        }
+    }
+}
+
+/// Run a single-FN scenario end-to-end through the real ingress, logging every
+/// step and asserting the ledger invariant scan after each. HALTS (panics with
+/// the log printed above) on the first divergence.
 async fn run(
     name: &str,
     steps: &[Action],
@@ -652,260 +961,72 @@ async fn run(
     wp: &dyn WritePathEntry,
     dps: &Arc<MatrixDps>,
 ) {
-    eprintln!("\n════════ SCENARIO: {name} ════════");
+    run_for_fn(name, FN, steps, app, wp, dps).await;
+}
+
+/// Like `run` but for an explicit fiscal_number (used when S1-S15/B1 pass FN_A
+/// explicitly, or for single-FN slices of multi-FN scenarios).
+async fn run_for_fn(
+    name: &str,
+    fiscal_number: &str,
+    steps: &[Action],
+    app: &App,
+    wp: &dyn WritePathEntry,
+    dps: &Arc<MatrixDps>,
+) {
+    eprintln!("\n════════ SCENARIO: {name} (fn={fiscal_number}) ════════");
     for (i, act) in steps.iter().enumerate() {
         let t0 = Instant::now();
-        let outcome: String = match act {
-            Action::Open => {
-                let (status, state) = drive_ingress(
-                    app,
-                    wp,
-                    &simple_body("SHIFT_OPEN", &format!("mx-{name}-OPEN-{i}")),
-                )
-                .await;
-                assert_eq!(state, DocState::Ack.as_str(), "SHIFT_OPEN → ACK [{status}]");
-                assert_eq!(
-                    shift_state(app.db()).await,
-                    "OPENED",
-                    "shift OPENED after open"
-                );
-                format!("SHIFT_OPEN → {state} [{status}]")
-            }
-            Action::Sell(seed) => {
-                let (body, total) = sell_body(*seed, &format!("mx-{name}-SELL-{i}"));
-                let (status, state) = drive_ingress(app, wp, &body).await;
-                let mode = node_row(app.db()).await.0;
-                let want = if mode == "OFFLINE" {
-                    DocState::OfflineLocalAck.as_str()
-                } else {
-                    DocState::Ack.as_str()
-                };
-                assert_eq!(state, want, "SELL step {i}: mode={mode} status={status}");
-                format!("SELL(seed={seed},total={total}) → {state} [{status}]")
-            }
-            Action::Return(seed) => {
-                let (body, total) = return_body(*seed, &format!("mx-{name}-RET-{i}"));
-                let (status, state) = drive_ingress(app, wp, &body).await;
-                let mode = node_row(app.db()).await.0;
-                let want = if mode == "OFFLINE" {
-                    DocState::OfflineLocalAck.as_str()
-                } else {
-                    DocState::Ack.as_str()
-                };
-                assert_eq!(state, want, "RETURN step {i}: mode={mode} status={status}");
-                format!("RETURN(seed={seed},total={total}) → {state} [{status}]")
-            }
-            Action::ZClose => {
-                let (status, state) = drive_ingress(
-                    app,
-                    wp,
-                    &simple_body("Z_REPORT", &format!("mx-{name}-Z-{i}")),
-                )
-                .await;
-                assert_eq!(state, DocState::Ack.as_str(), "Z → ACK [{status}]");
-                assert_eq!(
-                    shift_state(app.db()).await,
-                    "CLOSED",
-                    "shift CLOSED after Z"
-                );
-                format!("Z_REPORT → {state} [{status}] (shift CLOSED)")
-            }
-            Action::NetDown => {
-                dps.set_online(false);
-                "NET_DOWN (DPS unreachable)".into()
-            }
-            Action::NetUp => {
-                dps.set_online(true);
-                "NET_UP (DPS restored)".into()
-            }
-            Action::GoOffline => {
-                prro::admin::go_offline(app.db(), FN, "matrix: net down")
-                    .await
-                    .expect("live door: GO_OFFLINE");
-                let codes: Vec<String> = (0..20).map(|j| format!("MX-{name}-{i}-{j}")).collect();
-                prro::admin::seed_dps_offline_codes(app.db(), FN, &codes)
-                    .await
-                    .expect("seed offline codes");
-                assert_eq!(
-                    node_row(app.db()).await.0,
-                    "OFFLINE",
-                    "mode OFFLINE after GO_OFFLINE"
-                );
-                "GO_OFFLINE (live door) + 20 codes seeded".into()
-            }
-            Action::GoOnlineDrain => {
-                prro::admin::go_online(app.db(), FN, "matrix: net restored")
-                    .await
-                    .expect("live door: GO_ONLINE");
-                assert_eq!(
-                    node_row(app.db()).await.0,
-                    "GOING_ONLINE",
-                    "mode GOING_ONLINE"
-                );
-                let carriers = drain_carriers(dps.clone());
-                let view = drain_view(&carriers);
-                let outcome = app
-                    .drain_offline_backlog_scheduled(FN, &view)
-                    .await
-                    .expect("drain must run for GOING_ONLINE FN");
-                match outcome {
-                    ScheduledDrainOutcome::Ran(_) => {}
-                    ScheduledDrainOutcome::SkippedBackoff { .. } => {
-                        panic!("drain must run, not skip-backoff")
-                    }
-                }
-                assert_eq!(
-                    doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await,
-                    0,
-                    "all OLA docs drained to terminal after GO_ONLINE+drain"
-                );
-                assert_eq!(
-                    node_row(app.db()).await.0,
-                    "ONLINE",
-                    "mode ONLINE after drain converge"
-                );
-                "GO_ONLINE (live door) + drain → converged".into()
-            }
-            Action::SellRetryable(seed) => {
-                let (body, total) = sell_body(*seed, &format!("mx-{name}-SELLR-{i}"));
-                let (status, _resp) = drive_ingress(app, wp, &body).await;
-                let doc = last_doc_state(app.db()).await;
-                let mode = node_row(app.db()).await.0;
-                assert_eq!(
-                    doc,
-                    DocState::ErrorRetryable.as_str(),
-                    "net-down online SELL step {i}: doc must rest ERROR_RETRYABLE \
-                     (stays online, retried — NOT OLA, NOT lost)"
-                );
-                assert_eq!(
-                    mode, "ONLINE",
-                    "net-down SELL must NOT flip mode to OFFLINE"
-                );
-                format!("SELL(seed={seed},total={total}) NET-DOWN → doc={doc} [{status}]")
-            }
-            Action::Reconcile => {
-                let carriers = drain_carriers(dps.clone());
-                // Re-drive the ErrorRetryable doc (net restored). Several ticks,
-                // exactly as the supervisor loop does.
-                for _ in 0..8 {
-                    let deps = ReconciliationRuntime::single_fn(drain_view(&carriers));
-                    app.reconcile_pending_with(deps)
-                        .await
-                        .expect("reconcile_pending_with must run");
-                }
-                // PROVEN: reconcile forward-drives the doc OUT of ErrorRetryable
-                // (not lost, not stuck-retryable). NOTE (harness finding): the
-                // re-driven doc rests at KVT1 — the reconcile path does not
-                // finalise KVT1→KVT2→ACK from the same last_chk evidence the
-                // INLINE path finalises with. Asymmetry captured; full KVT2
-                // fidelity (or the real online-convergence tick) is a follow-up.
-                assert_eq!(
-                    doc_count_in_state(app.db(), "ERROR_RETRYABLE").await,
-                    0,
-                    "reconcile must re-drive the doc FORWARD out of ERROR_RETRYABLE"
-                );
-                let st = last_doc_state(app.db()).await;
-                format!("RECONCILE (re-drive) → ErrorRetryable cleared, doc now {st}")
-            }
-            Action::OnlineConverge => {
-                let carriers = drain_carriers(dps.clone());
-                // Active KVT1 → ACK finalisation (the M3b online-convergence tick,
-                // distinct from Reconcile's passive KVT1-hold). Tick to terminal.
-                let mut ticks = 0;
-                loop {
-                    let view = drain_view(&carriers);
-                    app.converge_online_for_fn(FN, &view)
-                        .await
-                        .expect("converge_online_for_fn must run");
-                    ticks += 1;
-                    if non_terminal_doc_count(app.db()).await == 0 || ticks >= 8 {
-                        break;
-                    }
-                }
-                assert_eq!(
-                    non_terminal_doc_count(app.db()).await,
-                    0,
-                    "online-convergence must finalise KVT1 → ACK ({ticks} ticks)"
-                );
-                format!("ONLINE-CONVERGE ({ticks} ticks) → KVT1 finalised to ACK")
-            }
-            Action::ServiceIn(kop) => {
-                let (status, state) = drive_ingress(
-                    app,
-                    wp,
-                    &service_in_body(*kop, &format!("mx-{name}-SVCIN-{i}")),
-                )
-                .await;
-                let mode = node_row(app.db()).await.0;
-                let want = if mode == "OFFLINE" {
-                    DocState::OfflineLocalAck.as_str()
-                } else {
-                    DocState::Ack.as_str()
-                };
-                assert_eq!(
-                    state, want,
-                    "SERVICE_IN step {i}: mode={mode} status={status}"
-                );
-                format!("SERVICE_IN(+{kop}) → {state} [{status}]")
-            }
-            Action::ServiceOut(kop) => {
-                let (status, state) = drive_ingress(
-                    app,
-                    wp,
-                    &service_out_body(*kop, &format!("mx-{name}-SVCOUT-{i}")),
-                )
-                .await;
-                let mode = node_row(app.db()).await.0;
-                let want = if mode == "OFFLINE" {
-                    DocState::OfflineLocalAck.as_str()
-                } else {
-                    DocState::Ack.as_str()
-                };
-                assert_eq!(
-                    state, want,
-                    "SERVICE_OUT step {i}: mode={mode} status={status} (drawer must cover {kop})"
-                );
-                format!("SERVICE_OUT(-{kop}) → {state} [{status}]")
-            }
-            Action::Epz(kop) => {
-                let (status, state) =
-                    drive_ingress(app, wp, &epz_body(*kop, 2, &format!("mx-{name}-EPZ-{i}"))).await;
-                let mode = node_row(app.db()).await.0;
-                let want = if mode == "OFFLINE" {
-                    DocState::OfflineLocalAck.as_str()
-                } else {
-                    DocState::Ack.as_str()
-                };
-                assert_eq!(
-                    state, want,
-                    "EPZ step {i}: mode={mode} status={status} (drawer must cover {kop})"
-                );
-                format!("EPZ(-{kop} card-funded) → {state} [{status}]")
-            }
-        };
-
+        let outcome = apply_action(name, i, fiscal_number, act, app, wp, dps).await;
         let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let (mode, node_shift) = node_row(app.db()).await;
+        let (mode, node_shift) = node_row(app.db(), fiscal_number).await;
         let wire = dps.drain_calls();
         eprintln!(
             "[{name}][step {i:>2}] {outcome:<48} {dt_ms:>6.1}ms | mode={mode:<12} shift={:<10} node_shift={node_shift:<10} cash={} | dps{:?}",
-            shift_state(app.db()).await,
-            cash_on_hand(app.db()).await,
+            shift_state(app.db(), fiscal_number).await,
+            cash_on_hand(app.db(), fiscal_number).await,
             wire,
         );
-
-        // HALT-ON-ERROR: the universal oracle. Any illegal non-terminal doc at
-        // this quiescent boundary (#192 / P1 ledger-pin) panics here.
+        // HALT-ON-ERROR: whole-DB universal oracle (covers all FNs in this App).
         prro::db::invariant_scan::assert_clean(app.db()).await;
     }
     eprintln!("════════ {name}: PASS ════════\n");
 }
 
-async fn fresh_harness() -> (App, Arc<MatrixDps>, Arc<dyn WritePathEntry>) {
+/// Run a multi-FN interleaved scenario. Each step is `(fiscal_number, Action)`.
+/// The whole-DB `assert_clean` runs after every step.
+async fn run_interleaved(
+    name: &str,
+    steps: &[(&str, Action)],
+    app: &App,
+    wp: &dyn WritePathEntry,
+    dps: &Arc<MatrixDps>,
+) {
+    eprintln!("\n════════ SCENARIO (interleaved): {name} ════════");
+    for (i, (fn_num, act)) in steps.iter().enumerate() {
+        let t0 = Instant::now();
+        let outcome = apply_action(name, i, fn_num, act, app, wp, dps).await;
+        let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let (mode_a, _) = node_row(app.db(), FN_A).await;
+        let (mode_b, _) = node_row(app.db(), FN_B).await;
+        let wire = dps.drain_calls();
+        eprintln!(
+            "[{name}][step {i:>2}][fn={fn_num}] {outcome:<44} {dt_ms:>6.1}ms | A={mode_a} B={mode_b} | dps{:?}",
+            wire,
+        );
+        // HALT-ON-ERROR: whole-DB oracle — covers BOTH FN_A and FN_B in one scan.
+        prro::db::invariant_scan::assert_clean(app.db()).await;
+    }
+    eprintln!("════════ {name}: PASS ════════\n");
+}
+
+async fn fresh_harness(fns: &[&str]) -> (App, Arc<MatrixDps>, Arc<dyn WritePathEntry>) {
     let app = boot_app().await;
     let dps = Arc::new(MatrixDps::new());
-    let registry = build_registry(&app, dps.clone()).await;
-    seed_boot_baseline(app.db()).await;
+    let registry = build_registry(&app, fns, dps.clone()).await;
+    for fn_num in fns {
+        seed_boot_baseline(app.db(), fn_num).await;
+    }
     let wp = production_write_path(app.clone(), Arc::new(registry));
     (app, dps, wp)
 }
@@ -919,7 +1040,7 @@ async fn fresh_harness() -> (App, Arc<MatrixDps>, Arc<dyn WritePathEntry>) {
 /// to terminal ACK on a clean scan at every step.
 #[tokio::test]
 async fn matrix_s1_online_happy_varied_packets() {
-    let (app, dps, wp) = fresh_harness().await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
     let steps = vec![
         Action::Open,
         Action::Sell(1),
@@ -938,7 +1059,7 @@ async fn matrix_s1_online_happy_varied_packets() {
 /// the real ingress.
 #[tokio::test]
 async fn matrix_s2_offline_lifecycle_drain_close() {
-    let (app, dps, wp) = fresh_harness().await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
     let steps = vec![
         Action::Open,
         Action::Sell(3),
@@ -1023,19 +1144,25 @@ async fn matrix_s3_dps_reject_corpus() {
     ];
     eprintln!("\n════════ DPS REJECT CORPUS ════════");
     for (code, meaning, exp_state, exp_mode) in corpus {
-        let (app, dps, wp) = fresh_harness().await;
+        let (app, dps, wp) = fresh_harness(&[FN]).await;
         // Open a shift online (this send succeeds).
-        let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "corpus-OPEN")).await;
+        let (st, _) = drive_ingress(
+            &app,
+            &*wp,
+            FN,
+            &simple_body(FN, "SHIFT_OPEN", "corpus-OPEN"),
+        )
+        .await;
         assert_eq!(
             st, 200,
             "corpus setup: SHIFT_OPEN must ACK before the reject (code {code})"
         );
         // Inject the DPS reject onto the SELL's send.
         dps.reject_next(*code);
-        let (body, _total) = sell_body(1, "corpus-SELL");
-        let (status, resp) = drive_ingress(&app, &*wp, &body).await;
-        let doc = last_doc_state(app.db()).await;
-        let mode = node_row(app.db()).await.0;
+        let (body, _total) = sell_body(FN, 1, "corpus-SELL");
+        let (status, resp) = drive_ingress(&app, &*wp, FN, &body).await;
+        let doc = last_doc_state(app.db(), FN).await;
+        let mode = node_row(app.db(), FN).await.0;
         eprintln!(
             "[corpus] DPS {code:>4} {meaning:<38} → ingress[{status} {resp:<34.34}] doc={doc:<15} node={mode}"
         );
@@ -1050,11 +1177,11 @@ async fn matrix_s3_dps_reject_corpus() {
     eprintln!("════════ DPS REJECT CORPUS: PASS ════════\n");
 }
 
-/// (fiscal_documents count, sqlite page_count) — coarse DB-growth probe.
-async fn db_stats(pool: &SqlitePool) -> (i64, i64) {
+/// (fiscal_documents count for `fiscal_number`, sqlite page_count) — coarse DB-growth probe.
+async fn db_stats(pool: &SqlitePool, fiscal_number: &str) -> (i64, i64) {
     let docs: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
-            .bind(FN)
+            .bind(fiscal_number)
             .fetch_one(pool)
             .await
             .unwrap();
@@ -1073,25 +1200,25 @@ async fn db_stats(pool: &SqlitePool) -> (i64, i64) {
 /// NOT real DSTU-4145 crypto cost (that is a separate live/bench concern).
 #[tokio::test]
 async fn matrix_s4_throughput_and_db() {
-    let (app, _dps, wp) = fresh_harness().await;
-    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "perf-OPEN")).await;
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "perf-OPEN")).await;
     assert_eq!(st, 200, "perf setup: SHIFT_OPEN must ACK");
 
     let n: u64 = 200;
     let t0 = Instant::now();
     for i in 0..n {
-        let (body, _) = sell_body(i, &format!("perf-SELL-{i}"));
-        let (status, _state) = drive_ingress(&app, &*wp, &body).await;
+        let (body, _) = sell_body(FN, i, &format!("perf-SELL-{i}"));
+        let (status, _state) = drive_ingress(&app, &*wp, FN, &body).await;
         assert_eq!(status, 200, "SELL {i} must ACK");
     }
     let elapsed = t0.elapsed();
-    let (dz, _) = drive_ingress(&app, &*wp, &simple_body("Z_REPORT", "perf-Z")).await;
+    let (dz, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "Z_REPORT", "perf-Z")).await;
     assert_eq!(dz, 200, "perf: Z must close the shift");
 
     let total_ms = elapsed.as_secs_f64() * 1000.0;
     let per_ms = total_ms / n as f64;
     let ops = n as f64 / elapsed.as_secs_f64();
-    let (docs, pages) = db_stats(app.db()).await;
+    let (docs, pages) = db_stats(app.db(), FN).await;
     eprintln!("\n════════ THROUGHPUT (sign=STUB) ════════");
     eprintln!(
         "  {n} SELLs in {total_ms:.0}ms  →  {per_ms:.2} ms/sell, {ops:.0} sells/sec  (pipeline+DB, crypto stubbed)"
@@ -1111,7 +1238,7 @@ async fn matrix_s4_throughput_and_db() {
 /// the network (MatrixDps) is faked.
 #[tokio::test]
 async fn matrix_s5_net_drop_mid_online_retry() {
-    let (app, dps, wp) = fresh_harness().await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
     let steps = vec![
         Action::Open,             // online SHIFT_OPEN → ACK
         Action::Sell(6),          // online SELL → ACK
@@ -1140,7 +1267,7 @@ async fn matrix_s5_net_drop_mid_online_retry() {
 /// clean. Every step scanned (`assert_clean`); a stuck non-terminal doc halts.
 #[tokio::test]
 async fn matrix_s6_mixed_online_offline_day() {
-    let (app, dps, wp) = fresh_harness().await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
     let steps = vec![
         Action::Open,
         Action::Sell(11),
@@ -1167,7 +1294,7 @@ async fn matrix_s6_mixed_online_offline_day() {
 /// mints a fresh OPENED shift. Return-after-sell keeps drawer cash ≥ 0.
 #[tokio::test]
 async fn matrix_s7_multi_shift_reopen_sequence() {
-    let (app, dps, wp) = fresh_harness().await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
     let steps = vec![
         // ── shift 1 ──
         Action::Open,
@@ -1205,14 +1332,14 @@ async fn matrix_s7_multi_shift_reopen_sequence() {
 /// leaks drawer cash during the closed window, goes RED here.
 #[tokio::test]
 async fn matrix_s8_cross_shift_cash_carryover() {
-    let (app, _dps, wp) = fresh_harness().await;
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
 
     // ── shift 1: open + two CASH sells (even seeds) → drawer accumulates ──
-    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s8-OPEN-1")).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s8-OPEN-1")).await;
     assert_eq!(st, 200, "S8 setup: shift 1 SHIFT_OPEN must ACK");
     for (idx, seed) in [2u64, 6u64].into_iter().enumerate() {
-        let (body, _t) = sell_body(seed, &format!("s8-SELL1-{idx}"));
-        let (s, state) = drive_ingress(&app, &*wp, &body).await;
+        let (body, _t) = sell_body(FN, seed, &format!("s8-SELL1-{idx}"));
+        let (s, state) = drive_ingress(&app, &*wp, FN, &body).await;
         assert_eq!(
             state,
             DocState::Ack.as_str(),
@@ -1220,23 +1347,23 @@ async fn matrix_s8_cross_shift_cash_carryover() {
         );
     }
     // Drawer at the END of shift 1 — still OPEN, so this is an IN-contract read.
-    let close_drawer_1 = cash_on_hand(app.db()).await;
+    let close_drawer_1 = cash_on_hand(app.db(), FN).await;
     assert!(
         close_drawer_1 > 0,
         "S8 precondition: shift 1 must accumulate CASH to carry (got {close_drawer_1})"
     );
 
     // ── Z closes shift 1 ──
-    let (zs, zstate) = drive_ingress(&app, &*wp, &simple_body("Z_REPORT", "s8-Z-1")).await;
+    let (zs, zstate) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "Z_REPORT", "s8-Z-1")).await;
     assert_eq!(zstate, DocState::Ack.as_str(), "S8 Z-1 → ACK [{zs}]");
     assert_eq!(
-        shift_state(app.db()).await,
+        shift_state(app.db(), FN).await,
         "CLOSED",
         "S8 shift 1 CLOSED after Z"
     );
 
     // (1) Closed-window read → documented no-open-shift sentinel (0), NOT the drawer.
-    let sentinel = cash_on_hand(app.db()).await;
+    let sentinel = cash_on_hand(app.db(), FN).await;
     assert_eq!(
         sentinel, 0,
         "S8: cash_on_hand during the CLOSED window is the no-open-shift sentinel (0), \
@@ -1244,12 +1371,16 @@ async fn matrix_s8_cross_shift_cash_carryover() {
     );
 
     // ── shift 2: reopen ──
-    let (os, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s8-OPEN-2")).await;
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s8-OPEN-2")).await;
     assert_eq!(os, 200, "S8: shift 2 SHIFT_OPEN must ACK");
-    assert_eq!(shift_state(app.db()).await, "OPENED", "S8 shift 2 OPENED");
+    assert_eq!(
+        shift_state(app.db(), FN).await,
+        "OPENED",
+        "S8 shift 2 OPENED"
+    );
 
     // (2)+(3) Opening drawer of shift 2 == closing drawer of shift 1 (carry-over).
-    let open_drawer_2 = cash_on_hand(app.db()).await;
+    let open_drawer_2 = cash_on_hand(app.db(), FN).await;
     assert_eq!(
         open_drawer_2, close_drawer_1,
         "S8: drawer cash must CARRY across the Z — shift-2 opening anchor ({open_drawer_2}) \
@@ -1271,7 +1402,7 @@ async fn matrix_s8_cross_shift_cash_carryover() {
 /// drawer move.
 #[tokio::test]
 async fn matrix_s9_service_io_lifecycle() {
-    let (app, dps, wp) = fresh_harness().await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
     let steps = vec![
         Action::Open,
         Action::ServiceIn(5000),  // +50.00 into the drawer
@@ -1289,14 +1420,19 @@ async fn matrix_s9_service_io_lifecycle() {
 /// proceeds to ACK and drains it to 0, proving the guard is a floor, not a wall.
 #[tokio::test]
 async fn matrix_s10_service_out_guard_3b() {
-    let (app, _dps, wp) = fresh_harness().await;
-    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s10-OPEN")).await;
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s10-OPEN")).await;
     assert_eq!(st, 200, "S10 setup: SHIFT_OPEN must ACK");
-    let rows_before = db_stats(app.db()).await.0;
+    let rows_before = db_stats(app.db(), FN).await.0;
 
     // over-drawer видача on an EMPTY drawer → fail-closed, row-less
-    let (status, state) =
-        drive_ingress(&app, &*wp, &service_out_body(5000, "s10-SVCOUT-over")).await;
+    let (status, state) = drive_ingress(
+        &app,
+        &*wp,
+        FN,
+        &service_out_body(FN, 5000, "s10-SVCOUT-over"),
+    )
+    .await;
     assert_eq!(
         status, 422,
         "S10: over-drawer SERVICE_OUT must be HTTP 422 (got {status}: {state})"
@@ -1306,26 +1442,31 @@ async fn matrix_s10_service_out_guard_3b() {
         "S10: refusal must be CASH_INSUFFICIENT, got {state}"
     );
     assert_eq!(
-        db_stats(app.db()).await.0,
+        db_stats(app.db(), FN).await.0,
         rows_before,
         "S10: refused SERVICE_OUT must mint ZERO fiscal rows (row-less guard)"
     );
 
     // fund with a CASH sell, then видача the FULL drawer → ACK, cash 0
-    let (body, _t) = sell_body(2, "s10-SELL"); // even = cash
-    let (ss, sstate) = drive_ingress(&app, &*wp, &body).await;
+    let (body, _t) = sell_body(FN, 2, "s10-SELL"); // even = cash
+    let (ss, sstate) = drive_ingress(&app, &*wp, FN, &body).await;
     assert_eq!(sstate, DocState::Ack.as_str(), "S10 fund sell → ACK [{ss}]");
-    let drawer = cash_on_hand(app.db()).await;
+    let drawer = cash_on_hand(app.db(), FN).await;
     assert!(drawer > 0, "S10: drawer funded (got {drawer})");
-    let (cs, cstate) =
-        drive_ingress(&app, &*wp, &service_out_body(drawer, "s10-SVCOUT-covered")).await;
+    let (cs, cstate) = drive_ingress(
+        &app,
+        &*wp,
+        FN,
+        &service_out_body(FN, drawer, "s10-SVCOUT-covered"),
+    )
+    .await;
     assert_eq!(
         cstate,
         DocState::Ack.as_str(),
         "S10: covered SERVICE_OUT (exactly the drawer) → ACK [{cs}]"
     );
     assert_eq!(
-        cash_on_hand(app.db()).await,
+        cash_on_hand(app.db(), FN).await,
         0,
         "S10: видача of the full drawer → cash 0"
     );
@@ -1342,30 +1483,30 @@ async fn matrix_s10_service_out_guard_3b() {
 /// Close with a Z (the `<EPZ>` aggregation + z-quiescence include EPZ).
 #[tokio::test]
 async fn matrix_s11_epz_cash_advance_ledger() {
-    let (app, _dps, wp) = fresh_harness().await;
-    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s11-OPEN")).await;
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s11-OPEN")).await;
     assert_eq!(st, 200, "S11 setup: SHIFT_OPEN must ACK");
     // fund the drawer (+80.00)
-    let (fi, fstate) = drive_ingress(&app, &*wp, &service_in_body(8000, "s11-SVCIN")).await;
+    let (fi, fstate) = drive_ingress(&app, &*wp, FN, &service_in_body(FN, 8000, "s11-SVCIN")).await;
     assert_eq!(
         fstate,
         DocState::Ack.as_str(),
         "S11 fund внесення → ACK [{fi}]"
     );
-    let before = cash_on_hand(app.db()).await;
+    let before = cash_on_hand(app.db(), FN).await;
     assert!(before >= 3000, "S11: drawer funded ≥ 30.00 (got {before})");
 
     // EPZ cash advance of 30.00 (card-funded) → drawer -= 30.00
-    let (es, estate) = drive_ingress(&app, &*wp, &epz_body(3000, 2, "s11-EPZ")).await;
+    let (es, estate) = drive_ingress(&app, &*wp, FN, &epz_body(FN, 3000, 2, "s11-EPZ")).await;
     assert_eq!(estate, DocState::Ack.as_str(), "S11: EPZ → ACK [{es}]");
-    let after = cash_on_hand(app.db()).await;
+    let after = cash_on_hand(app.db(), FN).await;
     assert_eq!(
         after,
         before - 3000,
         "S11: EPZ must subtract 30.00 from the drawer ({before} → {after})"
     );
 
-    let (zs, zstate) = drive_ingress(&app, &*wp, &simple_body("Z_REPORT", "s11-Z")).await;
+    let (zs, zstate) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "Z_REPORT", "s11-Z")).await;
     assert_eq!(zstate, DocState::Ack.as_str(), "S11: Z → ACK [{zs}]");
     prro::db::invariant_scan::assert_clean(app.db()).await;
     eprintln!(
@@ -1379,13 +1520,13 @@ async fn matrix_s11_epz_cash_advance_ledger() {
 /// TOO_LOW (WebCheck «paymentid не может быть меньше 2»). Neither mints a row.
 #[tokio::test]
 async fn matrix_s12_epz_guards() {
-    let (app, _dps, wp) = fresh_harness().await;
-    let (st, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s12-OPEN")).await;
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s12-OPEN")).await;
     assert_eq!(st, 200, "S12 setup: SHIFT_OPEN must ACK");
-    let rows0 = db_stats(app.db()).await.0;
+    let rows0 = db_stats(app.db(), FN).await.0;
 
     // (a) over-drawer EPZ on an empty drawer → guard-3c
-    let (s1, st1) = drive_ingress(&app, &*wp, &epz_body(5000, 2, "s12-EPZ-over")).await;
+    let (s1, st1) = drive_ingress(&app, &*wp, FN, &epz_body(FN, 5000, 2, "s12-EPZ-over")).await;
     assert_eq!(
         s1, 422,
         "S12(a): over-drawer EPZ must be 422 (got {s1}: {st1})"
@@ -1397,7 +1538,7 @@ async fn matrix_s12_epz_guards() {
 
     // (b) paymentid < 2 (cash slot) → EPZ_PAYMENT_ID_TOO_LOW (checked before the
     // cash guard, so it fires even on an empty drawer)
-    let (s2, st2) = drive_ingress(&app, &*wp, &epz_body(1000, 1, "s12-EPZ-payid")).await;
+    let (s2, st2) = drive_ingress(&app, &*wp, FN, &epz_body(FN, 1000, 1, "s12-EPZ-payid")).await;
     assert_eq!(
         s2, 422,
         "S12(b): paymentid<2 EPZ must be 422 (got {s2}: {st2})"
@@ -1408,7 +1549,7 @@ async fn matrix_s12_epz_guards() {
     );
 
     assert_eq!(
-        db_stats(app.db()).await.0,
+        db_stats(app.db(), FN).await.0,
         rows0,
         "S12: both refused EPZ mint ZERO fiscal rows"
     );
@@ -1426,7 +1567,7 @@ async fn matrix_s12_epz_guards() {
 /// terminal), then Z. End-to-end coverage of the offline branch for all three ops.
 #[tokio::test]
 async fn matrix_s13_offline_service_io_epz_bimodal() {
-    let (app, dps, wp) = fresh_harness().await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
     let steps = vec![
         Action::Open,
         Action::Sell(4),          // even = CASH sell → fund the drawer online
@@ -1456,26 +1597,21 @@ async fn matrix_s13_offline_service_io_epz_bimodal() {
 /// MITM): no format/length validation of the DPS-returned fiscal number.
 #[tokio::test]
 async fn matrix_b1_byzantine_garbage_server_fiscal_no() {
-    let (app, dps, wp) = fresh_harness().await;
-    let (os, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "b1-OPEN")).await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "b1-OPEN")).await;
     assert_eq!(os, 200, "B1 setup: SHIFT_OPEN must ACK");
 
     // Byzantine-but-alive DPS: the NEXT send returns a non-empty GARBAGE fiscal no.
     let garbage = "☠GARBAGE-NOT-A-REAL-SFN☠";
     dps.inject_garbage_sfn(garbage);
-    let (body, _) = sell_body(3, "b1-garbage");
-    let (status, state) = drive_ingress(&app, &*wp, &body).await;
-    let doc = last_doc_state(app.db()).await;
-    let sfn = last_doc_sfn(app.db()).await;
+    let (body, _) = sell_body(FN, 3, "b1-garbage");
+    let (status, state) = drive_ingress(&app, &*wp, FN, &body).await;
+    let doc = last_doc_state(app.db(), FN).await;
+    let sfn = last_doc_sfn(app.db(), FN).await;
     eprintln!(
         "\n⚠ BYZANTINE garbage-SFN → ingress[{status} {state}] durable_doc={doc} server_fiscal_no={sfn:?}\n"
     );
 
-    // SAFETY PINS (the properties that matter regardless of the surface reason):
-    // 1. It must NOT cleanly issue — a byzantine fiscal number must never produce a
-    //    confirmed 200/ACK success handed back to the caller. (Empirically: the
-    //    inline write-path replay-verification catches it → REPLAY_LEDGER_DRIFT/500,
-    //    a fail-closed breach — a SECOND defense layer beyond stage_send's is_empty.)
     assert_ne!(
         status, 200,
         "B1: a garbage fiscal number must NOT yield a 200 success (got {status}: {state})"
@@ -1485,28 +1621,18 @@ async fn matrix_b1_byzantine_garbage_server_fiscal_no() {
         DocState::Ack.as_str(),
         "B1: garbage SFN must not reach terminal ACK (durable={doc})"
     );
-    // 2. THE KEY FAIL-CLOSED TEST: the ledger must be left CLEAN — no doc stuck in a
-    //    non-terminal PREPARED/SIGNED/ENCRYPTED state at this quiescent boundary
-    //    (#192 / P1 pin). If the byzantine 500 left a stuck doc, this panics = a bug.
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
-    // RESIDUAL CHARACTERIZATION: the doc rests at SENT with the garbage sfn stamped
-    // + the seed advanced. Does the normal online-convergence tick (last_chk now
-    // answers clean KVT1) finalise it to ACK — carrying the garbage fiscal number
-    // as a "confirmed" receipt? This decides the audit-integrity severity.
     let carriers = drain_carriers(dps.clone());
     for _ in 0..8 {
         let view = drain_view(&carriers);
         let _ = app.converge_online_for_fn(FN, &view).await;
-        if last_doc_state(app.db()).await != DocState::Sent.as_str() {
+        if last_doc_state(app.db(), FN).await != DocState::Sent.as_str() {
             break;
         }
     }
-    let final_state = last_doc_state(app.db()).await;
-    let final_sfn = last_doc_sfn(app.db()).await;
-    // The deciding fail-closed pin: a byzantine garbage fiscal number must NEVER
-    // converge to a confirmed terminal ACK. Empirically it escalates to
-    // RequiresManualReconciliation (operator intervention) — never a false confirm.
+    let final_state = last_doc_state(app.db(), FN).await;
+    let final_sfn = last_doc_sfn(app.db(), FN).await;
     assert_ne!(
         final_state,
         DocState::Ack.as_str(),
@@ -1530,21 +1656,18 @@ async fn matrix_b1_byzantine_garbage_server_fiscal_no() {
 /// shows the -12 then the clean re-send.
 #[tokio::test]
 async fn matrix_s14_mac_recovery_minus12_resigns_to_ack() {
-    let (app, dps, wp) = fresh_harness().await;
-    let (os, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s14-OPEN")).await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s14-OPEN")).await;
     assert_eq!(os, 200, "S14 setup: SHIFT_OPEN must ACK");
 
-    // Arm the next send: -12 whose `store {hex}` carries the REAL current chain
-    // seed (what DPS returns when it and the local tip agree — a transient MAC
-    // glitch on this doc's signing). Re-signing with it keeps the chain consistent.
-    let recovered_hash = chain_seed_hex(app.db()).await;
+    let recovered_hash = chain_seed_hex(app.db(), FN).await;
     dps.inject_mac_recovery(&recovered_hash);
     let _ = dps.drain_calls(); // clear the OPEN wire log
 
-    let (body, total) = sell_body(2, "s14-SELL");
-    let (status, _resp) = drive_ingress(&app, &*wp, &body).await;
-    let doc = last_doc_state(app.db()).await;
-    let attempts = last_doc_mac_recovery_attempts(app.db()).await;
+    let (body, total) = sell_body(FN, 2, "s14-SELL");
+    let (status, _resp) = drive_ingress(&app, &*wp, FN, &body).await;
+    let doc = last_doc_state(app.db(), FN).await;
+    let attempts = last_doc_mac_recovery_attempts(app.db(), FN).await;
     let wire = dps.drain_calls();
     eprintln!(
         "\n[S14] SELL(total={total}) with -12 injected → ingress[{status}] durable={doc} \
@@ -1582,15 +1705,15 @@ async fn matrix_s14_mac_recovery_minus12_resigns_to_ack() {
 /// whose scripted message has no `store {hex}`.
 #[tokio::test]
 async fn matrix_s15_mac_recovery_unextractable_hash_rejects() {
-    let (app, dps, wp) = fresh_harness().await;
-    let (os, _) = drive_ingress(&app, &*wp, &simple_body("SHIFT_OPEN", "s15-OPEN")).await;
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s15-OPEN")).await;
     assert_eq!(os, 200, "S15 setup: SHIFT_OPEN must ACK");
 
     dps.reject_next(-12); // -12 with "matrix: scripted DPS reject" — NO store {hex}
-    let (body, _t) = sell_body(2, "s15-SELL");
-    let (status, _resp) = drive_ingress(&app, &*wp, &body).await;
-    let doc = last_doc_state(app.db()).await;
-    let attempts = last_doc_mac_recovery_attempts(app.db()).await;
+    let (body, _t) = sell_body(FN, 2, "s15-SELL");
+    let (status, _resp) = drive_ingress(&app, &*wp, FN, &body).await;
+    let doc = last_doc_state(app.db(), FN).await;
+    let attempts = last_doc_mac_recovery_attempts(app.db(), FN).await;
     eprintln!(
         "\n[S15] SELL with -12 (no extractable hash) → ingress[{status}] durable={doc} \
          mac_recovery_attempts={attempts}\n"
@@ -1609,4 +1732,276 @@ async fn matrix_s15_mac_recovery_unextractable_hash_rejects() {
     eprintln!(
         "════════ S15-mac-recovery-fail: PASS — -12 unextractable → Rejected fail-closed (attempts=0, clean scan) ════════"
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Multi-FN cross-isolation scenarios (MF1, MF2, MF3)
+// ════════════════════════════════════════════════════════════════════════
+
+/// MF1 — interleaved open/sell/Z on two FNs (core isolation proof).
+/// FN-A and FN-B run concurrent shifts. A's Z must not close B's shift.
+/// FN-B ops must not mutate FN-A's chain seed.
+#[tokio::test]
+async fn matrix_mf1_interleaved_two_fn_isolation() {
+    let (app, dps, wp) = fresh_harness(&[FN_A, FN_B]).await;
+
+    // Interleaved open + sells on both FNs.
+    let steps: &[(&str, Action)] = &[
+        (FN_A, Action::Open),
+        (FN_B, Action::Open),
+        (FN_A, Action::Sell(1)),
+        (FN_B, Action::Sell(7)),
+        (FN_A, Action::Sell(2)),
+        (FN_B, Action::Sell(8)),
+        (FN_B, Action::Sell(9)),
+    ];
+    run_interleaved("MF1-interleave", steps, &app, &*wp, &dps).await;
+
+    // A closes its shift.
+    run_interleaved(
+        "MF1-interleave",
+        &[(FN_A, Action::ZClose)],
+        &app,
+        &*wp,
+        &dps,
+    )
+    .await;
+
+    // Snapshot A's chain seed AFTER A's Z (stable post-Z value).
+    let seed_a_after_z = chain_seed_hex(app.db(), FN_A).await;
+
+    // B does one more sell after A's Z — must not touch A's seed.
+    run_interleaved(
+        "MF1-interleave",
+        &[(FN_B, Action::Sell(10))],
+        &app,
+        &*wp,
+        &dps,
+    )
+    .await;
+
+    // ISOLATION: FN-B sell must not mutate FN-A's chain seed.
+    assert_eq!(
+        seed_a_after_z,
+        chain_seed_hex(app.db(), FN_A).await,
+        "cross-FN BLEED: FN-B ops mutated FN-A's chain seed"
+    );
+
+    // A's shift is CLOSED; B's is still OPENED.
+    assert_eq!(
+        shift_state(app.db(), FN_A).await,
+        "CLOSED",
+        "MF1: FN-A shift must be CLOSED after A's Z"
+    );
+    assert_eq!(
+        shift_state(app.db(), FN_B).await,
+        "OPENED",
+        "MF1: FN-B shift must still be OPENED after A's Z (A's Z must not close B)"
+    );
+
+    // B closes its own shift.
+    run_interleaved(
+        "MF1-interleave",
+        &[(FN_B, Action::ZClose)],
+        &app,
+        &*wp,
+        &dps,
+    )
+    .await;
+    assert_eq!(
+        shift_state(app.db(), FN_B).await,
+        "CLOSED",
+        "MF1: FN-B CLOSED after B's Z"
+    );
+
+    // Seeds must diverge: each FN has its own independent chain.
+    assert_ne!(
+        chain_seed_hex(app.db(), FN_A).await,
+        chain_seed_hex(app.db(), FN_B).await,
+        "cross-FN BLEED: FN-A and FN-B share one chain seed"
+    );
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!("════════ MF1-isolation: PASS ════════");
+}
+
+/// MF2 — mode isolation: FN-A goes OFFLINE while FN-B stays ONLINE.
+/// Does NOT use NetDown (MatrixDps.online is a shared global — would drop both FNs).
+/// Uses the live GO_OFFLINE door on A only.
+#[tokio::test]
+async fn matrix_mf2_offline_a_while_online_b() {
+    let (app, dps, wp) = fresh_harness(&[FN_A, FN_B]).await;
+
+    // Open both FNs online.
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_A,
+        &simple_body(FN_A, "SHIFT_OPEN", "mf2-A-OPEN"),
+    )
+    .await;
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_B,
+        &simple_body(FN_B, "SHIFT_OPEN", "mf2-B-OPEN"),
+    )
+    .await;
+
+    // Flip A to OFFLINE via the live door (leaves B untouched).
+    prro::admin::go_offline(app.db(), FN_A, "mf2: test offline A")
+        .await
+        .expect("GO_OFFLINE FN_A");
+    let codes_a: Vec<String> = (0..20).map(|j| format!("MF2-A-{j}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN_A, &codes_a)
+        .await
+        .expect("seed offline codes FN_A");
+
+    // Assert mode isolation: A=OFFLINE, B=ONLINE simultaneously.
+    assert_eq!(
+        node_row(app.db(), FN_A).await.0,
+        "OFFLINE",
+        "MF2: FN-A must be OFFLINE"
+    );
+    assert_eq!(
+        node_row(app.db(), FN_B).await.0,
+        "ONLINE",
+        "MF2: FN-B must remain ONLINE while A is offline"
+    );
+
+    // Interleaved sells: A lands OFFLINE_LOCAL_ACK, B lands ACK.
+    let (body_a, _) = sell_body(FN_A, 3, "mf2-A-SELL-1");
+    let (_, state_a) = drive_ingress(&app, &*wp, FN_A, &body_a).await;
+    assert_eq!(
+        state_a,
+        DocState::OfflineLocalAck.as_str(),
+        "MF2: offline A sell must land OFFLINE_LOCAL_ACK"
+    );
+
+    let (body_b, _) = sell_body(FN_B, 5, "mf2-B-SELL-1");
+    let (_, state_b) = drive_ingress(&app, &*wp, FN_B, &body_b).await;
+    assert_eq!(
+        state_b,
+        DocState::Ack.as_str(),
+        "MF2: online B sell must land ACK"
+    );
+
+    let (body_a2, _) = sell_body(FN_A, 4, "mf2-A-SELL-2");
+    let (_, state_a2) = drive_ingress(&app, &*wp, FN_A, &body_a2).await;
+    assert_eq!(
+        state_a2,
+        DocState::OfflineLocalAck.as_str(),
+        "MF2: second offline A sell must land OFFLINE_LOCAL_ACK"
+    );
+
+    let (body_b2, _) = sell_body(FN_B, 6, "mf2-B-SELL-2");
+    let (_, state_b2) = drive_ingress(&app, &*wp, FN_B, &body_b2).await;
+    assert_eq!(
+        state_b2,
+        DocState::Ack.as_str(),
+        "MF2: second online B sell must land ACK"
+    );
+
+    // Modes still isolated mid-sequence.
+    assert_eq!(node_row(app.db(), FN_A).await.0, "OFFLINE");
+    assert_eq!(node_row(app.db(), FN_B).await.0, "ONLINE");
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+
+    // Drain A → online, then Z both.
+    prro::admin::go_online(app.db(), FN_A, "mf2: drain A")
+        .await
+        .expect("GO_ONLINE FN_A");
+    let carriers = drain_carriers(dps.clone());
+    let view = drain_view(&carriers);
+    app.drain_offline_backlog_scheduled(FN_A, &view)
+        .await
+        .expect("drain FN_A");
+    assert_eq!(
+        doc_count_in_state(app.db(), FN_A, "OFFLINE_LOCAL_ACK").await,
+        0,
+        "MF2: all A OLA docs drained"
+    );
+    assert_eq!(
+        node_row(app.db(), FN_A).await.0,
+        "ONLINE",
+        "MF2: A ONLINE after drain"
+    );
+
+    drive_ingress(&app, &*wp, FN_A, &simple_body(FN_A, "Z_REPORT", "mf2-A-Z")).await;
+    drive_ingress(&app, &*wp, FN_B, &simple_body(FN_B, "Z_REPORT", "mf2-B-Z")).await;
+
+    assert_eq!(shift_state(app.db(), FN_A).await, "CLOSED", "MF2: A CLOSED");
+    assert_eq!(shift_state(app.db(), FN_B).await, "CLOSED", "MF2: B CLOSED");
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!("════════ MF2-mode-isolation: PASS ════════");
+}
+
+/// MF3 — cash-ledger isolation: each FN's drawer is keyed by fiscal_number.
+/// ServiceIn/Sell/ServiceOut on A and B must not bleed into each other's ledger.
+#[tokio::test]
+async fn matrix_mf3_cash_ledger_isolation() {
+    let (app, _dps, wp) = fresh_harness(&[FN_A, FN_B]).await;
+
+    // Open both shifts.
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_A,
+        &simple_body(FN_A, "SHIFT_OPEN", "mf3-A-OPEN"),
+    )
+    .await;
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_B,
+        &simple_body(FN_B, "SHIFT_OPEN", "mf3-B-OPEN"),
+    )
+    .await;
+
+    // A: ServiceIn 500.00; B: ServiceIn 100.00
+    drive_ingress(&app, &*wp, FN_A, &service_in_body(FN_A, 50000, "mf3-A-SIN")).await;
+    drive_ingress(&app, &*wp, FN_B, &service_in_body(FN_B, 10000, "mf3-B-SIN")).await;
+
+    // A: CASH sell (even seed=2); B: ServiceOut 50.00
+    let (body_a, _) = sell_body(FN_A, 2, "mf3-A-SELL");
+    drive_ingress(&app, &*wp, FN_A, &body_a).await;
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_B,
+        &service_out_body(FN_B, 5000, "mf3-B-SOUT"),
+    )
+    .await;
+
+    let cash_a = cash_on_hand(app.db(), FN_A).await;
+    let cash_b = cash_on_hand(app.db(), FN_B).await;
+
+    // Ledgers must differ: each FN tracks only its own cash legs.
+    assert_ne!(
+        cash_a, cash_b,
+        "MF3: FN-A and FN-B cash ledgers must be independent (got A={cash_a} B={cash_b})"
+    );
+    // A: 500.00 in + sell cash > 500.00; B: 100.00 in - 50.00 out = 50.00
+    assert_eq!(
+        cash_b, 5000,
+        "MF3: FN-B cash must be 50.00 (100.00 in - 50.00 out), got {cash_b}"
+    );
+    assert!(
+        cash_a > 50000,
+        "MF3: FN-A cash must be > 500.00 (500.00 in + CASH sell), got {cash_a}"
+    );
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+
+    // Z both.
+    drive_ingress(&app, &*wp, FN_A, &simple_body(FN_A, "Z_REPORT", "mf3-A-Z")).await;
+    drive_ingress(&app, &*wp, FN_B, &simple_body(FN_B, "Z_REPORT", "mf3-B-Z")).await;
+
+    assert_eq!(shift_state(app.db(), FN_A).await, "CLOSED", "MF3: A CLOSED");
+    assert_eq!(shift_state(app.db(), FN_B).await, "CLOSED", "MF3: B CLOSED");
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!("════════ MF3-cash-isolation: PASS — A={cash_a} B={cash_b} independent ════════");
 }
