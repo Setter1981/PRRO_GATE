@@ -34,7 +34,9 @@ use prro::db::repositories::shifts;
 use prro::runtime::ingress::convert::{convert_to_signer_payload, ConvertError};
 use prro::runtime::ingress::dto::CanonicalCommand;
 use prro::runtime::ingress::policy::{classify_command, CommandClass};
-use prro::services::cash_ledger::{aggregate_shift_epz, cash_on_hand_for_fn, derive_cash_on_hand};
+use prro::services::cash_ledger::{
+    aggregate_shift_cash_tx, aggregate_shift_epz, cash_on_hand_for_fn, derive_cash_on_hand,
+};
 use sqlx::SqlitePool;
 
 const FN: &str = "4000100003";
@@ -487,6 +489,42 @@ async fn pin_epz_ledger_subtracts() {
     // aggregate_shift_epz must report the 3000 EPZ-out.
     let epz_out = aggregate_shift_epz(&main, FN, shift).await.unwrap();
     assert_eq!(epz_out, 3000, "aggregate_shift_epz must sum EPZ ACK docs");
+}
+
+/// Pin 3-tx — TWIN of `pin_epz_ledger_subtracts` for the WRITE-LEASE aggregate
+/// `aggregate_shift_cash_tx` (the variant the in-lease TOCTOU cash-floor re-check
+/// at `stage_acquire.rs:808` calls, distinct from the pool `aggregate_shift_epz`).
+///
+/// FW-1 mutation A1 — `cash_ledger.rs` EPZ loop `if sum_kop <= 0` → `> 0` — is a
+/// real cargo-mutants survivor: Pin 3 pins only the POOL variant, and a SERIAL
+/// over-draw is refused earlier by pre-inbox guard-3c (which also reads the pool
+/// aggregate), so the in-lease re-check's `epz_out` is never oracle-pinned. This
+/// pins it directly: a committed EPZ ACK must be counted in the tx-aggregate's
+/// `epz_out` (5th tuple element). Under the mutation the positive EPZ is skipped
+/// → `epz_out` collapses to 0 → RED. (Verified: revert `<= 0`→`> 0` at line 343
+/// makes THIS test fail while every other EPZ test stays green.)
+#[tokio::test]
+async fn pin_epz_tx_aggregate_counts_epz_out() {
+    let (_dir, main, _secure, shift) = setup_open_shift().await;
+    seed_service_in(&main, shift, 1, 10000).await;
+    seed_epz_doc(&main, shift, 2, 3000, DocState::Ack).await;
+
+    // aggregate_shift_cash_tx returns (sell, ret, svc_in, svc_out, epz_out) under
+    // the write lease; epz_out must sum committed EPZ ACK docs (the drawer cash-out).
+    let epz_out = prro::db::tx::with_immediate(&main, move |tx| {
+        Box::pin(async move {
+            let (_sell, _ret, _svc_in, _svc_out, epz_out) =
+                aggregate_shift_cash_tx(tx, FN, shift).await?;
+            Ok(epz_out)
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        epz_out, 3000,
+        "aggregate_shift_cash_tx (in-lease) must count the committed EPZ ACK; \
+         mutation A1 (skip positive sum_kop) collapses epz_out to 0"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
