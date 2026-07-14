@@ -10,11 +10,22 @@ proves the native Rust fiscal cycle against the real DPS **test** cabinet.
 > are all **present and runnable on `main` HEAD**. The connect/probe-only
 > `live_smoke_w12_hardening.rs` also remains. The original note ("PENDING MERGE") is
 > obsolete; commands/env/gates below apply to `main` as-is.
+>
+> **Provenance refresh (2026-07-14).** The full cycle was re-proven live against the real
+> cabinet on a worktree off `origin/main` HEAD `05be64f` — **online AND offline** — and the
+> whole offline lane is now HEAD-wired (mode-setter + session-open + drain + INV-09/10 limits,
+> per the §4.9 2026-07-14 refresh). See **§4.6.1** for the HEAD-proven `server_fiscal_no`
+> values (online 5b/6/7 + T=112 codes + offline `<MAC ID>` drain).
 
-> **Pilot gate verdict: NO-GO (read first).** This is a **branch/technical wire smoke, NOT
-> a pilot authorization** — the pilot gate verdict on `rust-gateway` HEAD is **NO-GO** (see
-> §4.9 Hard-Blockers). A green run here proves the native crypto+wire profile only; it does
-> **not** clear the gate.
+> **Pilot gate verdict (read first).** This is a **technical wire smoke, NOT a pilot
+> authorization** — a green run here proves the native crypto+wire profile only; it does
+> **not** clear the gate (the canonical verdict lives in the MATRIX/PLAYBOOK, not this
+> runbook). **Refresh 2026-07-14:** the §4.9 Hard-Blocker list is now largely CLOSED — the
+> primary offline blocker (DF-1 drain-safety) and INV-09/10 limits are wired and live-proven.
+> The **genuinely still-open** items are narrower: DF-5 (`PRRO_FISCAL_MODE` not
+> harness-enforced), INV-05/06 channel-switch guards, the **automatic** GO-OFFLINE trigger
+> (design fork — offline entry is manual-CLI today), and a live 24h-auto-Z verification
+> (task #19). See §4.9.
 
 > **Scope honesty (REFRESHED 2026-07-05).** This smoke proves the **WIRE only**. It seeds a
 > `PREPARED` document directly and drives it through `reconcile_pending_with` →
@@ -29,10 +40,13 @@ proves the native Rust fiscal cycle against the real DPS **test** cabinet.
 > audit) on its SENT commit. The Sent commit **stands** (post-wire no-rollback policy) and
 > the smoke still passes; the CRITICAL entry is an **expected artifact of the acquire
 > bypass**, not a live defect. A refreshed procedure that enters through `stage_acquire`
-> (exercising the real shift wiring end-to-end) is the recommended Tier-1 re-run once A.3
-> PR-A (advance-at-SEND core) merges — that single run then validates BOTH the shift
-> wiring and the new seed semantics against the live cabinet. This smoke still does **not**
-> prove offline limits or channel-switch guards.
+> (exercising the real shift wiring end-to-end) is the recommended Tier-1 re-run — A.3
+> advance-at-SEND has **since merged** (#227-231, `80f8ced`), so such a run validates BOTH
+> the shift wiring and the new seed semantics against the live cabinet in one pass.
+> **Note (2026-07-14):** INV-09/10 offline limits are now WIRED in the write path
+> (T3 #256) — but *this seed-`PREPARED` smoke bypasses `stage_acquire`, so it does not
+> exercise them*; a `stage_acquire`-entry re-run (or the fuzzer / scenario harness) is what
+> proves the limits. This smoke still does **not** prove channel-switch guards (INV-05/06).
 
 ---
 
@@ -251,6 +265,29 @@ proof that the native `prro_crypto` ATTACHED CMS over CP1251 canonical XML, the 
 ФСКО SELL surface (driver→canonical tax translation, excise `<CA>`, UKTZED `CZD`,
 `<TX>` summaries), and the `sendChkV2` wire mapping are all accepted by the real server.
 
+### §4.6.1 HEAD-proven re-run — ONLINE **and** OFFLINE (2026-07-14)
+
+The full cycle was re-proven on a worktree off `origin/main` HEAD `05be64f` with the
+`live_dps_extended_smoke` harness (`--features live-dps`, `PRRO_LIVE_DPS=1`) against
+`cabinet.tax.gov.ua:9443`, FN `4000162280`, TN `13667753`. **Unlike the 2026-05-29 branch
+run, this harness IS on the merged line** — the cycle is now HEAD-wired, not only
+branch-proven. All steps ACCEPTED (zero `-1`/`-8`/`-12`/`-14`):
+
+| Step | Smoke | DPS-assigned `server_fiscal_no` / result (2026-07-14) |
+|---|---|---|
+| SHIFT_OPEN | `5b_shift_open` | `5csPvKsz96s` → SENT |
+| extended SELL | `6_extended_sell` | `UywxzaNUo_0` → SENT |
+| Z_REPORT | `7_z_report` | `uIoFs7NDBPQ` → SENT, shift closed |
+| T=112 ASK_OFFLINE_CODES | `8_ask_offline_codes` | ACCEPTED — `offline_codes=1`, id=`DyJVrXyeaSg`, chain_changed |
+| offline drain (`<MAC ID>`) | `9_offline_drain_mac_id` | ACCEPTED — 3 backlog docs drained to ACK, `failures=0`, offline SELL carried `<MAC ID='omyOfQ-gRs0'>` (no `-9`), session `OPEN→DRAINING→CLOSED` |
+
+Significance: the native gateway is proven against the **real** DPS — not mocks/goldens — on
+**both halves** end-to-end. The `-8` date fix (`comp_date`, #262 + teeth #280) works live
+(cycles without date-reject; offline via `PRRO_LIVE_DPS_OFFLINE_BACKDATE_SEC=3600`). INV-11
+`<MAC ID>` is closed live (smoke 9). NB: the offline drain's offline `SHIFT_OPEN` opens a DPS
+shift (the DocType-10 END closes the offline *session*, not the shift) — a cleanup Z closed
+it (sfn `lzA1Qy1fPnU`), end-state clean.
+
 ---
 
 ## §4.7 Rate-limit guard
@@ -445,6 +482,19 @@ are at minimum:
 > **Blocker-status refresh (2026-07-05):** two of the five original blockers are CLOSED;
 > the verdict stays **NO-GO** on the remaining three (seed-fork fix A.3 is in flight;
 > offline reachability and the binding flip are outstanding).
+>
+> **Blocker-status refresh (2026-07-14) — this list is LARGELY STALE.** A 6-agent
+> code-vs-runbook reconciliation against `main` HEAD `05be64f` found the offline blockers
+> below are now CLOSED end-to-end, and the full native fiscal cycle — **online AND offline**
+> — was ACCEPTED by the real DPS test cabinet on 2026-07-14 (see §4.6). Closing work:
+> A′.3 #245 (mode-setter `set_mode_offline_tx` + `go_offline_inner` session-open + drain
+> supervisor loops), B8/B9/B10 #248/#249/#252 (offline codes / `<MAC ID>` / DocType-9-10
+> drain), T3 #256 (INV-09/10 limits + unconditional 24h auto-Z, enforced), A.3 advance-at-SEND
+> (#227-231, seed-fork closed). **Genuinely still-open:** DF-5 (`PRRO_FISCAL_MODE` not
+> harness-enforced); INV-05/06 channel-switch guards; and ONE residual offline item — the
+> **automatic** GO-OFFLINE trigger (offline entry is manual-CLI-only today via
+> `prro admin go-offline`; there is no auto-transition on persistent DPS no-forward-progress /
+> the B11 criterion). Verifications pending: a live 24h-auto-Z smoke (task #19).
 
 - ~~**Online shift-lifecycle drivers UNWIRED (WL-1)**~~ — **CLOSED 2026-07-05**: A′.1
   pieces 3+2 (PRs #224/#225) wired create + edges 1/8 in `stage_acquire` and confirm edges
@@ -455,24 +505,45 @@ are at minimum:
   (see the refreshed Provenance note).
 - **PRRO_FISCAL_MODE not harness-enforced** — manual operator preflight only; a hard harness
   check remains a required pilot fix (DF-5, §4.3). **OPEN.**
-- **Offline drain-safety + manual-recon escalation UNREACHABLE IN PROD (DF-1)** — the
-  drain-reject-of-`OFFLINE_LOCAL_ACK`-backlog → `REQUIRES_MANUAL_RECONCILIATION` escalation
-  and the edge-5 drain-finalize path are code-present + test-pinned but **unreachable
-  end-to-end**: no `node_state` Offline/GoingOffline mode setter, zero production callers of
-  `OfflineSessionService::open_session`, `stage_offline_ack` requires `Opened` + an active
-  session — and W10a/W10b (offline `SHIFT_OPEN` accept + reserve gate) are still absent.
-  No mode flip → no session → no `OFFLINE_LOCAL_ACK` doc → no backlog → `drain()`
-  early-returns. **OPEN — scheduled as A′.1 piece 4 + roadmap A′.3.** (Anchor refresh: prod
-  bootstrap seeds `CLOSED` at `boot_phase.rs:1835` — the online half of the old "cannot
-  transact at all" statement is superseded by the WL-1 closure above; SELL is admitted once
-  a live SHIFT_OPEN confirms.)
-- **INV-05/06 channel guards UNWIRED** and **INV-09/10 offline limits UNWIRED** — risk-accept
-  only with an ops freeze / offline descoped + controlled (Appendix; canonical framing in the
-  MATRIX/PLAYBOOK). **OPEN** (offline limits: W10a reserve gate lands with piece 4).
-- **NEW (2026-07-05): online seed-fork fix (A.3, spec v3 LOCKED) not yet landed** — until
-  A.3 PR-A merges, the online seed advances only at ACK; the sequential one-doc-at-a-time
-  discipline of THIS runbook is fork-safe, but any concurrent/pipelined driving of two
-  online docs is forbidden (AUD-L2-1a). After PR-A this line closes.
+- ~~**Offline drain-safety + manual-recon escalation UNREACHABLE IN PROD (DF-1)**~~ —
+  **CLOSED 2026-07-14** (was the last standing offline blocker; a 6-agent code-vs-runbook
+  reconciliation against HEAD `05be64f` found this verdict STALE end-to-end). The whole
+  offline lane is now production-reachable AND live-proven:
+  - **mode setter** — `set_mode_offline_tx` (`node_state.rs:256`, guarded `ONLINE→OFFLINE`
+    CAS) + `set_mode_going_online_tx` (`:275`); the "no `node_state` Offline setter" claim
+    is false. Wired by A′.3 #245.
+  - **session-open** — `go_offline_inner` (`admin.rs:441`) opens the offline session, flips
+    the mode, and audits; production caller is `prro admin go-offline`
+    (`main.rs:509 → admin.rs:1399`), gated behind `FULL_OFFLINE_SURFACE_READY=true`. The
+    "zero `OfflineSessionService::open_session` callers" claim is false.
+  - **drain trigger** — `spawn_drain_loop` is unconditional (`supervisor.rs:328/939`),
+    ticks per-FN, drains when `mode==GoingOnline` (`backlog_drain.rs:687`); the
+    drain-reject→`REQUIRES_MANUAL_RECONCILIATION` escalation and edge-5 finalize are reached
+    in the real write path (PR-O3 #245 edge-2 stamps the pending-drain `shift_state`).
+  - **W10a/W10b** offline `SHIFT_OPEN` accept + close-reserve gate landed (T2 #255).
+  - **live proof** — smoke 9 (2026-07-14): 3 `OFFLINE_LOCAL_ACK` docs drained to ACK against
+    the real cabinet, offline SELL carried `<MAC ID='omyOfQ-gRs0'>` (no `-9` "not ID in MAC",
+    INV-11 closed live), session `OPEN→DRAINING→CLOSED` (see §4.6).
+
+    **Residual (NOT this blocker):** offline *entry* is manual-CLI-only — there is no
+    **automatic** `ONLINE→GOING_OFFLINE` trigger on persistent DPS no-forward-progress
+    (`GOING_OFFLINE` mode is read/matched but never written; no `set_mode_going_offline_tx`).
+    The B11 auto-offline criterion is designed but UNWIRED. This is a deliberate design fork
+    (auto-offline outage-resilience vs the legal "offline is not operator-elected" posture),
+    tracked separately — not a drain-safety gap.
+- ~~**INV-09/10 offline limits UNWIRED**~~ — **CLOSED 2026-07-14** (T3 #256, `f573b43`):
+  `time_budget::compute_budgets_for_fn` computes the session (36h from `opened_at`), month
+  (168h, recompute-on-read) and shift (24h) budgets, and they are **enforced** at the
+  admission gate (`inline.rs:776`, config-toggleable) with an **unconditional 24h auto-Z**.
+  Production-reachable on every ingress. Verification pending: a live 24h-auto-Z smoke against
+  the cabinet (task #19).
+- **INV-05/06 channel-switch guards UNWIRED** — the "no channel switch with an open shift"
+  guard is not yet enforced in the live path; risk-accept only with an ops freeze / offline
+  descoped + controlled (Appendix; canonical framing in the MATRIX/PLAYBOOK). **OPEN.**
+- ~~**online seed-fork fix (A.3, spec v3 LOCKED) not yet landed**~~ — **CLOSED**: A.3
+  advance-at-SEND landed (#227-231, `80f8ced`). The online chain seed now advances atomically
+  with the `server_fiscal_no` stamp at the `Sending→Sent` CAS (not at ACK), so the fork window
+  is gone and pipelined online driving is no longer forbidden by AUD-L2-1a.
 
 See the MATRIX §5 / PLAYBOOK exit criteria for the full Hard-Blocker list and the path to GO.
 
