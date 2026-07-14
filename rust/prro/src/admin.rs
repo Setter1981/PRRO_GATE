@@ -1917,6 +1917,34 @@ mod tests {
         assert_eq!(p["inserted_count"], 5);
     }
 
+    /// FW-1 mutation teeth — the `seed_offline_codes` range guard
+    /// `if first_lnd < 1 || first_lnd > last_lnd` (admin.rs). The `< 1`→`<= 1`
+    /// mutant wrongly rejects `first_lnd == 1` (the FIRST legal offline code); the
+    /// `> last`→`>= last` mutant wrongly rejects a single-code range
+    /// (`first == last`). Both are FALSE-POSITIVE rejections of valid provisioning
+    /// the operator legitimately needs. The populates test (100,104) and the
+    /// rejects test (5,3 / 0,4) never touch either boundary, so both survive.
+    #[tokio::test]
+    async fn seed_offline_codes_accepts_min_lnd_and_single_code_boundaries() {
+        let (_d, pool) = fresh_pool().await;
+        // first_lnd == 1 (the first legal offline code) must be ACCEPTED —
+        // mutant `first_lnd <= 1` wrongly rejects it.
+        let out = seed_offline_codes(&pool, "1234567890", 1, 3, "min-lnd boundary")
+            .await
+            .expect("first_lnd==1 is a valid range");
+        assert_eq!(out.first_lnd, 1);
+        assert_eq!(out.inserted_count, 3);
+        // Single-code range first_lnd == last_lnd must be ACCEPTED —
+        // mutant `first_lnd >= last_lnd` wrongly rejects it. Same (registered) FN,
+        // a non-overlapping range so the overlap pre-check stays clear.
+        let out2 = seed_offline_codes(&pool, "1234567890", 100, 100, "single-code boundary")
+            .await
+            .expect("single-code range (first==last) is valid");
+        assert_eq!(out2.first_lnd, 100);
+        assert_eq!(out2.last_lnd, 100);
+        assert_eq!(out2.inserted_count, 1);
+    }
+
     /// seed-codes rejects a non-positive / inverted range.
     #[tokio::test]
     async fn seed_offline_codes_rejects_invalid_range() {
