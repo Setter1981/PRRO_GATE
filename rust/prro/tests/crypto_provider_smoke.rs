@@ -17,10 +17,21 @@
 //!      does NOT silently return true (returns false OR a typed error).
 //!      This is the test that prevents a future stub regression in
 //!      `verify_dstu`.
+//!   6. `sign_cms_uses_the_sessions_real_private_scalar` — end-to-end
+//!      teeth for `SigningSession::param_d`: build a session around a
+//!      KNOWN scalar `d`, produce a REAL CMS via `sign_cms_detached`,
+//!      extract the raw DSTU signature from the assembled CMS, and prove
+//!      it verifies against the pubkey `Q = -d·G` derived from THAT SAME
+//!      `d`.  If `param_d` ever returns a constant/leaked scalar instead
+//!      of the operator's real key, the signature is made with the wrong
+//!      `d` and this verification fails — the exact FW-1 mutant
+//!      (`param_d -> Box::leak(Zeroizing::from([1; 32]))`) that survived
+//!      because tests only exercised the verifier with a self-contained
+//!      `(d, sig, pubkey)` triple that never flowed through `param_d`.
 
 use prro::crypto::{
     CryptoError, CryptoProvider, DstuVerifyResult, InProcessProvider, SealKind, SealedMaterial,
-    SigningSession, VerifyKind,
+    SignCmsRequest, SignKind, SigningSession, VerifyKind,
 };
 
 #[test]
@@ -234,5 +245,205 @@ async fn verify_dstu_known_good_sig_returns_true() {
             reason: VerifyKind::MalformedSignature,
         }) => {}
         other => panic!("expected MalformedSignature, got {other:?}"),
+    }
+}
+
+// ─── Test 6: `param_d` feeds the operator's REAL private scalar ─────────
+//
+// FW-1 mutation survivor: `SigningSession::param_d` returns
+// `Box::leak(Box::new(Zeroizing::from([1; 32])))` — a leaked constant —
+// instead of the real private scalar.  `param_d` is `pub(crate)`, so a
+// `tests/` integration crate cannot read it directly; the only surface that
+// consumes it is `sign_cms_detached` (and `unwrap_envelope`).  This test
+// therefore drives the WHOLE production signing line
+// (`InProcessProvider::sign_cms_detached` → `sign_cms_blocking` →
+// `FieldEl::from_le_bytes(&session.param_d()[..], ..)` →
+// `DstuInProcessSigner`), then cryptographically verifies the produced CMS
+// signature against the pubkey `Q = -d·G` derived from the SAME known `d`.
+// Under the mutation the signature is made with `d = [1; 32]` → it does not
+// verify against `Q(d_known)` → the test fails.
+
+/// Committed self-signed X.509 test cert (DER) — PUBLIC, no key material.
+/// `sign_cms_detached` parses it for the `IssuerAndSerialNumber` +
+/// `signingCertificateV2` attr; its own key/curve is irrelevant — the CMS
+/// signature value is produced from the session's `param_d`, which is what
+/// we verify.  (Same fixture the ATTACHED-profile proof uses.)
+const TEETH_CERT_DER: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/SELF_SIGNED_ENC_6929.cer"
+));
+
+/// Known DSTU 4145 private scalar `d` (32 LE bytes) — the "operator key"
+/// this session must actually sign with.  Distinct from the constant the
+/// mutant leaks (`[1; 32]`).
+const TEETH_KNOWN_D: [u8; 32] = [
+    0x42, 0x13, 0x37, 0xc0, 0xde, 0xca, 0xfe, 0x99, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0xfe, 0xed, 0xfa, 0xce, 0xba, 0xad, 0xf0, 0x0d, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00,
+];
+
+/// Compressed pubkey `Q = -d·G` (jkurwa/DSTU convention — see
+/// `prro_crypto::core::sign` tests + `generate_known_good_dstu_triple`
+/// above), the form `verify_dstu` expands via `expand_compressed_checked`.
+fn teeth_pubkey_from_known_d() -> Vec<u8> {
+    use prro_crypto::core::curve::Curve;
+    use prro_crypto::core::field::FieldEl;
+    use prro_crypto::core::point::{compress_point, Point};
+
+    let curve = Curve::dstu_pb_257();
+    let d = FieldEl::from_le_bytes(&TEETH_KNOWN_D, curve.mod_words);
+    let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
+    let pub_q = g.mul(&d, &curve).negate();
+    compress_point(&pub_q, &curve)
+}
+
+/// The `SignerInfo.signature` in an ATTACHED DSTU CMS is the terminal
+/// `SignatureValue ::= OCTET STRING` — a raw 64-byte `r || s`.  It is the
+/// LAST `04 40 <64 bytes>` TLV in the assembled DER (the 64-byte OCTET
+/// STRINGs that appear earlier are cert public-key / SKI material, never at
+/// the tail).  Return the last such run.
+fn teeth_extract_signature(cms: &[u8]) -> Vec<u8> {
+    let mut found: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i + 2 + 64 <= cms.len() {
+        if cms[i] == 0x04 && cms[i + 1] == 0x40 {
+            found = Some(cms[i + 2..i + 2 + 64].to_vec());
+        }
+        i += 1;
+    }
+    found.expect("no 64-byte OCTET STRING (SignerInfo.signature) found in CMS")
+}
+
+#[tokio::test]
+async fn sign_cms_uses_the_sessions_real_private_scalar() {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let provider = InProcessProvider::new();
+    let profile = prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb;
+    let content = b"<RQ V=\"1\">FW1-PARAM-D-TEETH</RQ>";
+
+    // Session built around the KNOWN operator scalar.
+    let session =
+        SigningSession::new_for_test("operator-1".into(), TEETH_KNOWN_D, TEETH_CERT_DER.to_vec());
+
+    // Produce a REAL CMS via the production provider path.  It stamps
+    // `signingTime = SystemTime::now()` internally (whole-second UTCTIME
+    // resolution), so bracket the call to recover the exact second later.
+    let sec_before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cms = provider
+        .sign_cms_detached(SignCmsRequest {
+            session: &session,
+            canonical_xml: content,
+            profile,
+        })
+        .await
+        .expect("sign_cms_detached must succeed with the committed test cert")
+        .0;
+    let sec_after = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Raw DSTU r||s the provider actually placed in the SignerInfo.
+    let sig = teeth_extract_signature(&cms);
+    assert_eq!(sig.len(), 64, "DSTU signature value must be 64 bytes");
+
+    // Pubkey derived from the KNOWN d.  If `param_d` returned the real
+    // scalar, the sig verifies against this; if it leaked `[1; 32]`, it
+    // does not.
+    let pubkey = teeth_pubkey_from_known_d();
+
+    // The signer signs H(SET OF signedAttrs).  Rebuild those signedAttrs
+    // via the SAME public builder the provider uses, sweeping the 1-2
+    // candidate whole-seconds the `now()` stamp could have landed on.
+    let content_digest = prro_crypto::core::hash::gost_34_311_95(content);
+    let mut verified = false;
+    for sec in sec_before..=sec_after {
+        let t = UNIX_EPOCH + Duration::from_secs(sec);
+        let attrs = prro_crypto::cms::attrs::build_signed_attrs_with_time(
+            profile,
+            &content_digest,
+            TEETH_CERT_DER,
+            Some(t),
+        )
+        .expect("rebuild signedAttrs");
+        let attrs_der = attrs.to_der_set_of().expect("SET OF signedAttrs DER");
+        let signed_attrs_digest = prro_crypto::core::hash::gost_34_311_95(&attrs_der);
+
+        if let Ok(DstuVerifyResult(true)) = provider
+            .verify_dstu(&signed_attrs_digest, &sig, &pubkey)
+            .await
+        {
+            verified = true;
+            break;
+        }
+    }
+
+    assert!(
+        verified,
+        "CMS signature does NOT verify against the pubkey derived from the \
+         session's known private scalar d — `SigningSession::param_d` fed the \
+         signer a DIFFERENT scalar than the one the session holds (e.g. a \
+         leaked constant). Every operator signature would be made with the \
+         wrong key → DPS `CryptBadSign` → zero receipts issuable."
+    );
+}
+
+/// FW-1 teeth (MEDIUM survivor `in_process.rs:129`): the accepted CMS
+/// profile guard in `sign_cms_blocking` must MATCH the production profile
+/// (`Dstu4145WithGost34311Pb`), NOT let it fall through to the wildcard
+/// reject arm.  Deleting the accept arm (the cargo-mutants MEDIUM survivor)
+/// makes the ONLY production profile fall through → `SignKind::CurveMismatch`
+/// → every fiscal document fails to sign → total loss of issuance.
+///
+/// Oracle design: drive `sign_cms_detached` for the accepted profile with a
+/// deliberately-garbage cert-DER.  On correct code the profile guard passes,
+/// so the signer proceeds and fails LATER inside `CmsSigner::sign_with`
+/// (bad cert) → `SignKind::BackendError`.  Under the mutation the accepted
+/// profile is no longer matched → the wildcard arm returns
+/// `SignKind::CurveMismatch` BEFORE any signer work.  We assert the surfaced
+/// error is NOT `CurveMismatch`; on correct code that holds (BackendError),
+/// under the mutation it fails.  This is the assertion the existing
+/// `secret_flow_tracing::drive_cms_sign_path` driver lacked.
+#[tokio::test]
+async fn accepted_cms_profile_is_not_rejected_as_curve_mismatch() {
+    // Accepted production profile + garbage cert-DER: correct code passes the
+    // profile guard, then fails at sign time (BackendError, not CurveMismatch).
+    let secret: [u8; 32] = *b"fw1-teeth-canary-secret-32bytes!";
+    let session =
+        SigningSession::new_for_test("op-fw1".into(), secret, b"<not-a-real-cert-DER>".to_vec());
+    let request = prro::crypto::SignCmsRequest {
+        session: &session,
+        canonical_xml: b"<test-payload/>",
+        profile: prro_crypto::cms::profile::CmsProfile::Dstu4145WithGost34311Pb,
+    };
+    let provider = InProcessProvider::new();
+    let err = provider
+        .sign_cms_detached(request)
+        .await
+        .expect_err("garbage cert-DER must surface a CmsSign error");
+
+    // The accepted profile MUST be matched by the guard, so the failure must
+    // come from downstream (BackendError), NOT the wildcard CurveMismatch
+    // reject.  If the accept arm is deleted (the survivor), the accepted
+    // profile falls through and this assertion fails.
+    match err {
+        CryptoError::CmsSign {
+            reason: SignKind::CurveMismatch,
+        } => panic!(
+            "accepted production profile Dstu4145WithGost34311Pb was rejected as \
+             CurveMismatch — the CmsProfile accept arm in sign_cms_blocking was \
+             not matched (in_process.rs:129 accept arm deleted?). This means every \
+             fiscal document would fail to sign."
+        ),
+        CryptoError::CmsSign {
+            reason: SignKind::BackendError,
+        } => {} // expected on correct code: guard passed, signer rejected garbage cert
+        other => panic!(
+            "unexpected error variant for accepted profile + garbage cert: {other:?} — \
+             expected CmsSign {{ BackendError }}"
+        ),
     }
 }
