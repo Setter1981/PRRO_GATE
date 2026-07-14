@@ -2274,7 +2274,7 @@ async fn count_doc_type(pool: &SqlitePool, dt: DocType) -> i64 {
         "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = ?",
     )
     .bind(resolve_fn())
-    .bind(dt)
+    .bind(dt.as_str())
     .fetch_one(pool)
     .await
     .unwrap()
@@ -2383,8 +2383,8 @@ async fn live_smoke_9_offline_drain_mac_id() {
          VALUES (?, ?, ?, NULL, 1, 'b', 't')",
     )
     .bind(&fiscal_number)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Closed)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Closed.as_str())
     .execute(pool)
     .await
     .expect("seed node_state ONLINE/Closed + profile bindings (no pre-opened shift — Pattern C)");

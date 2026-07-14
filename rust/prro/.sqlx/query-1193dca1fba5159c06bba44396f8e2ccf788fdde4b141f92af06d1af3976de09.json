@@ -1,10 +1,10 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT state                as \"state: DocState\",\n                  fiscal_number,\n                  lnd,\n                  doc_type             as \"doc_type: DocType\",\n                  business_ts,\n                  backend_profile_id,\n                  transport_profile_id,\n                  offline_fiscal_no,\n                  offline_dps_code,\n                  shift_id             as \"shift_id: ShiftId\",\n                  signed_by_cashier_id as \"signed_by_cashier_id: CashierId\",\n                  previous_hash        as \"previous_hash: Vec<u8>\",\n                  unsigned_xml_sha256  as \"unsigned_xml_sha256: Vec<u8>\",\n                  mac_recovery_attempts\n           FROM fiscal_documents WHERE document_id = ?",
+  "query": "SELECT state                as \"state: DbDocState\",\n                  fiscal_number,\n                  lnd,\n                  doc_type             as \"doc_type: DbDocType\",\n                  business_ts,\n                  backend_profile_id,\n                  transport_profile_id,\n                  offline_fiscal_no,\n                  offline_dps_code,\n                  shift_id             as \"shift_id: ShiftId\",\n                  signed_by_cashier_id as \"signed_by_cashier_id: CashierId\",\n                  previous_hash        as \"previous_hash: Vec<u8>\",\n                  unsigned_xml_sha256  as \"unsigned_xml_sha256: Vec<u8>\",\n                  mac_recovery_attempts\n           FROM fiscal_documents WHERE document_id = ?",
   "describe": {
     "columns": [
       {
-        "name": "state: DocState",
+        "name": "state: DbDocState",
         "ordinal": 0,
         "type_info": "Text"
       },
@@ -19,7 +19,7 @@
         "type_info": "Integer"
       },
       {
-        "name": "doc_type: DocType",
+        "name": "doc_type: DbDocType",
         "ordinal": 3,
         "type_info": "Text"
       },
@@ -94,5 +94,5 @@
       false
     ]
   },
-  "hash": "f1f3f24eef495e4a7cdd83726d8489224ed73bd503314001fa977e02f884cf4f"
+  "hash": "1193dca1fba5159c06bba44396f8e2ccf788fdde4b141f92af06d1af3976de09"
 }

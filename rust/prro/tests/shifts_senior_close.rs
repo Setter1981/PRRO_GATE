@@ -95,7 +95,7 @@ async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftS
     )
     .bind(id)
     .bind(fn_id)
-    .bind(state)
+    .bind(state.as_str())
     .execute(pool)
     .await
     .unwrap();

@@ -191,7 +191,7 @@ async fn list_pending_full_state_inclusion_contract() {
         fd::insert_prepared(&pool, &doc).await.unwrap();
         if state != DocState::Prepared {
             sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-                .bind(state)
+                .bind(state.as_str())
                 .bind(id)
                 .execute(&pool)
                 .await

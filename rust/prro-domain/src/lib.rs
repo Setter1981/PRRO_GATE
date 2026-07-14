@@ -11,10 +11,17 @@
 //!
 //! The oracle must never call `now()` — this crate holds **no clock**.
 //!
-//! CS-1a is the **scaffolding** slice: this is an empty skeleton. No domain
-//! type has been moved yet — the enums / ids / `CanonicalFiscalCommand`
-//! relocate in CS-1b / CS-1b′ / CS-1c behind explicit compatibility shims in
-//! `prro`, per
+//! CS-1b landed the **TEXT-affinity state/protocol enums** (`DocState`,
+//! `OfflineSessionState`, `ShiftState`, `NodeMode`, `Protocol`, `DocType`,
+//! `FiscalMode`, `Severity`) here, pure. The ids / `CanonicalFiscalCommand`
+//! relocate in CS-1b′ / CS-1c behind explicit compatibility shims in `prro`,
+//! per
 //! `docs/superpowers/specs/2026-07-14-cs1-contract-behaviour-neutral-skeleton.md`.
 
 #![forbid(unsafe_code)]
+
+pub mod enums;
+
+pub use enums::{
+    DocState, DocType, FiscalMode, NodeMode, OfflineSessionState, Protocol, Severity, ShiftState,
+};

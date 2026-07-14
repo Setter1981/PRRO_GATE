@@ -49,7 +49,7 @@ async fn seed_node_state(
          VALUES (?, 'ONLINE', ?, ?, 1, 'b1', 't1')",
     )
     .bind(FN)
-    .bind(shift_state)
+    .bind(shift_state.as_str())
     .bind(current)
     .execute(pool)
     .await
@@ -64,20 +64,21 @@ async fn seed_shift(pool: &sqlx::SqlitePool, id: ShiftId, state: ShiftState) {
     )
     .bind(id)
     .bind(FN)
-    .bind(state)
+    .bind(state.as_str())
     .execute(pool)
     .await
     .unwrap();
 }
 
 async fn read_node_shift_state(pool: &sqlx::SqlitePool) -> ShiftState {
-    sqlx::query_scalar(
-        r#"SELECT shift_state as "s: ShiftState" FROM node_state WHERE fiscal_number = ?"#,
+    sqlx::query_scalar::<_, prro::db::types::DbShiftState>(
+        r#"SELECT shift_state FROM node_state WHERE fiscal_number = ?"#,
     )
     .bind(FN)
     .fetch_one(pool)
     .await
     .unwrap()
+    .0
 }
 
 async fn read_current_shift_id(pool: &sqlx::SqlitePool) -> Option<Vec<u8>> {

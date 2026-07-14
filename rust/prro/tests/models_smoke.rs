@@ -62,17 +62,18 @@ async fn fiscal_mode_roundtrips_through_fn_config_text_column() {
     )
     .bind("4444444444")
     .bind("12345678")
-    .bind(FiscalMode::Test)
+    .bind(FiscalMode::Test.as_str())
     .execute(&pool)
     .await
     .unwrap();
 
-    let mode: FiscalMode = sqlx::query_scalar(
+    let mode: FiscalMode = sqlx::query_scalar::<_, prro::db::types::DbFiscalMode>(
         "SELECT fiscal_mode FROM fiscal_number_config WHERE fiscal_number = '4444444444'",
     )
     .fetch_one(&pool)
     .await
-    .unwrap();
+    .unwrap()
+    .0;
     assert_eq!(mode, FiscalMode::Test);
 }
 

@@ -35,6 +35,7 @@ use crate::db::repositories::ingress_inbox::{self, InboxRow};
 use crate::db::repositories::node_state;
 use crate::db::repositories::offline_sessions;
 use crate::db::tx::with_immediate;
+use crate::db::types::{DbDocState, DbDocType};
 use crate::runtime::ingress::canonical_builder::build_canonical;
 use crate::runtime::ingress::convert::aggregate_z_payload_for_shift;
 use crate::runtime::ingress::seam::{FiscalError, FiscalOutcome};
@@ -404,13 +405,15 @@ async fn terminalise_inbox(
             // arms (INLINE_SEND_*) no-op here; this fires for the post-sign refusal
             // arms (dispatch-internal / dispatch-refused / offline-refused) and a
             // pre-sign sign-failure (PREPARED) alike — one place fixes the class.
-            let dangling: Option<(Vec<u8>, DocState, DocType)> = sqlx::query_as(
-                "SELECT document_id, state, doc_type FROM fiscal_documents \
-                 WHERE request_id = ? AND state IN ('PREPARED','SIGNED') LIMIT 1",
-            )
-            .bind(&request_id[..])
-            .fetch_optional(&mut **tx)
-            .await?;
+            let dangling: Option<(Vec<u8>, DocState, DocType)> =
+                sqlx::query_as::<_, (Vec<u8>, DbDocState, DbDocType)>(
+                    "SELECT document_id, state, doc_type FROM fiscal_documents \
+                     WHERE request_id = ? AND state IN ('PREPARED','SIGNED') LIMIT 1",
+                )
+                .bind(&request_id[..])
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|(id, state, doc_type)| (id, state.0, doc_type.0));
             // A′.3 PR-O3 STOP-O3-1 fix (b): report the aborted doc back to the
             // caller when it is SHIFT-CLASS — the offline lifecycle edges
             // (2/9/7) commit the shift transition in stage_acquire's envelope,

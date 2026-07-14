@@ -24,6 +24,7 @@ use crate::db::models::{
     ids::{CashierId, DocumentId, OfflineSessionId, RequestId, ShiftId},
 };
 use crate::db::tx::WriteTxConn;
+use crate::db::types::{DbDocState, DbDocType};
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone)]
@@ -273,7 +274,7 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
     .bind(n.shift_id)
     .bind(n.offline_session_id)
     .bind(n.lnd)
-    .bind(n.doc_type)
+    .bind(n.doc_type.as_str())
     .bind(&n.backend_profile_id)
     .bind(&n.transport_profile_id)
     .bind(n.fs_mode)
@@ -333,16 +334,16 @@ pub async fn transition_state(
              SET state = ?, first_kvt1_at = COALESCE(first_kvt1_at, CURRENT_TIMESTAMP) \
              WHERE document_id = ? AND state = ?",
         )
-        .bind(to)
+        .bind(to.as_str())
         .bind(id)
-        .bind(from)
+        .bind(from.as_str())
         .execute(&mut **tx)
         .await?
     } else {
         sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ? AND state = ?")
-            .bind(to)
+            .bind(to.as_str())
             .bind(id)
-            .bind(from)
+            .bind(from.as_str())
             .execute(&mut **tx)
             .await?
     };
@@ -588,7 +589,7 @@ pub async fn active_boundary_doc_state_tx(
         ),
         "active_boundary_doc_state_tx is only meaningful for boundary doc types"
     );
-    let row: Option<DocState> = sqlx::query_scalar(
+    let row: Option<DocState> = sqlx::query_scalar::<_, DbDocState>(
         "SELECT state FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? AND doc_type = ? \
            AND state NOT IN ( \
@@ -598,9 +599,10 @@ pub async fn active_boundary_doc_state_tx(
     )
     .bind(fiscal_number)
     .bind(shift_id)
-    .bind(doc_type)
+    .bind(doc_type.as_str())
     .fetch_optional(&mut **tx)
-    .await?;
+    .await?
+    .map(|w| w.0);
     Ok(row)
 }
 
@@ -622,11 +624,13 @@ pub async fn doc_state_by_request_id_tx(
     tx: &mut WriteTxConn<'_>,
     request_id: &[u8; 16],
 ) -> sqlx::Result<Option<DocState>> {
-    let row: Option<DocState> =
-        sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE request_id = ? LIMIT 1")
-            .bind(&request_id[..])
-            .fetch_optional(&mut **tx)
-            .await?;
+    let row: Option<DocState> = sqlx::query_scalar::<_, DbDocState>(
+        "SELECT state FROM fiscal_documents WHERE request_id = ? LIMIT 1",
+    )
+    .bind(&request_id[..])
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|w| w.0);
     Ok(row)
 }
 
@@ -701,8 +705,8 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
         r#"SELECT document_id    as "document_id: DocumentId",
                   fiscal_number,
                   lnd,
-                  state           as "state: DocState",
-                  doc_type        as "doc_type: DocType",
+                  state           as "state: DbDocState",
+                  doc_type        as "doc_type: DbDocType",
                   server_fiscal_no,
                   submission_attempted_at,
                   backend_profile_id,
@@ -727,8 +731,8 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                 document_id: r.document_id,
                 fiscal_number: r.fiscal_number,
                 lnd: r.lnd,
-                state: r.state,
-                doc_type: r.doc_type,
+                state: r.state.0,
+                doc_type: r.doc_type.0,
                 server_fiscal_no: r.server_fiscal_no,
                 submission_attempted_at: r.submission_attempted_at,
                 backend_profile_id: r.backend_profile_id,
@@ -748,11 +752,24 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
 /// signing_config_snapshot_id)`.  The snapshot FK (nullable; NULL only for
 /// pre-W4-Z2a docs) lets the Z TXS aggregation resolve each receipt's tax
 /// groups with the SAME config it was signed under.
-#[derive(sqlx::FromRow)]
 struct ShiftReceiptRow {
     doc_type: DocType,
     payload_json: String,
     signing_config_snapshot_id: Option<i64>,
+}
+
+// Manual `FromRow` (CS-1b): `doc_type` is the pure `prro_domain::DocType`,
+// which is sqlx-free, so decode it through the store-side `DbDocType` wrapper
+// then convert to the domain enum — keeping the struct field type unchanged.
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for ShiftReceiptRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            doc_type: row.try_get::<DbDocType, _>("doc_type")?.0,
+            payload_json: row.try_get("payload_json")?,
+            signing_config_snapshot_id: row.try_get("signing_config_snapshot_id")?,
+        })
+    }
 }
 
 /// RS-2 piece-2b — the issued `SELL` / `RETURN` receipts of a shift, for
@@ -792,10 +809,21 @@ pub async fn list_shift_issued_receipts(
         .collect())
 }
 
-#[derive(sqlx::FromRow)]
 struct ShiftPendingRow {
     document_id: Vec<u8>,
     state: DocState,
+}
+
+// Manual `FromRow` (CS-1b): decode `state` via the store-side `DbDocState`
+// wrapper, then convert back to the pure domain enum.
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for ShiftPendingRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            document_id: row.try_get("document_id")?,
+            state: row.try_get::<DbDocState, _>("state")?.0,
+        })
+    }
 }
 
 /// RS-3 A1Z quiescence — the IN-FLIGHT (non-issued, non-terminal) SELL /
@@ -858,7 +886,7 @@ pub async fn list_shift_pending_receipts_for_z_quiescence(
 /// lowercase 32-char hex (`lower(hex(...))`) to match
 /// `runtime::ingress::dto::request_id_to_string`.  Read-only
 /// (`fetch_optional`), runtime `query_as` (no `.sqlx` cache), NO write-tx.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct TerminalOutcome {
     pub document_id: String,
     pub state: DocState,
@@ -872,6 +900,25 @@ pub struct TerminalOutcome {
     /// are NOT used.
     pub first_kvt1_at: Option<String>,
     pub total_sum_kop: Option<i64>,
+}
+
+// Manual `FromRow` (CS-1b): `state` / `doc_type` are the pure (sqlx-free)
+// domain enums, decoded via the store-side `DbDocState` / `DbDocType` wrappers
+// and converted back. The public field types stay the domain enums, so external
+// consumers (`replay.rs`, `inbox_reaper.rs`, `is_terminally_failed`) are
+// unchanged. Column-name based (matches the derived FromRow it replaces).
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for TerminalOutcome {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            document_id: row.try_get("document_id")?,
+            state: row.try_get::<DbDocState, _>("state")?.0,
+            doc_type: row.try_get::<DbDocType, _>("doc_type")?.0,
+            server_fiscal_no: row.try_get("server_fiscal_no")?,
+            first_kvt1_at: row.try_get("first_kvt1_at")?,
+            total_sum_kop: row.try_get("total_sum_kop")?,
+        })
+    }
 }
 
 pub async fn terminal_outcome_by_request_id(
@@ -1349,8 +1396,8 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
         r#"SELECT document_id    as "document_id: DocumentId",
                   fiscal_number,
                   lnd,
-                  state           as "state: DocState",
-                  doc_type        as "doc_type: DocType",
+                  state           as "state: DbDocState",
+                  doc_type        as "doc_type: DbDocType",
                   server_fiscal_no,
                   submission_attempted_at,
                   backend_profile_id,
@@ -1378,8 +1425,8 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
                 document_id: r.document_id,
                 fiscal_number: r.fiscal_number,
                 lnd: r.lnd,
-                state: r.state,
-                doc_type: r.doc_type,
+                state: r.state.0,
+                doc_type: r.doc_type.0,
                 server_fiscal_no: r.server_fiscal_no,
                 submission_attempted_at: r.submission_attempted_at,
                 backend_profile_id: r.backend_profile_id,
@@ -1472,8 +1519,8 @@ pub async fn get_pending_by_request_id_tx(
         r#"SELECT document_id    as "document_id: DocumentId",
                   fiscal_number,
                   lnd,
-                  state           as "state: DocState",
-                  doc_type        as "doc_type: DocType",
+                  state           as "state: DbDocState",
+                  doc_type        as "doc_type: DbDocType",
                   server_fiscal_no,
                   submission_attempted_at,
                   backend_profile_id,
@@ -1496,8 +1543,8 @@ pub async fn get_pending_by_request_id_tx(
         document_id: r.document_id,
         fiscal_number: r.fiscal_number,
         lnd: r.lnd,
-        state: r.state,
-        doc_type: r.doc_type,
+        state: r.state.0,
+        doc_type: r.doc_type.0,
         server_fiscal_no: r.server_fiscal_no,
         submission_attempted_at: r.submission_attempted_at,
         backend_profile_id: r.backend_profile_id,
@@ -1598,7 +1645,7 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
     .bind(n.shift_id)
     .bind(n.offline_session_id)
     .bind(n.lnd)
-    .bind(n.doc_type)
+    .bind(n.doc_type.as_str())
     .bind(&n.backend_profile_id)
     .bind(&n.transport_profile_id)
     .bind(n.fs_mode)
@@ -1650,7 +1697,7 @@ pub async fn get_signing_inputs_tx(
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<PinnedSigningInputs>> {
     let row = sqlx::query!(
-        r#"SELECT state                       as "state: DocState",
+        r#"SELECT state                       as "state: DbDocState",
                   previous_hash               as "previous_hash: Vec<u8>",
                   z_report_number,
                   signing_inputs_pinned_at,
@@ -1662,7 +1709,7 @@ pub async fn get_signing_inputs_tx(
     .await?;
     let Some(r) = row else { return Ok(None) };
     Ok(Some(PinnedSigningInputs {
-        state: r.state,
+        state: r.state.0,
         is_pinned: r.signing_inputs_pinned_at.is_some(),
         previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
         z_report_number: r.z_report_number,
@@ -1854,10 +1901,10 @@ pub async fn fetch_send_inputs_tx(
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<SendInputs>> {
     let row = sqlx::query!(
-        r#"SELECT state                as "state: DocState",
+        r#"SELECT state                as "state: DbDocState",
                   fiscal_number,
                   lnd,
-                  doc_type             as "doc_type: DocType",
+                  doc_type             as "doc_type: DbDocType",
                   business_ts,
                   backend_profile_id,
                   transport_profile_id,
@@ -1875,10 +1922,10 @@ pub async fn fetch_send_inputs_tx(
     .await?;
     let Some(r) = row else { return Ok(None) };
     Ok(Some(SendInputs {
-        state: r.state,
+        state: r.state.0,
         fiscal_number: r.fiscal_number,
         lnd: r.lnd,
-        doc_type: r.doc_type,
+        doc_type: r.doc_type.0,
         business_ts: r.business_ts,
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
@@ -1930,8 +1977,8 @@ pub async fn fetch_offline_ack_inputs_tx(
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<OfflineAckInputs>> {
     let row = sqlx::query!(
-        r#"SELECT state              as "state: DocState",
-                  doc_type           as "doc_type: DocType",
+        r#"SELECT state              as "state: DbDocState",
+                  doc_type           as "doc_type: DbDocType",
                   fiscal_number,
                   previous_hash      as "previous_hash: Vec<u8>",
                   unsigned_xml_sha256 as "unsigned_xml_sha256: Vec<u8>"
@@ -1942,8 +1989,8 @@ pub async fn fetch_offline_ack_inputs_tx(
     .await?;
     let Some(r) = row else { return Ok(None) };
     Ok(Some(OfflineAckInputs {
-        state: r.state,
-        doc_type: r.doc_type,
+        state: r.state.0,
+        doc_type: r.doc_type.0,
         fiscal_number: r.fiscal_number,
         previous_hash: r.previous_hash,
         unsigned_xml_sha256: r.unsigned_xml_sha256,

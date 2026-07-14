@@ -31,8 +31,8 @@ async fn seed_node_state(pool: &sqlx::SqlitePool, mode: NodeMode, shift_state: S
         "INSERT INTO node_state(fiscal_number, mode, shift_state, next_lnd) VALUES (?, ?, ?, 1)",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .execute(pool)
     .await
     .unwrap();

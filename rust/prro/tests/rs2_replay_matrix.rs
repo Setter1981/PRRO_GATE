@@ -101,7 +101,7 @@ async fn seed_doc_lnd(
         .await
         .expect("insert_prepared");
     sqlx::query("UPDATE fiscal_documents SET state = ?, server_fiscal_no = ? WHERE request_id = ?")
-        .bind(state)
+        .bind(state.as_str())
         .bind(server_fiscal_no)
         .bind(&request_id[..])
         .execute(pool)

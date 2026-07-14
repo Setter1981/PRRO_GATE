@@ -60,8 +60,8 @@ async fn seed_node_state(
          VALUES (?, ?, ?, 1)",
     )
     .bind(fn_id)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .execute(pool)
     .await
     .unwrap();

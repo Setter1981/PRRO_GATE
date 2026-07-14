@@ -63,8 +63,8 @@ async fn seed_node_state(pool: &SqlitePool, fn_id: &str, mode: NodeMode, shift: 
          VALUES (?, ?, ?, 1)",
     )
     .bind(fn_id)
-    .bind(mode)
-    .bind(shift)
+    .bind(mode.as_str())
+    .bind(shift.as_str())
     .execute(pool)
     .await
     .unwrap();

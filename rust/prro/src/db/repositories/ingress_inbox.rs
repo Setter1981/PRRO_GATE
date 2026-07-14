@@ -24,6 +24,7 @@
 
 use crate::db::models::enums::Protocol;
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::db::types::DbProtocol;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone)]
@@ -126,7 +127,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             let existing = sqlx::query!(
                 r#"SELECT request_id      as "request_id: Vec<u8>",
                           fiscal_number,
-                          protocol         as "protocol: Protocol",
+                          protocol         as "protocol: DbProtocol",
                           operation_type,
                           idempotency_key,
                           status,
@@ -161,7 +162,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
                     return Ok(InboxInsertOutcome::Replay(InboxRow {
                         request_id,
                         fiscal_number: r.fiscal_number,
-                        protocol: r.protocol,
+                        protocol: r.protocol.0,
                         operation_type: r.operation_type,
                         idempotency_key: r.idempotency_key,
                         status: r.status,
@@ -193,7 +194,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewInboxEntry) -> anyhow::Result<Inbo
             )
             .bind(&n.request_id[..])
             .bind(&n.fiscal_number)
-            .bind(n.protocol)
+            .bind(n.protocol.as_str())
             .bind(&n.operation_type)
             .bind(&n.idempotency_key)
             .bind(&n.payload_json)
@@ -295,7 +296,7 @@ pub async fn acquire_lease(
            WHERE request_id = ? AND status = 'NEW'
            RETURNING request_id      as "request_id: Vec<u8>",
                      fiscal_number,
-                     protocol         as "protocol: Protocol",
+                     protocol         as "protocol: DbProtocol",
                      operation_type,
                      idempotency_key,
                      status,
@@ -325,7 +326,7 @@ pub async fn acquire_lease(
     Ok(Some(InboxRow {
         request_id: req_array,
         fiscal_number: r.fiscal_number,
-        protocol: r.protocol,
+        protocol: r.protocol.0,
         operation_type: r.operation_type,
         idempotency_key: r.idempotency_key,
         status: r.status,

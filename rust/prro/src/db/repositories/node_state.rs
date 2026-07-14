@@ -29,6 +29,7 @@
 use crate::db::models::enums::{NodeMode, ShiftState};
 use crate::db::models::ids::ShiftId;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::{DbNodeMode, DbShiftState};
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,8 +94,8 @@ pub async fn upsert_initial(
             mode = excluded.mode, shift_state = excluded.shift_state",
     )
     .bind(fn_id)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .bind(next_lnd)
     .execute(pool)
     .await?;
@@ -120,8 +121,8 @@ pub async fn upsert_initial_tx(
             mode = excluded.mode, shift_state = excluded.shift_state",
     )
     .bind(fn_id)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .bind(next_lnd)
     .execute(&mut **tx)
     .await?;
@@ -286,8 +287,8 @@ pub async fn set_mode_going_online_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> 
 pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
     let row = sqlx::query!(
         r#"SELECT fiscal_number,
-                  mode               as "mode: NodeMode",
-                  shift_state        as "shift_state: ShiftState",
+                  mode               as "mode: DbNodeMode",
+                  shift_state        as "shift_state: DbShiftState",
                   next_lnd,
                   last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
                   current_shift_id   as "current_shift_id: ShiftId",
@@ -304,8 +305,8 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
     };
     Ok(Some(NodeStateRow {
         fiscal_number: r.fiscal_number,
-        mode: r.mode,
-        shift_state: r.shift_state,
+        mode: r.mode.0,
+        shift_state: r.shift_state.0,
         next_lnd: r.next_lnd,
         last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
         current_shift_id: r.current_shift_id,
@@ -321,8 +322,8 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
 pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
     let row = sqlx::query!(
         r#"SELECT fiscal_number,
-                  mode               as "mode: NodeMode",
-                  shift_state        as "shift_state: ShiftState",
+                  mode               as "mode: DbNodeMode",
+                  shift_state        as "shift_state: DbShiftState",
                   next_lnd,
                   last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
                   current_shift_id   as "current_shift_id: ShiftId",
@@ -339,8 +340,8 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Optio
     };
     Ok(Some(NodeStateRow {
         fiscal_number: r.fiscal_number,
-        mode: r.mode,
-        shift_state: r.shift_state,
+        mode: r.mode.0,
+        shift_state: r.shift_state.0,
         next_lnd: r.next_lnd,
         last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
         current_shift_id: r.current_shift_id,

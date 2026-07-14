@@ -210,8 +210,8 @@ async fn seed_boot_baseline(pool: &SqlitePool) {
          VALUES (?, ?, ?, NULL, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Closed)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Closed.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -317,7 +317,7 @@ async fn count_doc_type(pool: &SqlitePool, dt: DocType) -> i64 {
         "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = ?",
     )
     .bind(FN)
-    .bind(dt)
+    .bind(dt.as_str())
     .fetch_one(pool)
     .await
     .unwrap()
@@ -332,7 +332,7 @@ async fn boundary_payload_xml_and_code(pool: &SqlitePool, dt: DocType) -> (Strin
          WHERE fiscal_number = ? AND doc_type = ?",
     )
     .bind(FN)
-    .bind(dt)
+    .bind(dt.as_str())
     .fetch_one(pool)
     .await
     .unwrap();
@@ -371,7 +371,7 @@ async fn boundary_send_shape(
          WHERE fiscal_number = ? AND doc_type = ?",
     )
     .bind(FN)
-    .bind(dt)
+    .bind(dt.as_str())
     .fetch_one(pool)
     .await
     .unwrap()

@@ -16,12 +16,22 @@ name = "prro_domain"
 # NO type has been moved yet — this is the empty scaffolding slice (CS-1a).
 uuid = { version = "1", features = ["v7", "v5", "serde"] }
 
+# CS-1b: the moved TEXT-affinity enums keep BYTE-IDENTICAL serde output
+# (`#[serde(rename=$sql)]`). `serde` is NOT a forbidden crate under the
+# RP-CS1-1 purity gate (only sqlx / tonic / tokio / axum / prost / hyper /
+# reqwest are banned — see tests/purity_gate.rs::FORBIDDEN); it is pure,
+# I/O-free, runtime-free. Domain stays sqlx-free: the SQLite mapping lives
+# entirely in `prro::db::types` store-side wrappers.
+serde = { version = "1", features = ["derive"] }
+
 [dev-dependencies]
 # RP-CS1-1 (purity gate) shells out to `cargo metadata --format-version 1`
 # and walks the JSON dependency graph; serde_json is the only parser it needs
 # (a full `cargo_metadata` crate dep is avoided to keep the graph minimal).
 # Dev-deps do NOT appear in the normal/build/target edges the gate inspects,
-# so this does not weaken the invariant it enforces.
+# so this does not weaken the invariant it enforces. RP-CS1-5 (the enum
+# representation-conformance test) also asserts byte-identical serde output
+# via `serde_json::to_string`.
 serde_json = "1"
 
 # RP-CS1-1 fast canary — a `write_tx_conn_compile_fail.rs`-style trybuild

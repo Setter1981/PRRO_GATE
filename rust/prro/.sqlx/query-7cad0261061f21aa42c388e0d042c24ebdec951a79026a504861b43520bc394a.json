@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT fiscal_number,\n                  tax_number,\n                  vat_payer_inn,\n                  fiscal_mode    as \"fiscal_mode: FiscalMode\",\n                  org_name, point_name, org_address,\n                  tsp_enabled            as \"tsp_enabled: i64\",\n                  offline_enabled        as \"offline_enabled: i64\",\n                  national_check_enabled as \"national_check_enabled: i64\",\n                  min_offline_codes      as \"min_offline_codes: i64\",\n                  max_offline_codes      as \"max_offline_codes: i64\"\n           FROM fiscal_number_config WHERE fiscal_number = ?",
+  "query": "SELECT fiscal_number,\n                  tax_number,\n                  vat_payer_inn,\n                  fiscal_mode    as \"fiscal_mode: DbFiscalMode\",\n                  org_name, point_name, org_address,\n                  tsp_enabled            as \"tsp_enabled: i64\",\n                  offline_enabled        as \"offline_enabled: i64\",\n                  national_check_enabled as \"national_check_enabled: i64\",\n                  min_offline_codes      as \"min_offline_codes: i64\",\n                  max_offline_codes      as \"max_offline_codes: i64\"\n           FROM fiscal_number_config ORDER BY fiscal_number",
   "describe": {
     "columns": [
       {
@@ -19,7 +19,7 @@
         "type_info": "Text"
       },
       {
-        "name": "fiscal_mode: FiscalMode",
+        "name": "fiscal_mode: DbFiscalMode",
         "ordinal": 3,
         "type_info": "Text"
       },
@@ -65,7 +65,7 @@
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 0
     },
     "nullable": [
       false,
@@ -82,5 +82,5 @@
       false
     ]
   },
-  "hash": "2de0a02a6f3689a2573403eb74cd5748a438830ab69195efef42c73337384659"
+  "hash": "7cad0261061f21aa42c388e0d042c24ebdec951a79026a504861b43520bc394a"
 }

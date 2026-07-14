@@ -10,6 +10,7 @@
 //!   and runtime SQL keeps multi-line statements ergonomic.
 
 use crate::db::models::enums::FiscalMode;
+use crate::db::types::DbFiscalMode;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,7 +58,7 @@ pub async fn insert(pool: &SqlitePool, n: &NewFnConfig) -> sqlx::Result<()> {
     .bind(&n.fiscal_number)
     .bind(&n.tax_number)
     .bind(n.vat_payer_inn.as_deref())
-    .bind(n.fiscal_mode)
+    .bind(n.fiscal_mode.as_str())
     .bind(n.org_name.as_deref())
     .bind(n.point_name.as_deref())
     .bind(n.org_address.as_deref())
@@ -76,7 +77,7 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<FnConfig
         r#"SELECT fiscal_number,
                   tax_number,
                   vat_payer_inn,
-                  fiscal_mode    as "fiscal_mode: FiscalMode",
+                  fiscal_mode    as "fiscal_mode: DbFiscalMode",
                   org_name, point_name, org_address,
                   tsp_enabled            as "tsp_enabled: i64",
                   offline_enabled        as "offline_enabled: i64",
@@ -92,7 +93,7 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<FnConfig
         fiscal_number: r.fiscal_number,
         tax_number: r.tax_number,
         vat_payer_inn: r.vat_payer_inn,
-        fiscal_mode: r.fiscal_mode,
+        fiscal_mode: r.fiscal_mode.0,
         org_name: r.org_name,
         point_name: r.point_name,
         org_address: r.org_address,
@@ -109,7 +110,7 @@ pub async fn list_all(pool: &SqlitePool) -> sqlx::Result<Vec<FnConfig>> {
         r#"SELECT fiscal_number,
                   tax_number,
                   vat_payer_inn,
-                  fiscal_mode    as "fiscal_mode: FiscalMode",
+                  fiscal_mode    as "fiscal_mode: DbFiscalMode",
                   org_name, point_name, org_address,
                   tsp_enabled            as "tsp_enabled: i64",
                   offline_enabled        as "offline_enabled: i64",
@@ -126,7 +127,7 @@ pub async fn list_all(pool: &SqlitePool) -> sqlx::Result<Vec<FnConfig>> {
             fiscal_number: r.fiscal_number,
             tax_number: r.tax_number,
             vat_payer_inn: r.vat_payer_inn,
-            fiscal_mode: r.fiscal_mode,
+            fiscal_mode: r.fiscal_mode.0,
             org_name: r.org_name,
             point_name: r.point_name,
             org_address: r.org_address,
