@@ -8,6 +8,7 @@
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::offline_sessions::{self, OfflineSessionError};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 use uuid::Uuid;
 
 const FN: &str = "9990000001";
@@ -43,7 +44,7 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool) -> DocumentId {
          VALUES (?, ?, ?, 1, 'SELL', 'SIGNED', 'b', 't', 'OFFLINE', \
             '2026-05-15T00:00:00Z', '{}', ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
     .bind(&sha)

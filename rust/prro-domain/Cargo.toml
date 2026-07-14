@@ -24,6 +24,16 @@ uuid = { version = "1", features = ["v7", "v5", "serde"] }
 # entirely in `prro::db::types` store-side wrappers.
 serde = { version = "1", features = ["derive"] }
 
+# CS-1b′: the moved id newtypes carry `CashierIdError` / `DriverIdError`
+# (`#[derive(thiserror::Error)]`). `thiserror` is PURE (a proc-macro that
+# expands to `std::error::Error` / `Display` impls — no I/O, no runtime) and is
+# NOT in the RP-CS1-1 forbidden set (sqlx / tonic / tokio / axum / prost / hyper
+# / reqwest — see tests/purity_gate.rs::FORBIDDEN); the purity gate stays green.
+# `tracing` is deliberately NOT added — the CashierId oversize warn stays
+# store-side in `prro::db::types::DbCashierId` (contract §2), so the domain crate
+# keeps no logging dependency.
+thiserror = "1"
+
 [dev-dependencies]
 # RP-CS1-1 (purity gate) shells out to `cargo metadata --format-version 1`
 # and walks the JSON dependency graph; serde_json is the only parser it needs

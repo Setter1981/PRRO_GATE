@@ -38,6 +38,7 @@ use sqlx::SqlitePool;
 use prro::db::models::enums::{DocState, NodeMode};
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::{node_state, transport_trace};
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::error_routing::{ProbeReason, RetryClass};
 use prro::services::write_path::stage_send::{self, StageSendOutcome};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
@@ -180,7 +181,7 @@ async fn seed_signed_shift_close(pool: &SqlitePool, doc_byte: u8) -> DocumentId 
 
 async fn read_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -722,7 +723,7 @@ async fn fx21_pattern_b_retry_path_spy_observes_sending_marker_then_error_retrya
                     let row: String = sqlx::query_scalar(
                         "SELECT state FROM fiscal_documents WHERE document_id = ?",
                     )
-                    .bind(doc)
+                    .bind(DbDocumentId(doc))
                     .fetch_one(&pool)
                     .await
                     .unwrap();
@@ -805,7 +806,7 @@ async fn mac_fx01_hash_not_extractable_overrides_to_rejected() {
     let counter: i64 = sqlx::query_scalar(
         "SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -837,7 +838,7 @@ async fn mac_fx02_counter_exhausted_overrides_to_rejected_with_failed_repeat_aud
     )
     .await;
     sqlx::query("UPDATE fiscal_documents SET mac_recovery_attempts = 1 WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
@@ -942,7 +943,7 @@ async fn mac_fx03_second_minus_12_after_resigned_emits_failed_repeat() {
     let counter: i64 = sqlx::query_scalar(
         "SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();

@@ -18,6 +18,7 @@ use prro::db::{
         fiscal_documents::{self as fd, NewDocument},
         fiscal_number_config::{self as fn_repo, NewFnConfig},
     },
+    types::DbDocumentId,
 };
 
 async fn fresh_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
@@ -118,7 +119,7 @@ async fn migration_008_sending_state_accepted_by_check() {
     fd::insert_prepared(&pool, &new).await.unwrap();
 
     sqlx::query("UPDATE fiscal_documents SET state = 'SENDING' WHERE document_id = ?")
-        .bind(id)
+        .bind(DbDocumentId(id))
         .execute(&pool)
         .await
         .expect("UPDATE to SENDING must succeed: 008 added 'SENDING' to state CHECK");
@@ -136,7 +137,7 @@ async fn migration_008_bogus_state_still_rejected_by_check() {
 
     let err =
         sqlx::query("UPDATE fiscal_documents SET state = 'BOGUS_STATE' WHERE document_id = ?")
-            .bind(id)
+            .bind(DbDocumentId(id))
             .execute(&pool)
             .await;
     let msg = format!("{:?}", err.unwrap_err());
@@ -159,7 +160,7 @@ async fn doc_state_sending_round_trips_through_sqlx() {
 
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
         .bind(DocState::Sending.as_str())
-        .bind(id)
+        .bind(DbDocumentId(id))
         .execute(&pool)
         .await
         .unwrap();

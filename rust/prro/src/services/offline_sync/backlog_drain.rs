@@ -109,6 +109,7 @@ use crate::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
 use crate::db::repositories::{audit_log, fiscal_documents, node_state, offline_sessions, shifts};
 use crate::db::tx::with_immediate;
+use crate::db::types::DbDocumentId;
 use crate::services::offline_sync::kvt2_confirm;
 use crate::services::reconciliation::guard::ReconcileGuard;
 use crate::services::reconciliation::runtime::RuntimeView;
@@ -2668,12 +2669,14 @@ async fn ensure_and_drain_session_end(
         // LOW-3 (review): attribute the failure to the REAL END document_id (not
         // a throwaway) for forensic traceability.  Fall back to a fresh id only
         // if the row is somehow absent (should not happen — STEP A minted it).
-        let end_doc_id: Option<DocumentId> =
-            sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE request_id = ?")
-                .bind(request_id_typed.as_bytes().as_slice())
-                .fetch_optional(pool)
-                .await
-                .map_err(BootError::Database)?;
+        let end_doc_id: Option<DocumentId> = sqlx::query_scalar::<_, DbDocumentId>(
+            "SELECT document_id FROM fiscal_documents WHERE request_id = ?",
+        )
+        .bind(request_id_typed.as_bytes().as_slice())
+        .fetch_optional(pool)
+        .await
+        .map_err(BootError::Database)?
+        .map(|w| w.0);
         // `DocumentId::default()` == `DocumentId::new()` (a fresh random UUIDv7 —
         // see `id_newtype!`), so the default fallback is a distinct throwaway id,
         // only reached if the END row is somehow absent (STEP A rules it out).
@@ -2841,7 +2844,7 @@ async fn drive_session_end_to_sign(
         // at STEP-A mint = drain-close time).
         let business_ts: String =
             sqlx::query_scalar("SELECT business_ts FROM fiscal_documents WHERE document_id = ?")
-                .bind(doc.document_id)
+                .bind(DbDocumentId(doc.document_id))
                 .fetch_one(pool)
                 .await
                 .map_err(BootError::Database)?;
@@ -3504,6 +3507,7 @@ mod eligible_arm_tests {
     use super::*;
     use crate::db::models::ids::OfflineSessionId;
     use crate::db::repositories::node_state::NodeStateRow;
+    use crate::db::types::DbOfflineSessionId;
 
     const FN: &str = "1234567890";
 
@@ -3541,7 +3545,7 @@ mod eligible_arm_tests {
             "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at, drained_at) \
              VALUES (?, ?, 'DRAINING', '2026-05-21T00:00:00Z', '2026-05-21T00:00:01Z')",
         )
-        .bind(session_id)
+        .bind(DbOfflineSessionId(session_id))
         .bind(FN)
         .execute(pool)
         .await
@@ -3579,7 +3583,7 @@ mod eligible_arm_tests {
 
     async fn read_session_state(pool: &sqlx::SqlitePool, session_id: OfflineSessionId) -> String {
         sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
-            .bind(session_id)
+            .bind(DbOfflineSessionId(session_id))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -3675,6 +3679,7 @@ mod eligible_arm_tests {
     // ─── MED-W9B-1 (2026-05-21) — pending-drain shift closure ────────
 
     use crate::db::models::ids::ShiftId;
+    use crate::db::types::DbShiftId;
 
     async fn seed_node_state_with_shift(
         pool: &sqlx::SqlitePool,
@@ -3689,7 +3694,7 @@ mod eligible_arm_tests {
         .bind(FN)
         .bind(mode)
         .bind(shift_state)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(pool)
         .await
         .unwrap();
@@ -3703,7 +3708,7 @@ mod eligible_arm_tests {
                 open_mode, cash_balance_kop, opened_by_cashier_id) \
              VALUES (?, ?, 1, ?, 'OFFLINE', 0, 'test-cashier')",
         )
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .bind(state)
         .execute(pool)
@@ -3714,7 +3719,7 @@ mod eligible_arm_tests {
 
     async fn read_shift_state(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> String {
         sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .fetch_one(pool)
             .await
             .unwrap()

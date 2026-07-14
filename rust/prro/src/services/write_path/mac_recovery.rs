@@ -64,7 +64,7 @@ use crate::db::repositories::{
     fiscal_number_config, signing_config_snapshots,
 };
 use crate::db::tx::with_immediate;
-use crate::db::types::DbDocType;
+use crate::db::types::{DbDocType, DbDocumentId};
 
 use super::error_routing::MacRecoveryHint;
 use super::stage_send::StageSendError;
@@ -230,7 +230,7 @@ async fn read_recovery_inputs(
                   signing_config_snapshot_id, offline_fiscal_no
            FROM fiscal_documents WHERE document_id = ?"#,
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_optional(pool)
     .await
     .map_err(StageSendError::Db)?;
@@ -523,7 +523,7 @@ pub async fn run_mac_recovery(
             )
             .bind(&new_previous_hash[..])
             .bind(&new_sha_for_persist[..])
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .execute(&mut **tx)
             .await?;
 

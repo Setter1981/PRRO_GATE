@@ -22,6 +22,7 @@
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId};
 use prro::services::write_path::stage_offline_ack::{self, OfflineAckOutcome, RefusalReason};
 use uuid::Uuid;
 
@@ -80,7 +81,7 @@ async fn seed_offline_session(
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-15T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(fn_id)
     .bind(state.as_str())
     .execute(pool)
@@ -126,7 +127,7 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, fn_id: &str, lnd: i64) -> Do
          VALUES (?, ?, ?, ?, 'SELL', 'SIGNED', 'b', 't', 'OFFLINE', \
             '2026-05-15T00:00:00Z', '{}', ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(fn_id)
     .bind(lnd)
@@ -156,7 +157,7 @@ async fn mark_doc_stamped_at_sign(
         "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? AND code_lnd = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(fn_id)
     .bind(code_lnd)
     .execute(pool)
@@ -177,9 +178,9 @@ async fn mark_doc_stamped_at_sign(
              offline_dps_code = ? WHERE document_id = ?",
     )
     .bind(code_lnd)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(&dps_code)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -187,7 +188,7 @@ async fn mark_doc_stamped_at_sign(
 
 async fn fetch_doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -274,7 +275,7 @@ async fn applied_happy_path_atomically_consumes_code_and_transitions() {
         "SELECT offline_fiscal_no, offline_fiscal_date, offline_session_id \
          FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -647,7 +648,7 @@ async fn cross_fn_doc_and_code_attribution_is_rejected() {
         "SELECT offline_fiscal_no, offline_fiscal_date, offline_session_id \
          FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc_a)
+    .bind(DbDocumentId(doc_a))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -687,7 +688,7 @@ async fn sequential_two_docs_acquire_distinct_codes() {
     // 0xA0+1), matching the seed doc#1's offline-ack advances the chain to.
     sqlx::query("UPDATE fiscal_documents SET previous_hash = ? WHERE document_id = ?")
         .bind(vec![0xA1u8; 32])
-        .bind(doc_b)
+        .bind(DbDocumentId(doc_b))
         .execute(&pool)
         .await
         .unwrap();
@@ -809,7 +810,7 @@ async fn insert_signed_doc_with_type(
          VALUES (?, ?, ?, ?, ?, 'SIGNED', 'b', 't', 'OFFLINE', \
             '2026-05-20T00:00:00Z', '{}', ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(fn_id)
     .bind(lnd)

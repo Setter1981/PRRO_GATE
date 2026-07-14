@@ -1941,6 +1941,8 @@ async fn run_z_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // CS-1b′: store-side id wrappers for the sqlx boundary in test fixtures.
+    use crate::db::types::{DbDocumentId, DbShiftId};
     use crate::transports::dps::dto::{CheckAck, CheckEnvelope, RroInfo, StatusSnapshot};
     use crate::transports::dps::error::DpsError;
     use async_trait::async_trait;
@@ -2178,7 +2180,7 @@ mod tests {
                 cash_balance_kop, opened_by_cashier_id) \
              VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
         )
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(SW4_FN)
         .execute(pool)
         .await
@@ -2189,7 +2191,7 @@ mod tests {
              VALUES (?, 'ONLINE', 'OPENED', ?, 1, 'b', 't')",
         )
         .bind(SW4_FN)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(pool)
         .await
         .unwrap();
@@ -2198,7 +2200,7 @@ mod tests {
 
     async fn read_shift_state(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> String {
         sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -2379,7 +2381,7 @@ mod tests {
                 cash_balance_kop, opened_by_cashier_id) \
              VALUES (?, ?, 1, ?, 'OFFLINE', 0, 'csh')",
         )
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(SW4_FN)
         .bind(shift_state)
         .execute(pool)
@@ -2392,7 +2394,7 @@ mod tests {
         )
         .bind(SW4_FN)
         .bind(shift_state)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(pool)
         .await
         .unwrap();
@@ -2434,10 +2436,10 @@ mod tests {
              VALUES (?, ?, ?, ?, 1, ?, 'SIGNED', 'b', 't', 'OFFLINE', '2026-07-07T00:00:00Z', \
                 '{}', ?, ?)",
         )
-        .bind(DocumentId::new())
+        .bind(DbDocumentId(DocumentId::new()))
         .bind(&request_id[..])
         .bind(SW4_FN)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(doc_type)
         .bind(&[0u8; 32][..])
         .bind(&[0xA1u8; 32][..])

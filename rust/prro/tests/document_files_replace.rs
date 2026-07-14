@@ -15,6 +15,7 @@
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::document_files::{self, DocumentFileKind};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 use sqlx::SqlitePool;
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -62,7 +63,7 @@ async fn read_content(
     kind: DocumentFileKind,
 ) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(kind)
         .fetch_optional(pool)
         .await
@@ -118,7 +119,7 @@ async fn replace_overwrites_existing_row_in_place() {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM document_files WHERE document_id = ? AND kind = 'SIGNED_XML'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -192,7 +193,7 @@ async fn replace_fk_violation_on_missing_fiscal_document() {
 
     // Sanity: no row landed via the rolled-back attempt.
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM document_files WHERE document_id = ?")
-        .bind(bogus)
+        .bind(DbDocumentId(bogus))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -216,7 +217,7 @@ async fn replace_resets_created_at_to_recovery_time() {
         "INSERT INTO document_files (document_id, kind, content, created_at) \
          VALUES (?, 'SIGNED_XML', ?, '2020-01-01 00:00:00')",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(b"original".to_vec())
     .execute(&pool)
     .await
@@ -226,7 +227,7 @@ async fn replace_resets_created_at_to_recovery_time() {
         "SELECT created_at FROM document_files \
          WHERE document_id = ? AND kind = 'SIGNED_XML'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -251,7 +252,7 @@ async fn replace_resets_created_at_to_recovery_time() {
         "SELECT created_at FROM document_files \
          WHERE document_id = ? AND kind = 'SIGNED_XML'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();

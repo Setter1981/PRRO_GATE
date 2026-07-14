@@ -17,6 +17,7 @@
 //! Anchored on freeze §4.4 + R-W10.4-step1-review MED 1 close.
 
 use prro::db::models::ids::DocumentId;
+use prro::db::types::DbDocumentId;
 use sqlx::SqlitePool;
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -69,7 +70,7 @@ async fn mac_recovery_attempts_defaults_to_zero_on_insert() {
     let counter: i64 = sqlx::query_scalar(
         "SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -89,7 +90,7 @@ async fn mac_recovery_attempts_check_rejects_value_2() {
     // Try to bump counter to 2 — must violate CHECK.
     let res =
         sqlx::query("UPDATE fiscal_documents SET mac_recovery_attempts = 2 WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .execute(&pool)
             .await;
     let err = res.expect_err("CHECK (mac_recovery_attempts IN (0, 1)) must reject 2");
@@ -102,7 +103,7 @@ async fn mac_recovery_attempts_check_rejects_value_2() {
     // Negative also rejected (closed set IS (0, 1), -1 not in it).
     let res =
         sqlx::query("UPDATE fiscal_documents SET mac_recovery_attempts = -1 WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .execute(&pool)
             .await;
     let err = res.expect_err("CHECK must reject -1");
@@ -113,7 +114,7 @@ async fn mac_recovery_attempts_check_rejects_value_2() {
     let counter: i64 = sqlx::query_scalar(
         "SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -134,7 +135,7 @@ async fn outcome_kind_check_accepts_retryable_mac_hash_mismatch() {
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 1, 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(&sha)
     .execute(&pool)
     .await
@@ -154,7 +155,7 @@ async fn outcome_kind_check_accepts_retryable_mac_hash_mismatch() {
             retry_class = 'MacRecovery' \
          WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await;
     assert!(
@@ -167,7 +168,7 @@ async fn outcome_kind_check_accepts_retryable_mac_hash_mismatch() {
         "UPDATE transport_trace SET outcome_kind = 'UNKNOWN_GARBAGE' \
          WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await;
     let err = res.expect_err("unknown outcome_kind must violate CHECK");
@@ -191,7 +192,7 @@ async fn migration_010_w7_contracts_survive_the_013_rebuild() {
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 1, 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(&sha)
     .execute(&pool)
     .await
@@ -208,7 +209,7 @@ async fn migration_010_w7_contracts_survive_the_013_rebuild() {
             retry_class = NULL \
          WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .expect("W7 'OK' completion must still work post-013 rebuild");
@@ -222,7 +223,7 @@ async fn migration_010_w7_contracts_survive_the_013_rebuild() {
          VALUES (?, 2, 'b1', 't1', ?, '2026-05-09 10:00:01', \
             '2026-05-09 10:00:00', '2026-05-09 10:00:01', 'OK', NULL)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(&sha)
     .execute(&pool)
     .await;

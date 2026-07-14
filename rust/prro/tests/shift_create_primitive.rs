@@ -17,6 +17,7 @@ use prro::db::models::ids::{DocumentId, ShiftId};
 use prro::db::open_pool;
 use prro::db::repositories::shifts::{self, TransitionOutcome};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbShiftId;
 use prro::services::shift::transition as svc;
 
 const FN: &str = "1234567890";
@@ -50,7 +51,7 @@ async fn seed_node_state(
     )
     .bind(FN)
     .bind(shift_state.as_str())
-    .bind(current)
+    .bind(current.map(DbShiftId))
     .execute(pool)
     .await
     .unwrap();
@@ -62,7 +63,7 @@ async fn seed_shift(pool: &sqlx::SqlitePool, id: ShiftId, state: ShiftState) {
             opened_by_cashier_id) \
          VALUES (?, ?, ?, 'ONLINE', 0, 'seed')",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(FN)
     .bind(state.as_str())
     .execute(pool)

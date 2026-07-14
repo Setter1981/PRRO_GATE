@@ -31,6 +31,7 @@ use tokio::sync::OwnedMutexGuard;
 use crate::db::models::enums::{Protocol, ShiftState};
 use crate::db::repositories::ingress_inbox::{self, InboxInsertOutcome, NewInboxEntry};
 use crate::db::repositories::node_state;
+use crate::db::types::DbShiftId;
 use crate::runtime::ingress::seam::FiscalError;
 use crate::services::time_budget::{self, Clock, EnforcementToggles, TimeBudgetGate};
 use crate::services::write_path::inline;
@@ -125,7 +126,7 @@ pub async fn run_auto_z_if_over_limit(
          ORDER BY fd.lnd ASC LIMIT 1",
     )
     .bind(fiscal_number)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_optional(pool)
     .await?;
     let (open_driver_id, open_cashier_id) = match ident {

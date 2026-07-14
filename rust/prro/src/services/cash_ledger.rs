@@ -47,6 +47,7 @@
 
 use crate::db::models::ids::ShiftId;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::DbShiftId;
 use sqlx::SqlitePool;
 
 /// Derive cash-on-hand from the opening anchor and per-shift cash totals.
@@ -179,7 +180,7 @@ pub async fn aggregate_shift_epz(
          ORDER BY lnd",
     )
     .bind(fiscal_number)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_all(pool)
     .await?;
 
@@ -216,7 +217,7 @@ pub async fn aggregate_shift_service_io(
          ORDER BY lnd",
     )
     .bind(fiscal_number)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_all(pool)
     .await?;
 
@@ -267,7 +268,7 @@ pub async fn aggregate_shift_cash_tx(
          ORDER BY lnd",
     )
     .bind(fiscal_number)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_all(&mut **tx)
     .await?;
 
@@ -303,7 +304,7 @@ pub async fn aggregate_shift_cash_tx(
          ORDER BY lnd",
     )
     .bind(fiscal_number)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_all(&mut **tx)
     .await?;
 
@@ -332,7 +333,7 @@ pub async fn aggregate_shift_cash_tx(
          ORDER BY lnd",
     )
     .bind(fiscal_number)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_all(&mut **tx)
     .await?;
     let mut epz_out: i64 = 0;

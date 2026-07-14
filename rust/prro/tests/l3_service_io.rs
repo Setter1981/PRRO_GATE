@@ -22,6 +22,7 @@ use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig}
 use prro::db::repositories::node_state;
 use prro::db::repositories::payment_methods::{insert as pm_insert, NewPaymentMethod};
 use prro::db::repositories::shifts;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::runtime::ingress::convert::{convert_to_signer_payload, ConvertError};
 use prro::runtime::ingress::dto::CanonicalCommand;
 use prro::runtime::ingress::policy::{classify_command, CommandClass};
@@ -111,7 +112,7 @@ async fn setup_open_shift() -> (tempfile::TempDir, SqlitePool, SqlitePool, Shift
         .await
         .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift)
+        .bind(DbShiftId(shift))
         .bind(FN)
         .execute(&main)
         .await
@@ -165,7 +166,7 @@ async fn seed_service_doc(
         .expect("insert_prepared");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
         .bind(DocState::Ack.as_str())
-        .bind(id)
+        .bind(DbDocumentId(id))
         .execute(pool)
         .await
         .expect("set ACK state");

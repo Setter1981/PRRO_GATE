@@ -28,6 +28,7 @@ use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig}
 use prro::db::repositories::node_state;
 use prro::db::repositories::payment_methods::{insert as pm_insert, NewPaymentMethod};
 use prro::db::repositories::shifts;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::runtime::ingress::convert::{convert_to_signer_payload, ConvertError};
 use prro::runtime::ingress::dto::CanonicalCommand;
 use prro::services::cash_ledger::{
@@ -159,7 +160,7 @@ async fn seed_closed_shift_with_closing_cash(
     // confirm_shift_edge does atomically in prod).
     sqlx::query("UPDATE shifts SET cash_balance_kop = ? WHERE shift_id = ?")
         .bind(closing_cash)
-        .bind(id)
+        .bind(DbShiftId(id))
         .execute(pool)
         .await
         .expect("write closing cash");
@@ -201,7 +202,7 @@ async fn seed_issued_receipt(
         .expect("insert_prepared");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
         .bind(state.as_str())
-        .bind(id)
+        .bind(DbDocumentId(id))
         .execute(pool)
         .await
         .expect("set state");
@@ -222,7 +223,7 @@ async fn wire_node_state(pool: &SqlitePool, shift: ShiftId) {
         .await
         .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift)
+        .bind(DbShiftId(shift))
         .bind(FN)
         .execute(pool)
         .await
@@ -382,7 +383,7 @@ async fn pin_l0_boot_reconcile_detects_drift() {
 
     // Corrupt the stored opening anchor of shift B.
     sqlx::query("UPDATE shifts SET cash_balance_kop = 999 WHERE shift_id = ?")
-        .bind(shift_b)
+        .bind(DbShiftId(shift_b))
         .execute(&pool)
         .await
         .unwrap();

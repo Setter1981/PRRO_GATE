@@ -43,6 +43,7 @@ use prro::db::models::enums::{DocState, NodeMode, ShiftState};
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::fiscal_documents::allowed_transition;
 use prro::db::repositories::{node_state, outbox};
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::stage_finalize::{self, StageFinalizeError, StageFinalizeOutcome};
 use sqlx::SqlitePool;
 
@@ -178,7 +179,7 @@ async fn seed_doc(
 /// must survive finalize unchanged.
 async fn read_doc_file(pool: &SqlitePool, doc: DocumentId, kind: &str) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(kind)
         .fetch_optional(pool)
         .await
@@ -187,7 +188,7 @@ async fn read_doc_file(pool: &SqlitePool, doc: DocumentId, kind: &str) -> Option
 
 async fn read_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read state")
@@ -379,7 +380,7 @@ async fn finalize_does_not_advance_seed_offline_origin_lane() {
     // `seed_doc` seeds online-origin (NULL) by default.
     sqlx::query("UPDATE fiscal_documents SET offline_fiscal_no = ? WHERE document_id = ?")
         .bind(4242_i64)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .expect("stamp offline_fiscal_no (offline-origin)");

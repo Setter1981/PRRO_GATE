@@ -42,6 +42,7 @@ use prro::db::invariant_scan::{self, Violation};
 use prro::db::models::enums::{DocType, Protocol};
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::{ingress_inbox as inbox, ingress_inbox::NewInboxEntry};
+use prro::db::types::DbDocumentId;
 use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::transports::dps::dto::CheckSignBlob;
 use sqlx::SqlitePool;
@@ -188,7 +189,7 @@ async fn seed_prepared_sell(pool: &SqlitePool, fn_id: &str, doc_byte: u8) -> Doc
 
 async fn doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()

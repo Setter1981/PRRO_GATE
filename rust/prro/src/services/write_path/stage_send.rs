@@ -89,6 +89,7 @@ use crate::db::repositories::{
     transport_trace::{self, AttemptCompletion, NewAttempt},
 };
 use crate::db::tx::with_immediate;
+use crate::db::types::DbDocumentId;
 use crate::services::shift::transition;
 use crate::services::write_path::signer_guard::{self, SignerCashierMismatch};
 use crate::transports::dps::channel::DpsChannel;
@@ -1280,7 +1281,7 @@ async fn run_one_attempt(
             {
                 let fs_mode: Option<String> =
                     sqlx::query_scalar("SELECT fs_mode FROM fiscal_documents WHERE document_id = ?")
-                        .bind(doc)
+                        .bind(DbDocumentId(doc))
                         .fetch_one(&mut **tx)
                         .await?;
                 if fs_mode.as_deref() == Some("OFFLINE") {

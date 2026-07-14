@@ -1,5 +1,6 @@
 use prro::db::models::enums::FiscalMode;
 use prro::db::tx::with_immediate;
+use prro::db::types::DbShiftId;
 use prro::db::{
     models::{enums::ShiftState, ids::ShiftId},
     open_pool,
@@ -217,7 +218,7 @@ async fn new_shift_allowed_after_prior_left_active_set() {
     // transition path is exercised elsewhere; here we only set the index
     // precondition).
     sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
-        .bind(id1)
+        .bind(DbShiftId(id1))
         .execute(&pool)
         .await
         .unwrap();

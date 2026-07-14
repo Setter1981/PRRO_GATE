@@ -1,10 +1,10 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT document_id    as \"document_id: DocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DbDocState\",\n                  doc_type        as \"doc_type: DbDocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: CashierId\",\n                  signing_config_snapshot_id\n           FROM fiscal_documents\n           WHERE fiscal_number = ?\n             AND offline_session_id = ?\n             AND fs_mode = 'OFFLINE'\n             AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')\n           ORDER BY lnd, created_at, document_id",
+  "query": "SELECT document_id    as \"document_id: DbDocumentId\",\n                  fiscal_number,\n                  lnd,\n                  state           as \"state: DbDocState\",\n                  doc_type        as \"doc_type: DbDocType\",\n                  server_fiscal_no,\n                  submission_attempted_at,\n                  backend_profile_id,\n                  transport_profile_id,\n                  previous_hash         as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  unsigned_xml_sha256   as \"unsigned_xml_sha256: Vec<u8>\",\n                  signing_inputs_pinned_at,\n                  signed_by_cashier_id  as \"signed_by_cashier_id: DbCashierId\",\n                  signing_config_snapshot_id\n           FROM fiscal_documents\n           WHERE request_id = ?\n             AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')",
   "describe": {
     "columns": [
       {
-        "name": "document_id: DocumentId",
+        "name": "document_id: DbDocumentId",
         "ordinal": 0,
         "type_info": "Blob"
       },
@@ -69,7 +69,7 @@
         "type_info": "Text"
       },
       {
-        "name": "signed_by_cashier_id: CashierId",
+        "name": "signed_by_cashier_id: DbCashierId",
         "ordinal": 13,
         "type_info": "Text"
       },
@@ -80,7 +80,7 @@
       }
     ],
     "parameters": {
-      "Right": 2
+      "Right": 1
     },
     "nullable": [
       false,
@@ -100,5 +100,5 @@
       true
     ]
   },
-  "hash": "345d0fdceb02ed3bfe8caddc1fc0dd48574c74ec56634233f1154e7bcb289d56"
+  "hash": "083180729f26aa2f1e71afd311cea8707cf7daddfccc29b9f1220e97de3b2807"
 }

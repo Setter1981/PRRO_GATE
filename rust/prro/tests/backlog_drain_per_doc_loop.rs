@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -110,7 +111,7 @@ async fn seed_shift_with_state(pool: &SqlitePool, cashier_id: &str, state: &str)
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, ?, 'OFFLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(state)
     .bind(cashier_id)
@@ -125,7 +126,7 @@ async fn seed_shift_with_state(pool: &SqlitePool, cashier_id: &str, state: &str)
 /// the halt path need to backfill this column after seeding the shift.
 async fn set_node_current_shift(pool: &SqlitePool, shift_id: ShiftId) {
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(pool)
         .await
@@ -134,7 +135,7 @@ async fn set_node_current_shift(pool: &SqlitePool, shift_id: ShiftId) {
 
 async fn read_shift_state(pool: &SqlitePool, shift_id: ShiftId) -> String {
     sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -154,7 +155,7 @@ async fn seed_offline_session(pool: &SqlitePool, state: OfflineSessionState) -> 
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-20T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(state.as_str())
     .execute(pool)
@@ -196,14 +197,14 @@ async fn seed_complete_offline_local_ack(
             ?, ?, '2026-05-20T00:00:00Z', ? \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(&sha)
     .bind(signer_cashier)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(code_lnd)
     .bind(&dps_code)
     .execute(pool)
@@ -215,7 +216,7 @@ async fn seed_complete_offline_local_ack(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(b"FAKE-CMS-SIGNED-PAYLOAD".to_vec())
     .execute(pool)
     .await
@@ -230,7 +231,7 @@ async fn seed_complete_offline_local_ack(
     )
     .bind(FN)
     .bind(code_lnd)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -240,7 +241,7 @@ async fn seed_complete_offline_local_ack(
 
 async fn read_doc_state(pool: &SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -542,7 +543,7 @@ async fn c4_offline_minus_8_is_terminal_and_escalates_manual() {
         "SELECT server_status_code FROM transport_trace \
          WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_optional(&pool)
     .await
     .unwrap()
@@ -818,7 +819,7 @@ async fn strict_sequential_terminal_reject_halts_chain_and_escalates_manual() {
     // invariant_scan walk's first row matches its `None` start (the inbox row +
     // unsigned hash from seed_w12_finalize_prereqs are kept for the ACK advance).
     sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
-        .bind(doc_a)
+        .bind(DbDocumentId(doc_a))
         .execute(&pool)
         .await
         .unwrap();
@@ -1466,7 +1467,7 @@ async fn strict_sequential_transient_halts_this_tick_then_retries_next_tick() {
     .await
     .unwrap();
     sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
-        .bind(doc_a)
+        .bind(DbDocumentId(doc_a))
         .execute(&pool)
         .await
         .unwrap();
@@ -1581,7 +1582,7 @@ async fn h_m2_1_rejected_predecessor_never_wires_successor_bad_hash_prev_moot() 
     .await
     .unwrap();
     sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
-        .bind(doc_a)
+        .bind(DbDocumentId(doc_a))
         .execute(&pool)
         .await
         .unwrap();

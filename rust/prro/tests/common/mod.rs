@@ -59,6 +59,7 @@ use prro::crypto::provider::{
 };
 use prro::crypto::session::SigningSession;
 use prro::db::models::ids::DocumentId;
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{
@@ -366,12 +367,12 @@ pub async fn seed_w12_finalize_prereqs(
     )
     .bind(&unsigned_xml_sha[..])
     .bind(&prev_hash[..])
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await?;
     let request_id: Vec<u8> =
         sqlx::query_scalar("SELECT request_id FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(pool)
             .await?;
     let payload_sha = vec![0u8; 32];
