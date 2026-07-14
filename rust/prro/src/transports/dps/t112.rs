@@ -262,7 +262,10 @@ mod tests {
     #[test]
     fn kyiv_comp_date_nonzero_minute_seconds_summer() {
         // 2026-07-15 10:37:29 UTC → EEST (+3) → 13:37:29 local.
-        let utc = Utc.with_ymd_and_hms(2026, 7, 15, 10, 37, 29).single().unwrap();
+        let utc = Utc
+            .with_ymd_and_hms(2026, 7, 15, 10, 37, 29)
+            .single()
+            .unwrap();
         assert_eq!(
             kyiv_comp_date(utc),
             20_260_715_133_729_i64,
@@ -273,7 +276,10 @@ mod tests {
     #[test]
     fn kyiv_comp_date_nonzero_minute_seconds_winter() {
         // 2026-01-15 10:45:11 UTC → EET (+2) → 12:45:11 local.
-        let utc = Utc.with_ymd_and_hms(2026, 1, 15, 10, 45, 11).single().unwrap();
+        let utc = Utc
+            .with_ymd_and_hms(2026, 1, 15, 10, 45, 11)
+            .single()
+            .unwrap();
         assert_eq!(
             kyiv_comp_date(utc),
             20_260_115_124_511_i64,
@@ -285,7 +291,10 @@ mod tests {
     fn kyiv_comp_date_day_boundary_offset_flips_calendar_day() {
         // 2026-07-15 21:30:00 UTC → EEST (+3) → 2026-07-16 00:30:00 local:
         // the +3 offset rolls the instant PAST Kyiv midnight into the next day.
-        let utc = Utc.with_ymd_and_hms(2026, 7, 15, 21, 30, 0).single().unwrap();
+        let utc = Utc
+            .with_ymd_and_hms(2026, 7, 15, 21, 30, 0)
+            .single()
+            .unwrap();
         assert_eq!(
             kyiv_comp_date(utc),
             20_260_716_003_000_i64,
