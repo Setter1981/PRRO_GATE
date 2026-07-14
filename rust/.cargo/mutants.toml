@@ -11,3 +11,28 @@
 # test`), which cuts per-mutant wall time.
 additional_cargo_args = ["--features", "test-support"]
 test_tool = "nextest"
+
+# ── FW-1 confirmed dead / deliberately-retained survivors ──
+# These functions have ZERO callers @ 3e2088b (verified via `git grep`) and are
+# NOT test-oracle gaps — mutating them cannot change any reachable fiscal
+# behaviour. Excluding retires them from the actionable survivor list WITHOUT
+# deleting fiscal hot-zone source (physical deletion of the two true orphans is
+# a deferred architect decision, not a mutation-driven one). The comment on each
+# line IS the record of why — config-level anti-doc-rot.
+exclude_re = [
+    # A24 do-not-widen pin, twinned with `last_server_fiscal_no`: DELIBERATELY
+    # retained so no future consumer re-wires the stale ACK-only MAC-seed
+    # projection (would fork the DPS-legal chain). Boot uses the sibling
+    # `last_issued_unsigned_xml_sha256`. See the A24 seed-fork dossier.
+    "last_ack_unsigned_xml_sha256 ->",
+    # Orphaned by the M2-N4 ruling: the superseded classifier moved from an
+    # lnd-only compare against `max_submitted_lnd` to sfn-membership via
+    # `submitted_above_lnd`. The repo fn is dead; the concept lives on as local
+    # vars/audit keys of the same name (not this fn).
+    "fiscal_documents.rs.*max_submitted_lnd ->",
+    # Orphaned by B10: the END-online fix removed its only caller
+    # (`stage_sign::resolve_offline_dps_code_forced`). Offline-drain hot zone —
+    # its stale present-tense doc-comment is doc-rot; delete-vs-rewire is an
+    # architect call, so it is retired here rather than deleted.
+    "current_open_or_draining_session_id_tx ->",
+]
