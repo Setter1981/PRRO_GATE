@@ -158,7 +158,7 @@ async fn doc_state_sending_round_trips_through_sqlx() {
     fd::insert_prepared(&pool, &new).await.unwrap();
 
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(DocState::Sending)
+        .bind(DocState::Sending.as_str())
         .bind(id)
         .execute(&pool)
         .await

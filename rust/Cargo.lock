@@ -2156,6 +2156,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "prro-domain",
  "prro_crypto",
  "prro_escpos",
  "quote",
@@ -2188,6 +2189,7 @@ dependencies = [
 name = "prro-domain"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "trybuild",
  "uuid",

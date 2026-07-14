@@ -37,11 +37,12 @@
 
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::{DocState, NodeMode, Protocol, Severity, ShiftState};
+use crate::db::models::enums::{DocState, NodeMode, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::fiscal_documents::{self, TransitionOutcome};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::db::types::{DbProtocol, DbShiftState};
 use crate::services::shift::transition as shift_transition;
 use crate::services::write_path::signer_guard::SignerCashierMismatch as Scm;
 use crate::services::write_path::stage_send;
@@ -2073,13 +2074,17 @@ pub async fn run_boot_reconciliation(
                 // Read orphan shifts inside the envelope so any
                 // parallel writer (theoretical under non-SWFN) cannot
                 // race between SELECT and UPDATE.
-                let orphans: Vec<(ShiftId, ShiftState)> = sqlx::query_as(
-                    "SELECT shift_id, state FROM shifts \
-                     WHERE fiscal_number = ? AND state IN ('OPENING', 'CLOSING')",
-                )
-                .bind(&fn_owned)
-                .fetch_all(&mut **tx)
-                .await?;
+                let orphans: Vec<(ShiftId, ShiftState)> =
+                    sqlx::query_as::<_, (ShiftId, DbShiftState)>(
+                        "SELECT shift_id, state FROM shifts \
+                         WHERE fiscal_number = ? AND state IN ('OPENING', 'CLOSING')",
+                    )
+                    .bind(&fn_owned)
+                    .fetch_all(&mut **tx)
+                    .await?
+                    .into_iter()
+                    .map(|(id, state)| (id, state.0))
+                    .collect();
                 let orphans_resolved = orphans.len();
                 for (shift_id, current) in orphans {
                     // Branch e2 system-context recovery — raw UPDATE to
@@ -3389,7 +3394,7 @@ async fn dispatch_prepared_via_chain(
             let inbox_row = InboxRow {
                 request_id: inbox_request_id,
                 fiscal_number: inbox_row_db.try_get("fiscal_number")?,
-                protocol: inbox_row_db.try_get::<Protocol, _>("protocol")?,
+                protocol: inbox_row_db.try_get::<DbProtocol, _>("protocol")?.0,
                 operation_type: inbox_row_db.try_get("operation_type")?,
                 idempotency_key: inbox_row_db.try_get("idempotency_key")?,
                 status: inbox_row_db.try_get("status")?,

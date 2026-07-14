@@ -3,6 +3,11 @@ pub mod invariant_scan;
 pub mod models;
 pub mod repositories;
 pub mod tx;
+// CS-1b (contract §4): store-side sqlx wrappers (`DbDocState`, …) for the pure
+// `prro-domain` TEXT enums. Public so repository code + the `prro`-scope
+// conformance/round-trip tests (RP-CS1-5) can name them. Relocates into
+// `prro-store-sqlite` at CS-7.
+pub mod types;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;

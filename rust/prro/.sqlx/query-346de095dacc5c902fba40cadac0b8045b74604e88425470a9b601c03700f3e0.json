@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "UPDATE ingress_inbox\n           SET status = 'PROCESSING', processed_at = CURRENT_TIMESTAMP\n           WHERE request_id = ? AND status = 'NEW'\n           RETURNING request_id      as \"request_id: Vec<u8>\",\n                     fiscal_number,\n                     protocol         as \"protocol: Protocol\",\n                     operation_type,\n                     idempotency_key,\n                     status,\n                     payload_json,\n                     payload_sha256_canonical as \"payload_sha256_canonical: Vec<u8>\",\n                     correlation_id,\n                     received_at,\n                     signed_by_cashier_id,\n                     driver_id,\n                     business_ts,\n                     total_sum_kop",
+  "query": "SELECT request_id      as \"request_id: Vec<u8>\",\n                          fiscal_number,\n                          protocol         as \"protocol: DbProtocol\",\n                          operation_type,\n                          idempotency_key,\n                          status,\n                          payload_json,\n                          payload_sha256_canonical as \"payload_sha256_canonical: Vec<u8>\",\n                          correlation_id,\n                          received_at,\n                          signed_by_cashier_id,\n                          driver_id,\n                          business_ts,\n                          total_sum_kop\n                   FROM ingress_inbox\n                   WHERE fiscal_number = ? AND idempotency_key = ?",
   "describe": {
     "columns": [
       {
@@ -14,7 +14,7 @@
         "type_info": "Text"
       },
       {
-        "name": "protocol: Protocol",
+        "name": "protocol: DbProtocol",
         "ordinal": 2,
         "type_info": "Text"
       },
@@ -75,7 +75,7 @@
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 2
     },
     "nullable": [
       false,
@@ -94,5 +94,5 @@
       true
     ]
   },
-  "hash": "28844f04a43d90d595e05ea812c8ee995916a0158376995fb05720ac8ff43a76"
+  "hash": "346de095dacc5c902fba40cadac0b8045b74604e88425470a9b601c03700f3e0"
 }

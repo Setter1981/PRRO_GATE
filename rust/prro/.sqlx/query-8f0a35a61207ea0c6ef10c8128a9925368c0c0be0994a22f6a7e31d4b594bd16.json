@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT audit_id           as \"audit_id!\",\n                  entity_type, entity_id, event_type,\n                  severity            as \"severity: Severity\",\n                  actor, event_payload_json, created_at\n           FROM audit_log\n           WHERE entity_type = ? AND entity_id = ?\n           ORDER BY audit_id DESC\n           LIMIT ?",
+  "query": "SELECT audit_id           as \"audit_id!\",\n                  entity_type, entity_id, event_type,\n                  severity            as \"severity: DbSeverity\",\n                  actor, event_payload_json, created_at\n           FROM audit_log\n           WHERE entity_type = ? AND entity_id = ?\n           ORDER BY audit_id DESC\n           LIMIT ?",
   "describe": {
     "columns": [
       {
@@ -24,7 +24,7 @@
         "type_info": "Text"
       },
       {
-        "name": "severity: Severity",
+        "name": "severity: DbSeverity",
         "ordinal": 4,
         "type_info": "Text"
       },
@@ -58,5 +58,5 @@
       false
     ]
   },
-  "hash": "398821186b48175f43216a3a950ae6ac9746a52542e93f82eced2d9c28eb3206"
+  "hash": "8f0a35a61207ea0c6ef10c8128a9925368c0c0be0994a22f6a7e31d4b594bd16"
 }

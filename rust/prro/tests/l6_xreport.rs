@@ -192,7 +192,7 @@ async fn seed_receipt(
         .await
         .expect("insert_prepared");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(state)
+        .bind(state.as_str())
         .bind(id)
         .execute(pool)
         .await
@@ -246,7 +246,7 @@ async fn seed_service_doc(
         .await
         .expect("insert_prepared");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(state)
+        .bind(state.as_str())
         .bind(id)
         .execute(pool)
         .await
@@ -312,11 +312,14 @@ async fn read_seed(pool: &SqlitePool) -> Option<Vec<u8>> {
 }
 
 async fn read_shift_state(pool: &SqlitePool) -> ShiftState {
-    sqlx::query_scalar("SELECT shift_state FROM node_state WHERE fiscal_number = ?")
-        .bind(FN)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, prro::db::types::DbShiftState>(
+        "SELECT shift_state FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .0
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

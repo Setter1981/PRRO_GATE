@@ -210,8 +210,8 @@ async fn seed_node_state_online(pool: &SqlitePool, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Opened)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Opened.as_str())
     .bind(shift_id)
     .execute(pool)
     .await
@@ -467,8 +467,8 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_state: ShiftSt
          VALUES (?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -482,8 +482,8 @@ async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Offline)
-    .bind(ShiftState::Opened)
+    .bind(NodeMode::Offline.as_str())
+    .bind(ShiftState::Opened.as_str())
     .bind(shift_id)
     .execute(pool)
     .await
@@ -1456,8 +1456,8 @@ async fn blocked_node_is_offline_refused_and_inbox_terminal() {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Blocked)
-    .bind(ShiftState::Opened)
+    .bind(NodeMode::Blocked.as_str())
+    .bind(ShiftState::Opened.as_str())
     .bind(shift_id)
     .execute(&pool)
     .await

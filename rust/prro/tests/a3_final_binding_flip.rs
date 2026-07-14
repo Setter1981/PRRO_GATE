@@ -230,7 +230,7 @@ async fn seed_shift(pool: &SqlitePool, state: ShiftState) -> ShiftId {
     )
     .bind(shift_id)
     .bind(FN)
-    .bind(state)
+    .bind(state.as_str())
     .bind(CASHIER)
     .execute(pool)
     .await
@@ -251,8 +251,8 @@ async fn seed_node_state(
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .bind(shift_id)
     .execute(pool)
     .await

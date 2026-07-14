@@ -81,8 +81,8 @@ async fn seed_node_state(
          VALUES (?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .bind(current_shift_id)
     .bind(backend)
     .bind(transport)
@@ -143,7 +143,7 @@ async fn seed_shift_with_state(
     )
     .bind(shift_id)
     .bind(FN)
-    .bind(state)
+    .bind(state.as_str())
     .bind(opener)
     .execute(pool)
     .await

@@ -65,8 +65,8 @@ async fn seed_node_state(pool: &SqlitePool, shift_id: ShiftId, seed: Option<[u8;
          VALUES (?, ?, ?, ?, 10, 'b', 't', ?)",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Opened)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Opened.as_str())
     .bind(shift_id)
     .bind(seed.map(|s| s.to_vec()))
     .execute(pool)

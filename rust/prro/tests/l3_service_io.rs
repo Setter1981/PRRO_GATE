@@ -164,7 +164,7 @@ async fn seed_service_doc(
         .await
         .expect("insert_prepared");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(DocState::Ack)
+        .bind(DocState::Ack.as_str())
         .bind(id)
         .execute(pool)
         .await

@@ -64,6 +64,7 @@ use crate::db::repositories::{
     fiscal_number_config, signing_config_snapshots,
 };
 use crate::db::tx::with_immediate;
+use crate::db::types::DbDocType;
 
 use super::error_routing::MacRecoveryHint;
 use super::stage_send::StageSendError;
@@ -213,7 +214,7 @@ async fn read_recovery_inputs(
     // compile-time cache regen for a single MAC-recovery read.
     type Row = (
         String,          // fiscal_number
-        DocType,         // doc_type
+        DbDocType,       // doc_type (store-side wrapper; converted to DocType below)
         String,          // business_ts
         String,          // payload_json
         i64,             // lnd
@@ -248,6 +249,10 @@ async fn read_recovery_inputs(
         signing_config_snapshot_id,
         offline_fiscal_no,
     ) = row;
+    // Convert the store-side wrapper back to the pure domain enum so the rest of
+    // recovery (and the `RecoveryInputs { doc_type: DocType, .. }` field) is
+    // unchanged (CS-1b).
+    let doc_type: DocType = doc_type.0;
 
     let tax_number = match fiscal_number_config::get(pool, &fn_id)
         .await

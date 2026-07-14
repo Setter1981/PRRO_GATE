@@ -85,8 +85,8 @@ async fn seed_node_state(
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .bind(current_shift_id)
     .execute(pool)
     .await
@@ -101,7 +101,7 @@ async fn seed_shift(pool: &sqlx::SqlitePool, shift_id: ShiftId, state: ShiftStat
     )
     .bind(shift_id)
     .bind(FN)
-    .bind(state)
+    .bind(state.as_str())
     .execute(pool)
     .await
     .unwrap();

@@ -739,8 +739,8 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(HARNESS_FN)
-    .bind(mode)
-    .bind(ShiftState::Opened)
+    .bind(mode.as_str())
+    .bind(ShiftState::Opened.as_str())
     .bind(shift_id)
     .execute(pool)
     .await

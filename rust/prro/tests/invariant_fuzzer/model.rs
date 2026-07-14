@@ -1456,11 +1456,15 @@ impl RefModel {
     /// (invariant_scan.rs) forbids any raw DB read outside the tagged wrappers.
     pub async fn adopt_fault_deferred(&mut self, pool: &SqlitePool) {
         // docs ← the real ledger (lnd → state).
-        let docs: Vec<(i64, DocState)> =
-            sqlx::query_as("SELECT lnd, state FROM fiscal_documents ORDER BY lnd")
-                .fetch_all(pool)
-                .await
-                .unwrap();
+        let docs: Vec<(i64, DocState)> = sqlx::query_as::<_, (i64, prro::db::types::DbDocState)>(
+            "SELECT lnd, state FROM fiscal_documents ORDER BY lnd",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(lnd, s)| (lnd, s.0))
+        .collect();
         self.docs = docs.into_iter().collect();
         // A.3 PR-C — re-derive the offline-origin set (offline_fiscal_no set):
         // needed by the D5-gate blocker predicate to tell an offline-ER (issued)
@@ -1483,10 +1487,18 @@ impl RefModel {
 
         // mode / shift_state / next_lnd ← node_state.
         let (mode, shift_state, next_lnd): (NodeMode, ShiftState, i64) =
-            sqlx::query_as("SELECT mode, shift_state, next_lnd FROM node_state LIMIT 1")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+            sqlx::query_as::<
+                _,
+                (
+                    prro::db::types::DbNodeMode,
+                    prro::db::types::DbShiftState,
+                    i64,
+                ),
+            >("SELECT mode, shift_state, next_lnd FROM node_state LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .map(|(m, s, n)| (m.0, s.0, n))
+            .unwrap();
         self.mode = mode;
         self.shift_state = shift_state;
         self.next_lnd = next_lnd;
@@ -1496,12 +1508,13 @@ impl RefModel {
         self.seed = real_seed.is_some().then(|| synth_unsigned_hash(tip_lnd));
 
         // offline session + codes ← real.
-        self.session = sqlx::query_scalar::<_, OfflineSessionState>(
+        self.session = sqlx::query_scalar::<_, prro::db::types::DbOfflineSessionState>(
             "SELECT state FROM offline_sessions ORDER BY opened_at DESC LIMIT 1",
         )
         .fetch_optional(pool)
         .await
-        .unwrap();
+        .unwrap()
+        .map(|w| w.0);
         self.codes_issued = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM offline_codes")
             .fetch_one(pool)
             .await
@@ -1585,10 +1598,13 @@ impl RefModel {
     /// keeps the NEXT op dispatching from the real precondition state.
     pub async fn adopt_precondition(&mut self, pool: &SqlitePool) {
         let (mode, shift_state): (NodeMode, ShiftState) =
-            sqlx::query_as("SELECT mode, shift_state FROM node_state LIMIT 1")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+            sqlx::query_as::<_, (prro::db::types::DbNodeMode, prro::db::types::DbShiftState)>(
+                "SELECT mode, shift_state FROM node_state LIMIT 1",
+            )
+            .fetch_one(pool)
+            .await
+            .map(|(m, s)| (m.0, s.0))
+            .unwrap();
         self.mode = mode;
         self.shift_state = shift_state;
         // The ACTIVE (OPEN / DRAINING) session — the one a sell / drain
@@ -1599,13 +1615,17 @@ impl RefModel {
         // fires on a clean DB — it is a defense-in-depth sentinel (a >1-active
         // breach would otherwise be silently masked by the bare `LIMIT 1` picking
         // an arbitrary row).
-        let active_states: Vec<OfflineSessionState> = sqlx::query_scalar::<_, OfflineSessionState>(
-            "SELECT state FROM offline_sessions WHERE state IN ('OPEN', 'DRAINING') \
-             ORDER BY opened_at DESC, offline_session_id",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap();
+        let active_states: Vec<OfflineSessionState> =
+            sqlx::query_scalar::<_, prro::db::types::DbOfflineSessionState>(
+                "SELECT state FROM offline_sessions WHERE state IN ('OPEN', 'DRAINING') \
+                 ORDER BY opened_at DESC, offline_session_id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|w| w.0)
+            .collect();
         assert!(
             active_states.len() <= 1,
             "X2: multiple active OPEN/DRAINING offline sessions during precondition \

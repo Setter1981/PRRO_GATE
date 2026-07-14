@@ -140,9 +140,9 @@ async fn mirror_projection_tx(
         "UPDATE node_state SET shift_state = ? \
          WHERE fiscal_number = ? AND shift_state = ? AND current_shift_id = ?",
     )
-    .bind(to)
+    .bind(to.as_str())
     .bind(fiscal_number)
-    .bind(from)
+    .bind(from.as_str())
     .bind(shift_id)
     .execute(&mut **tx)
     .await?

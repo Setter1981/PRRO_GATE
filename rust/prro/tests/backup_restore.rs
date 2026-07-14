@@ -391,8 +391,8 @@ async fn seed_node_online(pool: &SqlitePool, shift_id: ShiftId) {
           backend_profile_id, transport_profile_id) VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Opened)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Opened.as_str())
     .bind(shift_id)
     .execute(pool)
     .await
@@ -651,7 +651,7 @@ async fn node_mode(pool: &SqlitePool) -> String {
 /// (`backlog_drain.rs:687`).
 async fn set_node_going_online(pool: &SqlitePool) {
     sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ?")
-        .bind(NodeMode::GoingOnline)
+        .bind(NodeMode::GoingOnline.as_str())
         .bind(FN)
         .execute(pool)
         .await

@@ -202,11 +202,14 @@ async fn seed_node_state(
          VALUES (?, 'ONLINE', ?, ?, 1, 'b', 't', ?)",
     )
     .bind(FN)
-    .bind(if current_shift_id.is_some() {
-        ShiftState::Opened
-    } else {
-        ShiftState::Closed
-    })
+    .bind(
+        if current_shift_id.is_some() {
+            ShiftState::Opened
+        } else {
+            ShiftState::Closed
+        }
+        .as_str(),
+    )
     .bind(current_shift_id)
     .bind(last_known.map(|h| &h[..]))
     .execute(pool)
@@ -238,7 +241,7 @@ async fn seed_prepared_doc(
     .bind(req_id)
     .bind(FN)
     .bind(lnd)
-    .bind(doc_type)
+    .bind(doc_type.as_str())
     .bind(payload_json)
     .bind(&payload_sha256[..])
     .execute(pool)
@@ -386,11 +389,14 @@ fn make_worker_context(
 // ─── DB probe helpers ────────────────────────────────────────────────
 
 async fn doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> DocState {
-    sqlx::query_scalar::<_, DocState>("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, prro::db::types::DbDocState>(
+        "SELECT state FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(doc_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .0
 }
 
 async fn doc_signing_inputs(

@@ -374,7 +374,7 @@ async fn seed_issued_receipt(
         .await
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(state)
+        .bind(state.as_str())
         .bind(id)
         .execute(main)
         .await
@@ -469,7 +469,7 @@ async fn seed_issued_receipt_with_items_opt(
         .await
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(state)
+        .bind(state.as_str())
         .bind(id)
         .execute(main)
         .await
@@ -519,7 +519,7 @@ async fn seed_issued_receipt_full(
         .await
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(state)
+        .bind(state.as_str())
         .bind(id)
         .execute(main)
         .await

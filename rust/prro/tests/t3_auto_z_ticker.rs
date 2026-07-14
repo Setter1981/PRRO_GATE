@@ -162,8 +162,8 @@ async fn seed_boot_baseline(pool: &SqlitePool) {
          VALUES (?, ?, ?, NULL, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Closed)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Closed.as_str())
     .execute(pool)
     .await
     .unwrap();

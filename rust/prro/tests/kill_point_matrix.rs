@@ -139,8 +139,8 @@ async fn seed_node_state_online(pool: &SqlitePool, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Opened)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Opened.as_str())
     .bind(shift_id)
     .execute(pool)
     .await
@@ -155,8 +155,8 @@ async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Offline)
-    .bind(ShiftState::Opened)
+    .bind(NodeMode::Offline.as_str())
+    .bind(ShiftState::Opened.as_str())
     .bind(shift_id)
     .execute(pool)
     .await
@@ -165,7 +165,7 @@ async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
 
 async fn set_node_mode(pool: &SqlitePool, mode: NodeMode) {
     sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ?")
-        .bind(mode)
+        .bind(mode.as_str())
         .bind(FN)
         .execute(pool)
         .await

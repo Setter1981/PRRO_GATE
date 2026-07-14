@@ -297,7 +297,7 @@ impl FuzzCtx {
     /// deliberately-adverse `OfflineSellDuringGoingOnline` intent).
     pub async fn force_node_mode(&self, mode: NodeMode) {
         sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ?")
-            .bind(mode)
+            .bind(mode.as_str())
             .bind(self.fn_id.as_str())
             .execute(&self.pool)
             .await
@@ -727,24 +727,28 @@ impl FuzzCtx {
     /// The real `node_state.mode` — the harness scan-timing gate reads this to
     /// scan ONLY in a SETTLED mode `{Online, Offline}` (never mid-transition).
     pub async fn read_node_mode(&self) -> NodeMode {
-        sqlx::query_scalar::<_, NodeMode>("SELECT mode FROM node_state WHERE fiscal_number = ?")
-            .bind(self.fn_id.as_str())
-            .fetch_one(&self.pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar::<_, prro::db::types::DbNodeMode>(
+            "SELECT mode FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+        .0
     }
 
     /// The real `node_state.shift_state` — the harness reads this BEFORE an op for
     /// the mode-independent AUD-K8-1 teeth (a drain re-tick on an RMR FN must make
     /// no new wire call).
     pub async fn read_shift_state(&self) -> ShiftState {
-        sqlx::query_scalar::<_, ShiftState>(
+        sqlx::query_scalar::<_, prro::db::types::DbShiftState>(
             "SELECT shift_state FROM node_state WHERE fiscal_number = ?",
         )
         .bind(self.fn_id.as_str())
         .fetch_one(&self.pool)
         .await
         .unwrap()
+        .0
     }
 
     /// B1/M1 — the FULL offline drain-cohort size: offline-origin docs in ANY
@@ -2361,8 +2365,8 @@ async fn seed_node_state_with_shift(
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .bind(current_shift_id)
     .execute(pool)
     .await

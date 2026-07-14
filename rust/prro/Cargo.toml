@@ -46,6 +46,13 @@ test-support = []
 live-dps = []
 
 [dependencies]
+# CS-1 architecture-consolidation: the pure domain model. CS-1b relocated the
+# TEXT-affinity state/protocol enums (DocState/DocType/ShiftState/NodeMode/
+# Protocol/OfflineSessionState/FiscalMode/Severity) here; `prro` re-exports
+# them via the `db::models::enums` facade shim and owns their SQLite mapping in
+# `db::types` (store-side `Db*` wrappers).
+prro-domain = { path = "../prro-domain" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }

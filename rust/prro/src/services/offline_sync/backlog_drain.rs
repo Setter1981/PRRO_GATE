@@ -3187,9 +3187,9 @@ async fn commit_finalize_envelope(
                 "UPDATE node_state SET mode = ? \
                  WHERE fiscal_number = ? AND mode = ?",
             )
-            .bind(NodeMode::Online)
+            .bind(NodeMode::Online.as_str())
             .bind(&fiscal_number_owned)
-            .bind(node_mode_from)
+            .bind(node_mode_from.as_str())
             .execute(&mut **tx)
             .await?
             .rows_affected();
