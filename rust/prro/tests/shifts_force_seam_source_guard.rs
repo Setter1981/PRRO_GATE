@@ -383,7 +383,8 @@ async fn force_seams_reject_malformed_and_oversized_evidence() {
             let res = with_immediate(&pool, move |tx| {
                 Box::pin(async move {
                     let o = if seam == "error" {
-                        shifts::force_to_error_with_audit(tx, shift_id, Some("op-007"), &bad_s).await
+                        shifts::force_to_error_with_audit(tx, shift_id, Some("op-007"), &bad_s)
+                            .await
                     } else {
                         shifts::force_to_manual_reconciliation_with_audit(
                             tx,
