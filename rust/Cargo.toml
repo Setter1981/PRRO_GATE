@@ -8,6 +8,11 @@ members = [
     "prro_escpos",
     "prro_escpos_daemon",
     "prro",
+    # CS-1 architecture-consolidation skeleton (contract §8 item 1). Empty
+    # crates for now; `prro-domain` receives the pure model in CS-1b/b′/c,
+    # `prro-testkit` is dev-only shared test scaffolding (publish = false).
+    "prro-domain",
+    "prro-testkit",
 ]
 
 # Profiles apply ONLY from the workspace root — the [profile.release]

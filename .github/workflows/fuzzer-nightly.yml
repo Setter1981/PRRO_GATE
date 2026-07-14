@@ -73,6 +73,14 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/fuzz-tmp"
           echo "TMPDIR=${RUNNER_TEMP}/fuzz-tmp" >> "$GITHUB_ENV"
 
+      - name: Purity gate — prro-domain (RP-CS1-1 / RP-CS1-4)
+        working-directory: rust
+        # CS-1a (contract §8 / RP-CS1-6): keep the cargo-metadata purity gate +
+        # testkit graph-absence check enforced on the nightly leg too, so a
+        # forbidden-dep / testkit-in-prod regression is caught even on a
+        # docs-heavy day the PR path-detector might route around.
+        run: cargo nextest run -p prro-domain -p prro-testkit --locked
+
       - name: Capstone large-N (both online + offline)
         working-directory: rust
         # Only the capstone reads FUZZ_CASES; the smoke + manual-demo blocks keep

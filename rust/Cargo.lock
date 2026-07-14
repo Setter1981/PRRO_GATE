@@ -2185,6 +2185,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "prro-domain"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "trybuild",
+ "uuid",
+]
+
+[[package]]
+name = "prro-testkit"
+version = "0.1.0"
+
+[[package]]
 name = "prro_crypto"
 version = "0.1.0-alpha.1"
 dependencies = [
