@@ -35,4 +35,26 @@ exclude_re = [
     # its stale present-tense doc-comment is doc-rot; delete-vs-rewire is an
     # architect call, so it is retired here rather than deleted.
     "current_open_or_draining_session_id_tx ->",
+
+    # ── round 2/3: ONLY genuinely dead / latent / test-only retired here ──
+    # The other LOW / observability round-2/3 survivors — boot_phase diagnostic
+    # counters (DispatchHistogram / ReconciliationSummary / TickSummary /
+    # dispatch_* `+=`), the reconcile_pending_inner log guard, stage_sign:372's
+    # single-writer-unreachable defensive arm, the dead-`active_shift` arm,
+    # iso8601_now / hex_lower audit-id+time helpers, is_unique_violation — are
+    # deliberately NOT excluded: they live in REAL functions whose CURRENTLY
+    # CAUGHT mutants would be silenced too (e.g. ReconciliationSummary feeds the
+    # asserted `prepared_dispatched == 1`), and they are already accepted in
+    # `docs/mutation/baseline/survivors.txt`, so `run.sh diff` reports them as
+    # known rather than NEW. See docs/MUTATION_TEETH_BACKLOG.md §C/D. Only
+    # zero-coverage-to-lose dead code is retired via config:
+    #
+    # LATENT: at-rest JKS password sealing is a deferred, unwired feature —
+    # `unseal_jks` and its `hex_digit` nibble decoder have ZERO production callers
+    # today. (`param_d`, the LIVE DSTU signing-scalar accessor, is deliberately
+    # NOT excluded — it is a real teeth-gap covered by a dedicated test.)
+    "unseal_jks",
+    "crypto/session.rs.*hex_digit",
+    # Test-only validator (`_for_testing`; not a production oracle).
+    "validate_signer_payload_shape_for_testing",
 ]
