@@ -213,6 +213,51 @@ If a test cannot be run:
 
 ---
 
+## Mutation-testing discipline (FW-1 ratchet)
+
+Green tests can be vacuous. Mutation testing (`cargo-mutants`) is the check on
+the tests; the committed `docs/mutation/baseline/survivors.txt` is the
+accepted-survivor line. The rule is a **ratchet** — test coverage may not
+silently erode, and survivors do not accumulate.
+
+1. **Diff-gate before merge.** A PR that changes fiscal-logic `src/`
+   (`services/write_path`, `services/reconciliation`, `repositories`,
+   `transports`, `adapters`, shift / offline / node state, `crypto`, migrations)
+   runs `scripts/mutation/run.sh diff` — cargo-mutants `--in-diff` on the changed
+   lines vs `origin/main`, compared to the baseline. It must introduce **NO new
+   survivor**. CI runs this (`mutation-diff`). Each NEW survivor is handled in
+   the same PR, one of two ways:
+   - **killed with a teeth test** (preferred), or
+   - **triaged EQUIVALENT / LOW and accepted** — with a one-line rationale, added
+     to `docs/mutation/baseline/survivors.txt` (or `rust/.cargo/mutants.toml`
+     `exclude_re` if genuinely dead / unreachable / test-only, never to silence a
+     real gap).
+   No survivor slips in unnoticed; each is a conscious decision. That is how we
+   don't accumulate.
+
+2. **Teeth are proven empirically — the canary.** A test is not "teeth" until you
+   have watched it go **RED under the exact mutation** and GREEN on revert.
+   Green-on-correct-code alone proves nothing — a toothless test passes too. Do
+   the mutate → RED → revert dance. (In the FW-1 round-1 pass this caught three
+   plausible-looking false-teeth.) When the mutation and the test live in the
+   same file, back up + restore the file (a `git checkout` would wipe the test).
+
+3. **Real-vs-equivalent before writing a test.** A survivor's plausible
+   reachability story can be wrong — confirm against the actual code + existing
+   coverage first (a masking guard upstream, a discarded value, a dead / test-only
+   fn). An EQUIVALENT mutant needs no test, only a note. Never ship a test whose
+   canary you have not seen fire.
+
+4. **New feature ⇒ mutation-impact check** (twins the fuzzer-impact rule): note
+   whether the feature adds a surface the diff-gate reaches (`--in-diff` sees
+   changed lines; an integration-only path may also need a scenario/fuzzer test).
+
+The full whole-workspace baseline is refreshed rarely, on a rented box
+(`scripts/mutation/bootstrap-vm.sh` → `run.sh full`); the per-PR gate is the
+cheap incremental `run.sh diff`.
+
+---
+
 ## Context discipline
 
 Main session context is precious.
