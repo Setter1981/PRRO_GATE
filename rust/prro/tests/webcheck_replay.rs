@@ -39,6 +39,7 @@ use prro::db::repositories::ingress_inbox::{
     self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
 };
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::{DbOfflineSessionId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
 use prro::services::reconciliation::RuntimeView;
@@ -722,7 +723,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(HARNESS_FN)
     .bind(CASHIER)
     .execute(pool)
@@ -741,7 +742,7 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
     .bind(HARNESS_FN)
     .bind(mode.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -753,7 +754,7 @@ async fn seed_open_offline_session(pool: &SqlitePool) {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-01-01T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(HARNESS_FN)
     .bind(OfflineSessionState::Open.as_str())
     .execute(pool)

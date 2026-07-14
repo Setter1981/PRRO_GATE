@@ -28,6 +28,7 @@ use prro::db::repositories::{
     fiscal_documents as fd, fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig,
     ingress_inbox as inbox, ingress_inbox::NewInboxEntry,
 };
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbRequestId};
 use prro::services::write_path::stage_sign::{self, SigningContext};
 use prro::services::write_path::types::{CanonicalFiscalCommand, WorkerContext};
 
@@ -158,7 +159,7 @@ async fn seed_open_session(pool: &sqlx::SqlitePool) -> OfflineSessionId {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-07-08T10:00:00Z')",
     )
-    .bind(sid)
+    .bind(DbOfflineSessionId(sid))
     .bind(FN)
     .execute(pool)
     .await
@@ -204,8 +205,8 @@ async fn seed_prepared_offline_sell(pool: &sqlx::SqlitePool, lnd: i64) -> (Docum
          ) VALUES (?, ?, ?, ?, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
              '2026-04-22T12:00:00Z', 15000, ?, ?)",
     )
-    .bind(doc_id)
-    .bind(req_id)
+    .bind(DbDocumentId(doc_id))
+    .bind(DbRequestId(req_id))
     .bind(FN)
     .bind(lnd)
     .bind(payload)
@@ -301,7 +302,7 @@ fn offline_sell_worker_ctx(doc_id: DocumentId, req_bytes: [u8; 16], lnd: i64) ->
 
 async fn fetch_offline_dps_code(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> Option<String> {
     sqlx::query_scalar("SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -309,7 +310,7 @@ async fn fetch_offline_dps_code(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> 
 
 async fn fetch_offline_fiscal_no(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> Option<i64> {
     sqlx::query_scalar("SELECT offline_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -317,7 +318,7 @@ async fn fetch_offline_fiscal_no(pool: &sqlx::SqlitePool, doc_id: DocumentId) ->
 
 async fn fetch_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -390,7 +391,7 @@ async fn online_sign_stays_bare_mac_and_never_touches_offline_columns() {
     // Insert an ONLINE prepared doc by overriding fs_mode.
     let (doc_id, req) = seed_prepared_offline_sell(&pool, 1).await;
     sqlx::query("UPDATE fiscal_documents SET fs_mode = 'ONLINE' WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -497,12 +498,12 @@ async fn offline_re_sign_reuses_stamped_code_no_double_consume() {
     // Delete the files the first (fully-completed) sign inserted so we faithfully
     // model the crash-before-persist window on re-sign.
     sqlx::query("UPDATE fiscal_documents SET state = 'PREPARED' WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query("DELETE FROM document_files WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -617,7 +618,7 @@ async fn unstamped_signed_offline_doc_aborts_at_offline_ack_even_with_session_an
          WHERE document_id = ?",
     )
     .bind(vec![0xA1u8; 32])
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(&pool)
     .await
     .unwrap();

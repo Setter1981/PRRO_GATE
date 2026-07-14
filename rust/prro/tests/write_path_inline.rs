@@ -23,6 +23,7 @@ use prro::db::models::enums::{
 use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::seam::FiscalError;
 use prro::services::write_path::inline;
@@ -212,7 +213,7 @@ async fn seed_node_state_online(pool: &SqlitePool, shift_id: ShiftId) {
     .bind(FN)
     .bind(NodeMode::Online.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -225,7 +226,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -307,9 +308,9 @@ async fn seed_committed_sell_ack(pool: &SqlitePool, shift_id: ShiftId) {
          ) VALUES (?, randomblob(16), ?, ?, 1, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
             '2026-06-09T12:00:00Z', ?, randomblob(32), 'DPS-SEED-1', '2026-06-09T12:00:05Z', ?)",
     )
-    .bind(prro::db::models::ids::DocumentId::new())
+    .bind(DbDocumentId(prro::db::models::ids::DocumentId::new()))
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(SELL_PAYLOAD)
     .bind(TOTAL_KOP)
     .execute(pool)
@@ -484,7 +485,7 @@ async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
     .bind(FN)
     .bind(NodeMode::Offline.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -496,7 +497,7 @@ async fn seed_open_offline_session(pool: &SqlitePool) -> OfflineSessionId {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-06-09T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(OfflineSessionState::Open.as_str())
     .execute(pool)
@@ -1458,7 +1459,7 @@ async fn blocked_node_is_offline_refused_and_inbox_terminal() {
     .bind(FN)
     .bind(NodeMode::Blocked.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(&pool)
     .await
     .unwrap();
@@ -1578,10 +1579,10 @@ async fn noop_resolves_accepted_truth_from_ledger() {
          ) VALUES (?, ?, ?, ?, 1, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
             '2026-06-09T12:00:00Z', '{}', ?, ?, '2026-06-09T12:00:05Z', ?)",
     )
-    .bind(prro::db::models::ids::DocumentId::new())
+    .bind(DbDocumentId(prro::db::models::ids::DocumentId::new()))
     .bind(&row.request_id[..])
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(vec![0u8; 32])
     .bind(SERVER_FISCAL_NO)
     .bind(TOTAL_KOP)

@@ -19,6 +19,7 @@
 
 use crate::db::models::ids::DocumentId;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::DbDocumentId;
 
 /// Schema-CHECK-aligned set of artefact kinds.  Adding a variant
 /// requires a matching migration to extend the
@@ -55,7 +56,7 @@ pub async fn insert_tx(
     content: &[u8],
 ) -> sqlx::Result<()> {
     sqlx::query("INSERT INTO document_files (document_id, kind, content) VALUES (?, ?, ?)")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .bind(kind)
         .bind(content)
         .execute(&mut **tx)
@@ -72,7 +73,7 @@ pub async fn get_tx(
 ) -> sqlx::Result<Option<Vec<u8>>> {
     let row: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .bind(kind)
             .fetch_optional(&mut **tx)
             .await?;
@@ -130,7 +131,7 @@ pub async fn replace_tx(
     sqlx::query(
         "INSERT OR REPLACE INTO document_files (document_id, kind, content) VALUES (?, ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(kind)
     .bind(content)
     .execute(&mut **tx)

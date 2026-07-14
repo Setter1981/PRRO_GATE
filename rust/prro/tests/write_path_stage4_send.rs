@@ -31,6 +31,7 @@ use prro::db::models::enums::DocState;
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::fiscal_documents::allowed_transition;
 use prro::db::repositories::transport_trace;
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::error_routing::RetryClass;
 use prro::services::write_path::stage_send::{self, StageSendError, StageSendOutcome};
 use prro::transports::dps::channel::DpsChannel;
@@ -146,7 +147,7 @@ async fn seed_signed_doc_with_xml(
 
 async fn read_doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read state")
@@ -154,7 +155,7 @@ async fn read_doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
 
 async fn read_server_fiscal_no(pool: &SqlitePool, doc: DocumentId) -> Option<String> {
     sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read server_fiscal_no")
@@ -162,7 +163,7 @@ async fn read_server_fiscal_no(pool: &SqlitePool, doc: DocumentId) -> Option<Str
 
 async fn read_submission_attempted_at(pool: &SqlitePool, doc: DocumentId) -> Option<String> {
     sqlx::query_scalar("SELECT submission_attempted_at FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read submission_attempted_at")
@@ -786,7 +787,7 @@ async fn pattern_b_ordering_spy_observes_committed_sending_before_send_chk() {
                     let row: String = sqlx::query_scalar(
                         "SELECT state FROM fiscal_documents WHERE document_id = ?",
                     )
-                    .bind(doc)
+                    .bind(DbDocumentId(doc))
                     .fetch_one(&pool)
                     .await
                     .expect("spy SELECT state");
@@ -977,7 +978,7 @@ async fn seed_w7a_offline_local_ack(pool: &SqlitePool, doc_byte: u8, code_lnd: i
     )
     .bind(code_lnd)
     .bind(consumed_at)
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(pool)
     .await
     .expect("seed offline_code (consumed by this doc)");
@@ -993,7 +994,7 @@ async fn seed_w7a_offline_local_ack(pool: &SqlitePool, doc_byte: u8, code_lnd: i
     .bind(consumed_at)
     .bind(&session_id)
     .bind(&dps_code)
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(pool)
     .await
     .expect("backfill W7a columns on fiscal_documents");
@@ -1257,7 +1258,7 @@ async fn w9a_offline_local_ack_with_non_positive_offline_fiscal_no_surfaces_type
         // invalid payload.
         sqlx::query("UPDATE fiscal_documents SET offline_fiscal_no = ? WHERE document_id = ?")
             .bind(bad_offline_fiscal_no)
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .execute(&pool)
             .await
             .expect("backfill non-positive offline_fiscal_no");
@@ -1669,7 +1670,7 @@ async fn mac_recovery_resigned_drives_attempt_2_through_loop_to_sent() {
     let counter: i64 = sqlx::query_scalar(
         "SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1711,7 +1712,7 @@ async fn mac_recovery_resigned_drives_attempt_2_through_loop_to_sent() {
     let signed: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT content FROM document_files WHERE document_id = ? AND kind = 'SIGNED_XML'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1741,7 +1742,7 @@ async fn variant_p_mac_recovery_skips_drift_assert_and_advances_seed() {
     // Recovery already burnt its single-bit budget; the node seed was re-anchored
     // to a NON-matching DPS tip (doc.previous_hash stayed NULL / genesis).
     sqlx::query("UPDATE fiscal_documents SET mac_recovery_attempts = 1 WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();

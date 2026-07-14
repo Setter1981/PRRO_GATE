@@ -47,6 +47,7 @@ use crate::db::models::ids::ShiftId;
 use crate::db::repositories::{
     fiscal_documents, node_state, payment_methods, signing_config_snapshots,
 };
+use crate::db::types::DbShiftId;
 use crate::services::write_path::tax_summary::{ResolvedTaxGroup, TaxResolutionSnapshot};
 use crate::xml::{calc_tax, CalcTaxError};
 use serde::{Deserialize, Serialize};
@@ -1257,7 +1258,7 @@ pub async fn aggregate_z_payload_for_shift(
                AND state IN ('ACK','OFFLINE_LOCAL_ACK')",
         )
         .bind(fiscal_number)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(main_pool)
         .await
         .map_err(ConvertError::LedgerRead)?;

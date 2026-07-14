@@ -24,7 +24,8 @@
 //! respected because every `DbX` is a `prro`-local type.
 
 use prro_domain::{
-    DocState, DocType, FiscalMode, NodeMode, OfflineSessionState, Protocol, Severity, ShiftState,
+    CashierId, DocState, DocType, DocumentId, FiscalMode, NodeMode, OfflineSessionId,
+    OfflineSessionState, OperatorId, PrinterId, Protocol, RequestId, Severity, ShiftId, ShiftState,
 };
 use sqlx::sqlite::{Sqlite, SqliteArgumentValue};
 use sqlx::{Decode, Encode, Type};
@@ -100,3 +101,150 @@ db_text_enum!(DbProtocol, Protocol);
 db_text_enum!(DbDocType, DocType);
 db_text_enum!(DbFiscalMode, FiscalMode);
 db_text_enum!(DbSeverity, Severity);
+
+// ─── CS-1b′: store-side wrappers for the pure `prro-domain` ids ───────
+//
+// The six UUID-BLOB ids (`DocumentId`, …) and `CashierId` are sqlx-free in
+// `prro-domain` (the orphan rule forbids `impl sqlx::* for prro_domain::X` from
+// `prro`, and dragging sqlx into the pure crate would break the purity gate).
+// Each gets a thin `prro`-local `Db*` newtype that owns the SQLite mapping,
+// **byte-identical** to the pre-move impls (contract §2). `DriverId` gets NO
+// wrapper — it keeps its raw-`String` boundary (bind `.as_str()`, decode
+// `String` then `DriverId::new()`), exactly as the baseline. Relocates into
+// `prro-store-sqlite` at CS-7.
+
+/// Define a store-side BLOB wrapper `Db$name(pub $inner)` for a pure UUID-BLOB
+/// id that exposes `as_bytes(&self) -> &[u8; 16]` and `from_bytes([u8; 16])`.
+///
+/// Byte-identical to the pre-move `id_newtype!` sqlx impls: `Type` = `Vec<u8>`
+/// (BLOB affinity); `Encode` pushes the 16 raw bytes as an owned blob; `Decode`
+/// reads a `Vec<u8>`, `try_into`s a `[u8; 16]` (**length≠16 ⇒ decode error
+/// `"invalid UUID byte length"`**, no truncation/pad), then rebuilds the id.
+macro_rules! db_blob_id {
+    ($wrapper:ident, $inner:ty) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub struct $wrapper(pub $inner);
+
+        impl From<$inner> for $wrapper {
+            fn from(v: $inner) -> Self {
+                Self(v)
+            }
+        }
+
+        impl From<$wrapper> for $inner {
+            fn from(w: $wrapper) -> Self {
+                w.0
+            }
+        }
+
+        impl Type<Sqlite> for $wrapper {
+            fn type_info() -> <Sqlite as sqlx::Database>::TypeInfo {
+                <Vec<u8> as Type<Sqlite>>::type_info()
+            }
+        }
+
+        impl<'q> Encode<'q, Sqlite> for $wrapper {
+            fn encode_by_ref(
+                &self,
+                buf: &mut <Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+            ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+                // Owned blob: self's lifetime is shorter than 'q, so we copy
+                // the 16-byte UUID into the argument buffer.
+                buf.push(SqliteArgumentValue::Blob(Cow::Owned(
+                    self.0.as_bytes().to_vec(),
+                )));
+                Ok(sqlx::encode::IsNull::No)
+            }
+        }
+
+        impl<'r> Decode<'r, Sqlite> for $wrapper {
+            fn decode(
+                value: <Sqlite as sqlx::Database>::ValueRef<'r>,
+            ) -> Result<Self, sqlx::error::BoxDynError> {
+                let bytes = <Vec<u8> as Decode<Sqlite>>::decode(value)?;
+                let array: [u8; 16] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "invalid UUID byte length")?;
+                Ok(Self(<$inner>::from_bytes(array)))
+            }
+        }
+    };
+}
+
+db_blob_id!(DbDocumentId, DocumentId);
+db_blob_id!(DbRequestId, RequestId);
+db_blob_id!(DbShiftId, ShiftId);
+db_blob_id!(DbOperatorId, OperatorId);
+db_blob_id!(DbPrinterId, PrinterId);
+db_blob_id!(DbOfflineSessionId, OfflineSessionId);
+
+/// Store-side TEXT wrapper for the legacy-tolerant `CashierId`.
+///
+/// Byte-identical to the pre-move `CashierId` sqlx impls (contract §2):
+///   * `Type<Sqlite>` = `String` (TEXT affinity).
+///   * `Encode` writes `self.0.as_str()` as owned TEXT.
+///   * `Decode` reads a `String`, then hydrates via
+///     [`CashierId::from_persisted_unchecked`] — **legacy-tolerant**: an empty
+///     string is accepted **SILENTLY**; a `> CashierId::MAX_LEN` value is
+///     accepted **WITH a `tracing::warn!`** (defensive observability for
+///     upstream schema drift — no panic, no decode error, which would reject a
+///     historical row). The strict `CashierId::new()` still rejects Empty /
+///     TooLong at construction; only this store-side decode path is tolerant.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DbCashierId(pub CashierId);
+
+impl From<CashierId> for DbCashierId {
+    fn from(v: CashierId) -> Self {
+        Self(v)
+    }
+}
+
+impl From<DbCashierId> for CashierId {
+    fn from(w: DbCashierId) -> Self {
+        w.0
+    }
+}
+
+impl Type<Sqlite> for DbCashierId {
+    fn type_info() -> <Sqlite as sqlx::Database>::TypeInfo {
+        <String as Type<Sqlite>>::type_info()
+    }
+}
+
+impl<'q> Encode<'q, Sqlite> for DbCashierId {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        buf.push(SqliteArgumentValue::Text(Cow::Owned(
+            self.0.as_str().to_owned(),
+        )));
+        Ok(sqlx::encode::IsNull::No)
+    }
+}
+
+impl<'r> Decode<'r, Sqlite> for DbCashierId {
+    fn decode(
+        value: <Sqlite as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let s = <String as Decode<Sqlite>>::decode(value)?;
+        // Decode path is from DB-side state — we assume invariants were
+        // checked at insert time; bypass the constructor checks to avoid
+        // rejecting historical rows that pre-date W14a-2a (including the
+        // `__pre_w14a1__` sentinel from migration 016 back-fill).
+        //
+        // PR #66 R1 L1 (moved store-side in CS-1b′): defensive observability —
+        // emit `tracing::warn!` if a stored cashier_id ever exceeds MAX_LEN.
+        // No panic, no Decode error (would reject the row); operators detect
+        // schema drift via logs.
+        if s.len() > CashierId::MAX_LEN {
+            tracing::warn!(
+                cashier_id_len = s.len(),
+                max_len = CashierId::MAX_LEN,
+                "CashierId decoded value exceeds MAX_LEN — possible upstream schema drift"
+            );
+        }
+        Ok(Self(CashierId::from_persisted_unchecked(s)))
+    }
+}

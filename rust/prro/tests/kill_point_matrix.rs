@@ -45,6 +45,7 @@ use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEnt
 use prro::db::repositories::transport_trace::{self, NewAttempt};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::tx::with_immediate;
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::canonical_builder::build_canonical;
 use prro::services::offline_sync::backlog_drain;
@@ -122,7 +123,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -141,7 +142,7 @@ async fn seed_node_state_online(pool: &SqlitePool, shift_id: ShiftId) {
     .bind(FN)
     .bind(NodeMode::Online.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -157,7 +158,7 @@ async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
     .bind(FN)
     .bind(NodeMode::Offline.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -178,7 +179,7 @@ async fn seed_open_offline_session(pool: &SqlitePool) -> OfflineSessionId {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-06-09T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(OfflineSessionState::Open.as_str())
     .execute(pool)
@@ -431,11 +432,14 @@ async fn sell_state_after(pool: &SqlitePool) -> String {
 }
 
 async fn read_doc_id(pool: &SqlitePool) -> DocumentId {
-    sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE fiscal_number = ?")
-        .bind(FN)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, DbDocumentId>(
+        "SELECT document_id FROM fiscal_documents WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .0
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1288,7 +1292,7 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
     let probe_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM transport_trace WHERE document_id = ? AND is_probe = 1",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1594,15 +1598,18 @@ async fn m2_online_offline_boundary_chain_continuous() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
 
     async fn doc_id_by_req(pool: &SqlitePool, req: &[u8; 16]) -> DocumentId {
-        sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE request_id = ?")
-            .bind(&req[..])
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar::<_, DbDocumentId>(
+            "SELECT document_id FROM fiscal_documents WHERE request_id = ?",
+        )
+        .bind(&req[..])
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .0
     }
     async fn state_by_id(pool: &SqlitePool, id: DocumentId) -> String {
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(id)
+            .bind(DbDocumentId(id))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -1610,7 +1617,7 @@ async fn m2_online_offline_boundary_chain_continuous() {
     async fn col_by_id(pool: &SqlitePool, id: DocumentId, col: &str) -> Option<Vec<u8>> {
         let q = format!("SELECT {col} FROM fiscal_documents WHERE document_id = ?");
         sqlx::query_scalar(&q)
-            .bind(id)
+            .bind(DbDocumentId(id))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -1827,7 +1834,7 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     .await
     .unwrap();
     sqlx::query("UPDATE shifts SET state = 'OPENED_LOCAL_PENDING_DRAIN' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -1893,7 +1900,7 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     assert_eq!(refused, 1, "one MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED audit");
     // Shift escalated to manual-recon.
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2018,7 +2025,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
 
     // FN escalated to durable manual-recon via edge 15 (plain Opened, NOT wedged).
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2132,7 +2139,7 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
         let pool = &pool;
         async move {
             sqlx::query_scalar::<_, String>("SELECT state FROM shifts WHERE shift_id = ?")
-                .bind(shift_id)
+                .bind(DbShiftId(shift_id))
                 .fetch_one(pool)
                 .await
                 .unwrap()
@@ -2415,7 +2422,7 @@ async fn read_doc_state_by_lnd(pool: &SqlitePool, lnd: i64) -> String {
 }
 
 async fn doc_id_by_lnd(pool: &SqlitePool, lnd: i64) -> DocumentId {
-    sqlx::query_scalar(
+    sqlx::query_scalar::<_, DbDocumentId>(
         "SELECT document_id FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?",
     )
     .bind(FN)
@@ -2423,11 +2430,12 @@ async fn doc_id_by_lnd(pool: &SqlitePool, lnd: i64) -> DocumentId {
     .fetch_one(pool)
     .await
     .unwrap()
+    .0
 }
 
 async fn read_shift_state_by_id(pool: &SqlitePool, shift_id: ShiftId) -> String {
     sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -2911,7 +2919,7 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
 
     // Pin the dangling-pointer status quo: shift CLOSED, current_shift_id still set.
     sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -3020,7 +3028,7 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
 
     // The Batch-C escalation state: shift CAS'd to RMR, mode LEFT at Online.
     sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -3164,7 +3172,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
     // Make the shift NON-escalatable: a stale current_shift_id dangling on a
     // CLOSED shift (SEAM-D-1 mirror-desync).  (Closed → RMR) is not whitelisted.
     sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();

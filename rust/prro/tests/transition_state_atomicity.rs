@@ -30,6 +30,7 @@ use prro::db::repositories::{
     fiscal_number_config::{self as fn_repo, NewFnConfig},
 };
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 
 async fn fresh_pool_with_fn() -> (sqlx::SqlitePool, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -181,7 +182,7 @@ async fn transition_state_post_contention_state_is_signed() {
 
     let state: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(id)
+            .bind(DbDocumentId(id))
             .fetch_one(&pool)
             .await
             .unwrap();

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use prro::db::models::ids::{DocumentId, RequestId};
 use prro::db::open_pool;
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxInsertOutcome, NewInboxEntry};
+use prro::db::types::DbDocumentId;
 use prro::runtime::ingress::replay::{resolve_replay, ReplayResolution};
 use prro::services::reconciliation::inbox_reaper::{sweep, REAPER_STALE_THRESHOLD};
 use sqlx::SqlitePool;
@@ -92,7 +93,7 @@ async fn seed_doc(pool: &SqlitePool, rid: &[u8; 16], state: &str, lnd: i64) {
          ) VALUES (?, ?, ?, ?, 'SELL', ?, 'b', 't', 'ONLINE', \
             '2026-06-09T12:00:00Z', 15000, '{}', ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(&rid[..])
     .bind(FN)
     .bind(lnd)

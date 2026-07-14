@@ -6,6 +6,7 @@
 //! glue is exercised end-to-end against bundled SQLite.
 
 use prro::db::models::*;
+use prro::db::types::DbShiftId;
 
 #[test]
 fn document_id_roundtrip_bytes() {
@@ -94,16 +95,18 @@ async fn shift_id_roundtrips_through_shifts_blob_column() {
             cash_balance_kop, opened_by_cashier_id) VALUES (?, '5555555555', 'CREATED', 'ONLINE', \
             '2026-04-22T00:00:00Z', 0, 'test-cashier')",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .execute(&pool)
     .await
     .unwrap();
 
-    let got: ShiftId =
-        sqlx::query_scalar("SELECT shift_id FROM shifts WHERE fiscal_number = '5555555555'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let got: ShiftId = sqlx::query_scalar::<_, DbShiftId>(
+        "SELECT shift_id FROM shifts WHERE fiscal_number = '5555555555'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .0;
     assert_eq!(
         id, got,
         "round-trip BLOB through real shifts column must be lossless"

@@ -63,6 +63,7 @@ use async_trait::async_trait;
 
 use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::kvt2_advance;
@@ -207,7 +208,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(pool)
@@ -222,7 +223,7 @@ async fn seed_offline_session(pool: &SqlitePool, state: OfflineSessionState) -> 
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-21T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(state.as_str())
     .execute(pool)
@@ -296,16 +297,16 @@ async fn seed_doc_in_state_typed(
             ?, ? \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(doc_type)
     .bind(state)
     .bind(&sha)
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(code_lnd)
     .bind(&dps_code)
     .bind(server_fiscal_no)
@@ -317,7 +318,7 @@ async fn seed_doc_in_state_typed(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(b"FAKE-CMS".to_vec())
     .execute(pool)
     .await
@@ -329,7 +330,7 @@ async fn seed_doc_in_state_typed(
     )
     .bind(FN)
     .bind(code_lnd)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -339,7 +340,7 @@ async fn seed_doc_in_state_typed(
 
 async fn read_doc_state(pool: &SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -382,7 +383,7 @@ async fn seed_transport_trace_attempt(
                 'RETRYABLE_SERVER', -1, 'Server', 'seed-er-class-guard', ? \
              )",
         )
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .bind(n)
         .bind(&sha)
         .bind(retry_class)
@@ -644,7 +645,7 @@ async fn c5_kvt1_doc_w12_reentry_advances_to_ack() {
     let persisted_kvt1_raw: Vec<u8> = sqlx::query_scalar(
         "SELECT content FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .expect("Envelope 1b MUST persist KVT1_RAW row in document_files");
@@ -770,7 +771,7 @@ async fn er_guard_budget_exhausted_no_wire_escalates_to_manual() {
     // plain Opened shift now escalates the FN shift to Manual via whitelist edge 15;
     // escalate_drain_to_manual reads node_state.current_shift_id, so backfill it.
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -815,7 +816,7 @@ async fn er_guard_budget_exhausted_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure HALTS + escalates the FN shift to
     // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -833,7 +834,7 @@ async fn er_guard_fn_config_error_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure escalates the FN shift to Manual
     // (edge 15) which reads node_state.current_shift_id; backfill it.
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -865,7 +866,7 @@ async fn er_guard_fn_config_error_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure HALTS + escalates the FN shift to
     // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -881,7 +882,7 @@ async fn er_guard_legacy_chain_settle_retry_no_wire_escalates_to_manual() {
     let (_d, pool) = fresh_pool().await;
     let (doc, shift_id, _sess) = seed_er_with_class(&pool, "DrainChainSettleRetry", 1).await;
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -914,7 +915,7 @@ async fn er_guard_legacy_chain_settle_retry_no_wire_escalates_to_manual() {
         1
     );
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -933,7 +934,7 @@ async fn er_guard_wrapper_bug_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure escalates the FN shift to Manual
     // (edge 15) which reads node_state.current_shift_id; backfill it.
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -960,7 +961,7 @@ async fn er_guard_wrapper_bug_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure HALTS + escalates the FN shift to
     // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -978,7 +979,7 @@ async fn er_guard_operator_escalation_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure escalates the FN shift to Manual
     // (edge 15) which reads node_state.current_shift_id; backfill it.
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -1009,7 +1010,7 @@ async fn er_guard_operator_escalation_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure HALTS + escalates the FN shift to
     // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1027,7 +1028,7 @@ async fn er_guard_mac_recovery_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure escalates the FN shift to Manual
     // (edge 15) which reads node_state.current_shift_id; backfill it.
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -1054,7 +1055,7 @@ async fn er_guard_mac_recovery_no_wire_escalates_to_manual() {
     // Strict-sequential: terminal failure HALTS + escalates the FN shift to
     // Manual (plain Opened → whitelist edge 15) + Critical halt audit.
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1072,7 +1073,7 @@ async fn er_guard_terminal_reject_no_wire_escalates_critical_inconsistent() {
     // Strict-sequential: terminal failure escalates the FN shift to Manual
     // (edge 15) which reads node_state.current_shift_id; backfill it.
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -1117,7 +1118,7 @@ async fn er_guard_terminal_reject_no_wire_escalates_critical_inconsistent() {
     // Manual (plain Opened → whitelist edge 15) + Critical halt audit (in addition
     // to the structural-inconsistency / Critical ER-escalation envelope above).
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1315,7 +1316,7 @@ async fn seam_b3_superseded_predecessor_halts_chain_and_escalates_manual() {
     // Drain reads node_state.current_shift_id to identify the shift to escalate
     // (M2-N2a edge 15 for plain Opened).
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -1355,7 +1356,7 @@ async fn seam_b3_superseded_predecessor_halts_chain_and_escalates_manual() {
     let h_b = common::chain_anchor(0x02);
     sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = ? WHERE document_id = ?")
         .bind(&h_a[..])
-        .bind(doc_a)
+        .bind(DbDocumentId(doc_a))
         .execute(&pool)
         .await
         .unwrap();
@@ -1399,7 +1400,7 @@ async fn seam_b3_superseded_predecessor_halts_chain_and_escalates_manual() {
 
     // FN escalated to durable manual-recon on a plain Opened shift (edge 15).
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1528,10 +1529,10 @@ async fn c5_walker_scope_excludes_online_cross_session_docs() {
             'b', 't', 'ONLINE', '2026-05-21T00:00:00Z', \
             '{}', ?, ?, ?)",
     )
-    .bind(online_doc)
+    .bind(DbDocumentId(online_doc))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(2_i64)
     .bind(&sha)
     .bind(CASHIER_OK)
@@ -1542,7 +1543,7 @@ async fn c5_walker_scope_excludes_online_cross_session_docs() {
     sqlx::query(
         "INSERT INTO document_files(document_id, kind, content) VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(online_doc)
+    .bind(DbDocumentId(online_doc))
     .bind(b"FAKE".to_vec())
     .execute(&pool)
     .await
@@ -1635,7 +1636,7 @@ async fn c5b2_sent_replay_lastchk_match_persists_kvt1_raw_byte_for_byte() {
     let kvt1_raw: Vec<u8> = sqlx::query_scalar(
         "SELECT content FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .expect("KVT1_RAW row MUST exist after SentReplay 1a-replay envelope commit");
@@ -2042,14 +2043,14 @@ async fn er_guard_pending_drain_manual_class_halts_and_escalates_shift() {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -2082,7 +2083,7 @@ async fn er_guard_pending_drain_manual_class_halts_and_escalates_shift() {
 
     // Shift CAS'd via edge 6 (pending-drain ladder).
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2165,16 +2166,16 @@ async fn seed_kvt2_doc_for_stage_finalize(
             ?, ?, ?, '2026-05-21T00:00:00Z', ? \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(&req_bytes[..])
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(&payload_sha)
     .bind(&unsigned_xml_sha[..])
     .bind(&previous_hash[..])
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(code_lnd)
     .bind(server_fiscal_no)
     .execute(pool)
@@ -2191,7 +2192,7 @@ async fn seed_kvt2_doc_for_stage_finalize(
             "INSERT INTO document_files(document_id, kind, content) \
              VALUES (?, ?, ?)",
         )
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .bind(kind)
         .bind(content)
         .execute(pool)
@@ -2217,7 +2218,7 @@ async fn seed_kvt2_doc_for_stage_finalize(
     )
     .bind(FN)
     .bind(code_lnd)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -2365,7 +2366,7 @@ async fn w12_kvt2_stage_finalize_typed_error_routes_to_boot_error_reconciliation
     )
     .await;
     sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = NULL WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
@@ -2805,7 +2806,7 @@ async fn c6_sent_fresh_hold_emits_hold_audit_and_projects_held_at_sent() {
 /// Helper — read `consecutive_holds` counter from `fiscal_documents`.
 async fn read_consecutive_holds(pool: &SqlitePool, doc_id: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -3335,7 +3336,7 @@ async fn a2_1a_advance_to_ack_audit_server_fiscal_no_is_handin_not_persisted() {
     let persisted_kvt1_raw: Vec<u8> = sqlx::query_scalar(
         "SELECT content FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .expect("Envelope 1a MUST persist KVT1_RAW row");
@@ -3464,7 +3465,7 @@ async fn a2_1a_advance_to_ack_cas_miss_yields_database_error() {
     let kvt1_raw_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -3521,7 +3522,7 @@ async fn a2_1a_advance_to_ack_empty_bytes_yields_structural_drift() {
     let kvt1_raw_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -3665,14 +3666,14 @@ async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -3686,7 +3687,7 @@ async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
         seed_kvt2_doc_for_stage_finalize(&pool, 1, 100, session_id, shift_id, "DPS-FN-KVT2-CSM")
             .await;
     sqlx::query("UPDATE fiscal_documents SET offline_fiscal_no = NULL WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
@@ -3728,7 +3729,7 @@ async fn w12_kvt2_chain_seed_mismatch_escalates_manual_recon_not_hard_abort() {
     // is surfaced by `invariant_scan` (detection moved; no recovery TRANSITION was
     // deleted — the escalation arms remain for scan/boot-detected breaks, PR-C).
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();

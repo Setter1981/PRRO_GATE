@@ -20,6 +20,7 @@ use prro::db::open_pool;
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::repositories::shifts::{self, TransitionOutcome};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbShiftId;
 
 const ALL_STATES: [ShiftState; 9] = [
     ShiftState::Created,
@@ -117,7 +118,7 @@ async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftS
             opened_by_cashier_id) \
          VALUES (?, ?, ?, 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(fn_id)
     .bind(state.as_str())
     .execute(pool)
@@ -179,7 +180,7 @@ async fn whitelist_matrix_15_allowed_66_forbidden_via_transition_state() {
             // this test isolates the transition whitelist, not per-FN
             // uniqueness (covered by `repo_shifts.rs`).
             sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
-                .bind(shift_id)
+                .bind(DbShiftId(shift_id))
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -247,7 +248,7 @@ async fn transition_state_returns_conflict_when_observed_state_drifted() {
             // raw UPDATE (simulates a concurrent admin path that
             // bypassed the typed transition surface).
             sqlx::query("UPDATE shifts SET state = 'CLOSING' WHERE shift_id = ?")
-                .bind(shift_id)
+                .bind(DbShiftId(shift_id))
                 .execute(&mut **tx)
                 .await?;
             // Whitelist-allowed transition (Opened → Closing edge 8)

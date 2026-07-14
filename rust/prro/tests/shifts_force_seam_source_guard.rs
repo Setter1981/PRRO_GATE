@@ -19,6 +19,7 @@ use prro::db::open_pool;
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::repositories::shifts;
 use prro::db::tx::with_immediate;
+use prro::db::types::DbShiftId;
 
 const ALL_STATES: [ShiftState; 9] = [
     ShiftState::Created,
@@ -89,7 +90,7 @@ async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftS
             opened_by_cashier_id) \
          VALUES (?, ?, ?, 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(fn_id)
     .bind(state.as_str())
     .execute(pool)
@@ -122,7 +123,7 @@ async fn force_to_error_with_audit_source_guard_9_cases() {
         let shift_id = seed_shift_in_state(&pool, &fn_id, from).await;
         let shift_id_hex: String =
             sqlx::query_scalar("SELECT lower(hex(shift_id)) FROM shifts WHERE shift_id = ?")
-                .bind(shift_id)
+                .bind(DbShiftId(shift_id))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -187,7 +188,7 @@ async fn force_to_error_with_audit_source_guard_9_cases() {
         // before the next `from` state is seeded for the same FN.  This
         // matrix isolates the force-seam source guard, not per-FN uniqueness.
         sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .execute(&pool)
             .await
             .unwrap();
@@ -204,7 +205,7 @@ async fn force_to_manual_reconciliation_with_audit_source_guard_9_cases() {
         let shift_id = seed_shift_in_state(&pool, &fn_id, from).await;
         let shift_id_hex: String =
             sqlx::query_scalar("SELECT lower(hex(shift_id)) FROM shifts WHERE shift_id = ?")
-                .bind(shift_id)
+                .bind(DbShiftId(shift_id))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -274,7 +275,7 @@ async fn force_to_manual_reconciliation_with_audit_source_guard_9_cases() {
         // before the next `from` state is seeded for the same FN.  This
         // matrix isolates the force-seam source guard, not per-FN uniqueness.
         sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .execute(&pool)
             .await
             .unwrap();
@@ -368,7 +369,7 @@ async fn force_seams_reject_malformed_and_oversized_evidence() {
     let shift_id = seed_shift_in_state(&pool, &fn_id, ShiftState::Opened).await;
     let shift_id_hex: String =
         sqlx::query_scalar("SELECT lower(hex(shift_id)) FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -442,7 +443,7 @@ async fn force_to_manual_records_operator_actor_in_audit() {
     let shift_id = seed_shift_in_state(&pool, &fn_id, ShiftState::Opened).await;
     let shift_id_hex: String =
         sqlx::query_scalar("SELECT lower(hex(shift_id)) FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .fetch_one(&pool)
             .await
             .unwrap();

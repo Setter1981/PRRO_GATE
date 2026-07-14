@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -86,7 +87,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(pool)
@@ -101,7 +102,7 @@ async fn seed_offline_session(pool: &SqlitePool, state: OfflineSessionState) -> 
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-21T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(state.as_str())
     .execute(pool)
@@ -141,15 +142,15 @@ async fn seed_doc(
             ?, ? \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(state)
     .bind(&sha)
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(code_lnd)
     .bind(&dps_code)
     .bind(server_fiscal_no)
@@ -160,7 +161,7 @@ async fn seed_doc(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(b"FAKE-CMS".to_vec())
     .execute(pool)
     .await
@@ -171,7 +172,7 @@ async fn seed_doc(
     )
     .bind(FN)
     .bind(code_lnd)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -188,7 +189,7 @@ async fn read_node_mode(pool: &SqlitePool) -> String {
 
 async fn read_session_state(pool: &SqlitePool, session_id: OfflineSessionId) -> String {
     sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
-        .bind(session_id)
+        .bind(DbOfflineSessionId(session_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -446,14 +447,14 @@ async fn c6_halt_escalate_path_does_not_fire_partial() {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'OFFLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -596,14 +597,14 @@ async fn w12_crash_recovery_finalizes_session_when_all_docs_already_ack() {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'OFFLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -638,7 +639,7 @@ async fn w12_crash_recovery_finalizes_session_when_all_docs_already_ack() {
     assert_eq!(read_session_state(&pool, session_id).await, "CLOSED");
     let shift_state_after: String =
         sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .fetch_one(&pool)
             .await
             .unwrap();

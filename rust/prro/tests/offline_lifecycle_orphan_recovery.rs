@@ -36,6 +36,7 @@ use prro::db::repositories::ingress_inbox::{
     self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
 };
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
 use prro::runtime::ingress::inline_binding::production_write_path;
@@ -329,7 +330,7 @@ async fn boot_escalates_pre_existing_olpd_orphan_with_terminal_lifecycle_doc() {
                 cash_balance_kop, opened_by_cashier_id) \
              VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'OFFLINE', 0, 'csh')",
         )
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -341,7 +342,7 @@ async fn boot_escalates_pre_existing_olpd_orphan_with_terminal_lifecycle_doc() {
              VALUES (?, 'OFFLINE', 'OPENED_LOCAL_PENDING_DRAIN', ?, 2, 'b', 't')",
         )
         .bind(FN)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -350,7 +351,7 @@ async fn boot_escalates_pre_existing_olpd_orphan_with_terminal_lifecycle_doc() {
             "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
              VALUES (?, ?, 'OPEN', '2026-07-07T00:00:00Z')",
         )
-        .bind(session_id)
+        .bind(DbOfflineSessionId(session_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -365,10 +366,10 @@ async fn boot_escalates_pre_existing_olpd_orphan_with_terminal_lifecycle_doc() {
              VALUES (?, ?, ?, ?, 1, 'SHIFT_OPEN', 'ABORTED', 'b', 't', 'OFFLINE', \
                 '2026-07-07T08:00:00Z', '{}', ?)",
         )
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .bind(&req_id[..])
         .bind(FN)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(&[0u8; 32][..])
         .execute(&pool)
         .await

@@ -42,7 +42,7 @@ use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::fiscal_documents::{self, TransitionOutcome};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::{with_immediate, WriteTxConn};
-use crate::db::types::{DbProtocol, DbShiftState};
+use crate::db::types::{DbDocumentId, DbProtocol, DbShiftId, DbShiftState};
 use crate::services::shift::transition as shift_transition;
 use crate::services::write_path::signer_guard::SignerCashierMismatch as Scm;
 use crate::services::write_path::stage_send;
@@ -1253,7 +1253,7 @@ pub async fn passive_hold_kvt1(pool: &SqlitePool, doc_id: DocumentId) -> anyhow:
             let (state, first_kvt1_at_text): (String, Option<String>) = sqlx::query_as(
                 "SELECT state, first_kvt1_at FROM fiscal_documents WHERE document_id = ?",
             )
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&mut **tx)
             .await?;
             anyhow::ensure!(
@@ -1617,7 +1617,7 @@ pub async fn close_orphan_transport_traces(
                 .bind(&now_iso_owned)
                 .bind(&started_at_owned)
                 .bind(&now_iso_owned)
-                .bind(doc_id)
+                .bind(DbDocumentId(doc_id))
                 .bind(attempt_no_owned)
                 .execute(&mut **tx)
                 .await?
@@ -1999,7 +1999,7 @@ pub async fn run_boot_reconciliation(
                    AND state NOT IN ('ABORTED','REJECTED','CANCELLED')"
             ))
             .bind(fiscal_number)
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .fetch_one(pool)
             .await?;
             if live_anchor_count == 0 {
@@ -2011,7 +2011,7 @@ pub async fn run_boot_reconciliation(
                      ORDER BY lnd DESC LIMIT 1"
                 ))
                 .bind(fiscal_number)
-                .bind(shift_id)
+                .bind(DbShiftId(shift_id))
                 .fetch_optional(pool)
                 .await?;
                 let anchor_doc_id = dead_anchor
@@ -2075,7 +2075,7 @@ pub async fn run_boot_reconciliation(
                 // parallel writer (theoretical under non-SWFN) cannot
                 // race between SELECT and UPDATE.
                 let orphans: Vec<(ShiftId, ShiftState)> =
-                    sqlx::query_as::<_, (ShiftId, DbShiftState)>(
+                    sqlx::query_as::<_, (DbShiftId, DbShiftState)>(
                         "SELECT shift_id, state FROM shifts \
                          WHERE fiscal_number = ? AND state IN ('OPENING', 'CLOSING')",
                     )
@@ -2083,7 +2083,7 @@ pub async fn run_boot_reconciliation(
                     .fetch_all(&mut **tx)
                     .await?
                     .into_iter()
-                    .map(|(id, state)| (id, state.0))
+                    .map(|(id, state)| (id.0, state.0))
                     .collect();
                 let orphans_resolved = orphans.len();
                 for (shift_id, current) in orphans {
@@ -3333,7 +3333,7 @@ async fn dispatch_prepared_via_chain(
                         payload_sha256_canonical, source_sha256 \
                  FROM fiscal_documents WHERE document_id = ?",
             )
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&mut **tx)
             .await?;
             let request_id_v: Vec<u8> = fd_row.try_get("request_id")?;

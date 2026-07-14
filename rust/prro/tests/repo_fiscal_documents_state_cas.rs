@@ -1,5 +1,6 @@
 use prro::db::models::enums::FiscalMode;
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 use prro::db::{
     models::{
         enums::{DocState, DocType},
@@ -192,7 +193,7 @@ async fn list_pending_full_state_inclusion_contract() {
         if state != DocState::Prepared {
             sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
                 .bind(state.as_str())
-                .bind(id)
+                .bind(DbDocumentId(id))
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -269,7 +270,7 @@ async fn hashes_persist_at_32_bytes_through_insert_prepared() {
         "SELECT payload_sha256_canonical, unsigned_xml_sha256, previous_hash \
          FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(id)
+    .bind(DbDocumentId(id))
     .fetch_one(&pool)
     .await
     .unwrap();

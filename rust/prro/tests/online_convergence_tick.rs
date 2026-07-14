@@ -25,6 +25,7 @@ use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEnt
 use prro::db::repositories::node_state;
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::tx::with_immediate;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::reconciliation::online_convergence::run_tick_for_fn;
 use prro::services::reconciliation::RuntimeView;
@@ -102,7 +103,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -121,7 +122,7 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
     .bind(FN)
     .bind(mode.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -195,11 +196,14 @@ async fn read_inbox_status(pool: &SqlitePool, request_id: &[u8; 16]) -> String {
 }
 
 async fn read_doc_id(pool: &SqlitePool) -> DocumentId {
-    sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE fiscal_number = ?")
-        .bind(FN)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, DbDocumentId>(
+        "SELECT document_id FROM fiscal_documents WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .map(|w| w.0)
+    .unwrap()
 }
 
 async fn count_doc_rows(pool: &SqlitePool) -> i64 {
@@ -231,7 +235,7 @@ async fn count_audit_events(pool: &SqlitePool, event_type: &str) -> i64 {
 
 async fn read_shift_state(pool: &SqlitePool, shift_id: ShiftId) -> String {
     sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -982,7 +986,7 @@ async fn tick_skips_rmr_but_online_fn_no_reprobe() {
 
     // The Batch-C escalation state: shift CAS'd to RMR, mode LEFT at Online.
     sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();

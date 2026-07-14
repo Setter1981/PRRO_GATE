@@ -18,6 +18,7 @@
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::outbox::{self, NewOutboxRow};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
@@ -224,7 +225,7 @@ async fn published_status_without_published_at_violates_check() {
     // Try to flip status='PUBLISHED' WITHOUT setting published_at.
     // The all-or-none CHECK must reject.
     let err = sqlx::query("UPDATE outbox SET status = 'PUBLISHED' WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .expect_err("PUBLISHED without published_at must violate all-or-none CHECK");
@@ -240,7 +241,7 @@ async fn published_status_without_published_at_violates_check() {
         "UPDATE outbox SET status = 'PUBLISHED', published_at = '2026-05-09 13:00:00' \
          WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .expect("atomic PUBLISHED+published_at must succeed");
@@ -257,7 +258,7 @@ async fn fk_restrict_blocks_doc_delete_with_pending_outbox() {
     enqueue(&pool, doc, 1, [1u8; 32]).await;
 
     let err = sqlx::query("DELETE FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .expect_err("ON DELETE RESTRICT must block while outbox row references doc");
@@ -291,7 +292,7 @@ async fn pending_partial_index_filters_published_rows() {
         "UPDATE outbox SET status = 'PUBLISHED', published_at = '2026-05-09 13:00:00' \
          WHERE document_id = ?",
     )
-    .bind(doc_b)
+    .bind(DbDocumentId(doc_b))
     .execute(&pool)
     .await
     .unwrap();

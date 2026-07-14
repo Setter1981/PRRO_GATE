@@ -24,6 +24,7 @@ use crate::db::models::enums::ShiftState;
 use crate::db::models::ids::ShiftId;
 use crate::db::repositories::shifts::{self, TransitionOutcome};
 use crate::db::tx::WriteTxConn;
+use crate::db::types::DbShiftId;
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 
 /// Apply a whitelisted 9-state shift transition AND mirror the
@@ -91,7 +92,7 @@ pub async fn force_orphan_shift_to_error(
     shift_id: ShiftId,
 ) -> anyhow::Result<()> {
     sqlx::query("UPDATE shifts SET state = 'ERROR' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -143,7 +144,7 @@ async fn mirror_projection_tx(
     .bind(to.as_str())
     .bind(fiscal_number)
     .bind(from.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(&mut **tx)
     .await?
     .rows_affected();
@@ -220,7 +221,7 @@ pub async fn create_shift_tx(
         "UPDATE node_state SET current_shift_id = ?, shift_state = 'CREATED' \
          WHERE fiscal_number = ? AND shift_state = 'CLOSED'",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(fiscal_number)
     .execute(&mut **tx)
     .await?

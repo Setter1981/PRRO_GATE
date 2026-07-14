@@ -14,6 +14,7 @@ use prro::db::repositories::node_state;
 use prro::db::repositories::payment_methods::{insert, soft_delete, NewPaymentMethod};
 use prro::db::repositories::shifts;
 use prro::db::repositories::signing_config_snapshots;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::convert::{
     aggregate_z_payload_for_shift, convert_to_signer_payload, ConvertError,
@@ -375,7 +376,7 @@ async fn seed_issued_receipt(
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
         .bind(state.as_str())
-        .bind(id)
+        .bind(DbDocumentId(id))
         .execute(main)
         .await
         .expect("set terminal state");
@@ -470,7 +471,7 @@ async fn seed_issued_receipt_with_items_opt(
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
         .bind(state.as_str())
-        .bind(id)
+        .bind(DbDocumentId(id))
         .execute(main)
         .await
         .expect("set terminal state");
@@ -520,7 +521,7 @@ async fn seed_issued_receipt_full(
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
         .bind(state.as_str())
-        .bind(id)
+        .bind(DbDocumentId(id))
         .execute(main)
         .await
         .expect("set terminal state");
@@ -549,7 +550,7 @@ async fn zreport_aggregates_only_issued_shift_receipts() {
         .await
         .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift)
+        .bind(DbShiftId(shift))
         .bind(FN)
         .execute(&main)
         .await
@@ -624,7 +625,7 @@ async fn zreport_txs_aggregates_tax_group_turnover_from_items() {
         .await
         .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift)
+        .bind(DbShiftId(shift))
         .bind(FN)
         .execute(&main)
         .await

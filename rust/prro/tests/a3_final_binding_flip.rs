@@ -37,6 +37,7 @@ use prro::db::repositories::ingress_inbox::{
     self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
 };
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
+use prro::db::types::DbShiftId;
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
 use prro::runtime::ingress::inline_binding::{production_write_path, InlineWritePath};
@@ -228,7 +229,7 @@ async fn seed_shift(pool: &SqlitePool, state: ShiftState) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, ?, 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(state.as_str())
     .bind(CASHIER)
@@ -253,7 +254,7 @@ async fn seed_node_state(
     .bind(FN)
     .bind(mode.as_str())
     .bind(shift_state.as_str())
-    .bind(shift_id)
+    .bind(shift_id.map(DbShiftId))
     .execute(pool)
     .await
     .unwrap();

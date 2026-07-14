@@ -19,6 +19,7 @@ use prro::db::models::enums::{DocState, FiscalMode, NodeMode, Protocol, ShiftSta
 use prro::db::models::ids::{RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::DbShiftId;
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::{boot_phase, ReconcileGuard, RuntimeView};
@@ -376,7 +377,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, \
             cash_balance_kop, opened_by_cashier_id) VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -393,7 +394,7 @@ async fn seed_node_online(pool: &SqlitePool, shift_id: ShiftId) {
     .bind(FN)
     .bind(NodeMode::Online.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();

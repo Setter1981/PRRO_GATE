@@ -15,6 +15,7 @@ use prro::db::open_pool;
 use prro::db::repositories::fiscal_documents::{self as fd, NewDocument};
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 
 const FN: &str = "4000000099";
 
@@ -106,7 +107,7 @@ async fn fetch_snapshot_id(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> Optio
     sqlx::query_scalar(
         "SELECT signing_config_snapshot_id FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(pool)
     .await
     .unwrap()
@@ -221,7 +222,7 @@ async fn fetch_pin_state(
         "SELECT signing_config_snapshot_id, signing_inputs_pinned_at \
          FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(pool)
     .await
     .unwrap();

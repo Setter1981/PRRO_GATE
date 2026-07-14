@@ -12,6 +12,7 @@ use prro::db::models::enums::{FiscalMode, NodeMode, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, RequestId, ShiftId};
 use prro::db::open_pool;
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use sqlx::SqlitePool;
 
 const FN: &str = "4000000001";
@@ -49,7 +50,7 @@ async fn seed_fn(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .execute(pool)
     .await
@@ -67,7 +68,7 @@ async fn seed_node_state(pool: &SqlitePool, shift_id: ShiftId, seed: Option<[u8;
     .bind(FN)
     .bind(NodeMode::Online.as_str())
     .bind(ShiftState::Opened.as_str())
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(seed.map(|s| s.to_vec()))
     .execute(pool)
     .await
@@ -98,10 +99,10 @@ async fn seed_doc(
          ) VALUES (?, ?, ?, ?, ?, 'SELL', ?, 'b', 't', 'ONLINE', \
             '2026-06-11T00:00:00Z', '{}', ?, ?, ?, ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(&request_id[..])
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(state)
     .bind(vec![0u8; 32])
@@ -116,7 +117,7 @@ async fn seed_doc(
         sqlx::query(
             "INSERT INTO document_files(document_id, kind, content) VALUES (?, 'KVT1_RAW', ?)",
         )
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .bind(vec![0xAAu8; 8])
         .execute(pool)
         .await
@@ -231,7 +232,7 @@ async fn clean_offline_drained_ack_scans_clean() {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-06-13T00:00:00Z')",
     )
-    .bind(session)
+    .bind(DbOfflineSessionId(session))
     .bind(FN)
     .execute(&pool)
     .await
@@ -256,13 +257,13 @@ async fn clean_offline_drained_ack_scans_clean() {
          VALUES (?, 1, '2026-06-13T00:00:01Z', ?)",
     )
     .bind(FN)
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
-        .bind(session)
-        .bind(doc)
+        .bind(DbOfflineSessionId(session))
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
@@ -702,7 +703,7 @@ async fn detects_unbacked_offline_fiscal_no() {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-06-11T00:00:00Z')",
     )
-    .bind(session)
+    .bind(DbOfflineSessionId(session))
     .bind(FN)
     .execute(&pool)
     .await
@@ -788,7 +789,7 @@ async fn clean_error_retryable_offline_doc_mid_drain_scans_clean() {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-06-12T00:00:00Z')",
     )
-    .bind(session)
+    .bind(DbOfflineSessionId(session))
     .bind(FN)
     .execute(&pool)
     .await
@@ -825,13 +826,13 @@ async fn clean_error_retryable_offline_doc_mid_drain_scans_clean() {
         )
         .bind(FN)
         .bind(code_lnd)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
-            .bind(session)
-            .bind(doc)
+            .bind(DbOfflineSessionId(session))
+            .bind(DbDocumentId(doc))
             .execute(&pool)
             .await
             .unwrap();
@@ -858,7 +859,7 @@ async fn m2_n2b_rejected_offline_origin_predecessor_scans_clean() {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-06-13T00:00:00Z')",
     )
-    .bind(session)
+    .bind(DbOfflineSessionId(session))
     .bind(FN)
     .execute(&pool)
     .await
@@ -898,13 +899,13 @@ async fn m2_n2b_rejected_offline_origin_predecessor_scans_clean() {
         )
         .bind(FN)
         .bind(code_lnd)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
-            .bind(session)
-            .bind(doc)
+            .bind(DbOfflineSessionId(session))
+            .bind(DbDocumentId(doc))
             .execute(&pool)
             .await
             .unwrap();
@@ -1000,7 +1001,7 @@ async fn detects_shift_state_mirror_drift() {
     seed_node_state(&pool, shift, None).await; // node_state.shift_state = OPENED, current_shift_id = shift
                                                // Desync Mirror-1: drive the shifts row to RMR while node_state stays OPENED.
     sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
-        .bind(shift)
+        .bind(DbShiftId(shift))
         .execute(&pool)
         .await
         .unwrap();
@@ -1196,7 +1197,7 @@ async fn seed_shift_with_anchor(
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, ?, 'OFFLINE', 0, 'cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(state)
     .execute(pool)
@@ -1211,7 +1212,7 @@ async fn seed_shift_with_anchor(
     )
     .bind(FN)
     .bind(state)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -1221,10 +1222,10 @@ async fn seed_shift_with_anchor(
             payload_json, payload_sha256_canonical) \
          VALUES (?, ?, ?, ?, 1, ?, ?, 'b', 't', 'OFFLINE', '2026-07-07T00:00:00Z', '{}', ?)",
     )
-    .bind(DocumentId::new())
+    .bind(DbDocumentId(DocumentId::new()))
     .bind(&(*RequestId::new().as_bytes())[..])
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(doc_type)
     .bind(doc_state)
     .bind(vec![0u8; 32])

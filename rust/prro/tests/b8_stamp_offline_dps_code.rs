@@ -5,6 +5,7 @@
 //! GREEN after.
 
 use prro::db::models::ids::{DocumentId, OfflineSessionId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId};
 use prro::services::write_path::stage_offline_ack::{self, OfflineAckOutcome};
 use uuid::Uuid;
 
@@ -43,7 +44,7 @@ async fn seed_open_session(pool: &sqlx::SqlitePool) -> OfflineSessionId {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-07-08T10:00:00Z')",
     )
-    .bind(sid)
+    .bind(DbOfflineSessionId(sid))
     .bind(FN)
     .execute(pool)
     .await
@@ -73,7 +74,7 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, lnd: i64) -> DocumentId {
          VALUES (?, ?, ?, ?, 'SELL', 'SIGNED', 'b', 't', 'OFFLINE', \
             '2026-07-08T10:00:00Z', '{}', ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
     .bind(lnd)
@@ -87,7 +88,7 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, lnd: i64) -> DocumentId {
 
 async fn fetch_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -111,7 +112,7 @@ async fn offline_dps_code_stamped_at_offline_local_ack() {
         "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? AND code_lnd = 10",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(FN)
     .execute(&pool)
     .await
@@ -121,8 +122,8 @@ async fn offline_dps_code_stamped_at_offline_local_ack() {
              offline_fiscal_date = CURRENT_TIMESTAMP, offline_session_id = ?, \
              offline_dps_code = 'STAMP-TEST-CODE' WHERE document_id = ?",
     )
-    .bind(session_id)
-    .bind(doc_id)
+    .bind(DbOfflineSessionId(session_id))
+    .bind(DbDocumentId(doc_id))
     .execute(&pool)
     .await
     .unwrap();
@@ -144,7 +145,7 @@ async fn offline_dps_code_stamped_at_offline_local_ack() {
     // B8 core: the opaque dps_code is on the doc row (stamped at sign, survives OLA).
     let offline_dps_code: Option<String> =
         sqlx::query_scalar("SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -155,7 +156,7 @@ async fn offline_dps_code_stamped_at_offline_local_ack() {
     );
     let offline_fiscal_no: Option<i64> =
         sqlx::query_scalar("SELECT offline_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();

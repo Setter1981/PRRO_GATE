@@ -13,15 +13,23 @@
 //!
 //! CS-1b landed the **TEXT-affinity state/protocol enums** (`DocState`,
 //! `OfflineSessionState`, `ShiftState`, `NodeMode`, `Protocol`, `DocType`,
-//! `FiscalMode`, `Severity`) here, pure. The ids / `CanonicalFiscalCommand`
-//! relocate in CS-1b′ / CS-1c behind explicit compatibility shims in `prro`,
-//! per
+//! `FiscalMode`, `Severity`) here, pure. CS-1b′ landed the **UUID-BLOB ids +
+//! legacy TEXT ids** (`DocumentId`, `RequestId`, `ShiftId`, `OperatorId`,
+//! `PrinterId`, `OfflineSessionId`, `CashierId`, `DriverId` + their errors)
+//! here, pure — their SQLite mapping lives store-side in `prro::db::types`
+//! (`DbDocumentId`, `DbCashierId`, …). `CanonicalFiscalCommand` relocates in
+//! CS-1c behind an explicit compatibility shim in `prro`, per
 //! `docs/superpowers/specs/2026-07-14-cs1-contract-behaviour-neutral-skeleton.md`.
 
 #![forbid(unsafe_code)]
 
 pub mod enums;
+pub mod ids;
 
 pub use enums::{
     DocState, DocType, FiscalMode, NodeMode, OfflineSessionState, Protocol, Severity, ShiftState,
+};
+pub use ids::{
+    CashierId, CashierIdError, DocumentId, DriverId, DriverIdError, OfflineSessionId, OperatorId,
+    PrinterId, RequestId, ShiftId,
 };

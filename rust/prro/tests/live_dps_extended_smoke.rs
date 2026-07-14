@@ -79,6 +79,7 @@ use prro::crypto::session::SigningSession;
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::signing_config_snapshots;
 use prro::db::tx::with_immediate;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::services::write_path::tax_summary::{
@@ -739,7 +740,7 @@ async fn seed_open_shift_and_node_piece4(pool: &SqlitePool, fn_id: &str) {
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(fn_id)
     .execute(pool)
     .await
@@ -750,7 +751,7 @@ async fn seed_open_shift_and_node_piece4(pool: &SqlitePool, fn_id: &str) {
          VALUES (?, 'ONLINE', 'OPENED', ?, 1, 'b1', 't1')",
     )
     .bind(fn_id)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -849,7 +850,7 @@ async fn seed_inbox_processing_for_sell_piece4(pool: &SqlitePool, fn_id: &str, r
 
 async fn doc_state_piece4(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -861,7 +862,7 @@ async fn read_document_file_piece4(
     kind: &str,
 ) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(kind)
         .fetch_optional(pool)
         .await
@@ -1220,7 +1221,7 @@ async fn print_live_diagnostics(pool: &SqlitePool, doc: DocumentId) {
         "SELECT outcome_kind, server_status_code, error_kind, error_message, server_fiscal_no \
          FROM transport_trace WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
@@ -1378,7 +1379,7 @@ async fn live_smoke_5b_shift_open() {
     let state = doc_state_piece4(app.db(), doc).await;
     let server_fiscal_no: Option<String> =
         sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(app.db())
             .await
             .unwrap();
@@ -1592,7 +1593,7 @@ async fn live_smoke_6_extended_sell() {
     let state = doc_state_piece4(app.db(), doc).await;
     let server_fiscal_no: Option<String> =
         sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(app.db())
             .await
             .unwrap();
@@ -1688,7 +1689,7 @@ async fn live_smoke_7_z_report() {
     let state = doc_state_piece4(app.db(), doc).await;
     let server_fiscal_no: Option<String> =
         sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(app.db())
             .await
             .unwrap();
@@ -2785,7 +2786,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
     // code, not a synthetic one).
     let stamped_code: Option<String> =
         sqlx::query_scalar("SELECT offline_dps_code FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(pool)
             .await
             .unwrap();
@@ -2871,13 +2872,13 @@ async fn live_smoke_9_offline_drain_mac_id() {
 
     let final_state: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(pool)
             .await
             .unwrap_or_else(|_| "UNKNOWN".into());
     let server_fiscal_no: Option<String> =
         sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(pool)
             .await
             .unwrap();
@@ -2886,7 +2887,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
         "SELECT server_status_code FROM transport_trace \
          WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_optional(pool)
     .await
     .unwrap_or(None)
@@ -2911,7 +2912,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
         //     date_time derive from.
         let business_ts: Option<String> =
             sqlx::query_scalar("SELECT business_ts FROM fiscal_documents WHERE document_id = ?")
-                .bind(doc)
+                .bind(DbDocumentId(doc))
                 .fetch_optional(pool)
                 .await
                 .unwrap_or(None)
@@ -2959,7 +2960,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
     // (a) Locate the single DocType=9 OFFLINE_SESSION_BEGIN row for this FN, and
     //     print its date triplet + chain state.  The BEGIN is a SEPARATE
     //     `fiscal_documents` row from the SELL (`doc_id`).
-    let begin_row: Option<(DocumentId, i64, Option<Vec<u8>>)> = sqlx::query_as(
+    let begin_row: Option<(DbDocumentId, i64, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT document_id, lnd, previous_hash \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN' \
@@ -2975,7 +2976,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
              (check the audit lines above)"
         ),
         Some((begin_doc, begin_lnd, begin_prev)) => {
-            print_date_triplet(pool, "BEGIN(9)", *begin_doc).await;
+            print_date_triplet(pool, "BEGIN(9)", begin_doc.0).await;
             // (5) chain tip + lnd for the BEGIN — in case -8 correlates with chain
             //     state rather than date.
             println!(
@@ -2987,7 +2988,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
             );
             // The BEGIN's latest transport_trace (its DPS reject code, i.e. the -8).
             println!("  [BEGIN(9)] transport_trace + audit tail:");
-            print_live_diagnostics(pool, *begin_doc).await;
+            print_live_diagnostics(pool, begin_doc.0).await;
         }
     }
 
@@ -2997,7 +2998,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
     print_date_triplet(pool, "SELL(accepted)", doc_id).await;
     let sell_chain: Option<(i64, Option<Vec<u8>>)> =
         sqlx::query_as("SELECT lnd, previous_hash FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_optional(pool)
             .await
             .unwrap_or(None);
@@ -3075,7 +3076,7 @@ async fn live_smoke_9_offline_drain_mac_id() {
     //      column (the DPS reject code lives in transport_trace) — so we print
     //      state / offline_dps_code (the `<MAC ID>` code) / server_fiscal_no here
     //      and the DPS code via `print_live_diagnostics` below.
-    let end_row: Option<(DocumentId, String, Option<String>, Option<String>)> = sqlx::query_as(
+    let end_row: Option<(DbDocumentId, String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT document_id, state, offline_dps_code, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_END' \
@@ -3094,13 +3095,13 @@ async fn live_smoke_9_offline_drain_mac_id() {
             println!(
                 "  END row: document_id={} state={end_state} \
                  offline_dps_code(<MAC ID>)={end_offline_code:?} server_fiscal_no={end_sfn:?}",
-                hex_lower(end_doc_id.as_bytes())
+                hex_lower(end_doc_id.0.as_bytes())
             );
             // (iii) Latest transport_trace for the END: outcome_kind, the DPS
             //       reject CODE (server_status_code), error_kind, error_message —
             //       this is the `-N` reason the END was terminal-rejected.
             println!("  END transport_trace + audit tail:");
-            print_live_diagnostics(pool, end_doc_id).await;
+            print_live_diagnostics(pool, end_doc_id.0).await;
             // (iv) The END's SIGNED `<C T='110'>` document — mirror how the SELL's
             //      signed XML is surfaced above.  PAYLOAD_XML carries the human-
             //      readable `<C T='110'>` header + `<MAC ID>`; SIGNED_XML is the
@@ -3108,13 +3109,13 @@ async fn live_smoke_9_offline_drain_mac_id() {
             //      confirm its eContent == PAYLOAD_XML, as smoke 9 does for the
             //      SELL).  cp1251 payload but the `<C T>`/MAC region is ASCII, so
             //      lossy UTF-8 is fine for the printed substring.
-            match read_document_file_piece4(pool, end_doc_id, "PAYLOAD_XML").await {
+            match read_document_file_piece4(pool, end_doc_id.0, "PAYLOAD_XML").await {
                 Some(end_payload) => {
                     println!(
                         "  END PAYLOAD_XML (<C T='110'> boundary): {}",
                         String::from_utf8_lossy(&end_payload)
                     );
-                    match read_document_file_piece4(pool, end_doc_id, "SIGNED_XML").await {
+                    match read_document_file_piece4(pool, end_doc_id.0, "SIGNED_XML").await {
                         Some(end_signed) => {
                             let econtent_matches = extract_econtent(&end_signed)
                                 .map(|inner| inner == end_payload)

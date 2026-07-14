@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT fiscal_number,\n                  mode               as \"mode: DbNodeMode\",\n                  shift_state        as \"shift_state: DbShiftState\",\n                  next_lnd,\n                  last_known_unsigned_xml_sha256 as \"last_known_unsigned_xml_sha256: Vec<u8>\",\n                  current_shift_id   as \"current_shift_id: ShiftId\",\n                  backend_profile_id,\n                  transport_profile_id,\n                  next_z_report_number\n           FROM node_state WHERE fiscal_number = ?",
+  "query": "SELECT fiscal_number,\n                  mode               as \"mode: DbNodeMode\",\n                  shift_state        as \"shift_state: DbShiftState\",\n                  next_lnd,\n                  last_known_unsigned_xml_sha256 as \"last_known_unsigned_xml_sha256: Vec<u8>\",\n                  current_shift_id   as \"current_shift_id: DbShiftId\",\n                  backend_profile_id,\n                  transport_profile_id,\n                  next_z_report_number\n           FROM node_state WHERE fiscal_number = ?",
   "describe": {
     "columns": [
       {
@@ -29,7 +29,7 @@
         "type_info": "Blob"
       },
       {
-        "name": "current_shift_id: ShiftId",
+        "name": "current_shift_id: DbShiftId",
         "ordinal": 5,
         "type_info": "Blob"
       },
@@ -64,5 +64,5 @@
       false
     ]
   },
-  "hash": "983420796ccd204877195bca9377b6ca029e949aa9c7c15bbb88575386a2e9a4"
+  "hash": "ca43ca45d1568717b34ff1ff77eac0afc1955f293201d4de1c085fc88ca73751"
 }

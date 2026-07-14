@@ -36,6 +36,7 @@ use prro::db::repositories::payment_methods::{insert as pm_insert, NewPaymentMet
 use prro::db::repositories::tax_groups::NewTaxGroup;
 use prro::db::repositories::{fiscal_documents, offline_sessions, tax_groups};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::{DbOfflineSessionId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::convert::convert_to_signer_payload;
 use prro::runtime::ingress::dto::CanonicalCommand;
@@ -330,7 +331,7 @@ impl FuzzCtx {
             "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
              VALUES (?, ?, 'CLOSED', '2026-06-08T00:00:00Z')",
         )
-        .bind(foreign)
+        .bind(DbOfflineSessionId(foreign))
         .bind(self.fn_id.as_str())
         .execute(&self.pool)
         .await
@@ -339,7 +340,7 @@ impl FuzzCtx {
             "UPDATE fiscal_documents SET offline_session_id = ? \
              WHERE fiscal_number = ? AND offline_fiscal_no IS NOT NULL",
         )
-        .bind(foreign)
+        .bind(DbOfflineSessionId(foreign))
         .bind(self.fn_id.as_str())
         .execute(&self.pool)
         .await
@@ -398,7 +399,7 @@ impl FuzzCtx {
             "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
              VALUES (?, ?, 'OPEN', '2026-06-09T00:00:00Z')",
         )
-        .bind(extra)
+        .bind(DbOfflineSessionId(extra))
         .bind(self.fn_id.as_str())
         .execute(&self.pool)
         .await
@@ -2339,7 +2340,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -2367,7 +2368,7 @@ async fn seed_node_state_with_shift(
     .bind(FN)
     .bind(mode.as_str())
     .bind(shift_state.as_str())
-    .bind(current_shift_id)
+    .bind(current_shift_id.map(DbShiftId))
     .execute(pool)
     .await
     .unwrap();
@@ -2379,7 +2380,7 @@ async fn seed_open_offline_session(pool: &SqlitePool) {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-06-09T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(OfflineSessionState::Open.as_str())
     .execute(pool)

@@ -31,6 +31,7 @@ use prro::crypto::provider::{
 use prro::crypto::session::SigningSession;
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::document_files::DocumentFileKind;
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::error_routing::MacRecoveryHint;
 use prro::services::write_path::mac_recovery::{self, MacRecoveryOutcome};
 use prro::services::write_path::stage_send::StageSendError;
@@ -170,7 +171,7 @@ async fn seed_recoverable_doc(pool: &SqlitePool, doc_byte: u8) -> DocumentId {
 
 async fn read_doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -178,7 +179,7 @@ async fn read_doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
 
 async fn read_counter(pool: &SqlitePool, doc: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -186,7 +187,7 @@ async fn read_counter(pool: &SqlitePool, doc: DocumentId) -> i64 {
 
 async fn read_previous_hash(pool: &SqlitePool, doc: DocumentId) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT previous_hash FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -211,7 +212,7 @@ async fn read_artifact(
     kind: DocumentFileKind,
 ) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(kind)
         .fetch_optional(pool)
         .await
@@ -365,7 +366,7 @@ async fn run_mac_recovery_counter_already_burnt_returns_counter_exhausted() {
     // Pre-burn the counter (simulates: prior worker tick claimed,
     // then crashed mid-PERSIST).
     sqlx::query("UPDATE fiscal_documents SET mac_recovery_attempts = 1 WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
@@ -405,7 +406,7 @@ async fn run_mac_recovery_pre_persist_assertion_rolls_back_typed_error() {
     // (impossible in normal operation, but the orchestrator MUST
     // surface it typed rather than silently INSERT via replace_tx).
     sqlx::query("DELETE FROM document_files WHERE document_id = ? AND kind = 'PAYLOAD_XML'")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();

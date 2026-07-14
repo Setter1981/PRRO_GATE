@@ -14,7 +14,7 @@ use crate::db::models::{
 };
 use crate::db::repositories::audit_log;
 use crate::db::tx::WriteTxConn;
-use crate::db::types::DbShiftState;
+use crate::db::types::{DbCashierId, DbDocumentId, DbShiftId, DbShiftState};
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use sqlx::SqlitePool;
 
@@ -137,7 +137,7 @@ pub async fn insert_created(
             opened_by_cashier_id) \
          VALUES (?, ?, 'CREATED', ?, ?, ?)",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(fiscal_number)
     .bind(open_mode)
     .bind(opening_cash_kop)
@@ -169,7 +169,7 @@ pub async fn insert_created_tx(
             opened_by_cashier_id) \
          VALUES (?, ?, 'CREATED', ?, ?, ?)",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(fiscal_number)
     .bind(open_mode)
     .bind(opening_cash_kop)
@@ -190,32 +190,33 @@ pub async fn update_cash_balance_tx(
 ) -> sqlx::Result<()> {
     sqlx::query("UPDATE shifts SET cash_balance_kop = ? WHERE shift_id = ?")
         .bind(cash_balance_kop)
-        .bind(id)
+        .bind(DbShiftId(id))
         .execute(&mut **tx)
         .await?;
     Ok(())
 }
 
 pub async fn get(pool: &SqlitePool, id: ShiftId) -> sqlx::Result<Option<ShiftRow>> {
+    let db_id = DbShiftId(id);
     let row = sqlx::query!(
-        r#"SELECT shift_id      as "shift_id: ShiftId",
+        r#"SELECT shift_id      as "shift_id: DbShiftId",
                   fiscal_number,
                   serial,
                   state          as "state: DbShiftState",
                   cash_balance_kop,
-                  opened_by_cashier_id as "opened_by_cashier_id: CashierId"
+                  opened_by_cashier_id as "opened_by_cashier_id: DbCashierId"
            FROM shifts WHERE shift_id = ?"#,
-        id
+        db_id
     )
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| ShiftRow {
-        shift_id: r.shift_id,
+        shift_id: r.shift_id.0,
         fiscal_number: r.fiscal_number,
         serial: r.serial,
         state: r.state.0,
         cash_balance_kop: r.cash_balance_kop,
-        opened_by_cashier_id: r.opened_by_cashier_id,
+        opened_by_cashier_id: r.opened_by_cashier_id.0,
     }))
 }
 
@@ -255,25 +256,26 @@ pub async fn active_shift_for_fn(
 /// reads the shift row inside its `with_immediate` envelope alongside
 /// `node_state.current_shift_id`.  No CAS, no UPDATE — strictly read.
 pub async fn get_tx(tx: &mut WriteTxConn<'_>, id: ShiftId) -> sqlx::Result<Option<ShiftRow>> {
+    let db_id = DbShiftId(id);
     let row = sqlx::query!(
-        r#"SELECT shift_id      as "shift_id: ShiftId",
+        r#"SELECT shift_id      as "shift_id: DbShiftId",
                   fiscal_number,
                   serial,
                   state          as "state: DbShiftState",
                   cash_balance_kop,
-                  opened_by_cashier_id as "opened_by_cashier_id: CashierId"
+                  opened_by_cashier_id as "opened_by_cashier_id: DbCashierId"
            FROM shifts WHERE shift_id = ?"#,
-        id
+        db_id
     )
     .fetch_optional(&mut **tx)
     .await?;
     Ok(row.map(|r| ShiftRow {
-        shift_id: r.shift_id,
+        shift_id: r.shift_id.0,
         fiscal_number: r.fiscal_number,
         serial: r.serial,
         state: r.state.0,
         cash_balance_kop: r.cash_balance_kop,
-        opened_by_cashier_id: r.opened_by_cashier_id,
+        opened_by_cashier_id: r.opened_by_cashier_id.0,
     }))
 }
 
@@ -303,7 +305,7 @@ pub async fn transition(
     }
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(to.as_str())
-        .bind(id)
+        .bind(DbShiftId(id))
         .bind(from.as_str())
         .execute(&mut **tx)
         .await?;
@@ -336,7 +338,7 @@ pub async fn transition_state(
     }
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(to.as_str())
-        .bind(id)
+        .bind(DbShiftId(id))
         .bind(from.as_str())
         .execute(&mut **tx)
         .await?;
@@ -353,7 +355,7 @@ pub async fn transition_state(
     // don't have to map opaque `sqlx::Error::RowNotFound`.
     let observed: Option<ShiftState> =
         sqlx::query_scalar::<_, DbShiftState>(r#"SELECT state FROM shifts WHERE shift_id = ?"#)
-            .bind(id)
+            .bind(DbShiftId(id))
             .fetch_optional(&mut **tx)
             .await?
             .map(|w| w.0);
@@ -548,7 +550,7 @@ pub async fn force_to_error_with_audit(
     let row: Option<(ShiftState, String)> = sqlx::query_as::<_, (DbShiftState, String)>(
         r#"SELECT state, fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_optional(&mut **tx)
     .await?
     .map(|(s, fiscal_number)| (s.0, fiscal_number));
@@ -597,7 +599,7 @@ pub async fn force_to_error_with_audit(
     // `fiscal_documents.rs:351` HIGH-3 convention.
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(ShiftState::Error.as_str())
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(current_state.as_str())
         .execute(&mut **tx)
         .await?;
@@ -678,7 +680,7 @@ pub async fn force_to_manual_reconciliation_with_audit(
     let row: Option<(ShiftState, String)> = sqlx::query_as::<_, (DbShiftState, String)>(
         r#"SELECT state, fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_optional(&mut **tx)
     .await?
     .map(|(s, fiscal_number)| (s.0, fiscal_number));
@@ -717,7 +719,7 @@ pub async fn force_to_manual_reconciliation_with_audit(
     // violation path — see force_to_error_with_audit for rationale).
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
         .bind(ShiftState::RequiresManualReconciliation.as_str())
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(current_state.as_str())
         .execute(&mut **tx)
         .await?;
@@ -801,7 +803,7 @@ async fn emit_cas_isolation_violation_audit(
     // Re-read for diagnostics — same tx, serialised with the failed UPDATE.
     let observed: Option<ShiftState> =
         sqlx::query_scalar::<_, DbShiftState>(r#"SELECT state FROM shifts WHERE shift_id = ?"#)
-            .bind(ctx.shift_id)
+            .bind(DbShiftId(ctx.shift_id))
             .fetch_optional(&mut **tx)
             .await?
             .map(|w| w.0);
@@ -954,7 +956,7 @@ pub async fn senior_cashier_close_shift_with_audit(
     let row: Option<(ShiftState, String)> = sqlx::query_as::<_, (DbShiftState, String)>(
         r#"SELECT state, fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_optional(&mut **tx)
     .await?
     .map(|(s, fiscal_number)| (s.0, fiscal_number));
@@ -1044,8 +1046,8 @@ pub async fn senior_cashier_close_shift_with_audit(
     )
     .bind(ShiftState::Closed.as_str())
     .bind(senior_cashier_id.as_str())
-    .bind(z_report_doc_id)
-    .bind(shift_id)
+    .bind(DbDocumentId(z_report_doc_id))
+    .bind(DbShiftId(shift_id))
     .bind(current_state.as_str())
     .execute(&mut **tx)
     .await?;

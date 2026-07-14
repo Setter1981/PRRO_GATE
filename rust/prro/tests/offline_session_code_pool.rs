@@ -17,6 +17,7 @@
 use prro::db::models::ids::{DocumentId, OfflineSessionId};
 use prro::db::repositories::offline_sessions::{self, OfflineSessionError};
 use prro::db::tx::with_immediate;
+use prro::db::types::{DbDocumentId, DbOfflineSessionId};
 use std::sync::Arc;
 
 const FN: &str = "1234567890";
@@ -57,7 +58,7 @@ async fn insert_fiscal_doc(pool: &sqlx::SqlitePool, fiscal_number: &str, lnd: i6
          VALUES (?, ?, ?, ?, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
             '2026-05-15T00:00:00Z', '{}', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(fiscal_number)
     .bind(lnd)
@@ -273,7 +274,7 @@ async fn acquire_code_classifies_partial_unique_violation_as_offline_code_alread
          SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? AND code_lnd = 1",
     )
-    .bind(doc_x)
+    .bind(DbDocumentId(doc_x))
     .bind(FN)
     .execute(&pool)
     .await
@@ -369,7 +370,7 @@ async fn list_pending_for_session_returns_non_terminal_docs_in_lnd_order() {
         "INSERT INTO offline_sessions (offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-05-15T00:00:00Z')",
     )
-    .bind(sid)
+    .bind(DbOfflineSessionId(sid))
     .bind(FN)
     .execute(&pool)
     .await
@@ -386,12 +387,12 @@ async fn list_pending_for_session_returns_non_terminal_docs_in_lnd_order() {
              VALUES (?, ?, ?, ?, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
                 '2026-05-15T00:00:00Z', '{}', ?, ?)",
         )
-        .bind(did)
+        .bind(DbDocumentId(did))
         .bind(rid.as_bytes().to_vec())
         .bind(FN)
         .bind(lnd)
         .bind(&sha)
-        .bind(sid)
+        .bind(DbOfflineSessionId(sid))
         .execute(&pool)
         .await
         .unwrap();
@@ -413,7 +414,7 @@ async fn list_pending_for_session_excludes_terminal_states() {
         "INSERT INTO offline_sessions (offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-05-15T00:00:00Z')",
     )
-    .bind(sid)
+    .bind(DbOfflineSessionId(sid))
     .bind(FN)
     .execute(&pool)
     .await
@@ -430,13 +431,13 @@ async fn list_pending_for_session_excludes_terminal_states() {
              VALUES (?, ?, ?, ?, 'SELL', ?, 'b', 't', 'OFFLINE', \
                 '2026-05-15T00:00:00Z', '{}', ?, ?)",
         )
-        .bind(did)
+        .bind(DbDocumentId(did))
         .bind(rid.as_bytes().to_vec())
         .bind(FN)
         .bind(lnd)
         .bind(state)
         .bind(&sha)
-        .bind(sid)
+        .bind(DbOfflineSessionId(sid))
         .execute(&pool)
         .await
         .unwrap();
@@ -469,7 +470,7 @@ async fn list_pending_for_session_includes_offline_local_ack() {
         "INSERT INTO offline_sessions (offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-05-15T00:00:00Z')",
     )
-    .bind(sid)
+    .bind(DbOfflineSessionId(sid))
     .bind(FN)
     .execute(&pool)
     .await
@@ -485,11 +486,11 @@ async fn list_pending_for_session_includes_offline_local_ack() {
          VALUES (?, ?, ?, 1, 'SELL', 'OFFLINE_LOCAL_ACK', 'b', 't', 'OFFLINE', \
             '2026-05-15T00:00:00Z', '{}', ?, ?)",
     )
-    .bind(did)
+    .bind(DbDocumentId(did))
     .bind(rid.as_bytes().to_vec())
     .bind(FN)
     .bind(&sha)
-    .bind(sid)
+    .bind(DbOfflineSessionId(sid))
     .execute(&pool)
     .await
     .unwrap();

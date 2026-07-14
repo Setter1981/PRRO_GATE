@@ -12,6 +12,7 @@
 use sqlx::SqlitePool;
 
 use prro::db::models::ids::DocumentId;
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::signer_guard::SignerCashierMismatch;
 use prro::services::write_path::stage_send::{self, StageSendOutcome};
 use prro::transports::dps::dto::CheckAck;
@@ -126,7 +127,7 @@ async fn seed(
 
 async fn read_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -219,7 +220,7 @@ async fn stage_send_signer_mismatch_returns_signer_refused_with_audit() {
     // No transport_trace row (no intent marked).
     let trace_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -328,7 +329,7 @@ async fn stage_send_sent_state_with_null_shift_returns_state_conflict_not_signer
     // No transport_trace row (no intent marked).
     let trace_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();

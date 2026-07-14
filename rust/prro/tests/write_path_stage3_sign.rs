@@ -47,6 +47,7 @@ use prro::db::repositories::{
     fiscal_documents as fd, fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig,
     ingress_inbox as inbox, ingress_inbox::NewInboxEntry,
 };
+use prro::db::types::{DbDocumentId, DbRequestId, DbShiftId};
 use prro::services::write_path::stage_sign::{self, test_hook, SignError, SigningContext};
 use prro::services::write_path::types::{CanonicalFiscalCommand, WorkerContext};
 
@@ -182,7 +183,7 @@ async fn seed_open_shift(pool: &sqlx::SqlitePool) -> ShiftId {
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .execute(pool)
     .await
@@ -210,7 +211,7 @@ async fn seed_node_state(
         }
         .as_str(),
     )
-    .bind(current_shift_id)
+    .bind(current_shift_id.map(DbShiftId))
     .bind(last_known.map(|h| &h[..]))
     .execute(pool)
     .await
@@ -237,8 +238,8 @@ async fn seed_prepared_doc(
              total_sum_kop, payload_json, payload_sha256_canonical
          ) VALUES (?, ?, ?, ?, ?, 'PREPARED', 'b', 't', 'ONLINE', '2026-04-22T12:00:00Z', 15000, ?, ?)",
     )
-    .bind(doc_id)
-    .bind(req_id)
+    .bind(DbDocumentId(doc_id))
+    .bind(DbRequestId(req_id))
     .bind(FN)
     .bind(lnd)
     .bind(doc_type.as_str())
@@ -392,7 +393,7 @@ async fn doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> DocState {
     sqlx::query_scalar::<_, prro::db::types::DbDocState>(
         "SELECT state FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(pool)
     .await
     .unwrap()
@@ -420,7 +421,7 @@ async fn doc_signing_inputs(
         "SELECT previous_hash, z_report_number, signing_inputs_pinned_at, unsigned_xml_sha256 \
          FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(pool)
     .await
     .unwrap();
@@ -437,7 +438,7 @@ async fn next_z_report_number(pool: &sqlx::SqlitePool) -> i64 {
 
 async fn document_files_count(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM document_files WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -475,7 +476,7 @@ async fn stage3_stale_workercontext_returns_state_conflict_no_pin_no_z_alloc() {
     // Force fd.state PREPARED → SIGNED directly (simulating a concurrent
     // finalize / external transition between W5 stage 1 and W6 stage 3).
     sqlx::query("UPDATE fiscal_documents SET state = 'SIGNED' WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -885,7 +886,7 @@ async fn stage3_persist_rollback_on_post_sign_db_error() {
     sqlx::query(
         "INSERT INTO document_files (document_id, kind, content) VALUES (?, 'PAYLOAD_XML', X'00')",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(&pool)
     .await
     .unwrap();
@@ -1218,7 +1219,7 @@ async fn stage3_runtime_byte_equiv_zn_zero_for_nonz_artifact() {
         "UPDATE fiscal_documents SET state = 'SENT', server_fiscal_no = 'D-1' \
          WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(&pool)
     .await
     .unwrap();
@@ -1313,7 +1314,7 @@ async fn seed_sibling_doc(
     } else {
         "ONLINE"
     })
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();

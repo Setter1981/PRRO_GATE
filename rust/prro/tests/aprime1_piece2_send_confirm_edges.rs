@@ -14,6 +14,7 @@
 use sqlx::SqlitePool;
 
 use prro::db::models::ids::{CashierId, DocumentId, RequestId};
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::stage_send::{self, StageSendOutcome};
 use prro::transports::dps::dto::CheckAck;
 
@@ -154,14 +155,14 @@ async fn seed_signed_doc(
 
 async fn doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
 }
 async fn sfn(pool: &SqlitePool, doc: DocumentId) -> Option<String> {
     sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -356,14 +357,14 @@ async fn c_e2e_open_then_sell_admitted_and_sent() {
     )
     .bind(vec![0x31u8; 32])
     .bind(vec![0x3Fu8; 32])
-    .bind(sell_doc)
+    .bind(DbDocumentId(sell_doc))
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO document_files(document_id, kind, content) VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(sell_doc)
+    .bind(DbDocumentId(sell_doc))
     .bind(b"FAKE-CMS".to_vec())
     .execute(&pool)
     .await

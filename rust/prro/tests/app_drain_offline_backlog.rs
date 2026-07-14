@@ -39,6 +39,7 @@ use std::sync::Arc;
 use prro::config::AppConfig;
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::dto::{CheckAck, CheckSignBlob};
@@ -108,7 +109,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(pool)
@@ -123,7 +124,7 @@ async fn seed_offline_session(pool: &SqlitePool, state: OfflineSessionState) -> 
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-21T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(state.as_str())
     .execute(pool)
@@ -158,14 +159,14 @@ async fn seed_offline_local_ack(
             ?, ?, '2026-05-21T00:00:00Z', ? \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(&sha)
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(code_lnd)
     .bind(&dps_code)
     .execute(pool)
@@ -175,7 +176,7 @@ async fn seed_offline_local_ack(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(b"FAKE-CMS".to_vec())
     .execute(pool)
     .await
@@ -186,7 +187,7 @@ async fn seed_offline_local_ack(
     )
     .bind(FN)
     .bind(code_lnd)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -211,7 +212,7 @@ async fn read_node_mode(pool: &SqlitePool) -> String {
 
 async fn read_session_state(pool: &SqlitePool, session_id: OfflineSessionId) -> String {
     sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
-        .bind(session_id)
+        .bind(DbOfflineSessionId(session_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -515,13 +516,13 @@ async fn rec2_scheduled_after_hold_skips_within_backoff_window() {
             'b1', 't1', 'OFFLINE', '2026-05-21T00:00:00Z', \
             '{}', ?, ?, ?, 100, '2026-05-21T00:00:00Z', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(vec![0u8; 32])
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind("DPS-FN-REC2")
     .execute(&pool)
     .await
@@ -825,13 +826,13 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
             'b1', 't1', 'OFFLINE', '2026-05-21T00:00:00Z', \
             '{}', ?, ?, ?, 100, '2026-05-21T00:00:00Z', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(vec![0u8; 32])
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind("DPS-FN-E2E")
     .execute(&pool)
     .await
@@ -868,7 +869,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     // ── Step 3: verify Tier 2 fired ──
     let counter: i64 =
         sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -910,7 +911,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     );
     let counter_post_reset: i64 =
         sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -928,7 +929,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     // only counter + node mode).
     let doc_state_post_reset: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -953,7 +954,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     );
     let doc_state_final: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -970,7 +971,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     // atomically з advance per REC-1 6.1.1 contract).
     let counter_final: i64 =
         sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();

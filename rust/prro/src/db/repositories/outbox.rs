@@ -23,6 +23,7 @@
 
 use crate::db::models::ids::DocumentId;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::DbDocumentId;
 
 /// Inputs for `enqueue_document_tx`.  Caller (`stage_finalize::run`)
 /// supplies the FN, the lnd as `sequence_no` (monotonic per FN),
@@ -62,7 +63,7 @@ pub async fn enqueue_document_tx(
         "INSERT INTO outbox (document_id, fiscal_number, sequence_no, payload_sha256) \
          VALUES (?, ?, ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(&row.fiscal_number)
     .bind(row.sequence_no)
     .bind(&row.payload_sha256[..])
@@ -111,7 +112,7 @@ pub async fn get_for_document(
                     enqueued_at, status, published_at \
              FROM outbox WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_optional(pool)
     .await?;
     let Some(r) = row else { return Ok(None) };

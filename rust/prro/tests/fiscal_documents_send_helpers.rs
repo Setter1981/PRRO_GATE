@@ -12,6 +12,7 @@ use prro::db::models::enums::{DocState, DocType};
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::fiscal_documents;
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 use sqlx::SqlitePool;
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -184,7 +185,7 @@ async fn mark_submission_attempted_updates_existing_row() {
     let pre: Option<String> = sqlx::query_scalar(
         "SELECT submission_attempted_at FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -205,7 +206,7 @@ async fn mark_submission_attempted_updates_existing_row() {
     let v: Option<String> = sqlx::query_scalar(
         "SELECT submission_attempted_at FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -252,7 +253,7 @@ async fn mark_submission_attempted_idempotent_preserves_first_stamp() {
         "UPDATE fiscal_documents SET submission_attempted_at = '2020-01-01 00:00:00' \
          WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .unwrap();
@@ -275,7 +276,7 @@ async fn mark_submission_attempted_idempotent_preserves_first_stamp() {
     let post: Option<String> = sqlx::query_scalar(
         "SELECT submission_attempted_at FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -323,7 +324,7 @@ async fn set_server_fiscal_no_updates_existing_row() {
 
     let v: Option<String> =
         sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -360,7 +361,7 @@ async fn seed_error_retryable_doc(pool: &SqlitePool, doc_byte: u8, lnd: i64) -> 
 
 async fn read_mac_recovery_attempts(pool: &SqlitePool, doc: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read mac_recovery_attempts")

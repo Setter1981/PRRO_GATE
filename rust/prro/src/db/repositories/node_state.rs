@@ -29,7 +29,7 @@
 use crate::db::models::enums::{NodeMode, ShiftState};
 use crate::db::models::ids::ShiftId;
 use crate::db::tx::WriteTxConn;
-use crate::db::types::{DbNodeMode, DbShiftState};
+use crate::db::types::{DbNodeMode, DbShiftId, DbShiftState};
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,7 +291,7 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
                   shift_state        as "shift_state: DbShiftState",
                   next_lnd,
                   last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
-                  current_shift_id   as "current_shift_id: ShiftId",
+                  current_shift_id   as "current_shift_id: DbShiftId",
                   backend_profile_id,
                   transport_profile_id,
                   next_z_report_number
@@ -309,7 +309,7 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
         shift_state: r.shift_state.0,
         next_lnd: r.next_lnd,
         last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
-        current_shift_id: r.current_shift_id,
+        current_shift_id: r.current_shift_id.map(|s| s.0),
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
         next_z_report_number: r.next_z_report_number,
@@ -326,7 +326,7 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Optio
                   shift_state        as "shift_state: DbShiftState",
                   next_lnd,
                   last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
-                  current_shift_id   as "current_shift_id: ShiftId",
+                  current_shift_id   as "current_shift_id: DbShiftId",
                   backend_profile_id,
                   transport_profile_id,
                   next_z_report_number
@@ -344,7 +344,7 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Optio
         shift_state: r.shift_state.0,
         next_lnd: r.next_lnd,
         last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
-        current_shift_id: r.current_shift_id,
+        current_shift_id: r.current_shift_id.map(|s| s.0),
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
         next_z_report_number: r.next_z_report_number,

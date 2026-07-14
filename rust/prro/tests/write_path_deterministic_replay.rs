@@ -35,6 +35,7 @@ use async_trait::async_trait;
 
 use prro::config::AppConfig;
 use prro::db::models::ids::DocumentId;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::runtime::ingress::convert::aggregate_z_payload;
 use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::transports::dps::channel::DpsChannel;
@@ -164,7 +165,7 @@ async fn seed_doc_in_state(
 
 async fn doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -202,7 +203,7 @@ async fn read_document_file_kind(
     kind: &str,
 ) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(kind)
         .fetch_optional(pool)
         .await
@@ -211,7 +212,7 @@ async fn read_document_file_kind(
 
 async fn count_outbox_for(pool: &SqlitePool, doc: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("count outbox rows for doc")
@@ -219,7 +220,7 @@ async fn count_outbox_for(pool: &SqlitePool, doc: DocumentId) -> i64 {
 
 async fn insert_document_file(pool: &SqlitePool, doc: DocumentId, kind: &str, content: &[u8]) {
     sqlx::query("INSERT INTO document_files (document_id, kind, content) VALUES (?, ?, ?)")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(kind)
         .bind(content)
         .execute(pool)
@@ -598,7 +599,7 @@ async fn seed_doc_with_signed_xml(
 
 async fn read_mac_recovery_attempts(pool: &SqlitePool, doc: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read mac_recovery_attempts")
@@ -985,7 +986,7 @@ async fn seed_doc_sent_with_server_fiscal_no(
     let doc = seed_doc_with_signed_xml(pool, fn_id, doc_byte, "SENT").await;
     sqlx::query("UPDATE fiscal_documents SET server_fiscal_no = ? WHERE document_id = ?")
         .bind(server_fiscal_no)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(pool)
         .await
         .expect("seed server_fiscal_no on SENT doc");
@@ -1003,7 +1004,7 @@ async fn read_latest_transport_trace(
         "SELECT outcome_kind, server_fiscal_no FROM transport_trace \
          WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(pool)
     .await
     .expect("read transport_trace row")
@@ -1011,7 +1012,7 @@ async fn read_latest_transport_trace(
 
 async fn count_transport_trace(pool: &SqlitePool, doc: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("count transport_trace rows")
@@ -1052,7 +1053,7 @@ async fn seed_completed_transport_trace_at_attempt(
          VALUES (?, ?, 'b1', 't1', ?, '2026-04-22T12:00:00Z', \
             '2026-04-22T12:00:00Z', '2026-04-22T12:00:01Z', ?, ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(attempt_no)
     .bind(&envelope_sha)
     .bind(outcome_kind)
@@ -1064,7 +1065,7 @@ async fn seed_completed_transport_trace_at_attempt(
 
 async fn read_server_fiscal_no(pool: &SqlitePool, doc: DocumentId) -> Option<String> {
     sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read server_fiscal_no")
@@ -1596,7 +1597,7 @@ async fn seed_open_shift_and_node(
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(fn_id)
     .execute(pool)
     .await
@@ -1607,7 +1608,7 @@ async fn seed_open_shift_and_node(
          VALUES (?, 'ONLINE', 'OPENED', ?, 1, 'b1', 't1')",
     )
     .bind(fn_id)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -2301,7 +2302,7 @@ async fn make_doc_z(
     .bind(payload)
     .bind(&source[..])
     .bind(&payload_sha[..])
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(pool)
     .await
     .unwrap();
@@ -2410,7 +2411,7 @@ async fn a1z_non_z_consistently_corrupted_payload_is_drift() {
     .bind(doc_payload)
     .bind(&doc_sha[..])
     .bind(&doc_sha[..]) // non-Z: source == canonical
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(app.db())
     .await
     .unwrap();
@@ -2763,7 +2764,7 @@ async fn fixture_9h_er_latest_unfinished_trace_holds_no_send() {
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 2, 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(vec![0u8; 32])
     .execute(app.db())
     .await
@@ -2865,7 +2866,7 @@ async fn fixture_3b_sending_crash_after_transient_retry_second_boot_no_resend() 
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 2, 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(vec![0u8; 32])
     .execute(app.db())
     .await
