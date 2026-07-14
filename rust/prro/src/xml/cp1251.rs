@@ -113,6 +113,50 @@ fn encode_char(c: char) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// FW-1 mutation A4 — the 17 `encode_char` match arms cargo-mutants can
+    /// delete without any existing test noticing (the unit tests pin only the
+    /// KEPT arms — 201C/201D/2014 etc. — and the goldens use ASCII + core
+    /// Cyrillic + і/ї). Deleting an arm ⇒ that codepoint returns `None` ⇒
+    /// `encode` fails with `Cp1251Unmappable` ⇒ the whole receipt build is
+    /// REFUSED (false receipt-refusal). Several are common in Ukrainian fiscal
+    /// text: `«` U+00AB (opening guillemet in legal company names — note the
+    /// closing `»` U+00BB is a KEPT arm, so breakage is asymmetric), `°` (spirit
+    /// names), `·`, plus typographic `… – ‘ ’ • „`. One round-trip pins all 17;
+    /// deleting any single arm turns this test RED.
+    #[test]
+    fn deleted_table_arms_round_trip_to_exact_bytes() {
+        let cases: &[(char, u8)] = &[
+            ('\u{201E}', 0x84), // „
+            ('\u{2026}', 0x85), // …
+            ('\u{2030}', 0x89), // ‰
+            ('\u{0409}', 0x8A), // Љ
+            ('\u{2018}', 0x91), // ‘
+            ('\u{2019}', 0x92), // ’
+            ('\u{2022}', 0x95), // •
+            ('\u{2013}', 0x96), // –
+            ('\u{045B}', 0x9E), // ћ
+            ('\u{045F}', 0x9F), // џ
+            ('\u{045E}', 0xA2), // ў
+            ('\u{0408}', 0xA3), // Ј
+            ('\u{00AB}', 0xAB), // «
+            ('\u{00AC}', 0xAC), // ¬
+            ('\u{00AD}', 0xAD), // SHY
+            ('\u{00B0}', 0xB0), // °
+            ('\u{00B7}', 0xB7), // ·
+        ];
+        for &(c, expected) in cases {
+            let out = encode(&c.to_string())
+                .unwrap_or_else(|_| panic!("cp1251 must encode U+{:04X}", c as u32));
+            assert_eq!(
+                out,
+                vec![expected],
+                "U+{:04X} must map to 0x{:02X}",
+                c as u32,
+                expected
+            );
+        }
+    }
+
     #[test]
     fn ascii_passthrough() {
         let out = encode("Hello, World!").unwrap();

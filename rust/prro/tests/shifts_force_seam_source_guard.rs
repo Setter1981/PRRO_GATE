@@ -349,3 +349,136 @@ fn tx_isolation_violation_variant_is_constructible_and_matchable() {
         }
     ));
 }
+
+/// FW-1 mutation A2 — `validate_evidence_json` body → `Ok(())` (shifts.rs:475).
+/// Both force seams call `validate_evidence_json(evidence_json)?` as their FIRST
+/// line (shifts.rs:540 / :671), before the source-state check and the shift
+/// lookup. The existing 9-case guards always pass the VALID `EVIDENCE` const, so
+/// the malformed / oversized paths are never exercised → the mutation (which
+/// disables both the 8 KiB cap and the JSON-shape check) survives. This feeds
+/// invalid + oversized evidence to both seams on an allowed source (Opened) and
+/// pins: reject with `InvalidEvidenceJson`, no state change, no forensic audit.
+#[tokio::test]
+async fn force_seams_reject_malformed_and_oversized_evidence() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    // One Opened shift, REUSED across all cases: a rejected force never mutates
+    // state, so the shift stays a valid Opened source — and one FN cannot hold
+    // two active shifts (UNIQUE(shifts.fiscal_number)), so re-seeding per case
+    // would spuriously fail.
+    let shift_id = seed_shift_in_state(&pool, &fn_id, ShiftState::Opened).await;
+    let shift_id_hex: String =
+        sqlx::query_scalar("SELECT lower(hex(shift_id)) FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // valid JSON but over the 8 KiB cap → must still be rejected (size guard).
+    let oversized = format!(
+        "{{\"x\":\"{}\"}}",
+        "a".repeat(shifts::FORCE_SEAM_EVIDENCE_MAX_BYTES)
+    );
+    for bad in ["not-json-at-all", oversized.as_str()] {
+        for seam in ["error", "manual"] {
+            let bad_s = bad.to_string();
+            let res = with_immediate(&pool, move |tx| {
+                Box::pin(async move {
+                    let o = if seam == "error" {
+                        shifts::force_to_error_with_audit(tx, shift_id, Some("op-007"), &bad_s).await
+                    } else {
+                        shifts::force_to_manual_reconciliation_with_audit(
+                            tx,
+                            shift_id,
+                            Some("op-007"),
+                            &bad_s,
+                        )
+                        .await
+                    };
+                    anyhow::Ok(o)
+                })
+            })
+            .await
+            .unwrap();
+            // Rejected with the typed evidence error before any state change.
+            // Mutation (validate → Ok(())) lets it proceed → Ok(Applied/ForbiddenSource).
+            assert!(
+                matches!(res, Err(shifts::ForceSeamError::InvalidEvidenceJson(_))),
+                "seam={seam} bad-evidence must be InvalidEvidenceJson, got {res:?}"
+            );
+        }
+    }
+    // No case mutated the shift and no forensic audit fired — validation precedes
+    // the source check and every DB write.
+    let st = shifts::get(&pool, shift_id).await.unwrap().unwrap().state;
+    assert_eq!(
+        st,
+        ShiftState::Opened,
+        "state must not change on rejected evidence"
+    );
+    assert_eq!(
+        count_audit_events(&pool, &shift_id_hex, "SHIFT_FORCE_TO_ERROR").await,
+        0,
+        "rejected evidence must not emit SHIFT_FORCE_TO_ERROR"
+    );
+    assert_eq!(
+        count_audit_events(&pool, &shift_id_hex, "SHIFT_FORCE_TO_MANUAL_RECONCILIATION").await,
+        0,
+        "rejected evidence must not emit SHIFT_FORCE_TO_MANUAL_RECONCILIATION"
+    );
+}
+
+/// FW-1 mutation A3 — delete `!` in `actor_id.filter(|s| !s.is_empty())`
+/// (shifts.rs:674, force_to_manual). Flips "keep non-empty actor, drop empty"
+/// into "keep only empty" ⇒ a real operator id like `Some("op-007")` normalizes
+/// to `None` ⇒ every emitted audit records `actor = NULL`, destroying the
+/// non-repudiable "who forced the shift into manual reconciliation" trail. The
+/// mutation leaves outcome / state / audit COUNT identical (that is why the
+/// 9-case test misses it — it never reads `audit_log.actor`). This pins the
+/// stored actor column directly.
+#[tokio::test]
+async fn force_to_manual_records_operator_actor_in_audit() {
+    let (pool, fn_id) = fresh_with_fn().await;
+    // Opened is an allowed source for force_to_manual → the success audit fires.
+    let shift_id = seed_shift_in_state(&pool, &fn_id, ShiftState::Opened).await;
+    let shift_id_hex: String =
+        sqlx::query_scalar("SELECT lower(hex(shift_id)) FROM shifts WHERE shift_id = ?")
+            .bind(shift_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let outcome = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            let o = shifts::force_to_manual_reconciliation_with_audit(
+                tx,
+                shift_id,
+                Some("op-007"),
+                EVIDENCE,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("force-seam: {e}"))?;
+            anyhow::Ok(o)
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, shifts::ForceSeamOutcome::Applied),
+        "Opened is an allowed source; expected Applied, got {outcome:?}"
+    );
+
+    // Oracle: the Critical success audit must carry the operator id verbatim.
+    // Under the mutation `filter(|s| s.is_empty())` drops "op-007" → actor = NULL.
+    let actor: Option<String> = sqlx::query_scalar(
+        "SELECT actor FROM audit_log WHERE entity_type = 'shift' AND entity_id = ? \
+         AND event_type = 'SHIFT_FORCE_TO_MANUAL_RECONCILIATION'",
+    )
+    .bind(&shift_id_hex)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        actor.as_deref(),
+        Some("op-007"),
+        "force-to-manual audit must record the operator actor for forensic attribution"
+    );
+}
