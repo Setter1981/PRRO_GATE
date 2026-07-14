@@ -1,0 +1,47 @@
+name: mutation-diff
+
+# Per-PR mutation ratchet (the FW-1 discipline in CLAUDE.md → "Mutation-testing
+# discipline"). Runs cargo-mutants `--in-diff` on the changed prro/src lines vs
+# the committed baseline and FAILS on a NEW survivor that the PR did not account
+# for — either killed by a teeth test, or consciously accepted in
+# docs/mutation/baseline/survivors.txt / rust/.cargo/mutants.toml `exclude_re`.
+# Keeps test coverage from silently eroding; survivors do not accumulate.
+#
+# Heavier than fmt/clippy (it builds the unmutated baseline, then mutates only
+# the changed functions), so it is path-filtered + time-boxed. To make it a HARD
+# merge gate, add the "mutation diff-gate" check to the repo's required status
+# checks (branch protection) — the same way "fmt + clippy (gnu)" is required.
+
+on:
+  pull_request:
+    paths:
+      - 'rust/prro/src/**'
+      - 'rust/.cargo/mutants.toml'
+      - 'docs/mutation/baseline/survivors.txt'
+      - 'scripts/mutation/**'
+
+concurrency:
+  group: mutation-diff-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutation-diff:
+    name: mutation diff-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # run.sh diffs the PR against origin/main — need its history.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: taiki-e/install-action@nextest
+      - name: install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: mutation diff-gate (scripts/mutation/run.sh diff)
+        # Exits non-zero on a NEW survivor vs docs/mutation/baseline/survivors.txt.
+        # A no-op (no prro/src diff) exits 0.
+        run: scripts/mutation/run.sh diff
