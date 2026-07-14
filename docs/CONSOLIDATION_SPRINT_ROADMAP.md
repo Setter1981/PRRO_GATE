@@ -88,6 +88,10 @@ Plan LOCKED (rev 5). Next concrete moves: PR the plan to main; author specs #1 (
   operator-recovery (`prro doctor`); keys/updates; `schema_version`/upgrade; monitoring/alerts;
   worst-case backlog/drain capacity; update+rollback rehearsal; Windows installer; real-rig +
   final fuzzer/mutation/live-DPS pass.
+- **Reporting read-models (plan §7.13):** a derived, rebuildable, off-write-path `document_lines`
+  projection (line-item analytics) + the shift/receipt browse read-model → the operator/fleet
+  console. Fed from the outbox; reconciles to the signed payload (fuzzer tooth). Not pilot-critical
+  (pilot renders lines from the payload); powers the fleet-console moat.
 - Concrete adapters (**ЕВПЗ** second DPS protocol; each new ingress protocol) = **local slices**,
   slotted here as demand appears.
 - **EXIT:** the **safe-first-physical-register** gate (per `PILOT_GATE_CHECKLIST.md`).

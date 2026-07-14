@@ -418,6 +418,26 @@ The DPS test cabinet proves the *protocol*, not the whole till system. Before a 
     exhausting codes / time budget on return).
 12. **Update & rollback rehearsal** — a real upgrade (multi-version-skip) and a real rollback
     rehearsed end-to-end (rollback routes through reconciliation, never a raw DB swap).
+13. **Reporting read-models (observability) — derived, rebuildable, OFF the write-path.** The
+    signed payload/XML stays the **canonical** fiscal truth; reporting projections (notably a
+    **`document_lines`** normalized line-item table — goods/qty/price/tax, absent today: lines live
+    inside `payload_json` + the canonical `<P>` elements) are **derived read-models** fed off the
+    **event stream (outbox)**, never written on the hot fiscal path, and **rebuildable** by
+    replaying payloads. **Reconciliation invariant:** a projection must always reconcile to the
+    signed payload (`sum(lines) == doc total`; rebuild-equivalence) — an `invariant_scan`/fuzzer
+    tooth pins that it can never silently diverge from fiscal truth. Powers "browse shifts →
+    receipts → **lines**" and the fleet console. **Post-consolidation** (clean domain + outbox
+    seams from CS-3/CS-7); **not pilot-critical** — the pilot views lines by rendering the payload.
+    **Reference-validated (2026-07-14):** BOTH WebCheck (`CHECKBODY` table + `checkxml` blob) and the
+    official ДПС app (`Operation`+`Goods`+`ReceiptRate` tables + `XMLBlob`) store lines **normalized
+    & queryable** and keep the XML/blob for **transmission/reprint only** (reports derive from the
+    tables, not the blob). We take the **WebCheck-style DENORMALIZED `document_lines`** (line-as-
+    received: `code, uktzed, goods_name, unit, qty, unit_price, line_sum, tax_letter, excise,
+    discount`, **`barcode` OPTIONAL/nullable** — the POS may not send it) — **NOT** a ДПС-style
+    `Goods` master (the POS owns the catalog; a gateway does not).
+    WebCheck uses its line table for the **Z-report tax breakdown** (`GROUP BY tax_letter`), so this
+    is early-useful, not just post-pilot analytics → land it as an **early read-model slice after
+    CS-3** (once outbox/domain seams exist), unless our `aggregate_z` already carries doc-level tax.
 
 ## 8 · Effort & sizing (no installed base — the discount is real)
 
