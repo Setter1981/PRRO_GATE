@@ -42,7 +42,8 @@ jobs:
         working-directory: rust
         # prro_crypto/prro_escpos joined the fmt gate in the CRY-4 lint-debt
         # pass (2026-06-11) — both crates were fmt-standardized then.
-        run: cargo fmt -p prro -p prro_crypto -p prro_escpos -- --check
+        # prro-domain/prro-testkit joined in CS-1a (contract §8 / RP-CS1-6).
+        run: cargo fmt -p prro -p prro_crypto -p prro_escpos -p prro-domain -p prro-testkit -- --check
       - name: cargo clippy (-D warnings, crate-scoped)
         working-directory: rust
         # --features test-support: builds the integration test targets
@@ -56,3 +57,9 @@ jobs:
         # explicit-index CT loops; fixture-mirror fields) — do not silence
         # new lints here, fix or justify them in code.
         run: cargo clippy -p prro_crypto -p prro_escpos --all-targets --no-deps -- -D warnings
+
+      - name: cargo clippy prro-domain + prro-testkit (-D warnings)
+        working-directory: rust
+        # CS-1a skeleton crates (contract §8 / RP-CS1-6). `--all-targets` lints
+        # the purity-gate + trybuild-canary test targets too; keep them clean.
+        run: cargo clippy -p prro-domain -p prro-testkit --all-targets --no-deps -- -D warnings

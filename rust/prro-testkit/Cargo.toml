@@ -1,0 +1,15 @@
+[package]
+name = "prro-testkit"
+version = "0.1.0"
+edition = "2021"
+description = "PRRO Gateway shared test scaffolding — dev-dependency only, never published (CS-1 skeleton)"
+# Never published to any registry: this crate is a dev-only test-support
+# helper. It is a workspace member (so `cargo build --workspace` compiles it),
+# but RP-CS1-4 pins that it stays ABSENT from every production package's
+# normal/build dependency graph.
+publish = false
+
+[lib]
+name = "prro_testkit"
+
+[dependencies]

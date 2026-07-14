@@ -1,0 +1,31 @@
+[package]
+name = "prro-domain"
+version = "0.1.0"
+edition = "2021"
+description = "PRRO Gateway pure domain model — sqlx-free, I/O-free, runtime-free (CS-1 skeleton)"
+
+[lib]
+name = "prro_domain"
+
+[dependencies]
+# CS-1 dependency policy (contract §9): `uuid` is ALLOWED (the UUID-BLOB ids
+# — DocumentId/ShiftId/… — move here in CS-1b′ keeping `now_v7`/`new_v5`/serde
+# unchanged). Every I/O / async-runtime / DB crate is FORBIDDEN
+# (sqlx / tonic / tokio / axum / prost / hyper / reqwest) and the RP-CS1-1
+# purity gate (tests/purity_gate.rs) parses `cargo metadata` to enforce it.
+# NO type has been moved yet — this is the empty scaffolding slice (CS-1a).
+uuid = { version = "1", features = ["v7", "v5", "serde"] }
+
+[dev-dependencies]
+# RP-CS1-1 (purity gate) shells out to `cargo metadata --format-version 1`
+# and walks the JSON dependency graph; serde_json is the only parser it needs
+# (a full `cargo_metadata` crate dep is avoided to keep the graph minimal).
+# Dev-deps do NOT appear in the normal/build/target edges the gate inspects,
+# so this does not weaken the invariant it enforces.
+serde_json = "1"
+
+# RP-CS1-1 fast canary — a `write_tx_conn_compile_fail.rs`-style trybuild
+# fixture asserting a forbidden crate is not `use`-able from prro-domain's
+# graph. The cargo-metadata test above is the PRIMARY (alias/build/target-dep
+# proof); this is the cheap smoke.
+trybuild = "1"
