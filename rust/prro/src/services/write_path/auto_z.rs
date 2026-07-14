@@ -254,3 +254,44 @@ fn fiscal_error_code(e: &FiscalError) -> String {
         FiscalError::NotImplemented { .. } => "NOT_IMPLEMENTED".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FW-1 mutation teeth — `auto_z_idempotency_key -> "xyzzy"` (constant).
+    /// The key is `autoz-<fn>-<shift_hex>`, UNIQUE PER SHIFT (the module invariant
+    /// "one per shift"). A constant collapses the key across shifts, so a SECOND
+    /// over-limit shift on the same FN replays the FIRST shift's Z inbox row →
+    /// reports Issued but mints NO Z for shift #2, leaving it over the 24h wall
+    /// with no durable Z (RULING 3.4 violation, frozen INV #4 idempotency). The
+    /// `t3_auto_z_ticker` suite only ever drives ONE shift per FN, so the
+    /// cross-shift collision is unpinned. This pins per-shift distinctness (and
+    /// the request_id anchor derived from it) directly at the source.
+    #[test]
+    fn auto_z_key_and_request_id_are_distinct_per_shift() {
+        let fnum = "4000000042";
+        let k1 = auto_z_idempotency_key(fnum, "aaaaaaaa");
+        let k2 = auto_z_idempotency_key(fnum, "bbbbbbbb");
+        // Different shifts (same FN) → different keys. A constant fails this.
+        assert_ne!(
+            k1, k2,
+            "auto-Z idempotency key must be per-shift; a constant collapses \
+             shift #2 onto shift #1's Z (RULING 3.4: no shift crosses 24h without a Z)"
+        );
+        // The request_id anchor (sha256 of the key) must therefore also differ.
+        assert_ne!(
+            auto_z_request_id(&k1),
+            auto_z_request_id(&k2),
+            "auto-Z request_id (sha256 of the key) must be per-shift"
+        );
+        // Same shift → same key: the crash-resume re-tick idempotency (INV-7)
+        // the mutation would keep — pinned so the teeth are specific to the
+        // per-shift half, not the determinism half.
+        assert_eq!(
+            auto_z_idempotency_key(fnum, "aaaaaaaa"),
+            k1,
+            "same shift must yield the same key (crash-mid-Z re-tick resolves the same row)"
+        );
+    }
+}
