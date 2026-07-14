@@ -1,0 +1,157 @@
+prro/src/admin.rs:563:42: replace != with == in go_online_inner
+prro/src/admin.rs:636:18: replace < with <= in seed_offline_codes
+prro/src/admin.rs:636:35: replace > with >= in seed_offline_codes
+prro/src/admin.rs:901:9: replace <impl std::fmt::Debug for AddOperatorInput>::fmt -> std::fmt::Result with Ok(Default::default())
+prro/src/admin.rs:1254:5: replace run_add_operator -> Result<(), AdminError> with Ok(())
+prro/src/admin.rs:1322:9: replace <impl PasswordPrompter for StdinPasswordPrompter>::prompt -> std::io::Result<String> with Ok(String::new())
+prro/src/admin.rs:1322:9: replace <impl PasswordPrompter for StdinPasswordPrompter>::prompt -> std::io::Result<String> with Ok("xyzzy".into())
+prro/src/admin.rs:1332:20: delete ! in <impl PasswordPrompter for StdinPasswordPrompter>::prompt
+prro/src/admin_w4_z0.rs:120:9: replace CfgAdminError::exit_code -> i32 with 0
+prro/src/admin_w4_z0.rs:120:9: replace CfgAdminError::exit_code -> i32 with 1
+prro/src/admin_w4_z0.rs:120:9: replace CfgAdminError::exit_code -> i32 with -1
+prro/src/admin_w4_z0.rs:121:13: delete match arm CfgAdminError::Infrastructure(_) in CfgAdminError::exit_code
+prro/src/admin_w4_z0.rs:869:28: replace == with != in open_pools_from_config
+prro/src/admin_w4_z0.rs:949:5: replace run_update_tax_rate -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:959:5: replace run_remove_tax_group -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:924:5: replace run_add_tax_group -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:968:5: replace run_list_tax_groups -> Result<Vec<TaxGroup>, CfgAdminError> with Ok(vec![])
+prro/src/admin_w4_z0.rs:978:5: replace run_add_payment_method -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:1009:5: replace run_list_payment_methods -> Result<Vec<PaymentMethod>, CfgAdminError> with Ok(vec![])
+prro/src/admin_w4_z0.rs:1000:5: replace run_remove_payment_method -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:1018:5: replace run_set_flag -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:1028:5: replace run_set_national_receipt -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:1066:5: replace run_update_driver_mapping -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:1076:5: replace run_remove_driver_mapping -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:1085:5: replace run_list_driver_mappings -> Result<Vec<DriverTaxMapping>, CfgAdminError> with Ok(vec![])
+prro/src/admin_w4_z0.rs:1047:5: replace run_add_driver_mapping -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:1106:5: replace run_bootstrap_defaults -> Result<(), CfgAdminError> with Ok(())
+prro/src/admin_w4_z0.rs:1093:5: replace run_set_outgress_profile -> Result<(), CfgAdminError> with Ok(())
+prro/src/app.rs:96:9: replace BootError::exit_code -> i32 with 0
+prro/src/app.rs:96:9: replace BootError::exit_code -> i32 with 1
+prro/src/app.rs:249:13: replace && with || in App::boot
+prro/src/app.rs:215:16: delete ! in App::boot
+prro/src/app.rs:250:34: replace > with >= in App::boot
+prro/src/app.rs:297:28: replace match guard s == "ok" with true in App::boot
+prro/src/app.rs:366:16: delete ! in App::boot
+prro/src/app.rs:554:27: replace > with == in App::reconcile_pending_inner
+prro/src/app.rs:554:27: replace > with < in App::reconcile_pending_inner
+prro/src/app.rs:554:27: replace > with >= in App::reconcile_pending_inner
+prro/src/app.rs:821:13: replace || with && in App::drain_offline_backlog_scheduled
+prro/src/app.rs:820:39: replace > with < in App::drain_offline_backlog_scheduled
+prro/src/app.rs:821:44: replace > with < in App::drain_offline_backlog_scheduled
+prro/src/config/mod.rs:269:9: replace OfflineCfg::enforcement_toggles -> crate::services::time_budget::EnforcementToggles with Default::default()
+prro/src/config/mod.rs:278:5: replace default_return_online_probe_interval_seconds -> u64 with 0
+prro/src/config/mod.rs:417:5: replace default_auto_z_interval_seconds -> u64 with 0
+prro/src/config/mod.rs:417:5: replace default_auto_z_interval_seconds -> u64 with 1
+prro/src/config/mod.rs:461:9: replace SupervisorCfg::clamped_auto_z_interval_seconds -> (u64, bool) with (1, true)
+prro/src/config/mod.rs:461:9: replace SupervisorCfg::clamped_auto_z_interval_seconds -> (u64, bool) with (1, false)
+prro/src/config/mod.rs:577:5: replace default_dps_request_timeout_seconds -> u64 with 1
+prro/src/db/mod.rs:85:27: replace match guard e.kind() == std::io::ErrorKind::NotFound with true in set_owner_only_perms
+prro/src/doctor.rs:26:12: delete ! in run
+prro/src/xml/mod.rs:405:32: replace > with >= in calc_tax
+prro/src/xml/mod.rs:413:32: replace > with >= in calc_tax
+prro/src/xml/mod.rs:418:32: replace > with >= in calc_tax
+prro/src/xml/mod.rs:426:32: replace > with >= in calc_tax
+prro/src/crypto/in_process.rs:129:9: delete match arm CmsProfile::Dstu4145WithGost34311Pb | CmsProfile::Dstu4145WithDstu7564Pb in sign_cms_blocking
+prro/src/crypto/session.rs:191:29: replace / with % in unseal_jks
+prro/src/crypto/session.rs:96:9: replace SigningSession::param_d -> &Zeroizing<[u8; 32]> with Box::leak(Box::new(Zeroizing::from([1; 32])))
+prro/src/crypto/session.rs:185:8: delete ! in unseal_jks
+prro/src/crypto/session.rs:192:42: replace * with + in unseal_jks
+prro/src/crypto/session.rs:196:42: replace * with + in unseal_jks
+prro/src/crypto/session.rs:200:31: replace << with >> in unseal_jks
+prro/src/crypto/session.rs:210:12: replace ^= with &= in unseal_jks
+prro/src/crypto/session.rs:210:12: replace ^= with |= in unseal_jks
+prro/src/crypto/session.rs:279:5: replace hex_digit -> Option<u8> with Some(0)
+prro/src/crypto/session.rs:279:5: replace hex_digit -> Option<u8> with Some(1)
+prro/src/crypto/session.rs:280:31: replace - with / in hex_digit
+prro/src/crypto/session.rs:280:31: replace - with + in hex_digit
+prro/src/crypto/session.rs:281:31: replace - with / in hex_digit
+prro/src/crypto/session.rs:282:31: replace - with + in hex_digit
+prro/src/crypto/session.rs:282:31: replace - with / in hex_digit
+prro/src/db/backup.rs:220:24: replace || with && in parse_snapshot_stamp
+prro/src/db/backup.rs:223:23: replace || with && in parse_snapshot_stamp
+prro/src/db/backup.rs:263:32: replace > with >= in prune
+prro/src/doctor/live.rs:263:17: delete match arm LedgerSyncVerdict::NoLocalState in run_live
+prro/src/doctor/live.rs:421:5: replace hex_lower -> String with "xyzzy".into()
+prro/src/runtime/bindings.rs:79:9: replace BindingsRegistry::is_empty -> bool with true
+prro/src/runtime/bindings.rs:83:9: replace BindingsRegistry::fns -> impl Iterator<Item =&str> with ::std::iter::once("xyzzy")
+prro/src/runtime/bindings.rs:260:32: replace += with *= in BindingsRegistry::build_from_db
+prro/src/runtime/bindings.rs:352:37: replace += with *= in BindingsRegistry::build_from_db
+prro/src/runtime/outgress.rs:236:9: replace <impl SignEnvelope for CmsOverDatEnvelope>::wrap -> Result<Vec<u8>, SignError> with Ok(vec![])
+prro/src/runtime/outgress.rs:251:9: replace <impl DpsTransport for GrpcSendChkV2Transport>::submit -> Result<Vec<u8>, TransportError> with Ok(vec![])
+prro/src/runtime/outgress.rs:236:9: replace <impl SignEnvelope for CmsOverDatEnvelope>::wrap -> Result<Vec<u8>, SignError> with Ok(vec![0])
+prro/src/runtime/supervisor.rs:315:23: replace && with || in run_with_registry
+prro/src/runtime/supervisor.rs:700:5: replace log_join_failure with ()
+prro/src/runtime/supervisor.rs:1084:5: replace convergence_tick with ()
+prro/src/runtime/supervisor.rs:1180:5: replace auto_z_tick with ()
+prro/src/runtime/supervisor.rs:1294:75: replace + with - in spawn_backup_loop
+prro/src/runtime/supervisor.rs:1414:5: replace backup_same_device_advisory with ()
+prro/src/services/cash_ledger.rs:343:27: replace <= with > in aggregate_shift_cash_tx
+prro/src/services/cert_refresher.rs:529:28: replace | with ^ in hex_to_ski
+prro/src/xml/cp1251.rs:48:9: delete match arm 0x201E in encode_char
+prro/src/xml/cp1251.rs:49:9: delete match arm 0x2026 in encode_char
+prro/src/xml/cp1251.rs:53:9: delete match arm 0x2030 in encode_char
+prro/src/xml/cp1251.rs:54:9: delete match arm 0x0409 in encode_char
+prro/src/xml/cp1251.rs:62:9: delete match arm 0x2019 in encode_char
+prro/src/xml/cp1251.rs:61:9: delete match arm 0x2018 in encode_char
+prro/src/xml/cp1251.rs:65:9: delete match arm 0x2022 in encode_char
+prro/src/xml/cp1251.rs:66:9: delete match arm 0x2013 in encode_char
+prro/src/xml/cp1251.rs:74:9: delete match arm 0x045B in encode_char
+prro/src/xml/cp1251.rs:75:9: delete match arm 0x045F in encode_char
+prro/src/xml/cp1251.rs:78:9: delete match arm 0x045E in encode_char
+prro/src/xml/cp1251.rs:79:9: delete match arm 0x0408 in encode_char
+prro/src/xml/cp1251.rs:87:9: delete match arm 0x00AB in encode_char
+prro/src/xml/cp1251.rs:88:9: delete match arm 0x00AC in encode_char
+prro/src/xml/cp1251.rs:89:9: delete match arm 0x00AD in encode_char
+prro/src/xml/cp1251.rs:92:9: delete match arm 0x00B0 in encode_char
+prro/src/xml/cp1251.rs:99:9: delete match arm 0x00B7 in encode_char
+prro/src/db/models/ids.rs:172:9: replace DriverId::into_inner -> String with "xyzzy".into()
+prro/src/db/models/ids.rs:257:20: replace > with < in <impl Decode<'r, Sqlite> for CashierId>::decode
+prro/src/db/models/ids.rs:257:20: replace > with == in <impl Decode<'r, Sqlite> for CashierId>::decode
+prro/src/db/repositories/driver_tax_mapping.rs:84:19: replace match guard is_unique_violation(&e) with true in insert
+prro/src/db/repositories/driver_tax_mapping.rs:199:5: replace is_unique_violation -> bool with true
+prro/src/db/repositories/fiscal_documents.rs:1004:5: replace max_submitted_lnd -> sqlx::Result<Option<i64>> with Ok(None)
+prro/src/db/repositories/fiscal_documents.rs:1101:5: replace last_ack_unsigned_xml_sha256 -> sqlx::Result<Option<Vec<u8>>> with Ok(Some(vec![]))
+prro/src/db/repositories/fiscal_documents.rs:1101:5: replace last_ack_unsigned_xml_sha256 -> sqlx::Result<Option<Vec<u8>>> with Ok(Some(vec![0]))
+prro/src/db/repositories/offline_sessions.rs:482:5: replace current_open_or_draining_session_id_tx -> sqlx::Result<Option<OfflineSessionId>> with Ok(None)
+prro/src/db/repositories/operators.rs:204:5: replace is_unique_violation -> bool with true
+prro/src/db/repositories/shifts.rs:475:5: replace validate_evidence_json -> Result<(), ForceSeamError> with Ok(())
+prro/src/db/repositories/shifts.rs:674:48: delete ! in force_to_manual_reconciliation_with_audit
+prro/src/db/repositories/shifts.rs:798:5: replace emit_cas_isolation_violation_audit -> sqlx::Result<Option<ShiftState>> with Ok(None)
+prro/src/runtime/ingress/canonical_builder.rs:85:9: replace <impl std::fmt::Display for BuildReject>::fmt -> std::fmt::Result with Ok(Default::default())
+prro/src/runtime/ingress/convert.rs:525:26: replace < with <= in aggregate_zreport
+prro/src/runtime/ingress/handler.rs:279:5: replace hex32 -> String with String::new()
+prro/src/runtime/ingress/handler.rs:279:5: replace hex32 -> String with "xyzzy".into()
+prro/src/runtime/ingress/replay.rs:112:28: replace match guard t >= 0 with true in build_accepted
+prro/src/runtime/ingress/server.rs:283:5: replace status_read_error -> Response with Default::default()
+prro/src/services/offline_sync/backlog_drain.rs:2235:5: replace outcome_as_str -> &'static str with "xyzzy"
+prro/src/services/offline_sync/kvt2_confirm.rs:1410:5: replace iso8601_now -> String with String::new()
+prro/src/services/reconciliation/boot_phase.rs:375:13: replace + with - in DispatchHistogram::total_visited
+prro/src/services/reconciliation/boot_phase.rs:369:13: replace + with * in DispatchHistogram::total_visited
+prro/src/services/reconciliation/boot_phase.rs:368:13: replace + with * in DispatchHistogram::total_visited
+prro/src/services/reconciliation/boot_phase.rs:351:13: replace + with - in DispatchHistogram::total_visited
+prro/src/services/reconciliation/boot_phase.rs:447:29: replace += with *= in DispatchHistogram::merge
+prro/src/services/reconciliation/boot_phase.rs:448:26: replace += with *= in DispatchHistogram::merge
+prro/src/services/reconciliation/boot_phase.rs:459:42: replace += with *= in DispatchHistogram::merge
+prro/src/services/reconciliation/boot_phase.rs:459:42: replace += with -= in DispatchHistogram::merge
+prro/src/services/reconciliation/boot_phase.rs:471:38: replace += with -= in DispatchHistogram::merge
+prro/src/services/reconciliation/boot_phase.rs:472:40: replace += with -= in DispatchHistogram::merge
+prro/src/services/reconciliation/boot_phase.rs:471:38: replace += with *= in DispatchHistogram::merge
+prro/src/services/reconciliation/boot_phase.rs:614:85: replace += with *= in ReconciliationSummary::record
+prro/src/services/reconciliation/boot_phase.rs:613:73: replace += with *= in ReconciliationSummary::record
+prro/src/services/reconciliation/boot_phase.rs:1055:5: replace complete_probe_trace_no_state_change -> anyhow::Result<()> with Ok(())
+prro/src/services/reconciliation/boot_phase.rs:2827:64: replace += with *= in dispatch_sent_via_probe
+prro/src/services/reconciliation/boot_phase.rs:2847:64: replace += with -= in dispatch_sent_via_probe
+prro/src/services/reconciliation/boot_phase.rs:3511:17: delete match arm (ShiftState::Opened, Some(sid)) in dispatch_prepared_via_chain
+prro/src/services/reconciliation/boot_phase.rs:3713:57: replace += with -= in dispatch_prepared_via_chain
+prro/src/services/reconciliation/boot_phase.rs:3852:51: replace += with *= in dispatch_pending_doc
+prro/src/services/reconciliation/boot_phase.rs:3894:43: replace += with -= in dispatch_pending_doc
+prro/src/services/reconciliation/boot_phase.rs:3953:73: replace += with -= in dispatch_pending_doc
+prro/src/services/reconciliation/inbox_reaper.rs:230:5: replace hex_lower -> String with "xyzzy".into()
+prro/src/services/reconciliation/online_convergence.rs:112:13: delete field fiscal_number from struct Self expression in TickSummary::skipped_mode
+prro/src/services/reconciliation/online_convergence.rs:619:44: replace += with -= in converge_error_retryable_doc
+prro/src/services/write_path/auto_z.rs:62:5: replace auto_z_idempotency_key -> String with "xyzzy".into()
+prro/src/services/write_path/stage_sign.rs:372:32: replace match guard p.state != DocState::Prepared with true in run
+prro/src/services/write_path/stage_sign.rs:1585:5: replace validate_signer_payload_shape_for_testing -> Result<(), String> with Ok(())
+prro/src/transports/dps/t112.rs:134:72: replace + with - in kyiv_comp_date
+prro/src/transports/dps/t112.rs:139:5: replace kyiv_comp_date_now -> i64 with 0
