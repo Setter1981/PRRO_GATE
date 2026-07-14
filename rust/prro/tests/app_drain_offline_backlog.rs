@@ -581,6 +581,142 @@ async fn rec2_scheduled_after_hold_skips_within_backoff_window() {
     }
 }
 
+/// **FW-1 mutation teeth (2026-07-14)** — TWIN of
+/// `rec2_scheduled_after_hold_skips_within_backoff_window` whose ONLY
+/// hold projection is `HeldAtSent` (NOT `HeldAtKvt1`), so
+/// `summary.held_at_kvt1() == 0` at the post-drain backoff decision.
+///
+/// Kills a cargo-mutants survivor at `app.rs` `drain_offline_backlog_
+/// scheduled`: the `any_hold` expression
+/// ```ignore
+/// any_hold = held_at_kvt1() > 0 || held_at_sent() > 0 || er_redrive_queued() > 0
+/// ```
+/// The survivor rewrites the 2nd/3rd clauses to `held_at_sent() < 0
+/// && er_redrive_queued() < 0`.  Both counters are `usize` (always
+/// `>= 0`), so `< 0` is a constant `false`, collapsing the whole
+/// expression to `any_hold = held_at_kvt1() > 0`.  The existing
+/// KVT1-doc sibling still passes under that mutation (its
+/// `held_at_kvt1() == 1` keeps the surviving first clause `true`), so
+/// only a SENT-only cohort exposes it.
+///
+/// Cohort shape: a single `OFFLINE_LOCAL_ACK` doc that stage_send
+/// advances to `Sent` (`send_chk` → `Ok(ack)`), then the SentFresh
+/// KVT2-confirm lastChk returns a Transport error →
+/// `Kvt2ConfirmOutcome::Hold(DpsTransport)` →
+/// `HoldFnDrain { projection: HeldAtSent }` →
+/// `summary.record_doc_held_at_sent()`.  Thus tick-1 summary has
+/// `held_at_sent() == 1` AND `held_at_kvt1() == 0`.
+///
+///   - Correct code: `held_at_sent() > 0` clause keeps `any_hold ==
+///     true` → `backoff::on_hold` → tick 2 within window =
+///     `SkippedBackoff` (REC-2 backoff engaged).
+///   - Mutated code: `any_hold` collapses to `held_at_kvt1() > 0` ==
+///     `false` → `backoff::on_advance` (reset, immediate eligibility)
+///     → tick 2 `Ran` → the tick-2 assertion below FAILS (teeth fire).
+///
+/// The wire-call storm this guards against: a SENT-only Hold that
+/// never backs off means the supervisor re-hits DPS at full ~60s
+/// cadence forever instead of exponential backoff (REC-2 operational
+/// safety).
+#[tokio::test]
+async fn rec2_scheduled_after_held_at_sent_hold_skips_within_backoff_window() {
+    use prro::ScheduledDrainOutcome;
+    let (_d, app, pool) = boot_app("rec2_hold_sent.db").await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // Seed ONE OFFLINE_LOCAL_ACK doc: stage_send advances it to Sent
+    // (send_chk Ok), then the SentFresh lastChk confirm returns a
+    // Transport error → HoldFnDrain { HeldAtSent }.  Crucially this
+    // cohort has NO KVT1 doc, so held_at_kvt1() stays 0.
+    let doc_id = seed_offline_local_ack(&pool, 1, 100, session_id, shift_id).await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_id,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // Tick 1: send_chk → Ok(ack) (stage_send Sent), last_chk →
+    // Transport err (SentFresh confirm Hold → HeldAtSent).
+    //
+    // Tick-2 spare responses: on CORRECT code tick 2 is SkippedBackoff
+    // and never touches the wire, so these are simply left unconsumed
+    // (harmless).  Under the MUTATION tick 2 RUNS the drain again (the
+    // doc now rests at SENT → process_via_lastchk_replay → last_chk);
+    // the spare Transport err lets that second drain complete and
+    // return `Ran` so the explicit tick-2 `panic!` assertion fires
+    // with a legible mutation-specific message (instead of an
+    // empty-queue stub panic).
+    let c = carriers_with_last_chk(
+        vec![Ok(ack("DPS-FN-SENT"))],
+        vec![
+            Err(DpsError::Transport("simulated".into())),
+            Err(DpsError::Transport("simulated-tick2-spare".into())),
+        ],
+    );
+    let view = view_for(&c);
+
+    // Tick 1: drain runs; SentFresh Hold registers HeldAtSent only.
+    let outcome1 = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("tick 1 scheduled drain");
+    match outcome1 {
+        ScheduledDrainOutcome::Ran(summary) => {
+            assert_eq!(
+                summary.held_at_sent(),
+                1,
+                "tick 1 MUST register a SentFresh HeldAtSent Hold"
+            );
+            assert_eq!(
+                summary.held_at_kvt1(),
+                0,
+                "SENT-only cohort — held_at_kvt1 MUST be 0 so the mutation \
+                 that collapses any_hold to held_at_kvt1()>0 is exposed"
+            );
+            assert_eq!(
+                summary.er_redrive_queued(),
+                0,
+                "no ER redrive in this cohort"
+            );
+        }
+        ScheduledDrainOutcome::SkippedBackoff { .. } => {
+            panic!("tick 1 MUST run drain — no prior backoff state")
+        }
+    }
+
+    // Tick 2 (immediate): correct code engaged backoff::on_hold from
+    // the HeldAtSent Hold → within window = SkippedBackoff.  Under the
+    // mutation any_hold collapsed to held_at_kvt1()>0 == false →
+    // on_advance → this arm RUNS → panic → teeth fire.
+    let outcome2 = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("tick 2 scheduled drain");
+    match outcome2 {
+        ScheduledDrainOutcome::Ran(_) => {
+            panic!(
+                "tick 2 within backoff window MUST be skipped: a SENT-only \
+                 HeldAtSent Hold on tick 1 MUST engage REC-2 backoff \
+                 (any_hold via the held_at_sent()>0 clause). Ran here means \
+                 any_hold collapsed to held_at_kvt1()>0 == false → \
+                 backoff::on_advance → wire-call storm at full cadence."
+            )
+        }
+        ScheduledDrainOutcome::SkippedBackoff { next_eligible: _ } => {
+            // Success: HeldAtSent Hold engaged the backoff window.
+        }
+    }
+}
+
 /// **Polish cycle / GAP-3 (2026-05-25)** — locks REC-2 backoff
 /// `on_advance` reset path through the `drain_offline_backlog_
 /// scheduled` wrapper.  Validates that an empty-cohort drain
