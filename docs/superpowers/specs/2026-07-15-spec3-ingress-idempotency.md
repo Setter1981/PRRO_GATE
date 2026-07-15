@@ -1,133 +1,138 @@
 # Spec #3 — Canonical ingress contract + Idempotency (POS → gateway)
 
-**Status: 🟡 DRAFT rev 3 (post external audit round 2 → NOT-YET, converging). 2026-07-15. Grounded on `origin/main` `9ce76c2`** (fiscal-core re-verified on `specs-3-5-ingress-fleet @ f41b06e`; diff `9ce76c2..` contains only Spec #3).
-Rev 3 closes round-2's three load-bearing gaps: (1) the replay identity now uses the **locked-plan
-tuple** and `strategy_version` becomes a **provenance fence, not part of the key** (kills the
-upgrade-double-issue); (2) a **sealed store boundary** routes **all three** internal producers
-(`auto_z`, `b10-begin`, `b10-end`) + external writes through a resolved, session/shift-scoped identity
-(closes the direct-`INSERT` bypass); (3) the identity binds to a durable `IngressProfileId` so a
-channel switch cannot re-issue. Contract/types only — **no migration in CS-2** (the identity-key +
-`idempotency_strategy` migrations are deferred; the index choice is pinned in §3). Scope = **POS →
-gateway**.
+**Status: 🟡 DRAFT rev 4 (post external audit round 3 → NOT-YET, converging). 2026-07-15. Grounded on `origin/main` `9ce76c2`** (fiscal-core re-verified on `specs-3-5-ingress-fleet @ c6a2d2e`; `9ce76c2..` diff = only Spec #3).
+Rev 4 closes round-3's three blockers: (1) **`session_scope` is removed from the external identity**
+(it broke cross-shift external replay) — the identity is a **sum-type**, session scope lives **only**
+inside the internal-producer operation id; profile/policy/version are **provenance fences, never key
+components**; (2) the sealed store splits into **two** methods (`insert_new` vs the special
+B10-END `insert_processing_with_prepared_doc`), and internal `request_id` is **derived from the
+resolved identity** (kills the FN-only cross-session collision); (3) the profile-switch guard covers
+**any unresolved intent** (not just an open shift) and the capability matrix is **total** (default-deny
++ exhaustive over the closed `FiscalCommandKind`). Contract/types only; **no migration in CS-2**.
 
 ---
 
 ## 0 · Thesis
-Replay identity must be a **typed, sealed, resolved-before-mint, session-scoped** value using the
-**authoritative tuple** — never content, never a version-in-the-key, never a raw String an internal
-producer can hand-assemble. "No safe identity" is an explicit fail-closed refusal.
+Replay identity is a **typed sum-type**: an **external** POS identity that is **session-independent**
+(so a retry across a shift boundary still dedupes) and an **internal** producer identity that is
+**session-scoped**. Profile/policy/version are a **provenance fence**, never a way to mint a new key.
+"No safe identity" is an explicit fail-closed refusal.
 
 ## 1 · What EXISTS today — corrected grounding (do NOT rebuild)
-- `ingress_inbox` (`001_baseline.sql:80-100`); `Created/Replay/Conflict` (`InboxInsertOutcome`, `ingress_inbox.rs:87-100`) via atomic probe-then-insert.
-- **Uniqueness is ONLY `(fiscal_number, idempotency_key)`** — `ux_inbox_fn_idem` (`001:96`); `protocol`/`operation_type` columns exist (`001:83-84`) but are in **no** unique index (`ingress_inbox.rs:142-143`). Cross-protocol raw-key collision is structural, guarded only by convention (`maria304:`/`autoz-`/`b10-*` prefixes).
-- **Durable-before-ACK holds for SIGNABLE writes only** (`handler.rs:620-647`); **read-only X-report is exempt** (`handler.rs:571-572`, no inbox row).
-- **Finalize is NOT atomic with seed advance**: the chain seed advances **at SEND** (online `Sending→Sent` CAS; offline `Signed→OfflineLocalAck`, `stage_offline_ack.rs:456/:495`); `finalize` = `Kvt2→Ack` CAS + `mark_done_tx` + outbox only (`stage_finalize.rs:253/:307/:316/:286-296`).
-- **The reaper is TERMINALISE-ONLY** (`inbox_reaper.rs:9-22`): converges a stuck row to a terminal inbox status; writes `ingress_inbox.status`+`audit_log` only; never re-fiscalizes.
-- **Payload hash is CONFLICT-only, never identity** (`dto.rs:475-482`); the **Conflict audit is best-effort** (`handler.rs:867-909`).
-- **Only `webcheck` is a live ingress source** (`server.rs:97-98` `matches!(source, "webcheck")`). **maria304: driver implemented but its prro wiring is GATED OFF** (→ `404 UNKNOWN_SOURCE`, `server.rs:89-98`, re-enable after the `Option<fiscal_id>` mirror, RS-3); `checkbox`/`xmlrpc` have no live Rust adapter (dead Python). **PLANNED (CS-6)**.
-- **Three internal producers mint real inbox rows** — none is external POS traffic:
-  - `auto_z` → `NewInboxEntry`, key `autoz-{fn}-{shift_hex}` (**shift-scoped**), but tagged `Protocol::Rest` (`auto_z.rs:63/:158`) so `(protocol, op)` cannot tell it from an external WebCheck Z;
-  - **B10 BEGIN** → `NewInboxEntry`, key `b10-begin-{fn}` (**FN-only**, `inline.rs:~15/1622`);
-  - **B10 END** → **direct `INSERT OR IGNORE INTO ingress_inbox`** (bypasses the repo entirely), key `b10-end-{fn}` (**FN-only**, `backlog_drain.rs:2725`).
-  The `backlog_drain.rs:2854` `throwaway_inbox` is a stage_sign scaffold, never inserted — not a producer.
-  **FN-only keys are unsafe across shifts:** on shift 2, the END-probe by the new `shift_id` returns absent, the inbox insert is IGNORE'd on the stale key, and the fresh fiscal doc then collides on `UNIQUE(request_id)`.
+- `ingress_inbox` (`001_baseline.sql:80-100`); `Created/Replay/Conflict` (`InboxInsertOutcome`, `ingress_inbox.rs:87-100`, insert `:187-226`); handler fiscalizes only after `Created` (`handler.rs:642-651`).
+- **Uniqueness is ONLY `(fiscal_number, idempotency_key)`** (`ux_inbox_fn_idem`, `001:96`); `protocol`/`operation_type` exist (`001:83-84`) but in **no** unique index (`ingress_inbox.rs:142-143`).
+- **Durable-before-ACK for SIGNABLE writes only** (`handler.rs:620-647`); read-only X-report exempt (`:571-572`, no inbox row).
+- **Finalize NOT atomic with seed advance**: seed advances at SEND (online `Sending→Sent`; offline `Signed→OfflineLocalAck`, `stage_offline_ack.rs:456/:495`); `finalize` = `Kvt2→Ack` + `mark_done_tx` + outbox (`stage_finalize.rs:253/:307/:316/:286-296`).
+- **Reaper is TERMINALISE-ONLY** (`inbox_reaper.rs:9-22`), never re-fiscalizes.
+- **Payload hash is CONFLICT-only** (`dto.rs:475-482`); **Conflict audit is best-effort** (`handler.rs:867-909`).
+- **`idempotency_key` is a mandatory non-Option `String`** (`dto.rs:50-60`): an **absent** key ⇒ JSON deserialization failure ⇒ `400 MALFORMED_JSON` **before** the handler (`server.rs:164-181`); an **empty** key deserializes fine and today **can reach the inbox** (no guard). Making `AbsentKey → 422 NO_SAFE_REPLAY_IDENTITY` requires an explicit **DTO / evidence-boundary change** (Option-typed key), called out as such.
+- **Only `webcheck` is a live ingress source** (`server.rs:97-98`); **maria304: driver implemented, prro wiring GATED OFF** (→ `404 UNKNOWN_SOURCE`, re-enable after the `Option<fiscal_id>` mirror, RS-3); `checkbox`/`xmlrpc` = dead Python, **PLANNED (CS-6)**.
+- **Three internal producers** (never external POS traffic):
+  - `auto_z` → `NewInboxEntry` NEW, key `autoz-{fn}-{shift_hex}` (already shift-scoped), tagged `Protocol::Rest` (`auto_z.rs:63/:158-176`);
+  - **B10 BEGIN** → `NewInboxEntry` NEW, key `b10-begin-{fn}` (function `inline.rs:1622`, row/insert `:1672/:1687`); `request_id` = `begin_request_id(fn)` **FN-only** (`inline.rs:1202-1207`);
+  - **B10 END** → **direct `INSERT OR IGNORE`** creating **PROCESSING atomically with a PREPARED doc** (deliberately bypassing the acquire that is forbidden under `GoingOnline`, `backlog_drain.rs:2719-2779`), key `b10-end-{fn}`; `request_id` = `session_end_request_id(fn)` **FN-only** (`:2691-2698`). The `:2854` throwaway is a stage_sign scaffold, not a producer.
+  **FN-only `request_id` is unsafe across sessions:** on a 2nd offline session the inbox insert IGNOREs on the stale key and the fresh doc then collides on `UNIQUE(request_id)`.
 
-## 2 · GREENFIELD (this spec adds)
-The authoritative-tuple identity (§3), the sealed store boundary + two-stage resolver (§4), the total
-capability matrix (§6), and the fail-closed `NoSafeReplayIdentity` (§5).
+## 2 · GREENFIELD
+The sum-type identity + provenance fence (§3), the two-method sealed store + derived internal
+request_id (§4), the fail-closed refusal (§5), and the total capability matrix (§6).
 
 ## 3 · Key types (`prro-ingress-contract`, domain-owned, sqlx-free)
 ```rust
-// POLICY — how identity is obtained for (IngressProfile | InternalProducer, operation).
 enum IdempotencyPolicy {
-    SourceStableId,                        // external source supplies a durable request id
-    GatewayDeterministic { producer: InternalProducerId },  // auto_z / b10-begin / b10-end
-    // ClientHeldReservation { .. }  — DORMANT: two-phase token (single-use, durable-before-response,
-    //                                 bound to FN/profile/operation, mandatory on retry).
-    // ProtocolStableTuple { contract_id, version } — DORMANT: only with a proven stable+unique tuple.
+    SourceStableId,                              // external source supplies a durable request id
+    GatewayDeterministic { producer: InternalProducerId },
+    // ClientHeldReservation { .. }  — DORMANT (two-phase POS token).
+    // ProtocolStableTuple { contract_id, version } — DORMANT.
 }
 enum InternalProducerId { AutoZ, B10Begin, B10End }
 
-// RESULT — per-request outcome; the registry returns an EXPLICIT Reject, never guesses a policy.
-enum ReplayIdentityResolution { Resolved(ResolvedReplayIdentity), NoSafeReplayIdentity { reason: NoSafeReason } }
-enum NoSafeReason { EmptyKey, AbsentKey, ContentDerivedOnly, NoReservationToken, ProfileSwitchWithOpenShift }
-
-// The identity — the LOCKED-PLAN tuple (ARCHITECTURE_CONSOLIDATION_PLAN.md §3.7). SEALED constructor
-// (only the resolver / store builds it) so no caller hand-assembles a raw key.
-struct ResolvedReplayIdentity {
-    fiscal_number: FiscalNumber,
-    origin: ReplayOrigin,               // External{ source_protocol, source_installation_id } | Internal{ producer }
-    source_request_id: String,          // external stable request id; internal deterministic key
-    operation_kind: FiscalCommandKind,
-    session_scope: SessionScope,        // shift_id / offline_session generation → internal producers are per-shift unique
-    // NOT part of the identity — a fence, resolved separately:
-    // policy_version is carried in IdentityProvenance, NOT in the effective key (see below).
+// The identity — a SUM-TYPE. External is SESSION-INDEPENDENT; session scope is ONLY inside Internal.
+enum ReplayIdentity {
+    External { source_protocol: IngressProtocolId, source_installation_id: InstallationId,
+               source_request_id: String, operation_kind: FiscalCommandKind },
+    Internal { producer: InternalProducerId, internal_operation_id: InternalOperationId,  // embeds ShiftId/OfflineSessionId
+               operation_kind: FiscalCommandKind },
 }
+// SEALED constructor: only the resolver / store builds it. fiscal_number is the local partition key.
+struct ResolvedReplayIdentity { fiscal_number: FiscalNumber, identity: ReplayIdentity }
+
+// FENCE — stored atomically alongside the row, NEVER part of the effective key.
+struct IdentityProvenance { ingress_profile_id: IngressProfileId, policy_id: PolicyId, policy_version: u16 }
+
+enum ReplayIdentityResolution { Resolved(ResolvedReplayIdentity, IdentityProvenance), NoSafeReplayIdentity { reason: NoSafeReason } }
+enum NoSafeReason { EmptyKey, AbsentKey, ContentDerivedOnly, NoReservationToken, ProfileSwitchWithUnresolvedIntent, UnlistedOriginOperation }
 ```
-**Authoritative effective key = `(fiscal_number, source_protocol|internal_producer, source_installation_id, source_request_id, operation_kind, session_scope)`** — matching the locked plan's
-`schema_version, source_protocol, compatibility_profile_version, source_installation_id,
-source_request_id, …` envelope. **`strategy_version`/`policy_version` is a PROVENANCE FENCE, never a
-key component:** a version bump must NOT turn an already-accepted `(v0, K)` into a new `Created` after
-a lost-ACK retry as `(v1, K)`. A version mismatch on the same identity ⇒ **legacy lookup / block /
-reconciliation**, not an automatic new row.
+**Effective key** = the `ReplayIdentity` variant fields + `fiscal_number` (partition):
+- **External** = `(fiscal_number, source_protocol, source_installation_id, source_request_id, operation_kind)` — **no session** ⇒ a retry of the same `source_request_id` **after a shift boundary still dedupes** (fixes the round-3 counterexample).
+- **Internal** = `(fiscal_number, producer, internal_operation_id, operation_kind)` — `internal_operation_id` embeds the `ShiftId`/`OfflineSessionId` ⇒ each session is distinct.
+**Provenance fence:** `ingress_profile_id`/`policy_id`/`policy_version` are stored atomically as `IdentityProvenance`; a **version or profile mismatch on the same identity ⇒ lookup / block / reconciliation, NEVER an automatic `Created`** (RP3-4). This is the durable `IdentityProvenance` the round-2/3 audit asked for.
 
-**Index decision (pin):** the existing narrow `ux_inbox_fn_idem(fiscal_number, idempotency_key)`
-(`001:96`) **cannot be "augmented" by an additive wider index** — while the narrow unique index
-exists it still admits the collision. CS-3/CS-6 must **either canonical-encode the full tuple into the
-single `idempotency_key` TEXT** (so the one existing index becomes correct) **or drop-and-replace**
-the index. Namespacing is normative now; the migration is deferred.
+**Index decision (§9-answer):** **drop/replace** the narrow `ux_inbox_fn_idem` with a `UNIQUE` over the
+**normalized non-null identity columns** (not an opaque TEXT canonical-encoding, which needs a forever
+format + escaping + a legacy decoder). Deferred migration (CS-3/CS-6); normative now.
 
-## 4 · Sealed store boundary + two-stage resolution
-1. **Adapter → typed evidence.** Each adapter extracts `IngressIdentityEvidence` (client key Present/Empty/Absent, reservation token, content fingerprint); it does **not** decide the key.
-2. **Domain resolver → outcome.** A domain-owned `ReplayIdentityResolver` in `IngressService`, **before** the inbox insert, selects the `IdempotencyPolicy` for `(IngressProfile | InternalProducer, operation)` and returns `Resolved(ResolvedReplayIdentity)` or an explicit `NoSafeReplayIdentity{reason}`.
-3. **Sealed store API — the only path to an inbox row.** Add `insert_processing_tx(&mut WriteTxConn, ResolvedReplayIdentity, …)`; **statically forbid any `INSERT … ingress_inbox` outside the store module** (a compile/grep pin) so the current bypasses are structurally impossible: the `ensure_end` direct `INSERT OR IGNORE` (`backlog_drain.rs:2725`), the `auto_z` `NewInboxEntry` (`auto_z.rs:158`), and the `B10 BEGIN` `NewInboxEntry` (`inline.rs:1622`) all route through the sealed API with a `GatewayDeterministic{producer}` identity carrying the `session_scope`. The repo taking a `ResolvedReplayIdentity` (not a raw `String`) is necessary **but not sufficient** — the static no-direct-INSERT pin is what actually closes it.
-4. **`IngressProfileId` binding.** The identity binds to a durable `IngressProfileId`; a retry of the same intent via a **different** profile while a shift is open ⇒ `NoSafeReplayIdentity{ProfileSwitchWithOpenShift}` (extends the frozen no-channel-switch rule to replay identity) — else ACK-lost-on-A + retry-via-B mints a second document.
+## 4 · Sealed store boundary — TWO methods + derived request_id
+Direct `INSERT … ingress_inbox` is **statically forbidden outside the store module** (a compile/grep
+pin). Two sealed methods (the semantics differ — round-3):
+- **`insert_new_tx(&mut WriteTxConn, ResolvedReplayIdentity, IdentityProvenance, …)`** → a `NEW` row (the normal `Created|Replay` contract). Used by **external writes, `auto_z`, and B10 BEGIN**.
+- **`insert_processing_with_prepared_doc_tx(&mut WriteTxConn, ResolvedReplayIdentity, PreparedDoc, …)`** → a `PROCESSING` row **atomically with the PREPARED doc** — the B10-END path only (`backlog_drain.rs:2719-2779`), which deliberately bypasses the `GoingOnline`-forbidden acquire.
+**Internal `request_id` is DERIVED from the resolved identity** (or minted only after the identity
+lookup and then reused) — **not** an FN-only `format!()` — so `b10-begin`/`b10-end`/`auto_z` become
+per-session unique and never re-collide on `UNIQUE(request_id)`. Resolution stays two-stage: adapter →
+typed `IngressIdentityEvidence`; a domain resolver in `IngressService` **before** the insert picks the
+policy and returns `Resolved(…)` or an explicit `NoSafeReplayIdentity{reason}` (it **rejects**, it does
+not guess a missing policy). The `IngressProfileId` binding is checked **before** a new identity is
+formed (§6).
 
 ## 5 · The fail-closed `NoSafeReplayIdentity` contract
-Refused **before minting any inbox/fiscal row**:
-- domain-level stable outcome **`NO_SAFE_REPLAY_IDENTITY`** (the **HTTP `422`** is only the transport binding; non-HTTP ingress carries the same domain code);
-- the server **mints a correlation id** and writes a **ROWLESS `audit_log`** entry keyed by it (`audit_log` has no FK, so a rowless entry is structurally valid); **"pre-mint" = no inbox/fiscal row**, not the absence of a correlation id;
-- **audit insert fails ⇒ fail-closed `5xx`** (never 422-and-forget) — deliberately **stricter** than today's best-effort Conflict audit (`handler.rs:867-909`), which is acceptable there because the existing durable inbox row is its own evidence and a retry re-Conflicts, whereas a rowless refusal has no other durable trace.
-- `payload_hash` is never an identity.
-- **`ClientHeldReservation`** (two-phase POS token) is a **separate dormant** `IdempotencyPolicy` — not mixed with the deterministic auto-Z/B10 gateway identity.
+Refused **before minting any inbox/fiscal row**: a domain-level stable outcome
+**`NO_SAFE_REPLAY_IDENTITY`** (the **HTTP `422`** is only the transport binding; non-HTTP ingress
+carries the same domain code); the server mints a correlation id and writes a **ROWLESS `audit_log`**
+entry keyed by it (`audit_log` has no FK); **audit insert fails ⇒ fail-closed `5xx`** (stricter than
+today's best-effort Conflict audit — the asymmetry is justified: the inbox row is its own evidence, a
+rowless refusal has none). `payload_hash` is never an identity. **`ClientHeldReservation`** (two-phase
+POS token: single-use, durable-before-response, bound to FN/profile/operation, mandatory on retry) is
+a **separate dormant** policy, not mixed with the deterministic gateway identity.
 
-## 6 · Total capability matrix (NORMATIVE) — over `(IngressProfile | InternalProducer, operation)`
-Each cell is **`ReadOnlyNoInbox | Accept(policy) | Reject(NoSafeReason)`**. Rows (not just 4
-per-ingress):
+## 6 · Total capability matrix (NORMATIVE) — exhaustive, default-deny
+Decided over **`(origin, operation_kind)`** where `origin ∈ {WebCheck, InternalProducer::{AutoZ,
+B10Begin, B10End}, maria304, checkbox, xmlrpc}` and `operation_kind` ranges over the **closed
+`FiscalCommandKind`**. Each cell is exactly one of `ReadOnlyNoInbox | Accept(policy) |
+Reject(NoSafeReason)`; **any unlisted `(origin, operation_kind)` ⇒ `Reject(UnlistedOriginOperation)`
+(default-deny)**.
 | origin | operation | decision |
 |---|---|---|
-| WebCheck (LIVE) | X-report | `ReadOnlyNoInbox` |
-| WebCheck (LIVE) | signable write | `Accept(SourceStableId)` iff non-empty key; **empty ⇒ `Reject(EmptyKey)`** |
-| InternalProducer::AutoZ | Z-report | `Accept(GatewayDeterministic{AutoZ})`, `session_scope=shift` (already shift-keyed; add producer tag so it is not mistaken for external WebCheck Z) |
-| InternalProducer::B10Begin | offline-session-begin | `Accept(GatewayDeterministic{B10Begin})`, **`session_scope`=shift/session** (fix FN-only) |
-| InternalProducer::B10End | offline-session-end | `Accept(GatewayDeterministic{B10End})`, **`session_scope`=shift/session** (fix FN-only + kill the direct INSERT) |
-| **maria304** (driver impl, prro-wiring **gated off**) | fiscal write | **`Reject(ContentDerivedOnly)`** until a durable intent-id/reservation — retire the content-hash key `dispatcher.rs:741-745` (the CS-3 double-issue keystone on the ingress side, proven by `bridge_acceptance.rs:335-360`) |
-| checkbox / xmlrpc (PLANNED, dead Python) | write | `Reject(...)` unless a proven `external_request_id`/`doc_id` (`SourceStableId`); **kill** the `sha256(payload)` fallback and the `'no-ref'` constant |
-**Every content/no-ref fallback is removed.** The planned WebCheck shim's `sha256(payload)` fallback
-(`docs/architecture/2026-05-30-webcheck-shim-ingress-spec.md`) must be pinned to `Reject` on absent uuid.
+| WebCheck (LIVE) | X-report (read-only) | `ReadOnlyNoInbox` |
+| WebCheck (LIVE) | signable write | `Accept(SourceStableId)` iff key non-empty; **empty ⇒ `Reject(EmptyKey)`**. (A non-empty key does not by itself prove uniqueness — the tuple + the no-collision pins do.) |
+| InternalProducer::AutoZ | Z-report | `Accept(GatewayDeterministic{AutoZ})` (identity `Internal`, `internal_operation_id` = ShiftId) |
+| InternalProducer::B10Begin | offline-session-begin | `Accept(GatewayDeterministic{B10Begin})` (`internal_operation_id` = OfflineSessionId) |
+| InternalProducer::B10End | offline-session-end | `Accept(GatewayDeterministic{B10End})` **via `insert_processing_with_prepared_doc`** (`internal_operation_id` = OfflineSessionId) |
+| maria304 (gated off) | fiscal write | **`Reject(ContentDerivedOnly)`** — retire the content-hash key (`dispatcher.rs:741-745`; CS-3 keystone) until a durable intent-id/reservation |
+| checkbox / xmlrpc (PLANNED) | write | `Reject(NoReservationToken)` unless a proven `external_request_id`/`doc_id` (`SourceStableId`); **kill** the `sha256(payload)` fallback + the `'no-ref'` constant |
+| any | unlisted | **`Reject(UnlistedOriginOperation)`** |
+**Exhaustiveness pin:** a compile/test pin proves every `(origin, FiscalCommandKind)` maps to exactly one decision (closed match, no `_ =>` silent Accept).
 
 ## 7 · Normative invariants (corrected)
-- **I1 (request_id ≠ replay identity).** Dedup uses the tuple key, never the server-minted `request_id`.
-- **I2 (payload-only Conflict) over the tuple key.** `Conflict` iff the economic payload differs under the same **tuple** key; identical raw strings from different origins/operations/sessions do not alias.
-- **I3 (Replay resolves persisted truth, never re-processes).** A `Replay` calls only read-only `resolve_replay` (`handler.rs:854-864`) and returns the persisted outcome — which may be `Completed`, `InProgress`, or `Failed` (not necessarily "success"); it never re-invokes the engine. The Conflict audit is best-effort.
-- **I4 (durable-before-ACK — signable writes only).** The `NEW` row commits before the 2xx for signable writes; X-report exempt. `mark_done_tx` is atomic with `Kvt2→Ack` + outbox; the seed advanced earlier at SEND. A lost ACK yields no 2nd doc **only once a stable identity exists** (§6 closes maria304/empty/FN-only).
-- **I5 (NoSafeReplayIdentity — fail-closed).** Per §5.
-- **I6 (INACTIVE in CS-2).** No schema change; the tuple-index + `idempotency_strategy` migrations + the sealed-store refactor are CS-3/CS-6; this spec is the contract.
+- **I1** request_id ≠ replay identity. **I2** Conflict iff payload differs under the same **variant** key. **I3** Replay resolves persisted truth (`Completed|InProgress|Failed`), never re-processes; Conflict audit best-effort. **I4** durable-before-ACK for signable writes (X-report exempt); seed advanced earlier at SEND; **a lost external ACK dedupes across a shift boundary** because the external identity is session-independent. **I5** NoSafeReplayIdentity fail-closed (§5). **I6** INACTIVE in CS-2 (index + sealed-store refactor are CS-3/CS-6).
 
 ## 8 · RED-pins
-- **RP3-1 (Conflict, not Replay):** same tuple key + differing payload ⇒ `Conflict`.
-- **RP3-2 (empty key refused):** empty `idempotency_key` from a stable source ⇒ `Reject(EmptyKey)` ⇒ `422`, rowless audit, **zero inbox row**; audit-insert failure ⇒ `5xx`.
-- **RP3-3 (maria304 keystone — no intent-id ⇒ REFUSE, not assert_ne):** while no durable intent-id exists, **both** identical maria304 fiscal writes are **refused** (`Reject(ContentDerivedOnly)`) — inverting `assert_eq!(key_a1,key_a2)` to `assert_ne!` would trade under-issue for double-issue-after-reconnect. **Once an intent-id lands:** (a) same durable intent_id on a new TCP session ⇒ **same** identity; (b) different intent_id, same payload ⇒ **distinct** identity.
-- **RP3-4 (upgrade-double-issue):** a `policy_version` bump does NOT turn an accepted `(v0,K)` into a new `Created` on retry as `(v1,K)`; version mismatch ⇒ legacy lookup/reconcile, not a new row.
-- **RP3-5 (sealed store):** a static pin proves **no** `INSERT … ingress_inbox` exists outside the store module; the three internal producers mint via `insert_processing_tx(ResolvedReplayIdentity)` only.
-- **RP3-6 (session-scoped internal identity):** an internal producer retry within the **same** shift/session ⇒ same identity; the **next** shift/session ⇒ distinct identity (fixes `b10-begin`/`b10-end` FN-only cross-shift collision on `UNIQUE(request_id)`).
-- **RP3-7 (no profile-switch re-issue):** the same intent retried via a different `IngressProfileId` with an open shift ⇒ `Reject(ProfileSwitchWithOpenShift)`, no 2nd doc.
-- **RP3-8 (namespace separation, known-red until the tuple-index migration):** the same raw string for the same FN under two different origins/operations does not cross-collide.
-- **RP3-9 (reaper terminalises, never re-fiscalizes).**
+- **RP3-1** same variant key + differing payload ⇒ `Conflict`.
+- **RP3-2** empty key ⇒ `Reject(EmptyKey)` ⇒ 422, rowless audit, zero inbox row; audit-fail ⇒ 5xx.
+- **RP3-3 (maria304 keystone)** no intent-id ⇒ **both** identical fiscal writes `Reject(ContentDerivedOnly)` (not `assert_ne!`). With an intent-id: same intent on a new session ⇒ same identity; different intent, same payload ⇒ distinct.
+- **RP3-4 (upgrade/profile fence)** a `policy_version` or `ingress_profile_id` mismatch on the same identity ⇒ lookup/block/reconcile, never `Created`.
+- **RP3-5 (sealed store)** a static pin proves no `INSERT … ingress_inbox` outside the store; the three producers mint via the two sealed methods only.
+- **RP3-6 (session vs cross-shift)** (a) an **internal** producer retry in the **same** session ⇒ same identity+request_id, the **next** session ⇒ distinct; (b) an **external** retry of the same `source_request_id` **across a shift boundary** ⇒ **same** identity (dedupes — the round-3 counterexample).
+- **RP3-7 (no profile-switch re-issue on unresolved intent)** switching `IngressProfileId` while **any** non-terminal inbox row / reservation / `SubmittedUnknown` / `PendingApply` exists ⇒ `Reject(ProfileSwitchWithUnresolvedIntent)` — including after the shift closed but the intent is unresolved.
+- **RP3-8 (namespace separation, known-red until the migration)** same raw string, same FN, different `(origin, operation)` ⇒ no cross-collision.
+- **RP3-9** reaper terminalises, never re-fiscalizes.
+- **RP3-10 (B10-END mode)** B10-END uses `insert_processing_with_prepared_doc` (PROCESSING+PREPARED atomic); the `insert_new` path is not admissible for it, and vice-versa.
+- **RP3-11 (matrix totality)** every `(origin, FiscalCommandKind)` has exactly one decision; unlisted ⇒ `Reject(UnlistedOriginOperation)`.
 
-## 9 · Open questions for re-audit (round-2 residuals mostly resolved)
-1. **Index mechanism:** canonical-encode the full tuple into the single `idempotency_key` TEXT (keep one index) vs drop/replace `ux_inbox_fn_idem` — which does the audit prefer for the deferred migration?
-2. **`SessionScope` for `auto_z`:** it is already `shift_hex`-scoped; confirm the internal-producer tag is the only addition needed there (vs re-keying).
-3. **maria304 intent-id source:** does the maria304 wire protocol have any field that could carry a durable client intent-id (making `SourceStableId` reachable), or is `ClientHeldReservation`/refusal the only path?
-4. **`ClientHeldReservation` dormancy:** keep it dormant (no live two-phase POS today), or is any pilot POS expected to hold a reservation token?
-5. **Two mandatory CS-3-activation RED-pins** (per round-2 answer): namespace separation (RP3-8) + refuse write-profile switch with open shift / unresolved uncertainty (RP3-7) — confirm these are the right gate before activation.
+## 9 · Decisions + open items
+- **Index:** drop/replace with normalized non-null identity columns + a new `UNIQUE` (not opaque TEXT-encoding).
+- **auto-Z:** `InternalProducerId::AutoZ` + `ShiftId` (in `internal_operation_id`); the request_id follows from that identity.
+- **maria304 intent-id:** the legacy 304X-2 wire has no general client intent-id (PREP = department; COMP.p7 = a cashless payment-transaction id; CONF = a receipt counter for reconciliation) — none is intent identity. So a general fiscal write is **refusal** or a separate `ClientHeldReservation` extension.
+- **ClientHeldReservation:** dormant until a POS holds a token before mint and presents it on every retry.
+- **Activation gate (before CS-3 wires anything):** RP3-4, RP3-5, the strengthened RP3-6, RP3-7 (with unresolved-uncertainty), and RP3-8 are all mandatory.
+- **Open for re-audit:** confirm the External/Internal split + `IdentityProvenance` fence fully close the cross-shift/upgrade double-issue; confirm the two-method store + derived request_id are the right shape; confirm the matrix totality pin (closed `FiscalCommandKind`, default-deny) is sufficient.
