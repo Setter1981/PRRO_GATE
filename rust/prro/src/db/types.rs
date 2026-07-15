@@ -81,12 +81,16 @@ macro_rules! db_text_enum {
                     Some(v) => Ok(Self(v)),
                     // Closed set: an unknown literal is a hard decode error, not
                     // a silent fallback — matches the pre-move `#[sqlx]` derive.
-                    None => Err(format!(
-                        "unknown {} literal in TEXT column: {:?}",
-                        stringify!($inner),
-                        s
-                    )
-                    .into()),
+                    //
+                    // CS-1R R3.1 (spec §3): the error string is FROZEN to the
+                    // pre-move `#[sqlx(type_name="TEXT")]` derive's inner
+                    // `ColumnDecode.source` Display — `invalid value {value:?}
+                    // for enum {EnumIdent}` — captured empirically at f2c17b1
+                    // (golden `tests/golden/cs1r_decode_errors.json`) so the
+                    // relocation stays observably equivalent at this layer.
+                    None => {
+                        Err(format!("invalid value {:?} for enum {}", s, stringify!($inner)).into())
+                    }
                 }
             }
         }
@@ -239,7 +243,12 @@ impl<'r> Decode<'r, Sqlite> for DbCashierId {
         // No panic, no Decode error (would reject the row); operators detect
         // schema drift via logs.
         if s.len() > CashierId::MAX_LEN {
+            // CS-1R R3.2 (spec §3): the `target:` is restored EXPLICITLY to the
+            // pre-move module path `prro::db::models::ids` (this wrapper moved
+            // to `prro::db::types`, which would otherwise change the event's
+            // default module-path target). Message + fields stay verbatim.
             tracing::warn!(
+                target: "prro::db::models::ids",
                 cashier_id_len = s.len(),
                 max_len = CashierId::MAX_LEN,
                 "CashierId decoded value exceeds MAX_LEN — possible upstream schema drift"

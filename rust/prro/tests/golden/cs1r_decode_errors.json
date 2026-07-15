@@ -1,0 +1,17 @@
+{
+  "_comment": "CS-1R R3.1 frozen decode-error golden. Captured EMPIRICALLY by a one-time throwaway probe at the pre-move commit f2c17b1 (pre-move `#[sqlx(type_name=\"TEXT\")]` derive types), NOT computed from the current production formatter. Canonical unknown input: the literal `__CS1R_UNKNOWN__`. Compared layer: the inner `sqlx::Error::ColumnDecode.source` (BoxDynError) Display string, decoded from a real `sqlite::memory:` TEXT column. sqlx 0.8.6 renders `invalid value {value:?} for enum {EnumIdent}` — CORROBORATION only; this golden is the oracle. Keyed by the store-side `Db*` wrapper; value is the exact inner Display string.",
+  "probe_commit_sha": "f2c17b1e9cd125d5018cd671dd596fc5c1e2e7bb",
+  "unknown_literal": "__CS1R_UNKNOWN__",
+  "sqlx_version": "0.8.6",
+  "compared_layer": "sqlx::Error::ColumnDecode.source (BoxDynError) Display",
+  "errors": {
+    "DbDocState": "invalid value \"__CS1R_UNKNOWN__\" for enum DocState",
+    "DbDocType": "invalid value \"__CS1R_UNKNOWN__\" for enum DocType",
+    "DbFiscalMode": "invalid value \"__CS1R_UNKNOWN__\" for enum FiscalMode",
+    "DbNodeMode": "invalid value \"__CS1R_UNKNOWN__\" for enum NodeMode",
+    "DbOfflineSessionState": "invalid value \"__CS1R_UNKNOWN__\" for enum OfflineSessionState",
+    "DbProtocol": "invalid value \"__CS1R_UNKNOWN__\" for enum Protocol",
+    "DbSeverity": "invalid value \"__CS1R_UNKNOWN__\" for enum Severity",
+    "DbShiftState": "invalid value \"__CS1R_UNKNOWN__\" for enum ShiftState"
+  }
+}
