@@ -1,12 +1,12 @@
 # Spec #4 (part A) — Authority Mini-Lock + Migration 032 Co-Draft
 
-**Status: 🟡 DRAFT rev 5 (external audit round 4 + internal Sonnet SQL pass → two SQL fixes, then mint). 2026-07-15. Grounded on `origin/main` `f2628ba`.**
-Architecture settled (rounds 1-2); SQL triggers/matrix settled (rounds 3-4). Rev 5 closes the last two
-gaps both reviewers converged on: (a) `INSERT OR REPLACE` bypassed the UPDATE/DELETE triggers (a
-BEFORE-INSERT collision-guard now blocks it), and (b) `DrainChainSettleRetry` could pair with a
-fence-releasing `NOT_SUBMITTED`. Both the external auditor (round 4) and the decorrelated internal
-Sonnet pass (real SQLite 3.45.1, ~30 attacks) reported everything else clean. **Anchors:** Spec #1 +
-Spec #2 (rev 2) DESIGN-LOCKED. **The schema-implementer runs only after this re-audits to `mint 032`.**
+**Status: 🔒 LOCKED rev 5 (external audit `mint 032` + internal Sonnet MINT-READY). 2026-07-15. Grounded on `origin/main` `f2628ba`.**
+5 revisions, 4 external audit rounds (round 1: 5 blockers → 2: 2 fence holes → 3: SQL trigger defects →
+4/5: `INSERT OR REPLACE` + legacy `DrainChainSettleRetry`), and 2 decorrelated internal Sonnet passes
+on real SQLite 3.45.1 (22 attacks + 9 regressions, collision-guard unbreakable). Both reviewers
+independently converged on the same final fixes and signed off. **The §3 DDL is the checksum-frozen
+contract for migration 032 — copied verbatim by the implementer; the true freeze is at merge, after
+the §6 pin battery runs against the real runner.** **Anchors:** Spec #1 + Spec #2 (rev 2) DESIGN-LOCKED.
 
 ---
 
