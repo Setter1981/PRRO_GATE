@@ -1,10 +1,12 @@
 # Spec #4 (part A) — Authority Mini-Lock + Migration 032 Co-Draft
 
-**Status: 🟡 DRAFT rev 4 (post external audit round 3 → NOT-YET, SQL-only). 2026-07-15. Grounded on `origin/main` `f2628ba`.**
-Architecture is settled (rounds 1-2). Rev 4 closes round-3's concrete SQL defects: null-safe trigger
-comparisons + a **full transition-legality trigger**, a complete immutability trigger, **append-only**
-(no DELETE), and a tighter outcome truth-table. **Anchors:** Spec #1 + Spec #2 (rev 2) DESIGN-LOCKED.
-**The schema-implementer does NOT run until this re-audits to `mint 032`.**
+**Status: 🟡 DRAFT rev 5 (external audit round 4 + internal Sonnet SQL pass → two SQL fixes, then mint). 2026-07-15. Grounded on `origin/main` `f2628ba`.**
+Architecture settled (rounds 1-2); SQL triggers/matrix settled (rounds 3-4). Rev 5 closes the last two
+gaps both reviewers converged on: (a) `INSERT OR REPLACE` bypassed the UPDATE/DELETE triggers (a
+BEFORE-INSERT collision-guard now blocks it), and (b) `DrainChainSettleRetry` could pair with a
+fence-releasing `NOT_SUBMITTED`. Both the external auditor (round 4) and the decorrelated internal
+Sonnet pass (real SQLite 3.45.1, ~30 attacks) reported everything else clean. **Anchors:** Spec #1 +
+Spec #2 (rev 2) DESIGN-LOCKED. **The schema-implementer runs only after this re-audits to `mint 032`.**
 
 ---
 
@@ -51,10 +53,15 @@ CREATE TABLE delivery_reservation (
     call_started_at       TEXT,   -- durable wire marker (== stage_send wire_call_started_at); set at RN→CS
     dps_protocol_id            TEXT    NOT NULL CHECK (dps_protocol_id IN ('FSCO_ZZD','EVPZ_DPS')),
     protocol_contract_version  INTEGER NOT NULL CHECK (protocol_contract_version >= 1),
-    capability_profile_version INTEGER,  -- NULL = not yet profiled / default
-    endpoint_config_revision   INTEGER,  -- NULL = no revision pinned
+    capability_profile_version INTEGER CHECK (capability_profile_version IS NULL OR capability_profile_version >= 1),
+    endpoint_config_revision   INTEGER CHECK (endpoint_config_revision IS NULL OR endpoint_config_revision >= 1),
     envelope_hash         BLOB    NOT NULL CHECK (length(envelope_hash) = 32),  -- protocol-specific (prost Check, stage_send.rs:795)
     remote_correlation_id TEXT,
+    -- The three Spec #2 §2 orthogonal fields. NOTE (blessed, both reviewers): SUBMITTED_UNKNOWN +
+    -- NO_RESPONSE is the CANONICAL wire-timeout (bytes may have left, no ack came back — Spec #2
+    -- §3/§9-RP1); it is VALID, not a hole, and must NOT be forbidden. The full routing ↔
+    -- (certainty, provenance) classifier is the CS-3 typed constructor; this matrix is the minimal
+    -- structural floor.
     submission_certainty  TEXT CHECK (submission_certainty IN ('NOT_SUBMITTED','SUBMITTED_UNKNOWN','SUBMITTED')),
     response_provenance   TEXT CHECK (response_provenance IN ('NO_RESPONSE','AUTHENTICATED_PEER','PARSED_DPS_ENVELOPE')),
     -- PascalCase, byte-identical with the retry_class wire contract (error_routing.rs:120).
@@ -78,6 +85,10 @@ CREATE TABLE delivery_reservation (
     CHECK (routing_class NOT IN ('TerminalReject','FnConfigError','MacRecovery','OperatorEscalation')
         OR (submission_certainty = 'SUBMITTED' AND response_provenance = 'PARSED_DPS_ENVELOPE')),
     CHECK (routing_class <> 'ProbeRequired' OR response_provenance <> 'NO_RESPONSE'),
+    -- DrainChainSettleRetry is the legacy -8 tag (error_routing.rs:104): a parsed DPS artifact,
+    -- never pre-call/no-response, and must never release the fence as a cancel (audit round-4 §4).
+    CHECK (routing_class <> 'DrainChainSettleRetry'
+        OR (submission_certainty <> 'NOT_SUBMITTED' AND response_provenance = 'PARSED_DPS_ENVELOPE')),
     -- remote_correlation_id only exists once an outcome is observed:
     CHECK (remote_correlation_id IS NULL OR state = 'OUTCOME_OBSERVED'),
 
@@ -100,6 +111,21 @@ CREATE INDEX ix_reservation_call_started ON delivery_reservation(fiscal_number) 
 CREATE TRIGGER delivery_reservation_insert_state
 BEFORE INSERT ON delivery_reservation WHEN NEW.state <> 'RESERVED_NOT_STARTED'
 BEGIN SELECT RAISE(ABORT, 'reservation must be inserted as RESERVED_NOT_STARTED'); END;
+
+-- No-REPLACE collision-guard (audit round-4 §1): `INSERT OR REPLACE` resolves a PK / unique-index
+-- conflict by DELETE+INSERT, which (with recursive_triggers OFF, db/mod.rs) bypasses the
+-- UPDATE/DELETE triggers and can evict a live reservation or clear a marker. `INSERT OR REPLACE` is
+-- a real path in this codebase (document_files.rs:124). Fail-closed BEFORE INSERT on ANY collision:
+-- same reservation_id, same (document_id, attempt_no), or an existing ACTIVE (fenced) row on the FN.
+CREATE TRIGGER delivery_reservation_no_replace
+BEFORE INSERT ON delivery_reservation
+WHEN EXISTS (SELECT 1 FROM delivery_reservation WHERE reservation_id = NEW.reservation_id)
+  OR EXISTS (SELECT 1 FROM delivery_reservation WHERE document_id = NEW.document_id AND attempt_no = NEW.attempt_no)
+  OR EXISTS (SELECT 1 FROM delivery_reservation WHERE fiscal_number = NEW.fiscal_number
+        AND (state IN ('RESERVED_NOT_STARTED','CALL_STARTED')
+          OR (state = 'OUTCOME_OBSERVED' AND submission_certainty = 'SUBMITTED_UNKNOWN')
+          OR (state = 'OUTCOME_OBSERVED' AND submission_certainty = 'SUBMITTED' AND routing_class IS NOT NULL)))
+BEGIN SELECT RAISE(ABORT, 'delivery_reservation: collision on reservation_id / (document_id,attempt_no) / active fence — INSERT OR REPLACE forbidden'); END;
 
 -- Transition legality (audit round-3 §1): the ONLY legal edges. `IS`/`IS NOT` are null-safe.
 CREATE TRIGGER delivery_reservation_transition
@@ -155,6 +181,7 @@ BEGIN UPDATE delivery_reservation SET updated_at = CURRENT_TIMESTAMP WHERE reser
 - **RP-A4-2 (forensic cutover):** after CS-3, no resend/seed/fence path reads `transport_trace`; the three `f2628ba` consumer-paths are gone.
 - **RP-A4-3a/b/c (fence holds):** a 2nd reservation is refused when the first is `OUTCOME_OBSERVED` with `SUBMITTED_UNKNOWN` (a) or `SUBMITTED + routing!=NULL` (b); `NOT_SUBMITTED` with `call_started_at NOT NULL` is CHECK-rejected (c).
 - **RP-A4-3d (transition legality):** `CALL_STARTED→NOT_SUBMITTED`, `RESERVED_NOT_STARTED→OUTCOME_OBSERVED(SUBMITTED*)`, `CALL_STARTED→RESERVED_NOT_STARTED`, and marker/outcome mutation are all trigger-`ABORT`ed; `RN→CS→OO` succeeds.
+- **RP-A4-3e (no INSERT OR REPLACE):** `INSERT OR REPLACE` (or any colliding INSERT) on an existing `reservation_id` / `(document_id, attempt_no)` / active-FN is `ABORT`ed by the collision-guard — no eviction of a live reservation, no trigger-bypassing DELETE+INSERT.
 - **RP-A4-4 (bound protocol):** a doc whose `fn_outgress_profile` flips mid-shift still retries on its bound `dps_protocol_id`.
 - **RP-A4-5 (record-then-apply):** a crash after `OutcomeObserved` re-applies the recorded `ObservedOutcomeV1` idempotently; the DPS call is never repeated.
 - **RP-A4-6 (no blind resend):** `er_redrive` does not blind-resend a possibly-submitted doc on Transport-timeout (Spec #2 RP-1).
@@ -175,10 +202,13 @@ self-scoped). Merge gate:
 2. **`sqlite_master` diff** — pre-existing objects byte-identical; only the expected new objects added (incl. `ux_fd_docid_fn` on `fiscal_documents`);
 3. **production-flow test** — after a normal fiscalisation, `delivery_reservation` stays **empty**;
 4. **static call-graph pin** — allowed: migration + repository persistence tests; **forbidden: any production caller** of the `delivery_reservation` repo;
-5. **constraint / truth-table / phase-laundering matrix** — the 3-field structural matrix; a 2nd reservation after every unsafe state (`SUBMITTED_UNKNOWN`; `SUBMITTED + routing!=NULL` — both rejected); plus the negative pins: marker `value→NULL`; `RN→OO(SUBMITTED)`; `CS→RN`; clean `routing NULL→TerminalReject`; mutation of protocol versions / `remote_correlation_id`; a resolved-row DELETE (rejected — append-only) proving no `attempt_no` reuse; composite-FK mismatch (doc FN-A under fence FN-B); concurrent `attempt_no` (1,2); the positive `RN→CS→OO`; the CS-3 activation-empty / pre-feature gate.
+5. **constraint / truth-table / phase-laundering matrix** — the 3-field structural matrix; a 2nd reservation after every unsafe state (`SUBMITTED_UNKNOWN`; `SUBMITTED + routing!=NULL` — both rejected); plus the negative pins: marker `value→NULL`; `RN→OO(SUBMITTED)`; `CS→RN`; clean `routing NULL→TerminalReject`; mutation of protocol versions / `remote_correlation_id`; a resolved-row DELETE (rejected — append-only) proving no `attempt_no` reuse; **`INSERT OR REPLACE` by `reservation_id` rejected** (no trigger bypass); **`INSERT OR REPLACE` that would evict an active-FN reservation rejected**; **`DrainChainSettleRetry + NOT_SUBMITTED/NO_RESPONSE` rejected** (no legacy fence-release); a **negative `capability_profile_version` / `endpoint_config_revision` rejected**; composite-FK mismatch (doc FN-A under fence FN-B); concurrent `attempt_no` (1,2); the positive `RN→CS→OO`; the CS-3 activation-empty / pre-feature gate.
 
-## 7 · Residual for re-audit
-Believed closed by rev 4. Confirm: (a) the transition trigger's `BEFORE UPDATE OF …` column list is
-complete (does it need to also fire on an attempt to change `state` alone with no cert change?); (b)
-append-only is acceptable vs a separate durable counter (chosen append-only for the audit trail + to
-kill reuse in one); (c) any remaining accepted-but-impossible triple in the tightened matrix.
+## 7 · Mint-candidate status
+Round-4 (external) resolved: transition legality, immutability, append-only, fence, composite FK,
+`attempt_no`, `BEFORE UPDATE OF` completeness — all confirmed; the two residuals (`INSERT OR REPLACE`,
+legacy `DrainChainSettleRetry`) are closed above (collision-guard + the DrainChain CHECK). The
+decorrelated internal Sonnet pass (real SQLite 3.45.1) independently confirmed the same clean surface
+and its one finding (`SUBMITTED_UNKNOWN + NO_RESPONSE`) is adjudicated **valid** (blessed in §3). The
+only deferred item is the full routing↔(certainty,provenance) **typed classifier — explicitly CS-3**.
+**On a clean round-5 re-verify of the two rev-5 fixes, this is `mint 032`.**
