@@ -2197,6 +2197,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "prro-dps-contract"
+version = "0.1.0"
+
+[[package]]
+name = "prro-fleet-contract"
+version = "0.1.0"
+
+[[package]]
+name = "prro-ingress-contract"
+version = "0.1.0"
+
+[[package]]
 name = "prro-testkit"
 version = "0.1.0"
 

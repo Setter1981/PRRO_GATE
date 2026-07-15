@@ -42,8 +42,9 @@ jobs:
         working-directory: rust
         # prro_crypto/prro_escpos joined the fmt gate in the CRY-4 lint-debt
         # pass (2026-06-11) — both crates were fmt-standardized then.
-        # prro-domain/prro-testkit joined in CS-1a (contract §8 / RP-CS1-6).
-        run: cargo fmt -p prro -p prro_crypto -p prro_escpos -p prro-domain -p prro-testkit -- --check
+        # prro-domain/prro-testkit joined in CS-1a (contract §8 / RP-CS1-6);
+        # the three `*-contract` crates joined in CS-1d (contract §8 item 5).
+        run: cargo fmt -p prro -p prro_crypto -p prro_escpos -p prro-domain -p prro-testkit -p prro-ingress-contract -p prro-dps-contract -p prro-fleet-contract -- --check
       - name: cargo clippy (-D warnings, crate-scoped)
         working-directory: rust
         # --features test-support: builds the integration test targets
@@ -63,3 +64,10 @@ jobs:
         # CS-1a skeleton crates (contract §8 / RP-CS1-6). `--all-targets` lints
         # the purity-gate + trybuild-canary test targets too; keep them clean.
         run: cargo clippy -p prro-domain -p prro-testkit --all-targets --no-deps -- -D warnings
+
+      - name: cargo clippy contract crates (-D warnings)
+        working-directory: rust
+        # CS-1d boundary-contract skeleton crates (contract §8 item 5 / RP-CS1-6).
+        # Empty for now, but scoped-linted so a crate-local change is never
+        # SKIPPED. `--all-targets` covers any test target these crates grow later.
+        run: cargo clippy -p prro-ingress-contract -p prro-dps-contract -p prro-fleet-contract --all-targets --no-deps -- -D warnings

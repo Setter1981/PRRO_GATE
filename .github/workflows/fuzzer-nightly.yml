@@ -78,8 +78,11 @@ jobs:
         # CS-1a (contract §8 / RP-CS1-6): keep the cargo-metadata purity gate +
         # testkit graph-absence check enforced on the nightly leg too, so a
         # forbidden-dep / testkit-in-prod regression is caught even on a
-        # docs-heavy day the PR path-detector might route around.
-        run: cargo nextest run -p prro-domain -p prro-testkit --locked
+        # docs-heavy day the PR path-detector might route around. CS-1d adds the
+        # three `*-contract` members so the contract-crate DAG gate
+        # (rp_cs1_4_contract_dag.rs) runs and the empty crates are compiled here
+        # too, never SKIPPED.
+        run: cargo nextest run -p prro-domain -p prro-testkit -p prro-ingress-contract -p prro-dps-contract -p prro-fleet-contract --locked
 
       - name: Capstone large-N (both online + offline)
         working-directory: rust
