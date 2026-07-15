@@ -3,6 +3,12 @@ name = "prro-domain"
 version = "0.1.0"
 edition = "2021"
 description = "PRRO Gateway pure domain model — sqlx-free, I/O-free, runtime-free (CS-1 skeleton)"
+# CS-1R R4.2 — no *supported* external Rust API. The domain types are consumed
+# only inside this workspace (via `prro`'s `db::models` facade + `db::types`
+# store-side wrappers); the CS-1 source-API refactor is deliberately
+# unsupported for external consumers. `publish = false` states that honestly.
+# (Contract rev 5, source-API-break register.)
+publish = false
 
 [lib]
 name = "prro_domain"

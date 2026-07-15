@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `DocState: sqlx::Encode<'_, Sqlite>` is not satisfied
+  --> tests/rp_r4_1b_sqlx_break_compile_fail/enum_not_encodable.rs:12:20
+   |
+12 |     needs_encode::<prro::db::models::DocState>();
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `sqlx::Encode<'_, Sqlite>` is not implemented for `DocState`
+   |
+   = help: the following other types implement trait `sqlx::Encode<'q, DB>`:
+             `&'a str` implements `sqlx::Encode<'a, sqlx::Any>`
+             `&'q [u8]` implements `sqlx::Encode<'q, Sqlite>`
+             `&'q [u8]` implements `sqlx::Encode<'q, sqlx::Any>`
+             `&'q str` implements `sqlx::Encode<'q, Sqlite>`
+             `&T` implements `sqlx::Encode<'q, DB>`
+             `Box<[u8]>` implements `sqlx::Encode<'_, Sqlite>`
+             `Box<str>` implements `sqlx::Encode<'_, Sqlite>`
+             `Cow<'q, str>` implements `sqlx::Encode<'q, Sqlite>`
+           and $N others
+note: required by a bound in `needs_encode`
+  --> tests/rp_r4_1b_sqlx_break_compile_fail/enum_not_encodable.rs:9:24
+   |
+ 9 | fn needs_encode<'q, T: sqlx::Encode<'q, sqlx::Sqlite>>() {}
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `needs_encode`

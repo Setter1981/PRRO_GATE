@@ -1,7 +1,19 @@
-# CS-1 Contract — Behaviour-Neutral Crate Skeleton (rev 4, CONTRACT-READY)
+# CS-1 Contract — Fiscal-Runtime & Persisted-Representation Compatible Crate Skeleton (rev 5, CONTRACT-READY)
 
-**Status: ✅ CONTRACT-READY (rev 4). 2026-07-14.** External audit cleared all findings
-(CS1-V1…V5, §10 resolved). Rev 4 applied the two final mechanical fixes: RP-CS1-5 CashierId decode
+**Status: ✅ CONTRACT-READY (rev 5). 2026-07-15.** **CS-1R re-scope (spec
+`2026-07-15-cs1r-remediation-spec.md` §1 R4).** The *global* "behaviour-neutral" claim is **withdrawn
+and replaced** by the honest scope: this work is **"fiscal-runtime and persisted-representation
+compatible; a deliberate *unsupported* Rust source-API refactor."** "Behaviour-neutral" is retained
+**only** where it strictly means storage/serde bytes (SQLite affinity, TEXT literals, 16-byte BLOB,
+`#[serde(rename)]` output — all byte-identical; see §2). The Rust *source* API is NOT neutral: the
+8 TEXT enums + 6 UUID-BLOB ids + `CashierId` lost their public `sqlx::{Type,Encode,Decode}` impls
+(they moved store-side onto `prro::db::types::Db*` wrappers), and new public methods appeared
+(`from_sql_str`, `CashierId::from_persisted_unchecked`). The **Source-API-break register (§11)** names
+this verbatim; **`publish = false`** on `prro` + `prro-domain` (R4.2) makes "no *supported* external
+Rust API" honest. See §11 for the register + the RATIONAL-trade-off statement + the RP-R4-1a/1b/1c
+facade pins.
+
+Rev 4 applied the two final mechanical fixes: RP-CS1-5 CashierId decode
 = **empty-SILENT / oversize-WARN** + `#[serde(transparent)]` unchanged; and the RP-CS1-2 command
 matrix is now **literal & executable** (harness-scoped live-dps `--test live_dps_extended_smoke`,
 `FUZZ_CASES` capstone nightly, `--features prro/test-support --locked` inventory). Ready for the
@@ -12,8 +24,10 @@ manifest tightened — explicit `CashierIdError/DriverIdError`, **no `FiscalComm
 `InboxStatus` stays in `prro`, `Severity`→domain (§2/§3); and RP-CS1-2 now pins the **literal**
 command matrix + the full **179-file** SHA inventory + machine-readable `nextest list` name/status
 diff (§7). Open questions resolved (§10). Baseline: `origin/main f2c17b1` (code `8ec99ca`).
-Dual-session: architect authors this + RED-pins; implementer writes test-first. **Zero behaviour
-change** — only module location, crate boundaries, re-exports, and the sqlx-mapping relocation.
+Dual-session: architect authors this + RED-pins; implementer writes test-first. **Storage/serde-byte
+neutral** — module location, crate boundaries, re-exports, and the sqlx-mapping relocation change,
+but the persisted bytes and fiscal runtime do NOT. The **Rust source API is deliberately, and
+unsupportedly, refactored** (§11).
 
 ---
 
@@ -140,3 +154,76 @@ absent in baseline; money stays integer kopecks / BPS. Forbid all I/O/runtime cr
    domain-vs-store home is decided in **spec #3**, not CS-1.
 3. **Order `CS-1b` → `CS-1b′` confirmed** (homogeneous TEXT-enums + the facade/wrapper pattern first,
    then the riskier BLOB-ids + legacy hydration); `CanonicalFiscalCommand` (CS-1c) after both.
+
+## 11 · Source-API-break register (CS-1R rev 5 — normative)
+
+**Framing.** §1–§10 correctly establish that CS-1 is a **storage/serde-byte non-event** (SQLite
+affinity, TEXT literals, 16-byte BLOB, `#[serde(rename)]` output — byte-identical; RP-CS1-5). The
+prior *global* "behaviour-neutral" label over-claimed: the **Rust source API is not neutral**. This
+register names the break honestly. It does NOT roll the split back — it re-scopes the claim.
+
+**11.1 Removed public trait impls (the break).** The following impls existed on the domain types in
+the CS-1 baseline (`f2c17b1`) and are **removed** at CS-1 head (`f2628ba`) — they now live store-side
+on the `prro`-local `prro::db::types::Db*` wrappers (orphan-rule legal there), NOT on the pure
+domain types:
+
+| type set | removed impls (exact trait signatures) |
+|---|---|
+| 8 TEXT enums (`DocState`, `DocType`, `FiscalMode`, `NodeMode`, `OfflineSessionState`, `Protocol`, `Severity`, `ShiftState`) | `impl sqlx::Type<Sqlite>`, `impl<'q> sqlx::Encode<'q, Sqlite>`, `impl<'r> sqlx::Decode<'r, Sqlite>` |
+| 6 UUID-BLOB ids (`DocumentId`, `RequestId`, `ShiftId`, `OperatorId`, `PrinterId`, `OfflineSessionId`) | `impl sqlx::Type<Sqlite>`, `impl<'q> sqlx::Encode<'q, Sqlite>`, `impl<'r> sqlx::Decode<'r, Sqlite>` |
+| `CashierId` | `impl sqlx::Type<Sqlite>`, `impl<'q> sqlx::Encode<'q, Sqlite>`, `impl<'r> sqlx::Decode<'r, Sqlite>` |
+| `DriverId` | **none removed** — `DriverId` had NO sqlx impls in the baseline (raw-`String` DB boundary, §2/§3). Recorded so the register is exhaustive: 8 enums + 6 BLOB ids + `CashierId` broke; `DriverId` did not. |
+
+**Consequence (compile-observable, RP-R4-1b pins it):** `.bind(DocState::Prepared)`, a
+`T: sqlx::Type<Sqlite>` / `T: sqlx::Encode<'q, Sqlite>` bound monomorphised on any legacy path
+(`prro::db::models::DocState`, `…::DocumentId`, …), or a `query_as::<Db*>`-free decode of the raw
+domain type **no longer compiles (E0277)**. Callers wrap: `.bind(DbDocState(DocState::Prepared))`.
+
+**11.2 New public surface (added by CS-1).**
+- **`from_sql_str(&str) -> Option<Self>`** on all **8 TEXT enums** — the pure parse half the store-side
+  `Db*::decode` delegates to (exact-literal closed-set match; unknown ⇒ `None`).
+- **`CashierId::from_persisted_unchecked(String) -> Self`** — hydrates a legacy/oversize persisted
+  value bypassing strict `new()` (the private field + strict `new()` cannot rebuild pre-W14a-2a
+  empties or oversize drift; the store-side `DbCashierId::decode` calls it).
+
+**11.3 Changed defining-crate / type identity.** Every legacy path
+(`prro::db::models::enums::DocState`, `prro::db::models::DocState`, `…::ids::DocumentId`, …) now
+resolves to a **`prro_domain`** type (re-exported through the explicit `prro::db::models` facade),
+NOT a `prro`-local one. Even where the *name* is unchanged, the **defining crate** — hence the
+trait-impl surface reachable under the orphan rule — changed. External code that relied on `impl`ing
+its own traits for these types from a third crate, or on the `prro`-crate identity, is affected.
+
+**11.4 Trade-off statement (the break was RATIONAL, not impossible).** The orphan rule forbids
+`impl sqlx::Type for prro_domain::DocState` *from `prro`*, but source-API compatibility **was
+reachable** by worse means, all considered and rejected:
+- **(a) `prro`-local compat/shim types** re-exposing the sqlx surface — duplicates the type identity,
+  re-introduces the `prro`↔store coupling CS-1 exists to sever.
+- **(b) duplicate-with-conversion** (a second, sqlx-bearing copy of each type + `From`/`Into`) —
+  double the maintenance surface, two "sources of truth" for every variant/literal.
+- **(c) a `sqlx` feature *in* `prro-domain`** — re-pollutes the pure crate with a DB/runtime
+  dependency, defeating the RP-CS1-1 purity gate (the whole point of the split).
+All three are strictly worse than the `Db*` store-side wrappers (§4). Dropping the source-API is
+therefore a **deliberate trade-off**, correctly named here — **not** an impossibility to be undone.
+
+**11.5 `publish = false` (R4.2).** `prro` **and** `prro-domain` now carry `publish = false` in their
+`[package]` (baseline had neither; only `prro-testkit` + the 3 contract crates set it). The honest
+statement is **"no *supported* external Rust API"** — NOT "no external consumers" (that claim was
+false). The crates are workspace-internal; the source-API refactor is unsupported for outside
+consumers.
+
+**11.6 Facade = closed legacy surface (RP-R4-1a/1b/1c).** The `prro::db::models::mod.rs`
+`pub use enums::*; pub use ids::*;` globs are replaced by an **explicit per-symbol legacy
+export-list** (no widening). Three pins guard it (spec §1 R4.5):
+- **RP-R4-1a** — per-type retained-surface compile-manifest, both paths (nested
+  `prro::db::models::enums::DocState` + short `prro::db::models::DocState`); the surface is
+  **NON-uniform** (enums: `Copy`+`Hash`+serde+`as_str`+`from_sql_str`; BLOB ids:
+  `Copy`+`Hash`+`serde(transparent)`+`new`/`from_bytes`/`as_bytes`/`Default`, no public `now_v7`;
+  `CashierId`: no `Copy`, has `from_persisted_unchecked`/`as_str`/`into_inner`/`Display`/`FromStr`;
+  `DriverId`: no `Copy`/`Hash`/`Serialize`/`Deserialize`).
+- **RP-R4-1b** — `trybuild` compile-FAIL fixtures proving the legacy types no longer satisfy
+  `sqlx::Type<Sqlite>` / `Encode` (pins §11.1, not a restoration).
+- **RP-R4-1c** — an **AST parse** (`syn`) of `db/models/mod.rs` asserting **no glob** + **exact
+  set-equality** of the `pub use` set to the pinned legacy list (the only guard that catches
+  *widening*).
+Teeth: remove a legacy export → RP-R4-1a/1c RED; restore a glob or add an extra export → RP-R4-1c
+RED; a legacy `.bind`/`Type<Sqlite>` compiling again → RP-R4-1b RED.
