@@ -21,6 +21,11 @@ members = [
     "prro-ingress-contract",
     "prro-dps-contract",
     "prro-fleet-contract",
+    # CS-1R R2.2: `cargo xtask update-purity-closure` regenerates
+    # prro-domain/purity-closure.lock. Deliberately depends ONLY on serde_json
+    # (already resolved via `prro`), so it adds NO new crate to the lock and is
+    # NOT in prro-domain's dependency closure (the purity gate is unaffected).
+    "xtask",
 ]
 
 # Profiles apply ONLY from the workspace root — the [profile.release]
