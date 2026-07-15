@@ -1,0 +1,4 @@
+# CS-1R R2.2: `cargo xtask <task>` alias so `cargo xtask update-purity-closure`
+# works from the workspace root. The xtask crate depends only on serde_json.
+[alias]
+xtask = "run --package xtask --"

@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Workspace dev tasks (CS-1R R2: regenerate prro-domain/purity-closure.lock)"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+# ONLY serde_json + std. Deliberately no heavy deps — this must not bloat the
+# workspace graph (spec §2: "do NOT let it pull heavy deps into the graph").
+# serde_json is already resolved in the workspace (used by `prro`), so xtask
+# adds no new crate to the lock.
+serde_json = "1"
