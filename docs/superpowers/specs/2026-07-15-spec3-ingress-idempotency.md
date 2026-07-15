@@ -1,6 +1,6 @@
 # Spec #3 — Canonical ingress contract + Idempotency (POS → gateway)
 
-**Status: 🟡 DRAFT rev 5 (post external audit round 4 → 3/4 LOCK-READY; one narrow §3/§6 fix). 2026-07-15. Grounded on `origin/main` `9ce76c2`** (fiscal-core re-verified on `specs-3-5-ingress-fleet @ c6a2d2e`; `9ce76c2..` diff = only Spec #3).
+**Status: 🔒 LOCKED rev 5 (external audit round 5 → "lock #3"; all 4 sections CLOSED, no hard blockers). 2026-07-15. Grounded on `origin/main` `9ce76c2`** (fiscal-core re-verified on `specs-3-5-ingress-fleet @ c6a2d2e`; `9ce76c2..` diff = only Spec #3).
 Rev 4 closes round-3's three blockers: (1) **`session_scope` is removed from the external identity**
 (it broke cross-shift external replay) — the identity is a **sum-type**, session scope lives **only**
 inside the internal-producer operation id; profile/policy/version are **provenance fences, never key
@@ -66,7 +66,7 @@ struct IdentityProvenance { profile: ProvenanceProfile, policy_id: PolicyId, pol
 // profile is default-deny; non-emptiness of the key alone does NOT grant Accept.
 
 enum ReplayIdentityResolution { Resolved(ResolvedReplayIdentity, IdentityProvenance), NoSafeReplayIdentity { reason: NoSafeReason } }
-enum NoSafeReason { EmptyKey, AbsentKey, ContentDerivedOnly, NoReservationToken, ProfileSwitchWithUnresolvedIntent, UnlistedOriginOperation }
+enum NoSafeReason { EmptyKey, AbsentKey, ContentDerivedOnly, NoReservationToken, ProfileSwitchWithUnresolvedIntent, UnlistedOriginOperation, UnprovenProfileCapability }
 ```
 **Effective key** = the `ReplayIdentity` variant fields + `fiscal_number` (partition):
 - **External** = `(fiscal_number, source_protocol, source_installation_id, source_request_id, operation_kind)` — **no session** ⇒ a retry of the same `source_request_id` **after a shift boundary still dedupes** (fixes the round-3 counterexample).
@@ -132,7 +132,7 @@ Reject(NoSafeReason)`; **any unlisted `(origin, operation_kind)` ⇒ `Reject(Unl
 - **RP3-8 (namespace separation, known-red until the migration)** same raw string, same FN, different `(origin, operation)` ⇒ no cross-collision.
 - **RP3-9** reaper terminalises, never re-fiscalizes.
 - **RP3-10 (B10-END mode)** B10-END uses `insert_processing_with_prepared_doc` (PROCESSING+PREPARED atomic); the `insert_new` path is not admissible for it, and vice-versa.
-- **RP3-11 (matrix totality + capability proof)** over the **real closed operation enum** (`FiscalCommandKind` covering the `DocType` set — incl. `OfflineSessionBegin`/`OfflineSessionEnd` so the B10 rows formally belong), every `(origin, operation)` maps to exactly one decision (closed match, no `_ =>` silent Accept); an **unproven profile ⇒ default-deny**. The `ProvenSourceStableId` capability is granted **only** by a crash/replay contract-test (plan:155-158) proving: (a) the **same** intent across reconnect/reboot/shift ⇒ the **same** id; (b) two **independent identical** writes ⇒ **distinct** ids.
+- **RP3-11 (matrix totality + capability proof)** over the **real closed operation enum** (`FiscalCommandKind` covering the `DocType` set — incl. `OfflineSessionBegin`/`OfflineSessionEnd` so the B10 rows formally belong), every `(origin, operation)` maps to exactly one decision (closed match, no `_ =>` silent Accept); an **unproven profile ⇒ `Reject(UnprovenProfileCapability)`**. The `ProvenSourceStableId` capability is granted **only** by a crash/replay contract-test (plan:155-158) proving: (a) the **same** intent across reconnect/reboot/shift ⇒ the **same** id; (b) two **independent identical** writes ⇒ **distinct** ids. `FiscalCommandKind` is defined by an **exhaustive compile-checked `From<DocType>` conversion** (no `_ =>`), so adding a `DocType` forces a matrix decision.
 
 ## 9 · Decisions + open items
 - **Index:** drop/replace with normalized non-null identity columns + a new `UNIQUE` (not opaque TEXT-encoding).
