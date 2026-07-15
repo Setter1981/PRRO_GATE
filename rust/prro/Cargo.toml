@@ -3,6 +3,13 @@ name = "prro"
 version = "0.1.0"
 edition = "2021"
 description = "PRRO Gateway — single Rust binary for Ukrainian fiscal endpoint"
+# CS-1R R4.2 — there is NO *supported* external Rust API. CS-1 deliberately
+# moved the domain types to `prro-domain` and dropped their public
+# `sqlx::{Type,Encode,Decode}` impls (now store-side on `db::types::Db*`
+# wrappers); `.bind(DocState::…)` / `T: sqlx::Type<Sqlite>` no longer compiles.
+# `publish = false` makes that honest — the crate is not offered on any registry
+# as a consumable library. (Contract rev 5, source-API-break register.)
+publish = false
 
 [[bin]]
 name = "prro"
@@ -133,6 +140,14 @@ prro_escpos = { path = "../prro_escpos" }
 pretty_assertions = "1"
 tempfile = "3"
 
+# CS-1R R4 (RP-R4-1a) — `assert_not_impl_any!` compile-time NEGATIVE trait pins
+# (autoref-specialization trick; works on stable, zero runtime, zero transitive
+# deps). Pins the register's ABSENT surface: `DriverId: !Copy/!Hash/!Serialize/
+# !Deserialize`, `CashierId: !Copy` — so *adding* one of those derives is RED
+# (the removal direction is pinned by the positive trait bounds in the same
+# test). Makes RP-R4-1a symmetric per spec §1 R4.5.
+static_assertions = "1"
+
 # M3a W2 — `WriteTxConn<'_>` sealed-newtype seal proof.  Five compile-fail
 # fixtures (raw `&mut SqliteConnection` rejected, `WriteTxConn::new` private,
 # struct-literal `_seal: ()` private, `new_for_test` not visible outside
@@ -159,8 +174,12 @@ tower = { version = "0.5", features = ["util"] }
 # public API for forbidden sqlx types.  `visit` enables the syn::visit::Visit
 # trait the scanner walks; `extra-traits` gives Debug/Clone for diagnostics.
 # `quote::ToTokens` stringifies type expressions.
-syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+# CS-1R R4 (RP-R4-1c) also parses `src/db/models/mod.rs` via `syn::parse_file`
+# (needs `full` + `parsing`) to assert no glob re-export + exact legacy
+# export set-equality; `proc-macro2` gives the `Ident`/token surface.
+syn = { version = "2", features = ["full", "extra-traits", "visit", "parsing"] }
 quote = "1"
+proc-macro2 = "1"
 
 # M2 W6 secret-material flow tracing test — self-managed CaptureBuf
 # `MakeWriter` + `tracing::subscriber::set_global_default` installed

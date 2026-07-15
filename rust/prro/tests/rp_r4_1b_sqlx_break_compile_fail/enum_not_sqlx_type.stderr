@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `DocState: sqlx::Type<Sqlite>` is not satisfied
+  --> tests/rp_r4_1b_sqlx_break_compile_fail/enum_not_sqlx_type.rs:12:23
+   |
+12 |     needs_sqlx_type::<prro::db::models::DocState>();
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `sqlx::Type<Sqlite>` is not implemented for `DocState`
+   |
+   = help: the following other types implement trait `sqlx::Type<DB>`:
+             `&T` implements `sqlx::Type<DB>`
+             `Box<[u8]>` implements `sqlx::Type<Sqlite>`
+             `Box<str>` implements `sqlx::Type<Sqlite>`
+             `Cow<'_, str>` implements `sqlx::Type<Sqlite>`
+             `DateTime<Tz>` implements `sqlx::Type<Sqlite>`
+             `DbCashierId` implements `sqlx::Type<Sqlite>`
+             `DbDocState` implements `sqlx::Type<Sqlite>`
+             `DbDocType` implements `sqlx::Type<Sqlite>`
+           and $N others
+note: required by a bound in `needs_sqlx_type`
+  --> tests/rp_r4_1b_sqlx_break_compile_fail/enum_not_sqlx_type.rs:8:23
+   |
+ 8 | fn needs_sqlx_type<T: sqlx::Type<sqlx::Sqlite>>() {}
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `needs_sqlx_type`
