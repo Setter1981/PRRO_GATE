@@ -24,6 +24,12 @@ on:
       # gate lives in `prro-domain`.
       - 'rust/prro-domain/**'
       - 'rust/prro-testkit/**'
+      # CS-1d (contract §8 item 5 / RP-CS1-6): the three empty boundary-contract
+      # crates get the same treatment — a change confined to one must be
+      # built/linted, never SKIPPED.
+      - 'rust/prro-ingress-contract/**'
+      - 'rust/prro-dps-contract/**'
+      - 'rust/prro-fleet-contract/**'
       - 'rust/Cargo.*'
       - '.github/workflows/rust-prro.yml'
   # pull_request is deliberately UNFILTERED: the required
@@ -78,7 +84,7 @@ jobs:
           git fetch --no-tags --depth=1 origin "$base"
           files=$(git diff --name-only "$base" HEAD)
           echo "changed files:"; echo "$files"
-          if echo "$files" | grep -qE '^(rust/prro/|rust/prro_crypto/|rust/prro_escpos/|rust/prro-domain/|rust/prro-testkit/|rust/Cargo\.|\.github/workflows/rust-prro\.yml$)'; then
+          if echo "$files" | grep -qE '^(rust/prro/|rust/prro_crypto/|rust/prro_escpos/|rust/prro-domain/|rust/prro-testkit/|rust/prro-ingress-contract/|rust/prro-dps-contract/|rust/prro-fleet-contract/|rust/Cargo\.|\.github/workflows/rust-prro\.yml$)'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
@@ -140,15 +146,18 @@ jobs:
         # (aarch64) is covered by the nightly cross workflow.
         run: cargo nextest run -p prro_crypto --target x86_64-unknown-linux-gnu --locked
 
-      - name: Test prro-domain (RP-CS1-1 purity gate + RP-CS1-4 testkit graph-absence)
+      - name: Test prro-domain (RP-CS1-1 purity gate + RP-CS1-4 contract-DAG + testkit graph-absence)
         working-directory: rust
         # CS-1 skeleton (contract §8 / RP-CS1-6): the `prro-domain` crate carries
         # the cargo-metadata purity gate (sqlx/tonic/tokio/axum/prost/hyper/reqwest
-        # must never enter its normal+build+target closure) and the RP-CS1-4
-        # `prro-testkit` graph-absence check, plus the trybuild canary. Also
-        # `--workspace`-compiles the (currently empty) `prro-testkit` member so a
-        # crate-local change is linted/tested, never SKIPPED.
-        run: cargo nextest run -p prro-domain -p prro-testkit --target x86_64-unknown-linux-gnu --locked
+        # must never enter its normal+build+target closure), the RP-CS1-4
+        # `prro-testkit` graph-absence check AND the CS-1d contract-crate DAG gate
+        # (rp_cs1_4_contract_dag.rs: the three `*-contract` crates carry no
+        # adapter/IO dep and stay orthogonal — ingress ⊥ dps ⊥ fleet), plus the
+        # trybuild canary. Also compiles the (currently empty) `prro-testkit` +
+        # the three `*-contract` members so a crate-local change is linted/tested,
+        # never SKIPPED.
+        run: cargo nextest run -p prro-domain -p prro-testkit -p prro-ingress-contract -p prro-dps-contract -p prro-fleet-contract --target x86_64-unknown-linux-gnu --locked
 
       # Phase-2 U2 (spec §4 / F2): the fuzzer above writes a regression seed to
       # the pinned file on a find. Surface it so a find is never silently
