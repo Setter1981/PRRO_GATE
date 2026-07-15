@@ -1,93 +1,91 @@
-# Spec #5 — Fleet lifecycle (ADVISORY-only for pilot)
+# Spec #5A — Fleet telemetry projection (ADVISORY-only, pilot)
 
-**Status: 🟡 DRAFT rev 2 (post external audit round 1 → NOT-YET). 2026-07-15. Grounded on `origin/main` `4f51112`.**
-Home: **`prro-fleet-contract`** (+ a new **`prro-fleet-agent`** crate, §4). Rev 2 closes three
-load-bearing errors the audit found: (1) the rev-1 telemetry was **non-authoritative** — the "rich"
-`node_state` columns are **schema slots with zero Rust producers**; (2) read-only-by-handle was
-**incomplete** — the barrier must be at the **crate-DAG** level; (3) deferring the **command-lifecycle
-contract** conflicts with the locked plan (§3.10) — the lifecycle is authored **now as DORMANT** (zero
-callers), advisory-only at **runtime**. Scope = **authoritative telemetry projection (pilot,
-read-only)** + **dormant command-lifecycle contract**; command runtime-activation is post-pilot (after
-CS-4 + CS-5). Fleet = ADVISORY-only per the ratified pivot.
+**Status: 🟡 DRAFT rev 3 (post external audit round 2 → NOT-YET, near-lock). 2026-07-15. Grounded on `origin/main` `4f51112`.**
+Home: **`prro-fleet-contract`** (+ a new empty **`prro-fleet-agent`** crate, §4). **Split (audit +
+operator):** the fleet **command lifecycle** — which the locked plan §3.10 requires with **full
+semantics** (signed envelope, epoch, PULL, HOLD, resume, rotation) — is now **Spec #5B**, authored
+separately; **#5A is the read-only telemetry projection only**. Rev 3 closes round-2's telemetry-shape
+residuals + the precise crate-DAG allowlist. Fleet = ADVISORY-only.
 
 ---
 
 ## 0 · Thesis
-The pilot fleet is a **view computed from AUTHORITATIVE truth**, not a re-read of `node_state` slots; it
-is **read-only enforced at the crate boundary** (the agent cannot even *name* a mutator); and its
-**command lifecycle exists as a dormant, INACTIVE contract** so activation later is wiring, not a
-re-cut. Advisory ≠ authority: the local per-FN coordinator is the final arbiter.
+The pilot fleet is a **view computed from AUTHORITATIVE truth** (not `node_state` slots), **read-only
+enforced at the crate boundary** (the agent cannot *name* a mutator). Advisory ≠ authority.
 
-## 1 · What EXISTS today — corrected grounding
-- `node_state` (`001_baseline.sql:521-548`) holds **live** `mode` (`NodeMode` 7-state, set by `set_mode_*_tx`) and `shift_state`, plus **columns that are SCHEMA SLOTS WITHOUT RUST PRODUCERS**: `readiness_state`/`recovery_stage`/`current_month_offline_seconds`/`last_fs_ping_at`/`current_offline_session_id` have **zero write-sites** (verified: 14 `UPDATE node_state`, none touch them) — they rest at their DDL DEFAULTs (`STARTING`/`BOOT`/`0`/`NULL`). They are **not** health signals today.
-- The write-path `NodeMode` "telemetry" field is **discarded** by consumers — `PostSignRoute::Online { .. }` drops it (`inline.rs:909`, `boot_phase.rs:3682/3942`); it is not a live emitted signal.
-- **The authoritative offline budget is computed, not stored:** `time_budget::compute_budgets_for_fn` (`time_budget.rs:276-335`) derives the 168h/mo + 36h-continuous budgets **from `offline_sessions`** (0 when no sessions) — `node_state.current_month_offline_seconds` is a non-authoritative slot; reading it would show `0` while admission already refuses.
-- **Admin is NOT structurally CLI-only and does NOT deadlock:** `go_offline`/`go_online`/`reset_stop_mode` are **public** and take a plain `SqlitePool`; the singleton lock is **fail-fast** (`singleton.rs`: `file.try_lock_exclusive().map_err(|_| …)` → immediate error, not a hang). `open_pool` is a normal **read-write** pool with migrations (`db/mod.rs:123-136`), not a SQLite read-only handle.
-- Node-local ops-loops (`supervisor.rs`) iterate only this node's own `BindingsRegistry`; **no PULL / control-plane**.
-- **Zero fleet command representation in Rust** (no `ReceivedDurable/Applied/Rejected/Deferred`, epoch, signature, or command inbox). "epoch" in the source = the DPS Kyiv-date encoding (unrelated).
+## 1 · What EXISTS today — grounded (LOCK-READY per audit)
+- `node_state` (`001:521-548`) holds **live** `mode` + `shift_state`, plus **schema slots with ZERO Rust producers** — `readiness_state`/`recovery_stage`/`current_month_offline_seconds`/`last_fs_ping_at`/`current_offline_session_id` have **no write-sites** (14 `UPDATE node_state`, none touch them); they rest at DDL DEFAULTs (`STARTING`/`BOOT`/`0`/`NULL`). Not health signals.
+- The write-path `NodeMode` "telemetry" field is **discarded** (`PostSignRoute::Online { .. }`, `inline.rs:909`, `boot_phase.rs:3682/3942`).
+- **The authoritative offline budget is computed, not stored:** `time_budget::compute_budgets_for_fn` (`time_budget.rs:276-335`) from `offline_sessions`; enforcement is **separate** for the 36h-continuous session and the 168h-month budgets (`time_budget.rs:186-190`), and the session budget is `Option` (`None` = no active session, `:257-264`).
+- **Admin is public + fail-fast, not CLI-only / not deadlock:** `go_offline`/`go_online`/`reset_stop_mode` are public and take a plain `SqlitePool`; the singleton lock is `file.try_lock_exclusive().map_err(…)` → **immediate error**; `open_pool` is a normal **RW** pool (`db/mod.rs:123-136`).
+- The active offline session is authoritatively in `offline_sessions` (states `OPENING|OPEN|DRAINING`, protected by `ux_offline_active`, `001:413-431`) — **not** `node_state.current_offline_session_id` (a slot).
+- Node-local ops-loops (`supervisor.rs`); **no PULL / control-plane**; zero fleet command surface.
 
-## 2 · Scope
-- **Pilot (active):** an **authoritative** `FleetTelemetryProjection` + an **async read-only** `FleetTelemetrySource` port + the `prro-fleet-agent` crate-DAG barrier. No live commands.
-- **Dormant (authored now, zero callers, INACTIVE):** the **command-lifecycle contract** (`FleetCommand*`, signed, epoch-versioned, PULL) — required by the locked plan §3.10:165-189 + crate-map:218-219 + roadmap CS-2. **Runtime activation** is post-pilot, only after CS-4 (local final arbiter) + CS-5 (legality table).
+## 2 · Scope (#5A)
+The **authoritative** `FleetTelemetryProjection` + an **async read-only** `FleetTelemetrySource` +
+the **empty `prro-fleet-agent`** crate with a **cargo-metadata read-only DAG gate**. **No commands**
+(→ Spec #5B). No `node_state` write; a **separate read-only projection query** (do not widen
+`NodeStateRow`/`get_tx`).
 
 ## 3 · Key types (`prro-fleet-contract`, sqlx-free)
 ```rust
-// AUTHORITATIVE projection — each field carries its own authority + freshness, NOT a raw node_state slot.
 struct FleetTelemetryProjection {
     fiscal_number: FiscalNumber,
-    mode: Stamped<NodeMode>,                 // node_state (live)
-    shift_state: Stamped<ShiftState>,        // node_state (live)
-    offline_budget: OfflineBudgetView,       // from time_budget::compute_budgets_for_fn, NOT node_state
-    liveness: LivenessView,                  // split: last real fiscal ACK vs last probe response
-    current_offline_session_id: Option<OfflineSessionId>,
-    // readiness_state/recovery_stage are UNPOPULATED slots today — projected ONLY if/when producers land,
-    // and flagged `Unpopulated` meanwhile (never presented as a real health signal).
+    mode: Stamped<NodeMode>,               // node_state (live)
+    shift_state: Stamped<ShiftState>,      // node_state (live)
+    offline_budget: OfflineBudgetView,     // time_budget::compute_budgets_for_fn — NOT a node_state slot
+    liveness: LivenessView,
+    active_offline_session_id: Observed3<OfflineSessionId>,   // from offline_sessions active states, NOT the node_state slot
+    // readiness_state / recovery_stage are OUT of V1 (no producers today); re-introduce only when a
+    // producer lands — never presented as a fake READY.
 }
-struct Stamped<T> { value: T, authority_source: AuthoritySource, observed_at: String, freshness: Freshness }
-struct OfflineBudgetView { month_used: i64, month_limit: i64, session_used: i64, session_limit: i64,
-                           enforcement_active: bool, observed_at: String, source: AuthoritySource /* =OfflineSessionsComputed */ }
-struct LivenessView { last_fiscal_ack: Option<Stamped<()>>, last_probe_response: Option<Stamped<()>> }
+struct OfflineBudgetView {
+    month_used: i64, month_limit: i64, month_enforcement_active: bool,     // 168h — its OWN flag
+    session_used: Option<i64>, session_limit: i64, session_enforcement_active: bool, // 36h — its OWN flag; None = no active session
+    observed_at: String, source: AuthoritySource /* = OfflineSessionsComputed */,
+}
+struct LivenessView { last_fiscal_ack: Observed3<()>, last_probe_response: Observed3<()> }
 
-// ASYNC read-only port. The node-side adapter holds the pool PRIVATELY; only this trait object crosses
-// to the agent. (Sync would force blocking sqlx.)
-#[async_trait] trait FleetTelemetrySource {
+// Distinguishes "no producer exists yet" from "producer exists, no event yet" from an actual value.
+enum Observed3<T> { Unpopulated, NeverObserved, Observed(Stamped<T>) }
+struct Stamped<T> { value: T, authority_source: AuthoritySource, observed_at: String, freshness: Freshness }
+
+// ASYNC + Send + Sync read-only port. The node-side adapter holds the pool PRIVATELY; only this trait
+// object crosses to the agent.
+#[async_trait] trait FleetTelemetrySource: Send + Sync {
     async fn project(&self, fn_: &FiscalNumber) -> Result<FleetTelemetryProjection, FleetReadError>;
     async fn project_all(&self) -> Result<Vec<FleetTelemetryProjection>, FleetReadError>;
 }
-
-// DORMANT command lifecycle (zero callers in the pilot; INACTIVE). Locked plan §3.10.
-enum FleetCommandState { ReceivedDurable, Applied, Rejected, Deferred }
-struct FleetCommandProvenance { command_id: CommandId, epoch: FleetEpoch, signer_key_id: KeyId,
-                                signature_digest: [u8; 32], coordinator_outcome: Option<CoordinatorOutcome> }
-struct FleetCommand { /* kind, target FN, epoch, signature */ provenance: FleetCommandProvenance }
 ```
+`Stamped`/`Freshness`/`AuthoritySource`/`Observed3` are **observation semantics** → they live in
+`prro-fleet-contract`, not `prro-domain`.
 
 ## 4 · Normative invariants
-- **I1 (read-only at the CRATE-DAG — the real barrier).** A **separate `prro-fleet-agent` crate**; a **cargo-metadata allowlist pin** (primary) proves its normal+build dependency closure contains **`prro-fleet-contract` only** — **never `prro` / `prro-store-sqlite` / `sqlx` / the admin module**. The pool lives inside a **private node-side adapter**; only the `FleetTelemetrySource` **trait object** crosses the boundary. A handle-only restriction is insufficient (the agent could otherwise import `prro::admin::*`, call `App::db()` (`app.rs:903`), `with_immediate(pool, …)` (`tx.rs:118`), or raw SQL on the RW `open_pool`).
-- **I2 (advisory ≠ authority).** The local per-FN coordinator is the final arbiter; a projection is a view, never a control input. Fleet policy may never force an illegal offline / cap-breach / return-block.
-- **I3 (no admin reuse — fail-fast, not deadlock).** A future in-process apply path routes through the **coordinator's mailbox/API**, not the CLI `admin.rs` entrypoints (which **fail-fast** on the singleton `try_lock_exclusive`, not hang) — and the supervisor need not be the sole transport.
-- **I4 (command runtime-activation after CS-4 + CS-5).** The dormant contract is authored now; **wiring** a live apply/emit path waits for the coordinator + the legality table.
-- **I5 (MUST — separate INACTIVE fleet inbox).** A durable command inbox MUST be a **separate table** (idempotency-keyed, worker-triggered) with epoch + signature + fleet-provenance columns, landed INACTIVE-first — it **must not** overload `ingress_inbox`.
-- **I6 (typed provenance).** Fleet-originated actions carry a **typed** `FleetCommandProvenance` (`command_id`, `epoch`, `signer_key_id`, `signature_digest`, `coordinator_outcome`) in `audit_log` — not arbitrary JSON, and distinct from local `ADMIN_*` attribution.
-- **I7 (projection ∉ control path).** `FleetTelemetryProjection` appears in **no** admission / transition-oracle signature — a structural pin so a view can never become a control input.
+- **I1 (read-only at the CRATE-DAG — precise allowlist).** A **separate `prro-fleet-agent` crate**; a cargo-metadata pin proves that among **workspace** crates its normal+build+optional+target-specific closure (under **all features**) contains **only `prro-fleet-contract` (+ its transitive `prro-domain`)** — and **never `prro`, the store crate, any engine/composition crate, or `sqlx`**. (Non-workspace deps like `async_trait` are allowed.) The pool stays in a **private node-side adapter**; only the `FleetTelemetrySource` trait object crosses. Handle-only would be insufficient (the agent could otherwise import `prro::admin::*`, `App::db()` `app.rs:903`, `with_immediate` `tx.rs:118`, or raw SQL on the RW pool).
+- **I2 (advisory ≠ authority).** The local per-FN coordinator is the final arbiter; a projection is never a control input; fleet policy may never force an illegal offline / cap-breach / return-block.
+- **I3 (no admin reuse — fail-fast, not deadlock).** A future apply path (Spec #5B) routes through the coordinator's mailbox/API, not the CLI `admin.rs` entrypoints (fail-fast on the singleton `try_lock_exclusive`); the supervisor need not be the sole transport.
+- **I7 (projection ∉ control path).** `FleetTelemetryProjection` (and any alias/wrapper of it) appears in **no** admission / transition-oracle signature — a structural pin (covering aliases/wrappers, not just the literal name), consistent with the Spec #1 pure-oracle contract.
 
 ## 5 · RED-pins
-- **RP5-1 (crate-DAG read-only — primary):** a cargo-metadata pin proves `prro-fleet-agent`'s dependency closure excludes `prro`/`prro-store-sqlite`/`sqlx`/admin (mirrors the CS-1 purity gate); a `trybuild` canary that the port cannot yield a `WriteTxConn` (secondary).
-- **RP5-2 (authoritative telemetry, not slots):** the projection's offline budget equals `time_budget::compute_budgets_for_fn`, **not** `node_state.current_month_offline_seconds` — a test where the column reads `0` but the computed budget is non-zero (an open offline session) proves the authoritative source; readiness/recovery are flagged `Unpopulated`, never a fake `READY`.
-- **RP5-3 (dormant lifecycle, INACTIVE):** the `FleetCommand*` types exist in `prro-fleet-contract` but have **zero live callers / no wired apply or emit path** (a static pin) — dormant, per the CS-1 skeleton discipline.
-- **RP5-4 (advisory takes no lease):** the projection read acquires no write lease and never blocks a live write-path lease (a concurrency test).
-- **RP5-5 (projection ∉ oracle):** a static pin that no admission/transition-oracle signature names `FleetTelemetryProjection`.
+- **RP5A-1 (crate-DAG read-only — primary):** the cargo-metadata pin proves `prro-fleet-agent`'s workspace-dep closure excludes `prro`/store/engine/`sqlx` (mirrors the CS-1 purity gate); a `trybuild` canary that the port cannot yield a `WriteTxConn` (secondary). **Create the empty `prro-fleet-agent` in CS-2 so this is a real gate; CS-6 only fills it.**
+- **RP5A-2 (authoritative budget, not slots):** the projection's offline budget equals `time_budget::compute_budgets_for_fn`, **not** `node_state.current_month_offline_seconds` — a test where the column reads `0` but the computed budget is non-zero (an open session) proves it; the two enforcement flags are independent; `session_used` is `None` with no active session.
+- **RP5A-3 (Observed3 honesty):** a signal with no producer decodes to `Unpopulated`, not a fabricated value; readiness/recovery are absent from V1.
+- **RP5A-4 (advisory takes no lease):** the projection read takes no write lease and never blocks a live write-path lease.
+- **RP5A-5 (projection ∉ oracle):** the static pin covers aliases/wrappers of `FleetTelemetryProjection`.
 
 ## 6 · Decisions (from the audit)
-- **Projection source:** a **separate read-only query/adaptor** — do **not** widen the hot `NodeStateRow`/`get_tx`.
-- **168h/36h budget:** from `time_budget::compute_budgets_for_fn` (`offline_sessions`), carrying `{month_used, month_limit, session_used, session_limit, enforcement_active, observed_at, source}` — never the `node_state` slot.
-- **Liveness:** split `last_probe_response` from the last real **fiscal ACK**; both stamped with freshness; do not label a bare ping "DPS forward progress".
-- **Audit aggregates:** **not** in the base snapshot; a separate bounded read-model later, and RMR/stuck counts come from **authoritative tables**, not reconstructed from `audit_log`.
-- **Push seam:** an **async in-process port** now; there is no `/metrics` fleet endpoint in the baseline; the emitter/agent server is **CS-6**.
-- **N=1:** ship the agent **OFF/advisory**; "config-only enable" becomes true only once the CS-6 emitter/agent exists.
+- Separate read-only projection query; do not widen `NodeStateRow`/`get_tx`.
+- Budget from `time_budget::compute_budgets_for_fn`; two enforcement flags; `session_used: Option`.
+- `active_offline_session_id` from `offline_sessions` active states (`ux_offline_active`), not the slot.
+- **Fiscal progress:** after CS-3, the last real fiscal ACK comes from the **clean-accepted `delivery_reservation` outcome**, not `transport_trace`. **Probe-response:** no durable typed producer exists today ⇒ `Unpopulated` (never `last_fs_ping_at` or an audit-derived guess).
+- Audit aggregates: not in the base snapshot; RMR/stuck from authoritative tables later.
+- Push seam: async in-process port now; the emitter/agent server is CS-6; N=1 ships OFF/advisory.
 
 ## 7 · Open questions for re-audit
-1. **Dormant-lifecycle depth:** is authoring the `FleetCommand*` types + I5/I6 (zero callers) enough to satisfy the locked plan §3.10 now, or does the plan expect the full PULL/epoch state-machine semantics locked too (vs a later Spec #5B)?
-2. **`prro-fleet-agent` crate now vs CS-6:** create the empty crate + the cargo-metadata allowlist pin in CS-2 (like CS-1d contract crates), or only pin the boundary in the contract and add the agent crate at CS-6?
-3. **`Stamped`/`AuthoritySource` placement:** do these value types belong in `prro-domain` (shared) or `prro-fleet-contract`?
-4. **Liveness source:** which durable rows carry the "last real fiscal ACK" and "last probe response" (so the projection reads authoritative freshness, not a slot)?
+1. **`prro-fleet-agent` in CS-2:** create the empty crate + the cargo-metadata gate now (like CS-1d), confirmed? (Makes RP5A-1 a real gate.)
+2. **`Observed3` naming/placement:** acceptable in `prro-fleet-contract`, or should `Stamped`/`Observed3` be a shared observation module?
+3. **Liveness producer:** `last_fiscal_ack` reads the accepted `delivery_reservation` outcome (post-CS-3); until then it is `Unpopulated` — confirm no interim source is acceptable (vs an audit-derived stopgap).
+
+---
+**Companion:** Spec #5B (fleet command lifecycle — signed/epoch/PULL/HOLD/resume/rotation, dormant
+code but full **semantics** locked now per plan §3.10) is authored separately.
