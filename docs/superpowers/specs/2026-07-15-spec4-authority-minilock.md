@@ -1,124 +1,142 @@
 # Spec #4 (part A) — Authority Mini-Lock + Migration 032 Co-Draft
 
-**Status: 🟡 DRAFT for external audit. 2026-07-15. Grounded on `origin/main` `f2628ba`.**
-Scope of THIS doc = the **authority-distribution mini-lock** the operator gated CS-2 on, plus the
-**co-drafted migration 032** it governs. The full DPS-contract / typed-delivery / binding surface is
-authored later as Spec #4 (part B); this part exists so the **checksum-frozen** migration cements
-*decided* semantics, not open questions. **Anchors:** Spec #1 (transition contract) + Spec #2
-(3-field delivery + reservation FSM) are DESIGN-LOCKED and are the authority for the FSM this table
-backs.
+**Status: 🟡 DRAFT rev 2 (post external audit round 1 → NOT-YET). 2026-07-15. Grounded on `origin/main` `f2628ba`.**
+Rev 2 closes the audit's 5 blockers + MAJOR: (B1) the fence-index released the FN in the
+`SubmittedUnknown` window; (B2) the DDL didn't encode Spec #2's three fields; (B3) `PendingApply` had
+no replayable payload; (B5) the map was really 4-sided (seed lives in `node_state`); (MAJOR) A4-1 is
+violated on `f2628ba` today. **Anchors:** Spec #1 + Spec #2 (rev 2) DESIGN-LOCKED. **The
+schema-implementer does NOT run until this map re-audits to LOCK-READY.**
 
 ---
 
 ## 0 · Why a mini-lock before the DDL (the gate)
-`sqlx`'s native migration checksum (`_sqlx_migrations`, `db/mod.rs:37`) **refuses any altered applied
-file** — once 032 merges and runs, its column set + CHECK literals are frozen. Three durable
-structures already touch the *Sending / CallStarted* window, so before minting the table we must fix
-**which structure owns what**, or the frozen file will encode an unresolved contract. **The
-schema-implementer does NOT run until this map is audit-locked.**
+`sqlx`'s native checksum (`db/mod.rs:37`) freezes 032's column-set + CHECK literals once it applies.
+Four durable structures touch the *Sending / CallStarted* window; fixing **which owns what** before
+minting prevents the frozen file from cementing an unresolved contract.
 
-## 1 · The three durable structures + their authority (NORMATIVE)
-| structure | **owns (source of truth for)** | **NEVER** |
+## 1 · The FOUR durable structures + their authority (NORMATIVE — corrected per audit B5)
+| structure | **owns** | **NEVER** |
 |---|---|---|
-| `delivery_reservation` (NEW — migration 032, **INACTIVE in CS-2**) | (a) the **call lifecycle** `ReservedNotStarted → CallStarted → OutcomeObserved` (Spec #2 §3); (b) **delivery certainty** — the three orthogonal fields (Spec #2 §2); (c) the per-FN **chain-generation FENCE** (Spec #2 §5) | — |
-| `fiscal_documents` | the **fiscal doc-FSM** (14 `DocState`) + the **atomically-applied projection** of the delivery result — the existing `Sending → Sent` + `server_fiscal_no` + seed-advance CAS (`stage_send.rs:1704/1725`) | is **not** the call-lifecycle / certainty / fence source; `DocState::Sending` is a **doc-FSM marker**, not the reservation state |
-| `transport_trace` | **forensic / observability ONLY** (its declared role, `transport_trace.rs:6`) | is **NEVER** a basis for a resend decision, a seed-advance, or setting/lifting the fence |
+| `delivery_reservation` (NEW 032, **INACTIVE**) | call lifecycle `ReservedNotStarted→CallStarted→OutcomeObserved`; **delivery certainty** (3 orthogonal fields, Spec #2 §2); the **fence** *snapshot* (`generation`) | — |
+| `node_state` | the **chain-tip seed** (`last_known_unsigned_xml_sha256`, `stage_send.rs:1748`); in CS-3 the **current fence token/pointer** (`delivery_generation` + `active_delivery_reservation_id`) | (CS-2: no new columns — see §5) |
+| `fiscal_documents` | the **fiscal doc-FSM** (14 `DocState`) + the atomically-applied **projection** of the outcome (`Sending→Sent + sfn` CAS, `stage_send.rs:1704`) | is not the certainty/fence source; `Sending` is a doc marker, not the reservation |
+| `transport_trace` | **forensic / observability ONLY** (`transport_trace.rs:6`) | is **never** a basis for resend / seed-advance / fence |
 
-## 2 · Invariants (the mini-lock — normative for CS-3 activation)
-- **A4-1 (forensic-only).** No code path may read `transport_trace` to decide **resend**, **seed-advance**, or **fence** state. Re-affirms `transport_trace.rs:6`.
-- **A4-2 (single certainty/fence source).** `delivery_reservation` is the **only** source for delivery certainty and the generation fence. The CS-3 seed-advance gate reads `generation` / `state` from `delivery_reservation` — never from `fiscal_documents.state` nor `transport_trace`.
-- **A4-3 (fiscal_documents = projection).** `fiscal_documents` applies the outcome **atomically** (the existing `Sending→Sent + sfn + seed` CAS) as the **downstream projection** of the reservation's `OutcomeObserved` — not a parallel authority. The `(Sent, Rejected)` edge stays removed (A.3 PR-B); a post-SENT reject escalates to `RequiresManualReconciliation`, never rolls back the seed.
-- **A4-4 (immutable protocol binding).** `delivery_reservation.protocol_binding` is snapshot at reservation creation and carried through **every** retry; a document retries **only** on its bound protocol. This **extends frozen invariant #3** (no channel switch with an open shift) explicitly to **protocol**.
-- **A4-5 (cross-protocol forbidden by default).** A `SubmittedUnknown` on protocol A is **never** permission to act on protocol B; reconciliation runs first, on the **original** protocol. The cross-protocol path is lifted **only** if an official DPS source proves FSCO_ZZD and EVPZ share **one authoritative fiscal registration/ledger**. **Absence of that proof does NOT block CS-2** — the binding is stored; enforcement is CS-3.
-- **A4-6 (INACTIVE in CS-2).** CS-2 lands the table + columns + guards-as-schema **inert**: no writer wired, no enforcement. Activation — the seed-advance gate on the fence, typed-delivery recording (record-before-collapse, Spec #2 §8), and killing the blind-resend (`er_redrive`) — is **CS-3**.
+## 2 · Invariants (mini-lock — normative)
+- **A4-1 (forensic-only — with honest baseline).** **CURRENT (`f2628ba`):** `transport_trace` is the *legacy authority* for ER-redrive — `last_attempt_retry_class_for` (`transport_trace.rs:320`) picks the retry class, `attempts_used` (`:390`) sets the retry budget, `er_redrive_policy.rs:80` returns `Redrive`, called from `boot_phase.rs:3066` / `backlog_drain.rs:1537` / `online_convergence.rs:559`. Seed advance already does **not** read trace (it reads/writes `node_state.last_known_unsigned_xml_sha256`, `stage_send.rs:1748`). **TARGET (after the CS-3 atomic cutover):** `transport_trace` is forensic-only; those three redrive consumer-paths move to the reservation's typed outcome. This invariant is a **CS-3 target**, not a `f2628ba` fact.
+- **A4-2 (single certainty/fence authority).** `delivery_reservation` is the only source for delivery certainty and the fence. In **CS-2** the schema-level fence = the partial unique index `ux_reservation_active` (holds the FN while in-flight **or** `SubmittedUnknown`). In **CS-3** the seed-advance gate reads the current fence token from `node_state.delivery_generation` (added then) and matches it against `reservation.generation`; it never reads `fiscal_documents.state` or `transport_trace` for certainty/fence.
+- **A4-3 (fiscal_documents = projection).** The outcome is applied atomically via the existing `Sending→Sent + sfn` CAS as the downstream projection of `OutcomeObserved`; the `(Sent,Rejected)` edge stays removed; post-SENT reject → `RequiresManualReconciliation`, seed never rolled back.
+- **A4-4 (immutable protocol binding).** The reservation's typed binding columns are snapshot at creation and carried through every retry; a doc retries **only** on its bound protocol — extends frozen invariant #3 to **protocol**.
+- **A4-5 (cross-protocol forbidden by default).** `SubmittedUnknown` on protocol A is never permission to act on protocol B; reconciliation runs first on the original protocol. The forbid is lifted **only** on ALL of: an official DPS identity/correlation contract, proven cross-protocol consistency/visibility, a declared `ReconciliationCapability`, and cross-adapter conformance + negative tests. Until then **unknown ⇒ deny** (not an assumption). Absence of proof does not block CS-2 (binding stored; enforcement CS-3).
+- **A4-6 (atomic cross-table CAS — the CS-3 activation contract, B5).** Activation performs, in **one** `BEGIN IMMEDIATE`: (1) CAS reservation by `(reservation_id, generation)`; (2) CAS document by expected `(state, version)`; (3) seed update in `node_state` by expected previous seed + generation; (4) fence release; (5) audit/trace. No partial cross-table apply; on any precondition miss the actor recomputes. **CS-2 lands the columns inert; this CAS is CS-3.**
 
-## 3 · Migration 032 co-draft (governed by §1–§2) — `delivery_reservation` ONLY
-Per the operator: **no `ingress_inbox` delta here** — Spec #3 freezes the `IdempotencyStrategy`
-literals + no-key policy first, then a *separate additive* migration. 032 mints only the reservation
-table. New file only; do **not** edit 001–031. Full 5-section header (WHY / STRICT TABLE NOTE /
-BACKWARD COMPATIBILITY / ROLLBACK REASONING / LIVE FILE SEQUENCE) per the 028–031 convention.
+## 3 · Migration 032 co-draft rev 2 (governed by §1–§2) — `delivery_reservation` ONLY
+`delivery_reservation`-only (no `ingress_inbox` delta — Spec #3 first). New file; full 5-section
+header. **Apply-states + durable outcome payload are DEFERRED to CS-3** (they need the `TransitionPlan`
+type from CS-4; freezing an under-specified payload now would repeat audit B3). CS-2 carries the **3
+live lifecycle states** + the **3 Spec-#2 outcome fields** + **typed binding** + a **hard doc FK**.
 
 ```sql
 -- rust/prro/migrations/032_delivery_reservation.sql   (INACTIVE — CS-2 §2b)
 CREATE TABLE delivery_reservation (
-    -- soft-ref BLOBs, NO hard FK to fiscal_documents: a reservation may precede
-    -- the doc mint, so a hard FK under foreign_keys=ON would deadlock ordering.
-    reservation_id        BLOB    PRIMARY KEY CHECK (length(reservation_id) = 16),
-    fiscal_number         TEXT    NOT NULL
-        REFERENCES fiscal_number_config(fiscal_number) ON DELETE RESTRICT,
-    document_id           BLOB    CHECK (document_id IS NULL OR length(document_id) = 16),
-    attempt_id            INTEGER NOT NULL CHECK (attempt_id >= 1),
-    -- Spec #2 §3 FSM. First 3 states are the live lifecycle; the last two are
-    -- reserved for CS-3 apply-idempotency (Spec #2 §4 OutcomeRecordedPendingApply).
-    -- UPPER_SNAKE, matching shifts / fiscal_documents / offline_sessions.
+    reservation_id        BLOB    PRIMARY KEY CHECK (length(reservation_id) = 16),  -- independent identity (audit rec 1)
+    -- Hard FK (audit rec 3): the doc is minted PREPARED at stage_acquire (stage_acquire.rs:858)
+    -- BEFORE sign/send, so a reservation is never grounded before its doc. RESTRICT (not the
+    -- transport_trace CASCADE 001:605): deleting a doc must NOT silently drop an unresolved fence.
+    document_id           BLOB    NOT NULL CHECK (length(document_id) = 16),
+    fiscal_number         TEXT    NOT NULL,
+    attempt_no            INTEGER NOT NULL CHECK (attempt_no >= 1),  -- independent of transport_trace.attempt_no
+    -- Spec #2 §3 lifecycle — 3 LIVE states only. Apply-states (OUTCOME_RECORDED_PENDING_APPLY,
+    -- APPLIED) + their durable payload are CS-3 (audit B3). UPPER_SNAKE like the other FSMs.
     state                 TEXT    NOT NULL DEFAULT 'RESERVED_NOT_STARTED'
-        CHECK (state IN ('RESERVED_NOT_STARTED','CALL_STARTED','OUTCOME_OBSERVED',
-                         'OUTCOME_RECORDED_PENDING_APPLY','APPLIED')),
-    -- A4-4 immutable protocol binding (composite of backend/transport profile ids).
-    protocol_binding      TEXT    NOT NULL,
-    -- reuse compute_envelope_hash (stage_send.rs:1440); do NOT re-derive.
+        CHECK (state IN ('RESERVED_NOT_STARTED','CALL_STARTED','OUTCOME_OBSERVED')),
+    -- A4-4 typed binding (audit rec 4) — NOT an opaque composite. FSCO_ZZD|EVPZ_DPS is the real
+    -- domain discriminant (fn_outgress_profile.rs:23); (backend,transport)-profile-ids are NOT it.
+    dps_protocol_id           TEXT    NOT NULL CHECK (dps_protocol_id IN ('FSCO_ZZD','EVPZ_DPS')),
+    protocol_contract_version INTEGER NOT NULL,
+    capability_profile_version INTEGER,
+    endpoint_config_revision  INTEGER,
+    -- Protocol-specific canonical envelope: compute_envelope_hash hashes prost gen::Check
+    -- (stage_send.rs:795), so EVPZ needs its own canonical-envelope seam (Spec #4 part B).
     envelope_hash         BLOB    NOT NULL CHECK (length(envelope_hash) = 32),
-    remote_correlation_id TEXT,   -- generalises CheckAck.id / transport_request_id; NULL pre-outcome
-    -- A4-2 the fence lives here (Spec #2 §5). INACTIVE: stored, not enforced in CS-2.
-    generation            INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
-    -- Spec #2 §2/§8 three orthogonal outcome fields — recorded BEFORE the collapse
-    -- (inline_map.rs:396) so certainty/provenance are not lost. NULL pre-outcome.
-    submission_certainty  TEXT    CHECK (submission_certainty IS NULL OR
-        submission_certainty IN ('NOT_SUBMITTED','SUBMITTED_UNKNOWN','RESPONSE_OBSERVED')),
-    response_provenance   TEXT,   -- INACTIVE free-form until Spec #4 part B types land
+    remote_correlation_id TEXT,                       -- CheckAck.id / transport_request_id; NULL pre-outcome
+    generation            INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),  -- fence SNAPSHOT; token/CAS = CS-3
+    -- Spec #2 §2 THREE orthogonal outcome fields (audit B2). Recorded BEFORE the collapse
+    -- (inline_map.rs:396). NULL pre-outcome. routing_class mirrors the EXISTING retry_class wire
+    -- contract VERBATIM (camelCase, error_routing.rs:120-127) — NOT UPPER_SNAKE.
+    submission_certainty  TEXT CHECK (submission_certainty IN ('NOT_SUBMITTED','SUBMITTED_UNKNOWN','SUBMITTED')),
+    response_provenance   TEXT CHECK (response_provenance IN ('NO_RESPONSE','AUTHENTICATED_PEER','PARSED_DPS_ENVELOPE')),
+    routing_class         TEXT CHECK (routing_class IN ('TerminalReject','TransientRetry','FnConfigError',
+                            'WrapperBug','ProbeRequired','MacRecovery','OperatorEscalation','DrainChainSettleRetry')),
     created_at            TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    updated_at            TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-    -- Self-consistency (mirrors transport_trace 001:637-655): pre-outcome states
-    -- carry no certainty; OUTCOME_OBSERVED+ must.
+    updated_at           TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    -- Self-consistency (audit B2): pre-outcome ⇒ all 3 fields NULL; OUTCOME_OBSERVED ⇒ certainty+
+    -- provenance required; Spec #2 cross-field: NotSubmitted⇒NoResponse, Submitted⇒ParsedDpsEnvelope;
+    -- routing_class NULL ⇔ clean accept ⇒ Submitted.
     CHECK (
-        (state IN ('RESERVED_NOT_STARTED','CALL_STARTED') AND submission_certainty IS NULL)
-        OR (state IN ('OUTCOME_OBSERVED','OUTCOME_RECORDED_PENDING_APPLY','APPLIED')
-            AND submission_certainty IS NOT NULL)
+        (state IN ('RESERVED_NOT_STARTED','CALL_STARTED')
+            AND submission_certainty IS NULL AND response_provenance IS NULL AND routing_class IS NULL)
+        OR (state = 'OUTCOME_OBSERVED'
+            AND submission_certainty IS NOT NULL AND response_provenance IS NOT NULL
+            AND (submission_certainty <> 'NOT_SUBMITTED' OR response_provenance = 'NO_RESPONSE')
+            AND (submission_certainty <> 'SUBMITTED'     OR response_provenance = 'PARSED_DPS_ENVELOPE')
+            AND (routing_class IS NOT NULL OR submission_certainty = 'SUBMITTED'))
     ),
-    UNIQUE (document_id, attempt_id)
+    -- audit rec 3: reservation's fiscal_number must equal the doc's (composite FK; needs the
+    -- supporting unique index below — an ADDITIVE index on fiscal_documents, not an 001-031 edit).
+    FOREIGN KEY (document_id) REFERENCES fiscal_documents(document_id) ON DELETE RESTRICT,
+    FOREIGN KEY (document_id, fiscal_number)
+        REFERENCES fiscal_documents(document_id, fiscal_number) ON DELETE RESTRICT,
+    UNIQUE (document_id, attempt_no)
 ) STRICT;
 
--- One active reservation per FN — single-writer at the schema level (mirrors
--- ux_shifts_one_open_per_fn 026 / ux_offline_active 001:429). INERT while
--- inactive; BITES the first CS-3 writer (documented as a designed guard).
-CREATE UNIQUE INDEX ux_reservation_active ON delivery_reservation(fiscal_number)
-    WHERE state IN ('RESERVED_NOT_STARTED','CALL_STARTED');
+-- Supporting index for the composite FK above (additive; enables the doc↔fiscal_number guarantee).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_fd_docid_fn ON fiscal_documents(document_id, fiscal_number);
 
--- Crash-window scan target (mirrors ix_transport_trace_unfinished 001:663).
-CREATE INDEX ix_reservation_call_started ON delivery_reservation(fiscal_number)
-    WHERE state = 'CALL_STARTED';
+-- FENCE (audit B1 fix): hold the FN while IN-FLIGHT or FENCED (SubmittedUnknown). Releases ONLY on
+-- clean accept (OUTCOME_OBSERVED + SUBMITTED) or safe-cancel (OUTCOME_OBSERVED + NOT_SUBMITTED).
+-- Conservative: never under-fences (the seed-fork direction). CS-3 may relax via a later migration.
+CREATE UNIQUE INDEX ux_reservation_active ON delivery_reservation(fiscal_number)
+    WHERE state IN ('RESERVED_NOT_STARTED','CALL_STARTED')
+       OR (state = 'OUTCOME_OBSERVED' AND submission_certainty = 'SUBMITTED_UNKNOWN');
+
+CREATE INDEX ix_reservation_call_started ON delivery_reservation(fiscal_number) WHERE state = 'CALL_STARTED';
 
 CREATE TRIGGER delivery_reservation_updated_at
 AFTER UPDATE ON delivery_reservation
 BEGIN
-    UPDATE delivery_reservation SET updated_at = CURRENT_TIMESTAMP
-    WHERE reservation_id = NEW.reservation_id;
+    UPDATE delivery_reservation SET updated_at = CURRENT_TIMESTAMP WHERE reservation_id = NEW.reservation_id;
 END;
 ```
-**Repo (INACTIVE):** `pub mod delivery_reservation;` in `src/db/repositories/mod.rs`; model on
-`outbox.rs` (runtime-bound `sqlx::query`, **not** `query!` — avoids `.sqlx` dual-cache churn);
-tx-only `insert` on `&mut WriteTxConn` + pool-bound `get_active_for_fn`; **wire NO caller**.
-**Test:** `tests/migration_032_delivery_reservation.rs`, `tempfile` fresh pool
-(`migration_011_outbox.rs:25-31`), 8-fixture contract: table+index existence (`sqlite_master`),
-`PRAGMA table_info` column-set, INSERT round-trip + defaults, PK-dup rejected, `state` CHECK rejects
-unknown, `generation` CHECK rejects negative, self-consistency CHECK rejects
-`OUTCOME_OBSERVED`-with-NULL-certainty, `ux_reservation_active` rejects a 2nd active row per FN,
-`get_active_for_fn` on missing → `None`.
+**Repo (INACTIVE):** `pub mod delivery_reservation;`; model on `outbox.rs` (runtime `sqlx::query`, not
+`query!`); tx-only `insert` on `&mut WriteTxConn` + pool `get_active_for_fn`; **wire NO caller**.
 
-## 4 · RED-pins — the CS-3 activation contract (authored now, **known-red until CS-3**)
-- **RP-A4-1 (fence source):** the seed-advance gate reads the fence from `delivery_reservation.generation`, not `fiscal_documents` — revert the source → RED.
-- **RP-A4-2 (forensic-only):** any resend / seed-advance / fence decision that reads `transport_trace` (e.g. gated on `transport_trace.completed_at IS NULL`) → FAIL.
-- **RP-A4-3 (bound protocol):** a doc whose `fn_outgress_profile` flips mid-shift still retries on its **bound** protocol (proves A4-4).
-- **RP-A4-4 (no blind resend):** `er_redrive` does not blind-resend a possibly-submitted doc on a Transport-timeout (Spec #2 RP-1) — stays RED until the typed outcome lands in CS-3.
+## 4 · RED-pins (CS-3 activation contract — known-red until CS-3)
+- **RP-A4-1 (fence source):** seed-advance reads the fence token from `node_state.delivery_generation` matched to `reservation.generation`, not `fiscal_documents`/`transport_trace` — revert → RED.
+- **RP-A4-2 (forensic-only cutover):** after CS-3, no resend/seed/fence path reads `transport_trace` (a redrive gated on trace → FAIL); the three `f2628ba` consumer-paths (A4-1) are gone.
+- **RP-A4-3 (SubmittedUnknown fences):** while a reservation is `OUTCOME_OBSERVED + SUBMITTED_UNKNOWN`, a new issuance / offline-session / seed-advance on that FN is refused (Spec #2 RP-2) — the exact hole the fence-index now closes.
+- **RP-A4-4 (bound protocol):** a doc whose `fn_outgress_profile` flips mid-shift still retries on its bound `dps_protocol_id` (proves A4-4).
+- **RP-A4-5 (atomic cross-table CAS):** a crash mid-apply re-derives deterministically from the reservation payload; no partial cross-table effect (A4-6).
+- **RP-A4-6 (no blind resend):** `er_redrive` does not blind-resend a possibly-submitted doc on Transport-timeout (Spec #2 RP-1) — the double-issue keystone; stays RED until CS-3.
 
-## 5 · Deferred per operator (explicitly OUT of CS-2)
-- `ingress_inbox.idempotency_strategy` column — **not** added now (Spec #3 first, then a separate additive migration).
-- Fleet command lifecycle (epoch / signed / PULL / command-inbox) — Spec #5 is **read-only telemetry projection only** for the pilot.
-- `ABORTED` / EPZ-doctype CHECK history — untouched; migrations 025/030/031 are the subsequent authority.
+## 5 · Deferred to CS-3 (explicitly OUT of CS-2 — per operator + audit B3)
+- Apply-states `OUTCOME_RECORDED_PENDING_APPLY` / `APPLIED` **and** the versioned durable outcome payload / `TransitionPlan` needed to boot-idempotently replay (needs CS-4's `TransitionPlan` type).
+- `node_state.delivery_generation` + `active_delivery_reservation_id` (the fence **token/pointer**) + the atomic cross-table CAS (A4-6). CS-2's fence is the reservation index only.
+- `ingress_inbox.idempotency_strategy` — Spec #3 first, then a separate additive migration.
+- Fleet command lifecycle — Spec #5 is read-only telemetry projection for pilot.
+- `ABORTED`/EPZ CHECK history — untouched (025/030/031 are the subsequent authority).
 
-## 6 · Open questions REMAINING for the audit (operator resolved the rest)
-1. **`attempt_id` identity:** strictly `== transport_trace.attempt_no` (reuse the `allocate_and_insert_tx` allocator, single-sourced numbering) or an independent id? Reuse avoids a second allocator but couples the reservation's lifetime to `transport_trace`'s per-doc PK. Decide before CS-3 populates it.
-2. **Fence storage co-location:** does the per-FN generation fence live **only** on `delivery_reservation.generation`, or **also** as an INACTIVE column on `node_state` (next to `last_known_unsigned_xml_sha256`, `001:543`) so the seed-advance gate has the fence co-located with the seed it guards? A4-2 names `delivery_reservation` as authority either way; this is a storage-placement call.
-3. **Soft-ref vs hard FK on `document_id`:** the sketch uses a soft-ref BLOB because a reservation *may* precede the doc mint. **Confirm** the reservation can genuinely precede `fiscal_documents` — if it is *always* minted after, a hard FK `ON DELETE CASCADE` (like `transport_trace 001:605`) gives referential integrity for free.
-4. **`protocol_binding` shape:** the co-draft stores a composite TEXT `(backend_profile_id, transport_profile_id)`. Spec #4 part B may want the richer `{protocol_id, protocol_version, capability_profile_version, endpoint_config_revision}` (plan:134-137). Since 032 is checksum-frozen, decide **now** whether the column is a single opaque TEXT (future-proof, parse in code) or a fixed set of typed columns.
-5. **Cross-protocol registration (external DPS fact — A4-5):** does the audit have authority to state whether FSCO_ZZD and EVPZ observe one authoritative registration? If unknown, A4-5's default-forbid stands and the question carries to the EVPZ adapter sprint (CS-6).
+## 6 · INACTIVE pins (audit — not an absolute "zero behaviour change"; boot DOES apply the migration)
+The slice is fiscal/write-path behaviour-neutral (empty table, self-only indexes/trigger, no callers)
+— but boot applies 032 (schema + `_sqlx_migrations` change, DDL/disk-fail surface). Merge gate adds:
+1. **upgrade** 031→032 on a **non-empty representative DB** (not only a fresh pool);
+2. **`sqlite_master` diff** — pre-existing objects byte-identical, only the expected new objects added;
+3. **production-flow test** — after a normal fiscalisation, `delivery_reservation` stays **empty**;
+4. **static call-graph pin** — `delivery_reservation` repo is not referenced outside the migration test;
+5. **constraint matrix** — incl. a **second reservation after every unsafe state** (esp. `OUTCOME_OBSERVED + SUBMITTED_UNKNOWN` must be REJECTED by `ux_reservation_active`).
+
+## 7 · Open questions for re-audit
+1. **Composite FK cost:** the doc↔fiscal_number guarantee needs `ux_fd_docid_fn` on `fiscal_documents` (additive index in 032). Acceptable, or keep the single-column FK + a trigger, or drop `fiscal_number` from the reservation and derive it by join (loses the direct `ux_reservation_active(fiscal_number)` index)?
+2. **`attempt_no` allocation:** independent per-`document_id` ordinal allocated from this table (`MAX(attempt_no)+1` under the write lease) — confirm this needs no global allocator and cannot race under the FN single-writer.
+3. **Deferral acceptance (the two operator-aligned defers):** does the audit accept deferring (a) the apply-states + payload and (b) the `node_state` fence token/CAS to CS-3, given CS-2 is INACTIVE and the reservation index is a conservative fail-closed fence? Or must the fence token land now to avoid a second frozen migration later?
+4. **`generation` in CS-2:** stored snapshot only (enforcement CS-3) — is a stored-but-unenforced `generation` acceptable, or should 032 omit it until the token/CAS lands (avoid a "decorative" column)?
