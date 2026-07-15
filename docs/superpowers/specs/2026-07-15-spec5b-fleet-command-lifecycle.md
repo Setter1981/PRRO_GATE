@@ -1,117 +1,108 @@
-# Spec #5B — Fleet command lifecycle (signed / epoch / PULL — semantics locked, code dormant)
+# Spec #5B — Fleet command lifecycle: Hold / Release / Policy (signed / scoped-epoch / PULL)
 
-**Status: 🟡 DRAFT rev 1 (for external audit). 2026-07-15. Grounded on `origin/main` `c107854` + locked plan §3.10.**
-Home: **`prro-fleet-contract`** (the command port) + **`prro-fleet-agent`** (edge agent). Companion to
-the LOCKED Spec #5A (telemetry read-model). Per the audit + plan §3.10, the fleet command **semantics
-must be locked NOW**; the **code + schema stay dormant** (post-CS-5, runtime-activated at CS-6). The
-control-plane server is a **SEPARATE deployment**, never inside the edge binary. Fleet =
-**ADVISORY-only** for the pilot (N=1, agent OFF); enabling it later is deployment/config, not a
-re-cut. This is greenfield (zero fleet-command code today) — the spec reuses three proven patterns:
-the durable `ingress_inbox` (durable-before-ACK), the Spec #2 reservation **generation** (fencing),
-and the Spec #1 **pure-oracle coordinator** (the only applier).
+**Status: 🟡 DRAFT rev 2 (post external audit round 1 → NOT-YET, security-reshaped). 2026-07-15. Grounded on `origin/main` `c107854` + plan §3.10.**
+Rev 2 closes round-1's security holes: (1) **scoped, CONTIGUOUS epochs** (a hidden epoch can no longer
+bypass a HOLD/revocation); (2) a **trusted node-side intake** (the #5A agent has no crypto/store, so it
+only PULLs opaque bytes); (3) **atomic apply** (effect + state + generation in one tx); (4) **fail-closed
+restore / keyset anti-rollback**; (5) **law-over-policy made structural**. **Scope narrowed** to the core
+**Hold / Release / Policy** commands — `Config` / `Provision` / `ProtocolRevision` are **not accepted**
+until their own payload-specs define capability + quiescence + supersession. Semantics locked now; code
++ schema **dormant** (post-CS-5; runtime CS-6). The control-plane server is a **separate deployment**.
 
 ---
 
 ## 0 · Thesis
-A fleet command is a **signed, epoch-versioned, PULL-delivered** intent that lands in a **durable
-inbox before it is ACKed**, is applied **only by the local per-FN coordinator**, and can set **policy
-but never override law**. The edge agent has **no store-mutation access**. Input provenance (what was
-signed) and apply outcome (what the coordinator durably did) are **separate**.
+A fleet command is a **signed, scope-contiguous-epoch, PULL-delivered policy/hold intent**. The edge
+**agent is dumb** (pulls opaque bytes only); a **trusted node-side intake** verifies and persists it in
+a durable inbox **before ACK**; the **local coordinator is the only applier**, atomically; a command
+can set **policy but never law**; a **restore or key-rollback fails closed**.
 
 ## 1 · What EXISTS to reuse (greenfield otherwise)
-- **Durable-before-ACK** pattern — the `ingress_inbox` (`001:80-100`): a durable row committed before the client is told "accepted". The fleet inbox mirrors it (§3, I5) but is a **separate table**.
-- **The generation/fence** — Spec #2's `delivery_reservation.generation` + the per-FN chain-generation fence: the fleet ACK's `effective_generation` reuses this "monotonic durable token" idea.
-- **The pure-oracle coordinator** — Spec #1 (`admission = f(axes)`, `Allow|Denied|Deferred|NoTransition`): the coordinator is the **only** applier of a fleet command (CS-4).
-- **The signer** — `prro_crypto` (existing) verifies command signatures.
-- **Zero fleet-command representation exists today** (verified in Spec #5A §1); this is a dormant contract.
+- Durable-before-ACK — `ingress_inbox` (`001:80-100`); the fleet inbox mirrors it as a **separate** table.
+- The pure-oracle coordinator — Spec #1 (`admission = f(axes)`) — the **only** applier (CS-4).
+- **`prro_crypto` is only a RAW primitive** (`crypto/provider.rs:60-74`: DSTU sign/verify over a caller-supplied digest + pubkey) — **NOT** a fleet verifier or key-store. The verifier + trust-store are **greenfield** (§4, §8).
+- **Zero fleet-command code exists.** Dormant contract.
 
 ## 2 · Scope
-Lock the **full semantics** (§3–§6). **Dormant:** the `prro-fleet-contract` command types + the
-separate INACTIVE fleet-inbox schema land as code/DDL post-CS-5; **runtime** pull/apply is CS-6. Do
-NOT wire a live emitter/applier now.
+Lock the semantics of **`Hold` / `Release` / `Policy`** commands only. **`Config` / `Provision` /
+`ProtocolRevision` are REJECTED** until separate payload-specs define their capability set, quiescence
+requirement, and supersession family. Code/DDL are dormant (post-CS-5); runtime pull/apply is CS-6; the
+pilot ships the agent **OFF/advisory** with an **empty trust-store**.
 
-## 3 · Key types (`prro-fleet-contract`, sqlx-free) — INPUT vs OUTCOME split
+## 3 · Two-layer transport (the #5A crate-DAG forces this)
+- **`prro-fleet-agent` (dumb):** PULLs **opaque signed bytes** from the control-plane and hands them to a `FleetCommandIntake` **trait object**. Per #5A it depends on **no** `prro`/store/`sqlx`/crypto — so it **cannot verify or persist**; it is a transport shim only.
+- **`FleetCommandIntake` (trusted, node-side):** verifies the signature + scoped epoch (§4–§5) and writes the durable `ReceivedDurable` inbox row. An **invalid/untrusted signature never enters the authoritative inbox** under its claimed `command_id` — it produces a **separate bounded security rejection + audit**, and **advances no epoch high-water**.
+
+## 4 · Signed envelope + canonical bytes (fail-closed)
 ```rust
-// ── SIGNED INPUT (what the control-plane signed; the edge verifies, never fabricates) ──
-struct SignedFleetCommand {
-    envelope: FleetCommandEnvelope,        // the canonical-bytes-hashed, signed payload
-    signature: Signature,                  // over canonical_bytes(envelope); verified vs signer_key_id
-}
 struct FleetCommandEnvelope {
-    command_id: CommandId,                 // stable identity — the inbox idempotency key
-    epoch: FleetEpoch,                     // monotonic per (fleet-scope); see I2
-    target: CommandTarget,                 // { Fleet | Register(FiscalNumber) }
-    kind: FleetCommandKind,                // Policy | Hold | Release | Config | ProtocolRevision | Provision
+    // DOMAIN SEPARATION — all SIGNED, so a key reuse cannot move a command across fleets/environments.
+    domain_tag: [u8; 8],          // fixed protocol magic
+    schema_version: u16,          // envelope schema
+    canonical_bytes_version: u16, // the serialization rule id — a change cannot alias an old signature
+    authority_id: AuthorityId,    // which control-plane
+    fleet_id: FleetId,
+    environment: Environment,     // Test | Prod
+    // IDENTITY + ORDER
+    command_id: CommandId,        // inbox idempotency key
+    epoch_scope: EpochScope,      // RegisterStream(fleet_id, fiscal_number) | TrustStream(fleet_id)
+    epoch: u64,                   // CONTIGUOUS within epoch_scope (§5)
     signer_key_id: KeyId,
-    issued_at: String,
-    ttl: Duration,                         // expiry (I8)
-    payload: FleetCommandPayload,          // kind-specific, typed (never arbitrary JSON)
+    issued_at_unix_ms: u64,       // fixed-width, cross-language deterministic (NOT a String)
+    expires_at_unix_ms: u64,      // signed TTL (§7)
+    kind: FleetCommandKind,       // Hold | Release | Policy   (Config/Provision/ProtocolRevision REJECTED, §2)
+    payload: FleetCommandPayload, // typed; NO legal caps / constants / enforcement toggles (I-law)
 }
-// `canonical_bytes(envelope)` is a DETERMINISTIC, versioned serialization — the ONLY bytes signed and
-// hashed; a `canonical_bytes_version` is part of the envelope so a format change cannot alias signatures.
-
-// The signed INPUT provenance (carried into the durable inbox row) — distinct from the apply outcome.
-struct FleetInputProvenance { command_id: CommandId, epoch: FleetEpoch, signer_key_id: KeyId, signature_digest: [u8; 32], envelope_hash: [u8; 32] }
-
-// ── DURABLE APPLY OUTCOME (what the LOCAL coordinator durably decided — separate from the input) ──
-enum FleetCommandState { ReceivedDurable, Applied, Rejected, Deferred }
-struct FleetApplyOutcome {
-    state: FleetCommandState,
-    effective_generation: Generation,      // the durable token the ACK reports (reuses Spec #2 generation)
-    reason: FleetOutcomeReason,            // stale/dup/reorder/gap/expired/open-shift/law-violation/applied
-    // NOTE: the contract does NOT embed the engine's `CoordinatorOutcome` type — only a protocol-neutral reason.
-    decided_at: String,
-}
-// The PULL ACK the agent returns to the control-plane:
-struct FleetAck { command_id: CommandId, epoch: FleetEpoch, outcome_state: FleetCommandState, effective_generation: Generation, reason: FleetOutcomeReason }
-
-// Independent HOLDs (I6): a release clears ONLY its own source's hold.
-enum HoldSource { Local, Fleet }
-// effective_hold(FN) = ∃ an un-released hold from ANY source.
 ```
+- **`canonical_bytes(envelope)`** = a deterministic, **versioned**, fixed-width/length-prefixed encoding (no float, no locale, no map-iteration order); it is the **only** bytes signed and hashed. **Golden test vectors** pin it. An **unknown `schema_version`/`canonical_bytes_version` ⇒ fail-closed `Rejected(UnknownVersion)`**, never a best-effort parse. The **hash + signature suite** is pinned (DSTU digest → `prro_crypto` verify). `prro_crypto` supplies only the primitive; the digest construction + suite id live in the fleet verifier.
+- **INPUT provenance** (persisted, distinct from outcome): `FleetInputProvenance { command_id, epoch_scope, epoch, signer_key_id, signature_digest, envelope_hash, authority_id, fleet_id, environment }`.
 
-## 4 · Lifecycle FSM + crash resume
+## 5 · Scoped, CONTIGUOUS epochs (the BLOCKER fix)
+- **Two signed scopes:** `RegisterStream(fleet_id, fiscal_number)` for anything mutating an FN's policy/hold; `TrustStream(fleet_id)` for key rotation/revocation. A **fleet-wide** mutation is **fanned out by the control-plane into separately-signed `Register` commands** — the edge never applies a "fleet" command directly.
+- **Contiguity (kills the hidden-epoch bypass):** within a scope the accepted sequence must be **contiguous**. `epoch == last_accepted+1` ⇒ eligible; a **gap** (`epoch > last_accepted+1`) ⇒ `AwaitingPredecessors` (held, **not** applied, high-water **not** advanced) until the missing epochs replay or a **signed checkpoint** authorizes the jump. A hidden `E10=Hold/Revoke` can no longer be skipped by delivering `E11`.
+- **Check order (explicit):** (1) verify signature/domain/version → else `Rejected(BadSignature)` **without advancing high-water** (else high-epoch garbage is a DoS); (2) **duplicate `command_id`** → return the persisted outcome (replay, no re-apply); **same `command_id` + different `envelope_hash`** ⇒ `IdempotencyConflict` (security incident), never replay; (3) `epoch ≤ last_accepted` ⇒ `Rejected(Stale)`; (4) gap ⇒ `AwaitingPredecessors`; (5) contiguous ⇒ admit. A same-epoch/different-command race resolves by an **atomic CAS** on `(scope, epoch)`.
+
+## 6 · Lifecycle FSM + atomic apply + resume
 ```
-PULL → verify(signature, epoch, ttl) → persist ReceivedDurable (in the fleet inbox, BEFORE ACK)
-     → coordinator applies →  Applied            (policy set; ACK{epoch,Applied,gen,reason})
-                          |→  Rejected            (bad sig / stale|dup|reorder|gap epoch / expired TTL / would break law)
-                          |→  Deferred            (open shift for a Config/ProtocolRevision change; retried; a HIGHER-epoch command supersedes a Deferred one)
+ReceivedDurable → Applied | Rejected | Deferred
+Deferred        → Applied | Rejected(Expired | Superseded | RevokedKey)
+Applied | Rejected → immutable
 ```
-- **Durable-before-ACK:** the `ReceivedDurable` row commits **before** any ACK; the ACK reports the coordinator's durable outcome, never an optimistic one.
-- **Crash/boot resume (idempotent):** a `ReceivedDurable` row not yet `Applied`/`Rejected` is re-driven on boot by the coordinator **idempotently** (keyed by `command_id` + `epoch`); re-apply of an already-`Applied` command is a no-op (the effective_generation matches). No fleet command re-pulls or re-signs on resume.
-- **Deferred supersession:** `Deferred` commands are ordered by `epoch`; a newer-epoch command for the same target **supersedes** an older `Deferred` one (which becomes `Rejected(Superseded)`), so a stale config never applies after a newer one.
+- **Atomic apply:** the command **effect** (e.g. the HOLD record), the `state=Applied`, and the `effective_generation` bump commit in **ONE** transaction (a `TransitionPlan` / SQLite tx). A crash after the effect but before `Applied` is impossible — resume re-derives idempotently by `(command_id, epoch)`; re-apply of an `Applied` command is a no-op (generation matches).
+- **Scoped supersession:** a newer command supersedes an older `Deferred` one **only within the same `supersession_family`** (a `conflict_key` / explicit `supersedes_command_id`) — a new `Hold` does **not** cancel a `Deferred` policy change of a different family.
+- **ACK** carries `{epoch_scope, epoch, outcome_state, effective_generation, reason}`; the ACK is **authenticated by the transport** and correlates the signed scope/target. One `Register` command ⇒ one ACK ⇒ one generation.
 
-## 5 · Normative invariants
-- **I1 (signed + canonical bytes).** A command applies only if its `signature` verifies over `canonical_bytes(envelope)` against a **currently-valid** `signer_key_id`; the canonical serialization is deterministic + versioned (a `canonical_bytes_version` change cannot alias an old signature). A forged/tampered command ⇒ `Rejected(BadSignature)`.
-- **I2 (monotonic epoch; stale/dup/reorder/gap).** `epoch` is monotonic per fleet-scope. `epoch ≤ last_accepted_epoch` ⇒ `Rejected(Stale)` (dedup + reorder guard); a **duplicate** `command_id` returns the persisted outcome (replay, no re-apply); a detected **gap** does not block (later epochs may apply) but is surfaced. **The accepted epoch is durable + monotonic.**
-- **I3 (durable-before-ACK; ACK shape).** The inbox row is durable before the ACK; the ACK carries exactly `{epoch, outcome, effective_generation, reason}` (plan §3.10a).
-- **I4 (coordinator-only apply; no agent store-mutation).** ONLY the local per-FN coordinator applies a command (via its mailbox/API — not the CLI admin, not the supervisor as sole transport); the **fleet-agent has no direct store-mutation access** (the §3.5 fencing discipline — same as the ingress adapters). The agent pulls, verifies, persists `ReceivedDurable`, and hands off; it never writes fiscal/node state.
-- **I5 (separate INACTIVE fleet inbox — MUST).** The durable command inbox is a **separate table** (idempotency-keyed on `command_id`, worker-triggered) with `epoch` + `signature_digest` + `FleetInputProvenance` + the apply outcome columns — INACTIVE-first, **never** overloading `ingress_inbox`.
-- **I6 (independent HOLDs).** `Local` and `Fleet` HOLDs are stored independently; a `Release` clears **only its own source's** HOLD; `effective_hold` = OR across sources. A fleet release can never clear a local safety HOLD.
-- **I7 (fleet gives policy, local enforces law).** A command sets *policy* but can **NEVER** force illegal offline entry, a legal-cap breach (168h/36h/50k), or block a mandatory return — such a command ⇒ `Rejected(LawViolation)` at the coordinator (mirrors plan §3.10b + §7.6). Advisory ≠ authority.
-- **I8 (TTL).** A command past its `ttl` ⇒ `Rejected(Expired)`, never applied late.
-- **I9 (open-shift deferral).** A `Config`/`ProtocolRevision`/profile change with an **open write shift** ⇒ `Deferred` (or `Rejected`) — it may not switch the write-enabled `IngressProfileId`/`DpsProtocolId` mid-shift (extends the frozen no-channel-switch invariant, plan §3.9).
-- **I10 (backup/restore never rolls back an accepted epoch).** A restore to an older DB state must **not** revert `last_accepted_epoch`; the accepted epoch is reconciled **forward** (or the restore is refused for that FN) — an accepted fleet policy is durable across restore (plan §3.10a).
-- **I11 (key rotation/revocation).** `signer_key_id` is resolved against a durable, fleet-signed key set; a **revoked** key's future commands ⇒ `Rejected(RevokedKey)`; a rotation is itself a signed command; a command already `Applied` under a since-rotated key stays valid (the epoch, not the live key, is the authority).
-- **I12 (input ≠ outcome).** `FleetInputProvenance` (signed input) and `FleetApplyOutcome` (durable coordinator decision) are **separate** types; the contract carries only a protocol-neutral `FleetOutcomeReason`, never the engine's `CoordinatorOutcome`.
+## 7 · HOLD records + TTL (two clocks)
+- **HOLD is a durable RECORD, not a boolean:** `{ hold_id, source: {Local|Fleet}, scope, applied_epoch }`. A `Release` references a **specific `hold_id`** and clears only it; **`effective_hold` = OR over all un-released records**. A fleet `Release` can never clear a `Local` safety hold.
+- **HOLD never applies to a mandatory path:** law-permitted / mandatory **drain / reconciliation / mandatory return** proceed regardless of a fleet HOLD (I-law).
+- **Two clocks (TTL):** **message validity** (`expires_at_unix_ms`) — an expired command is **never applied** (`Rejected(Expired)`); **effect lifetime** — an already-`Applied` HOLD does **NOT** auto-release on any TTL; it stays **held + alerting** until a **signed `Release`**. Clock-skew / clock-rollback are **fail-closed** (an indeterminate clock ⇒ do not apply, do not auto-release).
 
-## 6 · RED-pins (dormant/known-red until CS-6 activation; semantics testable now)
-- **RP5B-1 (signature/canonical):** a tampered envelope or a `canonical_bytes_version` change that would alias a signature ⇒ `Rejected(BadSignature)`; a valid command applies.
-- **RP5B-2 (epoch monotonic):** `epoch ≤ last_accepted` ⇒ `Rejected(Stale)`; a duplicate `command_id` replays the persisted outcome (no re-apply); a reordered lower epoch does not overwrite a higher accepted one.
-- **RP5B-3 (durable-before-ACK + resume):** a crash between `ReceivedDurable` and `Applied` re-drives idempotently on boot; the ACK never precedes the durable row; re-apply of an `Applied` command is a no-op.
-- **RP5B-4 (coordinator-only / no agent mutation):** a static pin — the fleet-agent crate cannot reach a store mutator (reuses the Spec #5A crate-DAG gate); the only apply path is the coordinator mailbox.
-- **RP5B-5 (law over policy):** a command that would force illegal offline / cap-breach / return-block ⇒ `Rejected(LawViolation)`, applied by no coordinator.
-- **RP5B-6 (independent HOLD):** a `Fleet` release does not clear a `Local` HOLD (and vice versa); `effective_hold` stays set while any source holds.
-- **RP5B-7 (open-shift deferral):** a `ProtocolRevision`/profile change with an open shift ⇒ `Deferred`/`Rejected`, never a mid-shift channel switch.
-- **RP5B-8 (TTL):** an expired command ⇒ `Rejected(Expired)`.
-- **RP5B-9 (backup no-rollback):** restoring an older DB does not revert `last_accepted_epoch`; the accepted epoch reconciles forward.
-- **RP5B-10 (key revocation):** a revoked key's command ⇒ `Rejected(RevokedKey)`; a since-rotated key does not invalidate an already-`Applied` command.
-- **RP5B-11 (Deferred supersession):** a higher-epoch command supersedes an older `Deferred` one (`Rejected(Superseded)`).
+## 8 · Restore + keys (anti-rollback, fail-closed)
+- **Restore = REFUSE-until-forward-sync.** On a fleet-enrolled node a restored `last_accepted_epoch` / keyset is **not trusted** without an authenticated replay/checkpoint or an external monotonic anchor. Write-admission for that FN is **held (fail-safe)** until the control-plane re-syncs; if the control-plane is unreachable, **stay held**. This must **not** reuse the baseline path that leaves an FN `ONLINE` when DPS is unavailable (`backup_restore.rs:809-840`) nor its kill-switch (`:895-929`) — those are not anti-rollback.
+- **Trust-store (separate, secure, INACTIVE):** a `TrustStream`-versioned keyset (`keyset_epoch`) with a **root/recovery trust anchor**. **Routine rotation** may be signed by the current key; **emergency revocation** requires the root/recovery key. `ReceivedDurable`/`Deferred` **re-check the keyset generation before apply**; an already-`Applied` command stays valid (the epoch, not the live key, is authority). **Enrollment establishes the root LOCALLY** — trust can **never** be bootstrapped by a command signed by a not-yet-known key. An empty trust-store at advisory-OFF is fine.
 
-## 7 · Open questions for the audit
-1. **Epoch scope:** monotonic per **fleet** (one global epoch line) or per **FN**? Plan §3.10 says "epoch-versioned"; per-FN is simpler for N=1 but a fleet-wide policy may need a fleet epoch — which is authoritative for a `Fleet`-target command vs a `Register`-target one?
-2. **`effective_generation` vs Spec #2 `generation`:** reuse the same durable token/type, or a distinct fleet generation? (They fence different things — delivery vs policy.)
-3. **Backup/restore reconciliation (I10):** is "reconcile forward" (fetch the current accepted epoch from the control-plane on boot) acceptable, or must the pilot simply **refuse** to serve an FN whose restored epoch is behind until an operator re-syncs?
-4. **Key set storage:** where does the durable fleet-signed key set live (a separate INACTIVE table?), and is the pilot's advisory-OFF posture consistent with shipping a key set at all?
-5. **Deferred retry cadence:** who re-drives a `Deferred` command (the coordinator on shift-close, or the next pull)? — the plan implies the coordinator; confirm the transport.
-6. **Split vs merge:** is this the right #5B scope, or should provisioning/config land as a later spec once CS-6 defines the transport?
+## 9 · Law over policy (structural — I-law)
+- A fleet command changes **ONLY** the fleet policy/hold axis. It **NEVER** sets `NodeMode`, never carries a ready `TransitionPlan`, and **legal caps / constants / enforcement toggles (168h / 36h / 50k) are ABSENT from the payload type** (so a command cannot even express "disable the cap").
+- The **oracle recomputes law on EVERY admission/transition** (Spec #1), not only at command receipt — so a stored policy can never override a later legal check.
+- **`Applied` means "policy durably stored"**, NOT "the requested mode was forcibly reached". A policy that would force illegal offline / a cap breach / block a mandatory return is `Rejected(LawViolation)` at the coordinator.
+
+## 10 · RED-pins (semantics testable now; runtime dormant until CS-6)
+- **RP5B-1 (canonical/signature):** a tampered envelope, wrong `domain_tag`/`environment`/`fleet_id`, or an unknown version ⇒ `Rejected` fail-closed; golden vectors pin `canonical_bytes`.
+- **RP5B-2 (contiguous epoch — the BLOCKER):** a delivered `E(n+2)` while `E(n+1)` is missing ⇒ `AwaitingPredecessors`, high-water NOT advanced; a later `E(n+1)=Hold/Revoke` still applies. A hidden HOLD/revocation cannot be bypassed.
+- **RP5B-3 (check order):** `BadSignature` advances no high-water; duplicate `command_id` replays; same id + different hash ⇒ `IdempotencyConflict`; stale epoch ⇒ `Rejected(Stale)`.
+- **RP5B-4 (trusted intake / dumb agent):** the `prro-fleet-agent` crate cannot verify or persist (no crypto/store/sqlx per #5A); only `FleetCommandIntake` writes the inbox; an untrusted signature never occupies the authoritative `command_id`.
+- **RP5B-5 (atomic apply/resume):** effect + `Applied` + generation are one tx; a crash before `Applied` re-derives idempotently; re-apply is a no-op.
+- **RP5B-6 (law over policy — structural):** the payload type cannot express a cap/constant/toggle; a policy that would breach law ⇒ `Rejected(LawViolation)`; HOLD exempts mandatory drain/reconciliation/return.
+- **RP5B-7 (independent HOLD records):** a `Fleet` release clears only its `hold_id`; a `Local` hold survives; `effective_hold` = OR.
+- **RP5B-8 (TTL two-clock):** an expired command is never applied; an applied HOLD never auto-releases (held+alert until signed Release); indeterminate clock ⇒ fail-closed.
+- **RP5B-9 (restore anti-rollback):** a restore behind the accepted epoch holds write-admission until an authenticated forward-sync; unreachable control-plane ⇒ stay held.
+- **RP5B-10 (keyset anti-rollback):** a revoked key ⇒ `Rejected(RevokedKey)`; emergency revocation needs the root key; a since-rotated key does not invalidate an `Applied` command; trust cannot bootstrap from an unknown key.
+- **RP5B-11 (scoped supersession):** supersession only within a `conflict_key`/family; a `Hold` never cancels a `Deferred` policy of another family.
+
+## 11 · Open questions for re-audit
+1. **`effective_generation` type:** a **new** `FleetPolicyGeneration` (NOT the Spec #2 delivery generation — 032 has only a *comment* about a future `node_state.delivery_generation`, `032:17-18`, and it fences a different authority). Confirm a distinct fleet generation.
+2. **Signed checkpoint:** the exact shape of the "signed checkpoint" that authorizes an epoch jump after a real gap (a signed `(scope, up_to_epoch, state_digest)`?).
+3. **Restore posture:** is "refuse-until-forward-sync + fail-safe hold" acceptable for the pilot (which is advisory-OFF, so arguably no accepted epoch exists yet), or is it purely a post-CS-6 obligation?
+4. **Root/recovery anchor:** where does the local enrollment root live (a secure INACTIVE table + an out-of-band provisioning step), and does the advisory-OFF pilot ship any of it?
+5. **Deferred retry transport:** the coordinator re-drives on shift-close/quiescent + boot; the next PULL may wake it but is not the sole mechanism — confirm.
+6. **Scope:** is core `Hold`/`Release`/`Policy` the right #5B cut, with `Config`/`Provision`/`ProtocolRevision` as separate payload-specs?
