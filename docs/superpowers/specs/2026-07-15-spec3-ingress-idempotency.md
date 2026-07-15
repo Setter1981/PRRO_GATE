@@ -1,6 +1,6 @@
 # Spec #3 — Canonical ingress contract + Idempotency (POS → gateway)
 
-**Status: 🟡 DRAFT rev 4 (post external audit round 3 → NOT-YET, converging). 2026-07-15. Grounded on `origin/main` `9ce76c2`** (fiscal-core re-verified on `specs-3-5-ingress-fleet @ c6a2d2e`; `9ce76c2..` diff = only Spec #3).
+**Status: 🟡 DRAFT rev 5 (post external audit round 4 → 3/4 LOCK-READY; one narrow §3/§6 fix). 2026-07-15. Grounded on `origin/main` `9ce76c2`** (fiscal-core re-verified on `specs-3-5-ingress-fleet @ c6a2d2e`; `9ce76c2..` diff = only Spec #3).
 Rev 4 closes round-3's three blockers: (1) **`session_scope` is removed from the external identity**
 (it broke cross-shift external replay) — the identity is a **sum-type**, session scope lives **only**
 inside the internal-producer operation id; profile/policy/version are **provenance fences, never key
@@ -58,7 +58,12 @@ enum ReplayIdentity {
 struct ResolvedReplayIdentity { fiscal_number: FiscalNumber, identity: ReplayIdentity }
 
 // FENCE — stored atomically alongside the row, NEVER part of the effective key.
-struct IdentityProvenance { ingress_profile_id: IngressProfileId, policy_id: PolicyId, policy_version: u16 }
+// Internal producers have no external ingress profile → provenance profile is a sum-type.
+enum ProvenanceProfile { External(IngressProfileId), SystemInternal }
+struct IdentityProvenance { profile: ProvenanceProfile, policy_id: PolicyId, policy_version: u16 }
+// A write-enabled EXTERNAL profile also carries a CAPABILITY flag `ProvenSourceStableId`, EARNED only
+// by passing the mandatory crash/replay contract-test (locked plan:155-158) — see §6. An unproven
+// profile is default-deny; non-emptiness of the key alone does NOT grant Accept.
 
 enum ReplayIdentityResolution { Resolved(ResolvedReplayIdentity, IdentityProvenance), NoSafeReplayIdentity { reason: NoSafeReason } }
 enum NoSafeReason { EmptyKey, AbsentKey, ContentDerivedOnly, NoReservationToken, ProfileSwitchWithUnresolvedIntent, UnlistedOriginOperation }
@@ -76,7 +81,7 @@ format + escaping + a legacy decoder). Deferred migration (CS-3/CS-6); normative
 Direct `INSERT … ingress_inbox` is **statically forbidden outside the store module** (a compile/grep
 pin). Two sealed methods (the semantics differ — round-3):
 - **`insert_new_tx(&mut WriteTxConn, ResolvedReplayIdentity, IdentityProvenance, …)`** → a `NEW` row (the normal `Created|Replay` contract). Used by **external writes, `auto_z`, and B10 BEGIN**.
-- **`insert_processing_with_prepared_doc_tx(&mut WriteTxConn, ResolvedReplayIdentity, PreparedDoc, …)`** → a `PROCESSING` row **atomically with the PREPARED doc** — the B10-END path only (`backlog_drain.rs:2719-2779`), which deliberately bypasses the `GoingOnline`-forbidden acquire.
+- **`insert_processing_with_prepared_doc_tx(&mut WriteTxConn, ResolvedReplayIdentity, IdentityProvenance, PreparedDoc, …)`** → a `PROCESSING` row **atomically with the PREPARED doc** — the B10-END path only (`backlog_drain.rs:2719-2779`), which deliberately bypasses the `GoingOnline`-forbidden acquire.
 **Internal `request_id` is DERIVED from the resolved identity** (or minted only after the identity
 lookup and then reused) — **not** an FN-only `format!()` — so `b10-begin`/`b10-end`/`auto_z` become
 per-session unique and never re-collide on `UNIQUE(request_id)`. Resolution stays two-stage: adapter →
@@ -104,7 +109,7 @@ Reject(NoSafeReason)`; **any unlisted `(origin, operation_kind)` ⇒ `Reject(Unl
 | origin | operation | decision |
 |---|---|---|
 | WebCheck (LIVE) | X-report (read-only) | `ReadOnlyNoInbox` |
-| WebCheck (LIVE) | signable write | `Accept(SourceStableId)` iff key non-empty; **empty ⇒ `Reject(EmptyKey)`**. (A non-empty key does not by itself prove uniqueness — the tuple + the no-collision pins do.) |
+| WebCheck (LIVE) | signable write | `Accept(SourceStableId)` **iff the profile capability = `ProvenSourceStableId`** (earned via the mandatory crash/replay contract-test, locked plan:155-158) **AND** the key is present/non-empty; **empty ⇒ `Reject(EmptyKey)`**; **an unproven profile ⇒ default-deny**. Non-emptiness does NOT prove stability — two independent identical sales with one `K` would collapse to `Replay`, and a retry of one intent with a new `K` would double-issue; only the proven capability grants Accept. |
 | InternalProducer::AutoZ | Z-report | `Accept(GatewayDeterministic{AutoZ})` (identity `Internal`, `internal_operation_id` = ShiftId) |
 | InternalProducer::B10Begin | offline-session-begin | `Accept(GatewayDeterministic{B10Begin})` (`internal_operation_id` = OfflineSessionId) |
 | InternalProducer::B10End | offline-session-end | `Accept(GatewayDeterministic{B10End})` **via `insert_processing_with_prepared_doc`** (`internal_operation_id` = OfflineSessionId) |
@@ -123,11 +128,11 @@ Reject(NoSafeReason)`; **any unlisted `(origin, operation_kind)` ⇒ `Reject(Unl
 - **RP3-4 (upgrade/profile fence)** a `policy_version` or `ingress_profile_id` mismatch on the same identity ⇒ lookup/block/reconcile, never `Created`.
 - **RP3-5 (sealed store)** a static pin proves no `INSERT … ingress_inbox` outside the store; the three producers mint via the two sealed methods only.
 - **RP3-6 (session vs cross-shift)** (a) an **internal** producer retry in the **same** session ⇒ same identity+request_id, the **next** session ⇒ distinct; (b) an **external** retry of the same `source_request_id` **across a shift boundary** ⇒ **same** identity (dedupes — the round-3 counterexample).
-- **RP3-7 (no profile-switch re-issue on unresolved intent)** switching `IngressProfileId` while **any** non-terminal inbox row / reservation / `SubmittedUnknown` / `PendingApply` exists ⇒ `Reject(ProfileSwitchWithUnresolvedIntent)` — including after the shift closed but the intent is unresolved.
+- **RP3-7 (no profile-switch re-issue)** a write-profile switch is forbidden while **ANY** of: an **open write shift** (locked plan:162-164 — the write-enabled `IngressProfileId` is pinned to the open shift) · a **non-terminal inbox** row · an **active/fenced delivery reservation** (NOT "any" reservation — the reservation table is append-only, so a *resolved* row must not forbid switching forever) · a `SubmittedUnknown` · an `OutcomeRecordedPendingApply` exists ⇒ `Reject(ProfileSwitchWithUnresolvedIntent)`; the durable profile binding is checked **before** a new identity is formed.
 - **RP3-8 (namespace separation, known-red until the migration)** same raw string, same FN, different `(origin, operation)` ⇒ no cross-collision.
 - **RP3-9** reaper terminalises, never re-fiscalizes.
 - **RP3-10 (B10-END mode)** B10-END uses `insert_processing_with_prepared_doc` (PROCESSING+PREPARED atomic); the `insert_new` path is not admissible for it, and vice-versa.
-- **RP3-11 (matrix totality)** every `(origin, FiscalCommandKind)` has exactly one decision; unlisted ⇒ `Reject(UnlistedOriginOperation)`.
+- **RP3-11 (matrix totality + capability proof)** over the **real closed operation enum** (`FiscalCommandKind` covering the `DocType` set — incl. `OfflineSessionBegin`/`OfflineSessionEnd` so the B10 rows formally belong), every `(origin, operation)` maps to exactly one decision (closed match, no `_ =>` silent Accept); an **unproven profile ⇒ default-deny**. The `ProvenSourceStableId` capability is granted **only** by a crash/replay contract-test (plan:155-158) proving: (a) the **same** intent across reconnect/reboot/shift ⇒ the **same** id; (b) two **independent identical** writes ⇒ **distinct** ids.
 
 ## 9 · Decisions + open items
 - **Index:** drop/replace with normalized non-null identity columns + a new `UNIQUE` (not opaque TEXT-encoding).
