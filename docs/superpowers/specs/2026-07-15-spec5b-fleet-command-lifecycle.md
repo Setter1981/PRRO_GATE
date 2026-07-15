@@ -1,7 +1,7 @@
 # Spec #5B — Fleet Hold/Release lifecycle (signed / scoped-contiguous-epoch / PULL)
 
-**Status: 🔒 LOCKED rev 7 (external audit → "after this one fix, lock #5B"; the RecoveryLane epoch is decoupled from `TrustKeysetGeneration`). 2026-07-15. Grounded on `origin/main` `c107854` + plan §3.10.**
-6 adversarial audit rounds. Rev 7 closes the last one: `EmergencyRevoke` CASes `expected_keyset_generation → +1`, so a real-rotated generation (e.g. 20) is not rolled back to a RecoveryLane epoch of 1. Rev 6 had fixed the single code-BLOCKER: the digest is **Kupyna-256 (32-byte)** — Kupyna-512's 64 bytes
+**Status: 🔒 LOCKED rev 8 (external audit CONFIRMED "lock #5B" on rev 7; rev 8 folds the sole non-blocking round-7 follow-up — the loser-CAS outcome — into the oracle). 2026-07-15. Grounded on `origin/main` `c107854` + plan §3.10.**
+7 adversarial audit rounds (design-lock earned at rev 7). Rev 8 (round-7 follow-up, non-blocking): a losing generation-CAS is a **terminal `Rejected(StaleKeysetGeneration{expected,actual})`** that consumes its slot and moves nothing — **never `Deferred`** (a signed `expected` can never re-match the monotone `actual`, so a defer would wedge the contiguous stream); pinned in §7 + RP5B-11 so the CS-5/6 implementer cannot mis-route it. Rev 7 closed the RecoveryLane↔generation conflict: `EmergencyRevoke` CASes `expected_keyset_generation → +1`, so a real-rotated generation (e.g. 20) is not rolled back to a RecoveryLane epoch of 1. Rev 6 had fixed the single code-BLOCKER: the digest is **Kupyna-256 (32-byte)** — Kupyna-512's 64 bytes
 **panic** the PB-257 verifier (`FieldEl::from_le_bytes`, `mod_words=9`, `field.rs:71`); + full Trust-body
 layouts, a pinned golden-vector example (canonical/digest deterministic now, signature at code), and a
 precise attestation-TTL bound. Round-1-4 carried: rev 5 closed round-4's three residuals: (1) a **fresh, anti-replay `TrustHeadAttestation`**
@@ -113,11 +113,13 @@ mandatory auto-Z at a legal cap). A HOLD is **discretionary new-business gating 
 ```
 (intake) → ReceivedDurable | AwaitingPredecessors | AwaitingTrustPredecessors | SecurityRejected(no epoch, no slot)
 Awaiting* → ReceivedDurable (caught up) ; OR terminal-with-slot-consume (expired / revoked-key)
-ReceivedDurable → Applied | Rejected | Deferred ;  Deferred → Applied | Rejected(Expired|Superseded|RevokedKey)
+ReceivedDurable → Applied | Rejected(Expired|Superseded|RevokedKey|StaleKeysetGeneration) | Deferred ; Deferred → Applied | Rejected(Expired|Superseded|RevokedKey)
+   // a generation-CAS conflict is TERMINAL Rejected(StaleKeysetGeneration), NEVER Deferred (a signed expected_generation can never re-match the monotone actual)
 Applied | Rejected → immutable
 ```
 - **No skip:** an `Awaiting*` that becomes terminal — `Rejected(Expired)` **or `Rejected(RevokedKey)`** (after trust catch-up) — still **consumes its slot** when predecessors arrive: one tx `Awaiting + cursor=n-1 → Rejected(..) + cursor=n`. The immutable tombstone is retained until consumed (or de-enrollment). A TTL/revoke **never** authorizes a silent skip.
 - **Atomic apply (ONE tx):** effect + `Applied` + the trust-`(gen,digest)` CAS + the correct generation bump. **`Hold`/`Release` → per-`RegisterStream` `FleetPolicyGeneration`; `RotateKey`/`RevokeKey`/`EmergencyRevoke` → `TrustKeysetGeneration`** — never each other's; `generation` moves only on `Applied`. Supersession = one typed `ConflictKey`; `Hold`/`Release` never supersede; `Release` targets a `hold_id`.
+- **Loser-CAS is terminal, never `Deferred` (rev 8, audit round-7 follow-up):** when the generation CAS fails at apply (`VersionConflict`), the tx **recomputes** and writes a **terminal `Rejected(StaleKeysetGeneration{ expected, actual })`** — in the **same tx** it **consumes the RecoveryLane/Trust slot**, does **not** touch the keyset, does **not** bump `TrustKeysetGeneration`, and the ACK returns the **current** tagged generation (`Recovery(TrustKeysetGeneration)` / `Trust(..)`). `Deferred` is **inadmissible** here: a *signed* `expected_keyset_generation` can never re-match the monotone `actual`, so a retry could only re-fail — deferring would wedge the contiguous stream forever. (This is the explicit face of the general "authenticated contiguous command consumes its epoch even if Rejected" law — pinned so the CS-5/6 implementer routes it to `Rejected`, not `Deferred`.) A two-`EmergencyRevoke` race with both `expected=20`: exactly one CASes `20→21`; the loser observes `actual=21` → `Rejected(StaleKeysetGeneration{20,21})`, slot consumed; a legitimately-later `expected=21` command awaits its RecoveryLane predecessor, then applies `21→22`.
 - **ACK (all three scopes):** `{ epoch_scope, epoch, outcome_state, effective_generation, reason }`, transport-authenticated; `effective_generation` is **tagged** — `Register(FleetPolicyGeneration) | Trust(TrustKeysetGeneration) | Recovery(TrustKeysetGeneration)`.
 
 ## 8 · Anchor + trust-store + restore (explicit layout, anti-rollback)
@@ -139,6 +141,7 @@ Applied | Rejected → immutable
 - **RP5B-8 (independent HOLD + TTL):** a fleet release clears only its `hold_id`; an applied HOLD never auto-releases; indeterminate clock ⇒ fail-closed.
 - **RP5B-9 (enrollment/restore anti-rollback):** fresh install writes `Unenrolled`; missing/corrupt ⇒ `EnrolledUnknown`+HOLD; behind-cursor restore ⇒ HOLD; anchor-first.
 - **RP5B-10 (trust anti-rollback):** revoked key ⇒ `Rejected(RevokedKey)`; emergency revoke needs the root key; a rotated key does not invalidate an `Applied` command; no unknown-key bootstrap.
+- **RP5B-11 (loser-CAS is terminal, not `Deferred`):** two auth-contiguous `EmergencyRevoke` bodies both carrying `expected_keyset_generation=20` — exactly one applies (`20→21`); the loser's tx observes `actual=21`, writes **terminal `Rejected(StaleKeysetGeneration{20,21})`**, **consumes its RecoveryLane slot**, leaves the keyset + `TrustKeysetGeneration` untouched, ACKs the current `Recovery(21)`. A test that routes the loser to `Deferred` (or leaves its slot unconsumed) is RED — the stream would wedge.
 
 ## 10 · Open questions for re-audit
 1. Confirm the **anti-replay attestation** (seq + TTL + anchor-tracked `max_observed_attestation_seq`/`trust_head_floor` + local-digest match) fully closes the stale-attestation replay.
