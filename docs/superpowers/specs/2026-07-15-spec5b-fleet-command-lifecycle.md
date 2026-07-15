@@ -1,7 +1,7 @@
 # Spec #5B — Fleet Hold/Release lifecycle (signed / scoped-contiguous-epoch / PULL)
 
-**Status: 🟡 DRAFT rev 6 (post external audit round 5 → NOT-YET, one code-BLOCKER fixed). 2026-07-15. Grounded on `origin/main` `c107854` + plan §3.10.**
-Rev 6 fixes round-5's single BLOCKER: the digest is **Kupyna-256 (32-byte)** — Kupyna-512's 64 bytes
+**Status: 🔒 LOCKED rev 7 (external audit → "after this one fix, lock #5B"; the RecoveryLane epoch is decoupled from `TrustKeysetGeneration`). 2026-07-15. Grounded on `origin/main` `c107854` + plan §3.10.**
+6 adversarial audit rounds. Rev 7 closes the last one: `EmergencyRevoke` CASes `expected_keyset_generation → +1`, so a real-rotated generation (e.g. 20) is not rolled back to a RecoveryLane epoch of 1. Rev 6 had fixed the single code-BLOCKER: the digest is **Kupyna-256 (32-byte)** — Kupyna-512's 64 bytes
 **panic** the PB-257 verifier (`FieldEl::from_le_bytes`, `mod_words=9`, `field.rs:71`); + full Trust-body
 layouts, a pinned golden-vector example (canonical/digest deterministic now, signature at code), and a
 precise attestation-TTL bound. Round-1-4 carried: rev 5 closed round-4's three residuals: (1) a **fresh, anti-replay `TrustHeadAttestation`**
@@ -65,9 +65,9 @@ each prefixed by its `u16` tag. **Digest profile:** `prro_crypto` verifies over 
 PB-257 has `mod_words=9` → **≤ 36 bytes**, and `FieldEl::from_le_bytes` **panics** above that
 (`field.rs:71-82`). So the fleet pins **`DSTU-7564`/Kupyna-256 (`kupyna_256 → [u8;32]`, `kupyna.rs:401`)** —
 a **32-byte** digest passed as-is (Kupyna-512's 64 bytes would panic, per the round-5 finding). The
-signature is 64-byte `r‖s` LE (each 32-byte half parsed as a `FieldEl`, `in_process.rs:200-201`). Signature = **64-byte `r‖s` LE**. **Golden vectors — a fully-pinned example is fixed here; the byte
-hex is frozen as a committed artifact at first code (RP5B-1):** an example `FleetCommandEnvelope` with
-**every field a literal** (a `Hold{NewSalesOnly, OperatorRequested}` on `RegisterStream(fleet=1, fn="…")`,
+signature is 64-byte `r‖s` LE (each 32-byte half parsed as a `FieldEl`, `in_process.rs:200-201`). Signature = **64-byte `r‖s` LE**. **Golden vectors — a REQUIRED RED-freeze artifact (RP5B-1), not yet
+materialized here:** the spec pins the example's *construction*; the byte hex is committed as a
+freeze-test at first code. The example is a `FleetCommandEnvelope` with **every field a literal** (a `Hold{NewSalesOnly, OperatorRequested}` on `RegisterStream(fleet=1, fn="…")`,
 `epoch=1`, fixed times, etc.) — its `canonical_bytes` **hex** and `Kupyna-256(canonical_bytes)` **digest
 hex** are deterministic (**no key**, freezable by a tiny tool now) and MUST be committed; the
 **signature hex** is frozen with the **pinned test key** when the crypto runs. A matching
@@ -77,7 +77,7 @@ hex** are deterministic (**no key**, freezable by a tiny tool now) and MUST be c
 ## 5 · Epochs, streams, and the FRESH root-attested trust head (anti-replay)
 - **Three scopes:** `RegisterStream(fleet_id, fn)`; `TrustStream(fleet_id)`; `RecoveryLane(fleet_id)` (root-signed `EmergencyRevoke`, not blocked by a missed/captured TrustStream epoch). Each has a contiguous cursor.
 - **Fresh, anti-replay attestation (the round-4 fix):** the `SignedTrustHeadAttestation` is **root-signed** (never the operational key), **pulled fresh** alongside the command, and signs `authority_id + environment + fleet_id + attested_trust_head + keyset_digest + attestation_seq + issued/expires`. Admission requires ALL of: root-signature valid; `attestation_seq > anchor.max_observed_attestation_seq` **and** `attested_trust_head ≥ anchor.trust_head_floor` (monotone, anchor-tracked — a stale attestation is refused); **`issued_at ≤ now ≤ expires_at` AND `0 < (expires_at − issued_at) ≤ 300_000 ms`** (this bounds a future-dated attestation, not only age); an **indeterminate/rolled-back clock ⇒ fail-closed**; and the **local `keyset_digest` == attested `keyset_digest`**. The anchor's `max_observed_attestation_seq`/`trust_head_floor` advance on acceptance (§8) — so an **old head-9 attestation cannot be replayed** once a newer one has been seen.
-- **Guards:** a `Trust*` body only in `TrustStream`; `EmergencyRevoke` only in `RecoveryLane`; `new_keyset_epoch == envelope.epoch`; `epoch_scope.fleet_id == envelope.fleet_id`; `required_trust_head` is checked against the attested head, never self-asserted.
+- **Guards:** a `RotateKey`/`RevokeKey` body only in `TrustStream` (there `new_keyset_epoch == envelope.epoch`); `EmergencyRevoke` only in `RecoveryLane` (its `envelope.epoch` orders recovery only — **decoupled** from the keyset generation, which it moves by a CAS on `expected_keyset_generation → new = expected+1`); `epoch_scope.fleet_id == envelope.fleet_id`; `required_trust_head` is checked against the attested head, never self-asserted.
 - **Check order:** signature/attestation/domain/version → else `Rejected(BadSignature)`, no advance; dup `command_id` ⇒ replay; same-id+different-hash ⇒ `IdempotencyConflict`; `epoch ≤ last_consumed` ⇒ `Rejected(Stale)`; register gap ⇒ `AwaitingPredecessors`; `local_trust_head < attested` ⇒ `AwaitingTrustPredecessors`; else consume + admit (atomic §3). **Checkpoints FORBIDDEN in V1** (full replay only).
 
 ## 6 · Closed bodies + `HoldScope × OperationKind` matrix (structural law)
@@ -86,10 +86,14 @@ enum FleetCommandBody { Hold(HoldBody), Release(ReleaseBody), RotateKey(RotateKe
 struct HoldBody { hold_scope: HoldScope, reason_code: HoldReasonCode }   // hold_id := the command_id
 enum HoldScope { NewBusinessAll, NewSalesOnly, NewShiftOpen }
 struct ReleaseBody { hold_id: HoldId }   // = the Hold command's command_id
-// Trust bodies — full fields so their canonical bytes are DEFINED (round-5). new_keyset_epoch == envelope.epoch.
-struct RotateKeyBody      { new_key_id: KeyId, new_pubkey: [u8; 33], new_keyset_epoch: u64 }   // signed by the CURRENT key
-struct RevokeKeyBody      { revoked_key_id: KeyId, new_keyset_epoch: u64 }                     // signed by the current key
-struct EmergencyRevokeBody{ revoked_key_id: KeyId, new_keyset_epoch: u64, new_root_or_active_key_id: KeyId } // RecoveryLane, ROOT-signed
+// Trust bodies — full fields so their canonical bytes are DEFINED.
+// TrustStream: `new_keyset_epoch == envelope.epoch` holds (each trust epoch bumps the keyset once).
+struct RotateKeyBody      { new_key_id: KeyId, new_pubkey: [u8; 33], new_keyset_epoch: u64 }   // TrustStream, current-key-signed
+struct RevokeKeyBody      { revoked_key_id: KeyId, new_keyset_epoch: u64 }                     // TrustStream, current-key-signed
+// RecoveryLane: its envelope.epoch orders recovery commands ONLY and is DECOUPLED from the keyset
+// generation (round-6 fix — else the first EmergencyRevoke on epoch=1 would roll back a rotated
+// generation=20 or fail the CAS). Apply CASes `expected` and sets `new = expected+1`.
+struct EmergencyRevokeBody{ revoked_key_id: KeyId, expected_keyset_generation: u64, new_keyset_generation: u64 /* = expected+1 */, new_root_or_active_key_id: KeyId } // RecoveryLane, ROOT-signed
 ```
 `hold_id` **is the Hold command's `command_id`** (a `Release` names it). Caps/toggles are unrepresentable.
 **Matrix (exhaustive, compile-checked over the real `OperationKind`; no `_ =>`):**
