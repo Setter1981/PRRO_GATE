@@ -57,9 +57,10 @@ struct TrustHeadAttestation {
 `FleetCommandBody{Hold=1,Release=2,RotateKey=3,RevokeKey=4,EmergencyRevoke=5}`;
 `HoldScope{NewBusinessAll=1,NewSalesOnly=2,NewShiftOpen=3}`; `HoldReasonCode{OperatorRequested=1,ComplianceReview=2,Provisioning=3,Suspected=4}`.
 Strings UTF-8 **NFC**, ≤256 bytes. **Nested `body`/attestation** are encoded in declared field order,
-each prefixed by its `u16` tag. **Digest profile:** the bytes fed to `prro_crypto` = **`DSTU-7564(512)`
-(Kupyna-512) truncated/used per the live signer profile** over `canonical_bytes` — the exact hash MUST
-equal what the production signer consumes (open item §10.5). Signature = **64-byte `r‖s` LE**. **One
+each prefixed by its `u16` tag. **Digest profile:** `prro_crypto` verifies over a **caller-supplied digest**
+(`provider.rs:62-71` — it fixes NO hash), so the fleet verifier **pins its own**: **`DSTU-7564`
+(Kupyna-512) over `canonical_bytes`**. This is an **independent fleet-signing domain** (NOT the DPS
+fiscal signature) — no external signer constraint; the golden vector fixes it. Signature = **64-byte `r‖s` LE**. **One
 golden vector is REQUIRED before lock:** `canonical_bytes(envelope) → digest → 64-byte signature`.
 Unknown `schema_version`/`canonical_bytes_version`/`suite_id` ⇒ fail-closed `Rejected(UnknownVersion)`.
 
@@ -126,4 +127,4 @@ Applied | Rejected → immutable
 2. Confirm the **`HoldScope × OperationKind`** cut (allow all Z/X/Status/Reprint; block only new business per scope) against the frozen Spec #1 admission oracle.
 3. Confirm the **explicit anchor layout** + anchor-first protocol + fresh-install-`Unenrolled` is sufficient for autonomous behind-restore detection.
 4. **`OperationKind` source:** derive it from the locked `FiscalCommandKind`/`DocType` (+ Status/Reprint/Probe/BootRecover as non-DocType ops) — confirm the enum is closed and complete.
-5. **Digest/hash profile (§4):** confirm the exact hash the production `prro_crypto` path consumes (Kupyna-512 / other) so the canonical digest is byte-exact — the one item that needs a code/signer confirmation before the golden vector is frozen.
+5. **Digest/hash profile (§4) — RESOLVED by code:** `prro_crypto` takes a **caller-supplied** digest (`provider.rs:62-71`), so the fleet is an **independent signing domain** and PINS its own profile (`DSTU-7564`/Kupyna-512) — no external signer constraint. Confirm the choice; the golden vector can be frozen now.
