@@ -64,6 +64,12 @@ cargo mutants "${MUT_ARGS[@]}" || true
 CUR_SURV="$OUT/missed.txt"
 CUR_CAUGHT="$OUT/caught.txt"
 BASE_SURV="$BASE/survivors.txt"
+# cargo-mutants writes NO `mutants.out/` directory when a run tests zero mutants
+# (e.g. an `--in-diff` diff of pure plumbing / macro-generated code). Without
+# the dir, the empty-file guards below fail `No such file or directory` (exit 1)
+# and the gate reports a spurious failure. Zero mutants ⇒ zero NEW survivors ⇒
+# the gate must PASS, so ensure the dir exists first.
+mkdir -p "$OUT"
 [ -f "$CUR_SURV" ]  || : > "$CUR_SURV"
 [ -f "$CUR_CAUGHT" ] || : > "$CUR_CAUGHT"
 [ -f "$BASE_SURV" ] || : > "$BASE_SURV"
