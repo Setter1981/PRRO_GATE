@@ -17,23 +17,19 @@ test RED). The ask: does this close the NO-GO → **CS-1 GO**?
 All test/gate/docs/CI only — **no hot-zone LOGIC touched** (write_path / reconciliation / transports /
 adapters state machines unchanged; no migration / DDL). **Decode VALUE + persisted bytes are
 byte-identical** (SQLite TEXT/BLOB affinity, enum literals, UUID-BLOB-16, `#[serde(rename)]` output —
-pinned by RP-CS1-5). **CS-1R3 A4 correction — the SQL statement TEXT is NOT byte-identical, and it changed
-in PRODUCTION `src`, not only tests.** The prior dossier claim (SQL "byte-identical"; the `query!` macro
-"strips `: Type` at compile time") was **FALSE** and is retracted: sqlx sends the query string —
-including `as "col: Type"` — **VERBATIM** to SQLite for BOTH the compile-time `query!` MACRO and the
-runtime `query_scalar` API (confirmed via `cargo`-level macro source `sqlx-macros-core 0.8.6`
-`src/query/{input.rs,output.rs}` + the `.sqlx` describe cache, whose recorded column NAME is the whole
-`offline_session_id: DbOfflineSessionId` alias — see `docs/cs1r/PRODUCTION_SQL_DELTAS.md`). CS-1 changed
-the executed statement text in **24 production read sites across 6 `db/repositories/*` files** (18
-alias-type renames `X`→`DbX`, e.g. `state as "state: DocState"`→`… DbDocState`; 6 runtime alias removals,
-e.g. `SELECT state as "state: ShiftState"`→`SELECT state` + turbofish) — a deliberate, **fiscal-neutral**
-source refactor (the alias only names a read's output column; the fetched value + stored bytes are
-unchanged, pinned by RP-CS1-5). These production `src` sites are **out of the test-provenance tool's
-scope** (it audits the 79 test files) and are catalogued verbatim in
-`docs/cs1r/PRODUCTION_SQL_DELTAS.md`. The 3 analogous **test-side** runtime deltas are catalogued in
-`docs/cs1r/pins/runtime_sql_deltas.tsv` (code-owner-gated); any un-catalogued SQL edit in the 79 test
-files is RED. **Honest term:** "fiscal-runtime and persisted-representation compatible; deliberate
-source-API refactor — NOT byte-identical SQL."
+pinned by RP-CS1-5). **The SQL statement TEXT is NOT byte-identical, and SQL completeness / identity is
+NOT asserted.** The CS-1 source refactor changed SQL statement text (column-alias type annotations, e.g.
+`state as "state: DocState"` → `… DbDocState`; and `SELECT state as "state: ShiftState"` → `SELECT state`
++ turbofish) in `db/repositories` reads — **a fiscal change is NOT intended**. Fiscal-neutrality is covered
+by the behavioral fiscal test suite (RP-CS1-5 pins the decode-value + persisted-bytes identity; the alias
+only names a read's output column, so the fetched value + stored bytes are unchanged) plus the full `prro`
+suite. **CS-1R4** DELETED the earlier production SQL-delta catalog (`docs/cs1r/PRODUCTION_SQL_DELTAS.md`),
+the test-side runtime-SQL delta pin (`docs/cs1r/pins/runtime_sql_deltas.tsv`), and the provenance tool's
+SQL-byte-identity machinery — there is no SQL diff↔set to maintain (round-4 auditor: "don't add SQL
+machinery"). The provenance tool now treats the `as "col: Type"` decode-annotation removal as a
+fiscal-neutral transform class (it compares decode-annotation-stripped SQL); any OTHER SQL edit is RED.
+**Honest term:** "fiscal-runtime and persisted-representation compatible; deliberate source-API refactor —
+NOT byte-identical SQL; SQL identity NOT asserted."
 
 ---
 

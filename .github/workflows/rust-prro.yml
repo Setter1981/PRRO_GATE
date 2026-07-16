@@ -73,15 +73,15 @@ jobs:
       # shells `git show f2c17b1:… / f2628ba:…` to compare the CS-1 base/head
       # blobs; a shallow (depth-1) checkout lacks those commits and the test
       # panics. Full history makes both pinned SHAs reachable.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: rust
 
@@ -92,7 +92,7 @@ jobs:
       # inventory gate's `nextest list` snapshots are version-sensitive, so the
       # committed manifests are only reproducible against a pinned runner; cargo
       # is already pinned to 1.95.0 via rust-toolchain.toml.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
         with:
           tool: nextest@0.9.137
 
@@ -174,7 +174,7 @@ jobs:
       # failure.
       - name: Upload regression seed (if any)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: invariant-fuzzer-regressions-x86_64-unknown-linux-gnu
           path: rust/prro/tests/invariant_fuzzer.regressions

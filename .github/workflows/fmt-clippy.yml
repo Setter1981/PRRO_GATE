@@ -31,11 +31,11 @@ jobs:
     name: fmt + clippy (gnu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: rust
       - name: cargo fmt --check
@@ -53,34 +53,34 @@ jobs:
         # --features test-support: builds the integration test targets
         # that consume the W2 ReconcileGuard test seam. Production
         # builds never enable this feature.
-        run: cargo clippy -p prro --all-targets --no-deps --features test-support -- -D warnings
+        run: cargo clippy -p prro --all-targets --no-deps --features test-support --locked -- -D warnings
       - name: cargo clippy prro_crypto + prro_escpos (-D warnings)
         working-directory: rust
         # Lint-debt pass CRY-4 (2026-06-11) zeroed both crates; this gate
         # keeps them clean. Deliberate allows live at the source (core/mod.rs
         # explicit-index CT loops; fixture-mirror fields) — do not silence
         # new lints here, fix or justify them in code.
-        run: cargo clippy -p prro_crypto -p prro_escpos --all-targets --no-deps -- -D warnings
+        run: cargo clippy -p prro_crypto -p prro_escpos --all-targets --no-deps --locked -- -D warnings
 
       - name: cargo clippy prro-domain + prro-testkit (-D warnings)
         working-directory: rust
         # CS-1a skeleton crates (contract §8 / RP-CS1-6). `--all-targets` lints
         # the purity-gate + trybuild-canary test targets too; keep them clean.
-        run: cargo clippy -p prro-domain -p prro-testkit --all-targets --no-deps -- -D warnings
+        run: cargo clippy -p prro-domain -p prro-testkit --all-targets --no-deps --locked -- -D warnings
 
       - name: cargo clippy contract crates (-D warnings)
         working-directory: rust
         # CS-1d boundary-contract skeleton crates (contract §8 item 5 / RP-CS1-6).
         # Empty for now, but scoped-linted so a crate-local change is never
         # SKIPPED. `--all-targets` covers any test target these crates grow later.
-        run: cargo clippy -p prro-ingress-contract -p prro-dps-contract -p prro-fleet-contract --all-targets --no-deps -- -D warnings
+        run: cargo clippy -p prro-ingress-contract -p prro-dps-contract -p prro-fleet-contract --all-targets --no-deps --locked -- -D warnings
 
       - name: cargo clippy prro_sidecar (-D warnings)
         working-directory: rust
         # CS-1R R1.3 (contract §12 member×dimension matrix): prro_sidecar had NO
         # clippy leg before — verified CLEAN under `-D warnings --all-targets`
         # (2026-07-16), so it joins the required gate now.
-        run: cargo clippy -p prro_sidecar --all-targets --no-deps -- -D warnings
+        run: cargo clippy -p prro_sidecar --all-targets --no-deps --locked -- -D warnings
 
       - name: cargo clippy prro_crypto_v2 + maria304_driver + prro_escpos_daemon (-D warnings)
         working-directory: rust
@@ -99,4 +99,4 @@ jobs:
         #                           + a trailing-comma test-fmt fix.
         #   * prro_escpos_daemon  — test-only byte-str lint fixed cleanly
         #                           (&[b'\n'] → b"\n"), behaviour-identical.
-        run: cargo clippy -p prro_crypto_v2 -p maria304_driver -p prro_escpos_daemon --all-targets --no-deps -- -D warnings
+        run: cargo clippy -p prro_crypto_v2 -p maria304_driver -p prro_escpos_daemon --all-targets --no-deps --locked -- -D warnings

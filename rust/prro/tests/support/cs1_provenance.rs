@@ -575,7 +575,9 @@ fn pin_path(file_rel: &str) -> PathBuf {
     );
     // Belt-and-braces: the canonical file MUST live directly under the canonical dir.
     assert_eq!(
-        std::path::Path::new(file_rel).parent().and_then(|p| p.to_str()),
+        std::path::Path::new(file_rel)
+            .parent()
+            .and_then(|p| p.to_str()),
         Some(CANONICAL_PIN_DIR),
         "pin file {file_rel:?} is not directly under the canonical pin dir {CANONICAL_PIN_DIR:?}",
     );

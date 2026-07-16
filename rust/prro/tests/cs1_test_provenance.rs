@@ -465,14 +465,10 @@ fn t8_decode_annotation_removal_is_fiscal_neutral_class_not_byte_identity() {
 
     // (3) a changed LITERAL VALUE inside a SQL string must still diverge (the
     // annotation-strip only removes `as \"…: …\"`, never a VALUES literal).
-    let val_base: syn::File = syn::parse_str(
-        "fn q() { sqlx::query(\"INSERT INTO t VALUES (0)\").execute(p); }",
-    )
-    .unwrap();
-    let val_head: syn::File = syn::parse_str(
-        "fn q() { sqlx::query(\"INSERT INTO t VALUES (1)\").execute(p); }",
-    )
-    .unwrap();
+    let val_base: syn::File =
+        syn::parse_str("fn q() { sqlx::query(\"INSERT INTO t VALUES (0)\").execute(p); }").unwrap();
+    let val_head: syn::File =
+        syn::parse_str("fn q() { sqlx::query(\"INSERT INTO t VALUES (1)\").execute(p); }").unwrap();
     let vb = &extract_sqlx_sigs(&val_base)[0];
     let vh = &extract_sqlx_sigs(&val_head)[0];
     assert!(
