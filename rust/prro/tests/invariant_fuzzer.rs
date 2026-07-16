@@ -2898,6 +2898,36 @@ fn harness_recovered_go_online_full_snapshot_verified() {
     );
 }
 
+/// ORACLE-BUG regression (fuzzer find 2026-07-16) — an X-report AFTER a shift
+/// swap must snapshot the FRESH shift's cash-on-hand (0), not the closed
+/// shift's carry.  The offline-seeded fixture drives four ops in order:
+/// (1) `OnlineSell([Ack,Ack])` issues one 15_000-kop receipt into shift A;
+/// (2) `SellWithClosedShift` closes shift A (the SELL leg refuses);
+/// (3) `OfflineShiftOpen` opens a FRESH shift B (carry = 0);
+/// (4) `XReport` reads shift B's cash-on-hand.
+///
+/// The REAL impl is CORRECT: `cash_on_hand_for_fn` is per-OPEN-shift, and the
+/// 15_000 SELL is bound to the now-CLOSED shift A, so shift B reads 0.  The
+/// MODEL was WRONG: `apply_offline_shift_open` never reset `cash_on_hand`
+/// (its ONLINE twin `apply_online_shift_open` does — model.rs:727), so the
+/// model still reported 15_000 → `x-report turnover ... real cash_on_hand 0
+/// != model 15000`.  This test drives the EXACT 4-op sequence through the same
+/// `drive(&ops, true)` + x-report turnover oracle `harness_offline_seeded`
+/// uses; it MUST be GREEN once `apply_offline_shift_open` hard-zeroes the
+/// accumulator at its successful-mint tail.
+#[test]
+fn regression_offline_shiftopen_resets_cash_on_hand() {
+    drive(
+        &[
+            Op::OnlineSell(DpsScript::ack_path()),
+            Op::SellWithClosedShift,
+            Op::OfflineShiftOpen,
+            Op::XReport,
+        ],
+        true,
+    );
+}
+
 /// AUD-K8-1 TEETH CANARY (deterministic; see `tests/invariant_fuzzer/TEETH_TEST.md`).
 ///
 /// Constructs the exact AUD-K8-1 scenario the fuzzer hunts: an offline backlog
