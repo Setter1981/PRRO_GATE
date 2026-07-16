@@ -14,19 +14,26 @@ test RED). The ask: does this close the NO-GO → **CS-1 GO**?
 | oracle | #303 | `32166cc` | (bonus) the moat caught + we fixed an oracle bug found mid-remediation |
 | R1 | #304 | `60bc305` | RP-CS1-2 (provenance audit + forward inventory gate) + CI matrix |
 
-All test/gate/docs/CI only — **no hot zone touched** (write_path / reconciliation / transports / adapters /
-repositories / migrations untouched); storage/serde bytes byte-identical. **CS-1R2 A4 narrowing:** the
-_runtime SQL_ is NOT byte-identical — 3 test-side runtime `query_scalar` column-aliases were cleaned
-(`col as "alias: Type"` → `col`), catalogued in `RUNTIME_SQL_DELTAS`; the fiscal result + persisted
-representation are unchanged (the aliases only named a read's output column). **Same cleanup in production
-`src`:** the CS-1 refactor also removed runtime-query column-aliases in ~6 `db/repositories/*` read sites
-(e.g. `shifts.rs` `read_shift_state`; `query_as` state/fiscal_number reads) — identical fiscal-neutral pattern
-(`query_scalar(r#"…state as "state: ShiftState"…"#)` → `query_scalar::<_, DbShiftState>(r#"…state…"#)`). These
-are **out of the test-provenance tool's scope** (it audits the 79 test files) and are **disclosed here, not
-byte-identity-claimed**: consistent with the R4 re-scoped term ("fiscal-runtime and persisted-representation
-compatible; deliberate source-API refactor"), the runtime SQL statement text changed but the fiscal result +
-persisted representation are identical. NOT a hidden delta — the `query!`-MACRO sites (`as "col: DbShiftId"`)
-are separately SQL-byte-identical (the macro strips `: Type` at compile time; the alias name is unchanged).
+All test/gate/docs/CI only — **no hot-zone LOGIC touched** (write_path / reconciliation / transports /
+adapters state machines unchanged; no migration / DDL). **Decode VALUE + persisted bytes are
+byte-identical** (SQLite TEXT/BLOB affinity, enum literals, UUID-BLOB-16, `#[serde(rename)]` output —
+pinned by RP-CS1-5). **CS-1R3 A4 correction — the SQL statement TEXT is NOT byte-identical, and it changed
+in PRODUCTION `src`, not only tests.** The prior dossier claim (SQL "byte-identical"; the `query!` macro
+"strips `: Type` at compile time") was **FALSE** and is retracted: sqlx sends the query string —
+including `as "col: Type"` — **VERBATIM** to SQLite for BOTH the compile-time `query!` MACRO and the
+runtime `query_scalar` API (confirmed via `cargo`-level macro source `sqlx-macros-core 0.8.6`
+`src/query/{input.rs,output.rs}` + the `.sqlx` describe cache, whose recorded column NAME is the whole
+`offline_session_id: DbOfflineSessionId` alias — see `docs/cs1r/PRODUCTION_SQL_DELTAS.md`). CS-1 changed
+the executed statement text in **24 production read sites across 6 `db/repositories/*` files** (18
+alias-type renames `X`→`DbX`, e.g. `state as "state: DocState"`→`… DbDocState`; 6 runtime alias removals,
+e.g. `SELECT state as "state: ShiftState"`→`SELECT state` + turbofish) — a deliberate, **fiscal-neutral**
+source refactor (the alias only names a read's output column; the fetched value + stored bytes are
+unchanged, pinned by RP-CS1-5). These production `src` sites are **out of the test-provenance tool's
+scope** (it audits the 79 test files) and are catalogued verbatim in
+`docs/cs1r/PRODUCTION_SQL_DELTAS.md`. The 3 analogous **test-side** runtime deltas are catalogued in
+`docs/cs1r/pins/runtime_sql_deltas.tsv` (code-owner-gated); any un-catalogued SQL edit in the 79 test
+files is RED. **Honest term:** "fiscal-runtime and persisted-representation compatible; deliberate
+source-API refactor — NOT byte-identical SQL."
 
 ---
 

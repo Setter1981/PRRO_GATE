@@ -66,14 +66,18 @@ python3 "$SCRIPTS/source_inventory.py" --check "$INV_DIR/source_files.sha256" \
   || fail "source inventory drift (control 3)"
 ok "source inventory: no drift, every source test file recorded"
 
-# ── CS-1R2 A1: CI path-detector coverage (member dirs + gate inputs ⊆ detector) ─
-# Runs on the required x86 leg (this gate is invoked by rust-prro.yml's `build`
-# job). RED when a workspace member or gate-input path is NOT covered by the
-# `detect rust changes` grep pattern — closing the #305 skip-the-required-check
-# bypass at the source rather than trusting review.
+# ── CS-1R3 A1: CI rust-change-detector consistency (3 legs) ──────────────────
+# Runs on the required x86 leg (invoked by rust-prro.yml's `build` job). RED when
+# ANY of: (1) a workspace member / gate-input path is NOT covered by the canonical
+# prefix list (scripts/cs1r/rust_change_paths.py CANONICAL_PREFIXES); (2)
+# on.push.paths does not cover a canonical prefix (structural YAML parse); (3) the
+# `changes` job does not invoke `rust_change_paths.py detect` OR still has a
+# bypassable inline `grep -qE '^( … )'` detector. Closes the #305 skip-the-required
+# bypass AND the round-3 comment-injection + push.paths-unsync findings at the
+# source rather than trusting review.
 CARGO="$CARGO" python3 "$SCRIPTS/manifest_detector_paths.py" \
-  || fail "CI path-detector coverage (A1) — a gated path is not matched by the detector"
-ok "CI path-detector: covers every workspace member + gate input"
+  || fail "CI rust-change-detector consistency (A1) — coverage / push-paths / ci-wiring drift"
+ok "CI rust-change detector: coverage + push-paths + ci-wiring consistent"
 
 # ── control (2): additions-only vs base (PR mode) ────────────────────────────
 if [ "${1:-}" = "--pr" ]; then

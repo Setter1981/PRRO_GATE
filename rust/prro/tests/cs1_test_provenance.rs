@@ -30,20 +30,21 @@ mod prov;
 use std::collections::BTreeSet;
 
 use prov::{
-    extract_sqlx_sigs, git_hash_object, git_show, manual_residual_fingerprint, manual_ruling_files,
-    normalize_source, repo_root, BASE_SHA, HEAD_SHA,
+    extract_sqlx_sigs, git_hash_object, git_show, manual_residual_fingerprint,
+    manual_residual_fingerprint_pin, manual_ruling_files, normalize_source, post_cs1_carveout,
+    repo_root, BASE_SHA, HEAD_SHA,
 };
 
-/// CS-1R2 A2a — the pinned EXACT residual fingerprint of the sole manual-ruling
-/// file (`live_dps_extended_smoke.rs`). Its post-canonicalization residual is the
-/// documented T7 use-site `.0` (base→head). We pin the fingerprint of the
-/// (base-normalized, head-normalized) token pair so that ANY *other* residual —
-/// an assertion RHS flip, a control-flow edit, an added statement — perturbs the
-/// head token stream and turns the gate RED, instead of the old blanket
-/// "any residual OK for a manual file" waiver. Re-mint (via the ignored helper
-/// `print_manual_residual_fingerprint` below) ONLY when the documented T7
-/// residual itself legitimately changes, with an artifact update.
-const MANUAL_RESIDUAL_FINGERPRINT: &str = "4b6a3825f97d65880aaa8fd93fbd7d17";
+// CS-1R3 A2 — the pinned EXACT residual fingerprint of the sole manual-ruling file
+// (`live_dps_extended_smoke.rs`) is LOADED from the code-owner-gated pin file
+// `docs/cs1r/pins/manual_residual_fingerprint.txt` via `manual_residual_fingerprint_pin()`,
+// NOT a constant next to this oracle (A2: a pin next to its checker is self-
+// rewritable). Its post-canonicalization residual is the documented T7 use-site `.0`
+// (base→head); ANY *other* residual (an assertion RHS flip, a control-flow edit, an
+// added statement) perturbs the head token stream → a different fingerprint → RED.
+// Re-mint (via the ignored helper `print_manual_residual_fingerprint` below) ONLY
+// when the documented T7 residual itself legitimately changes — a CODEOWNER-gated
+// data diff, distinct from this logic.
 
 /// The 79 CS-1 modified test files (repo-relative). Frozen list: the provenance
 /// set is exactly the files `git diff --name-status f2c17b1 f2628ba` reports as
@@ -132,22 +133,16 @@ const CS1_MODIFIED_FILES: &[&str] = &[
     "rust/prro/tests/z_quiescence.rs",
 ];
 
-/// CS-1R2 A2b — files whose WORKING-TREE content legitimately differs from
-/// `f2628ba` due to a specific, APPROVED post-CS-1 change (the fuzzer oracle fix
-/// in `32166cc`). Each carries the EXACT approved blob SHA. The old gate blanket-
-/// excluded such a file from the live-drift leg (compared base↔`f2628ba` and
-/// ignored the worktree entirely), so ANY further edit to `model.rs` was
-/// invisible to this teeth leg. Now the live-drift leg first asserts the worktree
-/// blob == the approved SHA (any FURTHER drift → RED) and only then compares
-/// base↔approved-blob for the AST/sqlx check. A future legitimate change to this
-/// file must re-pin the SHA here with an artifact note.
-///
-/// `(repo-relative path, approved git blob SHA)`. The approved blob is
-/// `git rev-parse 32166cc:<path>` (the oracle-fix commit).
-const POST_CS1_CARVEOUT: &[(&str, &str)] = &[(
-    "rust/prro/tests/invariant_fuzzer/model.rs",
-    "c19654a4f1115cd500cef6bf67372a48ef7d197f",
-)];
+// CS-1R3 A2 (was A2b) — files whose WORKING-TREE content legitimately differs from
+// `f2628ba` due to a specific, APPROVED post-CS-1 change (the fuzzer oracle fix in
+// `32166cc`) are LOADED from the code-owner-gated pin file
+// `docs/cs1r/pins/post_cs1_carveout.tsv` via `post_cs1_carveout()` — NOT a constant
+// next to this oracle (A2: a pin next to its checker is self-rewritable). Each
+// carries the EXACT approved blob SHA. The live-drift leg asserts the worktree blob
+// == the approved SHA (any FURTHER drift → RED) and runs the AST/sqlx compare on the
+// frozen CS-1 endpoint (base↔`f2628ba`). A future legitimate change re-pins the SHA
+// in that DATA file with an artifact note — a CODEOWNER-gated diff distinct from
+// this logic.
 
 #[test]
 fn cs1_provenance_set_is_exactly_79() {
@@ -168,6 +163,7 @@ fn cs1_provenance_set_is_exactly_79() {
 fn cs1_immutable_provenance_base_vs_head() {
     let root = repo_root();
     let manual = manual_ruling_files();
+    let manual_fp = manual_residual_fingerprint_pin();
     let mut ast_ok = 0usize;
     let mut ast_manual = 0usize;
     let mut failures: Vec<String> = Vec::new();
@@ -180,6 +176,7 @@ fn cs1_immutable_provenance_base_vs_head() {
             &base_src,
             &head_src,
             &manual,
+            &manual_fp,
             &mut ast_ok,
             &mut ast_manual,
             &mut failures,
@@ -202,8 +199,14 @@ fn cs1_immutable_provenance_base_vs_head() {
 fn cs1_live_drift_base_vs_worktree() {
     let root = repo_root();
     let manual = manual_ruling_files();
-    let approved: std::collections::BTreeMap<&str, &str> =
-        POST_CS1_CARVEOUT.iter().copied().collect();
+    // CS-1R3 A2 — carve-outs + fingerprint loaded from the code-owner-gated pin
+    // DATA files (docs/cs1r/pins/), not constants next to this oracle.
+    let carveout = post_cs1_carveout();
+    let approved: std::collections::BTreeMap<&str, &str> = carveout
+        .iter()
+        .map(|(p, sha)| (p.as_str(), sha.as_str()))
+        .collect();
+    let manual_fp = manual_residual_fingerprint_pin();
     let mut ast_ok = 0usize;
     let mut ast_manual = 0usize;
     let mut failures: Vec<String> = Vec::new();
@@ -225,7 +228,8 @@ fn cs1_live_drift_base_vs_worktree() {
                 failures.push(format!(
                     "{path}: worktree drifted from the APPROVED post-CS-1 blob \
                      (oracle fix 32166cc). Any change to this carved-out file must \
-                     re-pin POST_CS1_CARVEOUT with an artifact note.\n  \
+                     re-pin the carve-out SHA in docs/cs1r/pins/post_cs1_carveout.tsv with \
+                     an artifact note.\n  \
                      approved sha={approved_sha}\n  worktree sha={live_sha}"
                 ));
             }
@@ -241,6 +245,7 @@ fn cs1_live_drift_base_vs_worktree() {
             &base_src,
             &head_src,
             &manual,
+            &manual_fp,
             &mut ast_ok,
             &mut ast_manual,
             &mut failures,
@@ -339,11 +344,13 @@ fn a2c_decode_type_is_pinned_in_sig() {
     );
 }
 
-/// CS-1R2 A4 — PERMANENT TEETH: prove the sqlx signature now compares the RAW
-/// runtime SQL (the bytes SQLite executes) and accepts a change ONLY when it is in
-/// the `RUNTIME_SQL_DELTAS` catalog. The old tool stripped the `as "col: Type"`
-/// alias from BOTH endpoints, so an alias removal (a real runtime-SQL byte change)
-/// was HIDDEN. This exercises the tool directly on syn snippets.
+/// CS-1R3 A4 — PERMANENT TEETH: prove the sqlx signature now compares the RAW
+/// runtime SQL (the bytes SQLite executes, alias included — sqlx sends it verbatim,
+/// the `query!` macro does NOT strip `: Type`) and accepts a change ONLY when it is
+/// in the catalogued deltas (`docs/cs1r/pins/runtime_sql_deltas.tsv`). The old tool
+/// stripped the `as "col: Type"` alias from BOTH endpoints, so an alias removal (a
+/// real runtime-SQL byte change) was HIDDEN. This exercises the tool on syn
+/// snippets.
 #[test]
 fn a4_runtime_sql_alias_removal_is_catalogued_not_hidden() {
     let with_alias: syn::File = syn::parse_str(
@@ -399,6 +406,9 @@ fn check_one(
     base_src: &str,
     head_src: &str,
     manual: &BTreeSet<String>,
+    // CS-1R3 A2 — the manual-residual fingerprint pin, loaded ONCE by the caller
+    // from the code-owner-gated `docs/cs1r/pins/manual_residual_fingerprint.txt`.
+    manual_fp: &str,
     ast_ok: &mut usize,
     ast_manual: &mut usize,
     failures: &mut Vec<String>,
@@ -469,7 +479,7 @@ fn check_one(
         // gate accepted ANY residual here, which let a real change ride in on a
         // manual-ruling file. The sqlx signature check above also still applies.
         let fp = manual_residual_fingerprint(&base_norm, &head_norm);
-        if fp == MANUAL_RESIDUAL_FINGERPRINT {
+        if fp == manual_fp {
             *ast_manual += 1;
         } else {
             let diag = first_token_divergence(&base_norm, &head_norm);
@@ -477,7 +487,7 @@ fn check_one(
                 "{path}: manual-ruling file residual does NOT match the pinned T7 \
                  fingerprint — the ONLY tolerated residual is the documented use-site \
                  `.0` (see docs/cs1r/CS1_TEST_PROVENANCE.md). This looks like a real \
-                 change smuggled onto a manual-ruling file.\n  expected fp={MANUAL_RESIDUAL_FINGERPRINT}\n  actual   fp={fp}\n{diag}"
+                 change smuggled onto a manual-ruling file.\n  expected fp={manual_fp}\n  actual   fp={fp}\n{diag}"
             ));
         }
     } else {

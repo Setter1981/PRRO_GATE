@@ -1,0 +1,44 @@
+# CODEOWNERS — CS-1R3 A2: independent review for the gate / pin / manifest surface.
+#
+# WHY. The CS-1 provenance/purity gates prove behaviour-neutrality by comparing
+# against PINNED constants (fingerprints, approved blob SHAs, catalogued SQL/graph
+# deltas). A pin that sits NEXT TO the oracle that checks it is inherently
+# self-rewritable: a single PR can change an assertion AND its pin in one diff and
+# stay GREEN. CS-1R3 A2 splits the pins out into committed DATA files under
+# docs/cs1r/pins/ (a visible data diff) AND requires an INDEPENDENT code-owner
+# review for both the gate LOGIC and the pin DATA — so a pin change is a reviewed,
+# owner-gated event, not a silent self-edit.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# OPERATOR ACTION REQUIRED (cannot be set from code — flagged for the operator):
+#   1. Enable branch protection on `main`:  Settings → Branches → main →
+#      "Require a pull request before merging" → "Require review from Code Owners".
+#      Without this flag, CODEOWNERS is advisory only and the self-rewrite path
+#      stays open.
+#   2. Set an INDEPENDENT owner. GitHub does NOT count the PR author as a satisfying
+#      code-owner reviewer, so `@Setter1981` below already forces a second party
+#      for any PR that party did not author. For genuine two-person integrity on
+#      solo-authored PRs, add a second maintainer or a review team here (e.g.
+#      `@your-org/cs1r-gate-reviewers`) and require it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CS-1 test-provenance gate — oracle logic + engine.
+/rust/prro/tests/cs1_test_provenance.rs        @Setter1981
+/rust/prro/tests/support/cs1_provenance.rs      @Setter1981
+
+# prro-domain purity gate — oracle logic + engine + the committed closure lock.
+/rust/prro-domain/tests/purity_gate.rs          @Setter1981
+/rust/prro-domain/tests/support/metadata_graph.rs @Setter1981
+/rust/prro-domain/purity-closure.lock           @Setter1981
+
+# CS-1R pin DATA (the split-out, data-diff pins the gates load).
+/docs/cs1r/pins/**                              @Setter1981
+
+# CS-1R committed inventory manifests (the forward additions-only gate's baseline).
+/docs/cs1r/inventory/**                         @Setter1981
+
+# CS-1R gate scripts (the CI rust-change detector + inventory gate + this surface).
+/scripts/cs1r/**                                @Setter1981
+
+# This ownership file itself (a change to who reviews the gates is itself gated).
+/.github/CODEOWNERS                             @Setter1981

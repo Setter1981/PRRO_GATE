@@ -30,14 +30,17 @@
 //! - **T3** `.bind(enum) -> .bind(enum.as_str())` (enum bind — the `as_str`
 //!   projection is the value-identity of a TEXT enum: `X::from_sql_str(x.as_str()) == x`)
 //! - **T8** SQL `as "col: Type"` alias removal on a runtime `query_scalar`.
-//!   CS-1R2 A4 CORRECTION: for the RUNTIME `sqlx::query*` API (NOT the
-//!   compile-time `query!` macro) the whole string — including `col as
-//!   "alias: Type"` — is sent VERBATIM to SQLite, so removing the alias DOES
-//!   change the executed SQL bytes. The AST canonicalizer still strips it for
+//!   CS-1R3 A4 CORRECTION: sqlx sends the SQL string — including `col as
+//!   "alias: Type"` — VERBATIM to SQLite for BOTH the runtime `sqlx::query*` API
+//!   AND the compile-time `query!` MACRO; NEITHER strips `: Type` (proven via
+//!   `sqlx-macros-core` `src/query/{input,output}.rs` + the `.sqlx` describe cache
+//!   — see `docs/cs1r/PRODUCTION_SQL_DELTAS.md`). So removing the alias DOES change
+//!   the executed SQL bytes. The AST canonicalizer still strips it for
 //!   token-legibility, but the sqlx signature now compares the RAW runtime SQL
-//!   (`sql_raw`) and accepts a change ONLY if it is in the `RUNTIME_SQL_DELTAS`
-//!   catalog (3 sites in 2 files); any other SQL edit is RED. So this is a
-//!   CATALOGUED, legible delta — NOT a silent "byte-identical" hide.
+//!   (`sql_raw`) and accepts a change ONLY if it is in the catalogued deltas loaded
+//!   from `docs/cs1r/pins/runtime_sql_deltas.tsv` (2 rows / 3 test call sites); any
+//!   other SQL edit is RED. So this is a CATALOGUED, legible delta — NOT a silent
+//!   "byte-identical" hide.
 //! - **T6** `use prro::db::types::{...}` import additions (add-only import lines;
 //!   dropped before compare)
 //! - **T7** use-site `.0` on a tuple-decoded id (`live_dps_extended_smoke.rs`
@@ -502,16 +505,18 @@ pub struct SqlxSig {
     /// `as "col: Type"` decode annotations stripped (T8) — used for the AST-side
     /// legibility only.
     pub sql: String,
-    /// CS-1R2 A4 — the RAW runtime SQL literal bytes, EXACTLY as passed to
-    /// `sqlx::query*` (NO alias stripping). For a runtime `sqlx::query_scalar`
-    /// (NOT the compile-time `query!` macro), the whole string — including a
-    /// `col as "alias: Type"` — is sent VERBATIM to SQLite, so removing that
-    /// alias CHANGES the executed SQL bytes. The old tool stripped the alias from
-    /// both endpoints (`strip_sqlx_decode_annotations`) and compared the stripped
-    /// forms, HIDING the change and letting the artifact claim "byte-identical
-    /// SQL" — which is FALSE for the runtime API. `equiv_across_cs1` now compares
-    /// `sql_raw` and only accepts a change that is in the explicit
-    /// `RUNTIME_SQL_DELTAS` catalog; any other SQL edit is RED.
+    /// CS-1R3 A4 — the RAW runtime SQL literal bytes, EXACTLY as passed to
+    /// `sqlx::query*` (NO alias stripping). sqlx sends the whole string — including
+    /// `col as "alias: Type"` — VERBATIM to SQLite for BOTH the runtime
+    /// `query_scalar`/`query_as` API AND the compile-time `query!` macro; NEITHER
+    /// strips `: Type` (proven via `sqlx-macros-core` + the `.sqlx` describe cache,
+    /// `docs/cs1r/PRODUCTION_SQL_DELTAS.md`). So removing that alias CHANGES the
+    /// executed SQL bytes. The old tool stripped the alias from both endpoints
+    /// (`strip_sqlx_decode_annotations`) and compared the stripped forms, HIDING
+    /// the change and letting the artifact claim "byte-identical SQL" — which is
+    /// FALSE. `equiv_across_cs1` now compares `sql_raw` and only accepts a change
+    /// in the catalogued deltas (`docs/cs1r/pins/runtime_sql_deltas.tsv`); any
+    /// other SQL edit is RED.
     pub sql_raw: String,
     /// Kind: `query`, `query_scalar`, `query_as`, `query_scalar_with`, …
     pub query_kind: String,
@@ -530,34 +535,91 @@ pub struct SqlxSig {
     pub fetch_mode: FetchMode,
 }
 
-/// CS-1R2 A4 — the CATALOGUED runtime-SQL deltas. Each is an APPROVED
-/// `(base_raw_sql, head_raw_sql)` pair: CS-1 removed the runtime `col as
-/// "alias: Type"` decode annotation from these three runtime `query_scalar`
-/// literals (the fiscal RESULT and persisted representation are unchanged; only
-/// the executed statement's column-alias bytes changed). These — and ONLY these —
-/// runtime-SQL edits are accepted; any other SQL change is RED. This REPLACES the
-/// old silent hiding: the change is now listed, pinned, and legible, and the
-/// dossier claim is narrowed to "fiscal result + persisted representation
-/// identical; N runtime-query column-aliases cleaned (catalogued)".
-pub const RUNTIME_SQL_DELTAS: &[(&str, &str)] = &[
-    // shift_transition_service.rs :: read_shift_state
-    (
-        "SELECT state as \"state: ShiftState\" FROM shifts WHERE shift_id = ?",
-        "SELECT state FROM shifts WHERE shift_id = ?",
-    ),
-    // shift_transition_service.rs :: read_node_shift_state
-    // shift_create_primitive.rs :: read_node_shift_state (identical literal)
-    (
-        "SELECT shift_state as \"s: ShiftState\" FROM node_state WHERE fiscal_number = ?",
-        "SELECT shift_state FROM node_state WHERE fiscal_number = ?",
-    ),
-];
+/// CS-1R3 A2 — pin DATA files (loaded, not inlined next to the oracle).
+///
+/// The pin CONSTANTS (catalogued runtime-SQL deltas, the manual-residual
+/// fingerprint, the carve-out blob SHAs) live in committed DATA files under
+/// `docs/cs1r/pins/`, code-owner-gated by `.github/CODEOWNERS`. A pin change is a
+/// visible data diff distinct from the gate LOGIC — closing the A2 finding that a
+/// pin sitting next to its checker is self-rewritable (one PR edits an assertion +
+/// its pin → GREEN). The loaders below read those files at test time (the tests
+/// already read committed blobs / worktree files, so file I/O is in-scope).
+pub const RUNTIME_SQL_DELTAS_FILE: &str = "docs/cs1r/pins/runtime_sql_deltas.tsv";
+pub const MANUAL_RESIDUAL_FINGERPRINT_FILE: &str = "docs/cs1r/pins/manual_residual_fingerprint.txt";
+pub const POST_CS1_CARVEOUT_FILE: &str = "docs/cs1r/pins/post_cs1_carveout.tsv";
 
-/// True if `(base, head)` is an APPROVED catalogued runtime-SQL delta (A4).
+/// Read a pin data file's meaningful lines (drop `#` comments + blank lines).
+fn read_pin_lines(file_rel: &str) -> Vec<String> {
+    let path = repo_root().join(file_rel);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read pin file {}: {e}", path.display()));
+    text.lines()
+        .map(str::trim_end)
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// CS-1R3 A2 (was A4) — the CATALOGUED runtime-SQL deltas, LOADED from the
+/// code-owner-gated pin file `docs/cs1r/pins/runtime_sql_deltas.tsv`. Each is an
+/// APPROVED `(base_raw_sql, head_raw_sql)` pair: CS-1 removed the runtime `col as
+/// "alias: Type"` decode annotation from these runtime `query_scalar` literals (the
+/// fiscal RESULT and persisted representation are unchanged; only the executed
+/// statement's column-alias bytes changed). These — and ONLY these — runtime-SQL
+/// edits are accepted; any other SQL change is RED.
+pub fn runtime_sql_deltas() -> Vec<(String, String)> {
+    read_pin_lines(RUNTIME_SQL_DELTAS_FILE)
+        .into_iter()
+        .map(|line| {
+            let mut it = line.splitn(2, '\t');
+            let base = it.next().unwrap_or("").to_string();
+            let head = it
+                .next()
+                .unwrap_or_else(|| panic!("malformed runtime_sql_deltas row (no TAB): {line:?}"))
+                .to_string();
+            (base, head)
+        })
+        .collect()
+}
+
+/// CS-1R3 A2 — the pinned manual-ruling residual fingerprint, LOADED from
+/// `docs/cs1r/pins/manual_residual_fingerprint.txt` (single 32-hex line).
+pub fn manual_residual_fingerprint_pin() -> String {
+    let lines = read_pin_lines(MANUAL_RESIDUAL_FINGERPRINT_FILE);
+    assert_eq!(
+        lines.len(),
+        1,
+        "manual_residual_fingerprint.txt must have exactly one value line, got {}",
+        lines.len()
+    );
+    lines[0].trim().to_string()
+}
+
+/// CS-1R3 A2 — the POST-CS1 carve-outs `(repo-relative path, approved blob SHA)`,
+/// LOADED from `docs/cs1r/pins/post_cs1_carveout.tsv` (path<TAB>sha<TAB>note).
+pub fn post_cs1_carveout() -> Vec<(String, String)> {
+    read_pin_lines(POST_CS1_CARVEOUT_FILE)
+        .into_iter()
+        .map(|line| {
+            let mut it = line.split('\t');
+            let path = it.next().unwrap_or("").to_string();
+            let sha = it
+                .next()
+                .unwrap_or_else(|| panic!("malformed post_cs1_carveout row (no TAB): {line:?}"))
+                .to_string();
+            (path, sha)
+        })
+        .collect()
+}
+
+/// True if `(base, head)` is an APPROVED catalogued runtime-SQL delta (A4/A2).
 fn is_catalogued_sql_delta(base_raw: &str, head_raw: &str) -> bool {
-    RUNTIME_SQL_DELTAS
+    runtime_sql_deltas()
         .iter()
-        .any(|(b, h)| *b == base_raw && *h == head_raw)
+        .any(|(b, h)| b == base_raw && h == head_raw)
 }
 
 impl SqlxSig {
@@ -568,8 +630,9 @@ impl SqlxSig {
     ///    (the whitelisted W3 inferred→explicit `Db*` transform); two DIFFERENT
     ///    explicit types diverge;
     ///  * the RAW runtime SQL (A4) must be byte-identical OR an APPROVED
-    ///    catalogued delta (`RUNTIME_SQL_DELTAS`) — any OTHER SQL edit is RED.
-    ///    This is what un-hides the runtime column-alias changes.
+    ///    catalogued delta (loaded from `docs/cs1r/pins/runtime_sql_deltas.tsv` via
+    ///    `runtime_sql_deltas()`) — any OTHER SQL edit is RED. This is what un-hides
+    ///    the runtime column-alias changes.
     pub fn equiv_across_cs1(&self, other: &SqlxSig) -> bool {
         let sql_ok =
             self.sql_raw == other.sql_raw || is_catalogued_sql_delta(&self.sql_raw, &other.sql_raw);

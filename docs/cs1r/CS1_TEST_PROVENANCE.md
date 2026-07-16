@@ -33,6 +33,14 @@ NOT part of the provenance-equivalence set (there is no base endpoint to compare
 against). The 79 modified files ARE the provenance set (pinned as
 `CS1_MODIFIED_FILES`).
 
+**Scope boundary.** This tool audits ONLY the `rust/prro/tests/*.rs` provenance set.
+The CS-1 refactor ALSO changed the executed SQL statement text in **24 production
+`src/db/repositories/*` read sites** (18 alias-type renames `X`→`DbX`, 6 runtime
+alias removals) — these are **out of this tool's scope** and are separately verified
++ catalogued in **`docs/cs1r/PRODUCTION_SQL_DELTAS.md`** (which also carries the
+`sqlx`-macro-verbatim proof that the `query!` macro does NOT strip `: Type`). Both
+scopes are stated so the reader has the FULL delta surface, not just the test half.
+
 ## What the tool proves (per file, both legs)
 
 1. **sqlx-signature equality.** For every sqlx query chain it extracts
@@ -69,7 +77,7 @@ of them; the equivalence argument for each is below.
 | **W3** | `query_*::<_, DbX>` decode type / `let (DbX, …)` | ✅ `DbX→X` in decode | the decode type is a compile-time hint; `DbX::decode` forwards to `X::decode` (RP-R3 pins the byte-for-byte decode). The tool DROPS the explicit turbofish for the AST compare (base used inference) and pins the runtime SQL + binds + fetch separately. |
 | **W4** | `.map(\|w\| w.0)` / trailing `.0` / `.into_iter().map(\|w\| w.0).collect()` | ✅ `.map(\|w\| w.0)` | pure unwrap of the decode wrapper's inner value; no value change. Both scalar (`.0`) and Vec (`.into_iter()…collect()`) forms are the same idiom. |
 | **T3** | `.bind(enum)` → `.bind(enum.as_str())` | ➕ MANUAL RULING | **Equivalence:** for a TEXT enum, `X::from_sql_str(x.as_str()) == x` for all variants (pinned by RP-CS1-5 representation conformance). The bound TEXT bytes are exactly what `DbX::encode` would have emitted. Stripped only when it is the direct argument of a `.bind(..)`. |
-| **T8** | SQL ` as "col: Type"` alias removed on a RUNTIME `query_scalar` | ➕ CATALOGUED RUNTIME-SQL DELTA (A4) | **CS-1R2 A4 correction — the prior "compile-time hint / never sent to SQLite" claim was FALSE for the runtime `sqlx::query*` API** (only the `query!` MACRO strips `as "…: T"` at compile time). For the runtime API the whole string is sent VERBATIM, so removing the alias **changes the executed SQL bytes**. This is a real, catalogued delta, NOT a hide: the fiscal RESULT and persisted representation are identical (the alias only named the output column of a read), but the statement bytes changed. Pinned in `RUNTIME_SQL_DELTAS` (3 sites in 2 files: `shift_transition_service.rs::read_shift_state`, `shift_transition_service.rs::read_node_shift_state`, `shift_create_primitive.rs::read_node_shift_state`). The signature compares the RAW SQL and accepts ONLY these 3 deltas; any other SQL edit (incl. a change to a REAL non-`:` alias) is RED. |
+| **T8** | SQL ` as "col: Type"` alias removed on a RUNTIME `query_scalar` | ➕ CATALOGUED RUNTIME-SQL DELTA (A4) | **CS-1R3 A4 correction — sqlx sends the SQL string VERBATIM to SQLite for BOTH the runtime `sqlx::query*` API AND the compile-time `query!` MACRO; NEITHER strips `as "col: T"`.** (Proven via `sqlx-macros-core 0.8.6` `src/query/input.rs`+`output.rs` — `let sql=&input.sql; quote!{#sql}`, no strip — and the `.sqlx` describe cache, whose recorded column NAME is the whole `col: DbType` alias; see `docs/cs1r/PRODUCTION_SQL_DELTAS.md` §1.) So removing / renaming the alias **changes the executed SQL bytes**. This is a real, catalogued delta, NOT a hide: the fiscal RESULT + persisted representation are identical (the alias only names a read's output column), but the statement bytes changed. The test-side deltas are pinned in the code-owner-gated `docs/cs1r/pins/runtime_sql_deltas.tsv` (2 rows covering 3 test call sites); the signature compares the RAW SQL and accepts ONLY those; any other SQL edit (incl. a change to a REAL non-`:` alias) is RED. The analogous **production** `src` deltas (24 sites, 6 files) are catalogued in `docs/cs1r/PRODUCTION_SQL_DELTAS.md`. |
 | **T6** | `use prro::db::types::{…}` import added | ➕ MANUAL RULING | **Equivalence:** add-only import lines (both standalone and nested inside a grouped `use prro::db::{…}`). Dropped from BOTH endpoints before the AST compare; they bring only the `Db*` wrappers into scope. |
 | **T7** | use-site `.0` on a tuple-decoded id (+ removed `*` deref) | ➕ MANUAL RULING | **Equivalence:** in `live_dps_extended_smoke.rs` only, a `query_as` tuple decode flips to a `Db*` element, so the downstream consumer reads `id.0` instead of `id`. This is a value-preserving projection of the same fetched id. This file is the **single manual-ruling file** whose AST compare is allowed a residual (`manual_ruling_files()`); its sqlx signature is still fully pinned. **This is a `#![cfg(feature = "live-dps")]` harness that never runs in CI** — the delta is confined to diagnostic print/read helper call sites, not a fiscal assertion. |
 | **T9** | rustfmt reflow (long line broken; trailing comma) | (formatting) | absorbed by the token compare after clearing trailing commas; not a semantic transform, so not a "ruling". |
@@ -84,17 +92,22 @@ of them; the equivalence argument for each is below.
 
 **No hunk in any of the 79 files changes a fixture value, an assertion, or
 control flow; and the fiscal result + persisted representation are identical.**
-**CS-1R2 A4 narrowing:** the runtime SQL is NOT byte-identical — 3 runtime
-`query_scalar` column-aliases were cleaned (`col as "alias: Type"` → `col`),
-catalogued verbatim in `RUNTIME_SQL_DELTAS` (2 files). Those aliases only named
-the output column of a read, so the fetched value and the stored bytes are
-unchanged; only the executed statement's alias bytes changed. This is proven by
-the tool: (a) the ordered sqlx bind-vector is identical in all 79 files (no bind
-added/dropped/reordered); (b) after canonicalization all 78 pure-whitelist files
-reduce to byte-identical token streams; (c) the RAW runtime SQL is byte-identical
-in every file EXCEPT the 3 catalogued deltas — any un-catalogued SQL edit is RED;
-(d) the one manual-ruling file's only residual is the documented T7 use-site `.0`,
-pinned by fingerprint, and its sqlx signature is unchanged.
+**The SQL statement text is NOT byte-identical** (sqlx sends `as "col: Type"`
+VERBATIM to SQLite — the `query!` macro does NOT strip it; see the T8 row + §1 of
+`docs/cs1r/PRODUCTION_SQL_DELTAS.md`): 3 test-side runtime `query_scalar`
+column-aliases were cleaned (`col as "alias: Type"` → `col`), catalogued verbatim
+in the code-owner-gated `docs/cs1r/pins/runtime_sql_deltas.tsv` (2 rows, 3 call
+sites). Those aliases only named the output column of a read, so the fetched value
+and the stored bytes are unchanged; only the executed statement's alias bytes
+changed. This is proven by the tool: (a) the ordered sqlx bind-vector is identical
+in all 79 files (no bind added/dropped/reordered); (b) after canonicalization all
+78 pure-whitelist files reduce to byte-identical AST token streams; (c) the RAW
+runtime SQL is byte-identical in every file EXCEPT the 3 catalogued deltas — any
+un-catalogued SQL edit is RED; (d) the one manual-ruling file's only residual is
+the documented T7 use-site `.0`, pinned by fingerprint, and its sqlx signature is
+unchanged. **(The analogous PRODUCTION `src` SQL-text deltas — 24 sites, 6 files —
+are out of this tool's scope and catalogued in
+`docs/cs1r/PRODUCTION_SQL_DELTAS.md`.)**
 
 ## RED-pin RP-R1-2 (teeth — empirically verified)
 

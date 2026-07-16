@@ -11,26 +11,18 @@ name: rust-prro
 on:
   push:
     branches: [rust-gateway]
+    # CS-1R3 A1: these MUST stay in sync with the canonical rust-change prefix
+    # list (`scripts/cs1r/rust_change_paths.py` CANONICAL_PREFIXES). The
+    # consistency gate `manifest_detector_paths.py` STRUCTURALLY parses this block
+    # (PyYAML, not text-search) and RED's if any canonical prefix is not covered
+    # here — closing the round-3 finding that push.paths was unsynced with the
+    # PR-detector (it missed prro_crypto_v2 / prro_sidecar / maria304_driver /
+    # prro_escpos_daemon / xtask and the cs1r inventory). One broad `rust/**`
+    # glob covers all 13 (and any future) workspace members — no per-crate gap.
     paths:
-      # `prro` plus its workspace path-dependencies (rust/prro/Cargo.toml
-      # references ../prro_crypto and ../prro_escpos), so a change there
-      # also breaks `cargo build -p prro` and must trigger this workflow.
-      - 'rust/prro/**'
-      - 'rust/prro_crypto/**'
-      - 'rust/prro_escpos/**'
-      # CS-1 skeleton crates (contract §8 / RP-CS1-6): a change confined to the
-      # new `prro-domain` / `prro-testkit` must NOT get a skipped build — they
-      # are workspace members `cargo build --workspace` compiles and the purity
-      # gate lives in `prro-domain`.
-      - 'rust/prro-domain/**'
-      - 'rust/prro-testkit/**'
-      # CS-1d (contract §8 item 5 / RP-CS1-6): the three empty boundary-contract
-      # crates get the same treatment — a change confined to one must be
-      # built/linted, never SKIPPED.
-      - 'rust/prro-ingress-contract/**'
-      - 'rust/prro-dps-contract/**'
-      - 'rust/prro-fleet-contract/**'
-      - 'rust/Cargo.*'
+      - 'rust/**'
+      - 'scripts/cs1r/**'
+      - 'docs/cs1r/inventory/**'
       - '.github/workflows/rust-prro.yml'
   # pull_request is deliberately UNFILTERED: the required
   # `x86_64-unknown-linux-gnu` context must be authoritative on EVERY PR.
@@ -84,20 +76,22 @@ jobs:
           git fetch --no-tags --depth=1 origin "$base"
           files=$(git diff --name-only "$base" HEAD)
           echo "changed files:"; echo "$files"
-          # CS-1R2 A1: the detector MUST cover EVERY input the `build` job
-          # gates, else a PR touching only an uncovered path SKIPS the required
-          # x86_64 context (= satisfied) — the exact #305 bypass (only
-          # prro_crypto_v2 / prro_sidecar / maria304 / escpos_daemon + the
-          # cs1r inventory changed, x86_64 skipped, merged green-but-unsound).
-          # Cover ALL of `rust/**` (all 13 workspace members build+test here),
-          # the cs1r inventory gate's scripts + committed manifests, and this
-          # workflow. `scripts/cs1r/manifest_detector_paths.py` asserts this
-          # pattern ⊇ every member dir + every gate-input path (RED on drift).
-          if echo "$files" | grep -qE '^(rust/|scripts/cs1r/|docs/cs1r/inventory/|\.github/workflows/rust-prro\.yml$)'; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
+          # CS-1R3 A1: the detector MUST cover EVERY input the `build` job gates,
+          # else a PR touching only an uncovered path SKIPS the required x86_64
+          # context (= satisfied) — the #305 bypass (only prro_crypto_v2 /
+          # prro_sidecar / maria304 / escpos_daemon + the cs1r inventory changed,
+          # x86_64 skipped, merged green-but-unsound).
+          #
+          # The decision is made by `scripts/cs1r/rust_change_paths.py detect`,
+          # which OWNS the canonical prefix list as executable Python data. We do
+          # NOT inline a `grep -qE '^( … )'` here: the CS-1R2 consistency gate
+          # text-searched the YAML for that regex and could be fooled by a WIDE
+          # reference regex in a COMMENT above a narrowed real line (round-3 A1).
+          # Calling the module removes the injectable comment surface entirely,
+          # and `scripts/cs1r/manifest_detector_paths.py` asserts (structurally,
+          # no YAML text-parse) that the canonical list ⊇ every member dir + gate
+          # input AND that on.push.paths ⊇ the canonical list (RED on drift).
+          printf '%s\n' "$files" | python3 scripts/cs1r/rust_change_paths.py detect >> "$GITHUB_OUTPUT"
 
   build:
     # MUST stay exactly `x86_64-unknown-linux-gnu`: this is the REQUIRED
