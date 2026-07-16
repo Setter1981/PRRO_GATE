@@ -18,7 +18,15 @@ All test/gate/docs/CI only — **no hot zone touched** (write_path / reconciliat
 repositories / migrations untouched); storage/serde bytes byte-identical. **CS-1R2 A4 narrowing:** the
 _runtime SQL_ is NOT byte-identical — 3 test-side runtime `query_scalar` column-aliases were cleaned
 (`col as "alias: Type"` → `col`), catalogued in `RUNTIME_SQL_DELTAS`; the fiscal result + persisted
-representation are unchanged (the aliases only named a read's output column).
+representation are unchanged (the aliases only named a read's output column). **Same cleanup in production
+`src`:** the CS-1 refactor also removed runtime-query column-aliases in ~6 `db/repositories/*` read sites
+(e.g. `shifts.rs` `read_shift_state`; `query_as` state/fiscal_number reads) — identical fiscal-neutral pattern
+(`query_scalar(r#"…state as "state: ShiftState"…"#)` → `query_scalar::<_, DbShiftState>(r#"…state…"#)`). These
+are **out of the test-provenance tool's scope** (it audits the 79 test files) and are **disclosed here, not
+byte-identity-claimed**: consistent with the R4 re-scoped term ("fiscal-runtime and persisted-representation
+compatible; deliberate source-API refactor"), the runtime SQL statement text changed but the fiscal result +
+persisted representation are identical. NOT a hidden delta — the `query!`-MACRO sites (`as "col: DbShiftId"`)
+are separately SQL-byte-identical (the macro strips `: Type` at compile time; the alias name is unchanged).
 
 ---
 
