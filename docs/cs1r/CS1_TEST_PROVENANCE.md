@@ -1,0 +1,118 @@
+# CS-1 test-provenance audit — machine artifact
+
+**Spec:** `docs/superpowers/specs/2026-07-15-cs1r-remediation-spec.md` §4 **R1.1**.
+**Tool (machine mechanism):** `rust/prro/tests/cs1_test_provenance.rs` +
+`rust/prro/tests/support/cs1_provenance.rs` (syn-based). This markdown is the
+committed **artifact** the tool's classification is recorded in; the tool is the
+**oracle** (it re-derives every claim below on each CI run — this file is the
+human-readable record, not the source of truth).
+
+## Pinned endpoints (immutable)
+
+| role | short | full SHA | date |
+|---|---|---|---|
+| base (pre-CS-1) | `f2c17b1` | `f2c17b1e9cd125d5018cd671dd596fc5c1e2e7bb` | 2026-07-14 21:16:38 +0300 |
+| head (CS-1 done) | `f2628ba` | `f2628ba76f0a4de648638d3ab14ea8ba3cdd9436` | 2026-07-15 07:02:50 +0300 |
+
+The **immutable provenance leg** (`cs1_immutable_provenance_base_vs_head`)
+compares the two git blobs. The **live-drift / teeth leg**
+(`cs1_live_drift_base_vs_worktree`) compares the base blob against the
+**working-tree** file, so a mutation in *this* PR to any CS-1 test file is caught
+RED (RP-R1-2). One file — `invariant_fuzzer/model.rs` — carries an approved
+post-CS-1 delta (the `32166cc` fuzzer oracle fix) and is compared against its
+`f2628ba` blob in the live leg (a documented carve-out;
+`POST_CS1_CARVEOUT` in the test).
+
+## Scope
+
+**79 modified** + **5 added** `rust/prro/tests/*.rs` under `f2c17b1..f2628ba`.
+The **5 added** files (`rp_cs1_3_command_facade.rs`, `rp_cs1_3_enum_facade.rs`,
+`rp_cs1_3_id_facade.rs`, `rp_cs1_5_db_enum_roundtrip.rs`,
+`rp_cs1_5_db_id_roundtrip.rs`) are **wholly new** characterization tests and are
+NOT part of the provenance-equivalence set (there is no base endpoint to compare
+against). The 79 modified files ARE the provenance set (pinned as
+`CS1_MODIFIED_FILES`).
+
+## What the tool proves (per file, both legs)
+
+1. **sqlx-signature equality.** For every sqlx query chain it extracts
+   `{enclosing_fn, occurrence, runtime_sql_literal_bytes, ordered_normalized_bind_vector, fetch_mode}`
+   and asserts the base list == head list. The **bind ORDER** is load-bearing:
+   a bind swap/drop, a SQL-literal edit, or a fetch-mode change is RED here even
+   if the AST compare missed it. SQL is compared after stripping the sqlx
+   ` as "alias: Type"` compile-time decode annotation (T8), so the RUNTIME SQL is
+   compared. Bind args are normalized (Db-wrap / `.map(Db)` / `.as_str()`
+   stripped) so a WRAPPER change is not a false-positive but a VALUE change is
+   caught. (~1047 query heads across the 79 files.)
+2. **AST token-equality outside the whitelist.** Both endpoints are parsed via
+   `syn`, canonicalized by a `VisitMut` pass that undoes ONLY the whitelisted
+   transforms, and compared as token streams. Any residual token divergence that
+   is neither a whitelisted transform nor covered by a manual ruling → the file
+   is FLAGGED and the check FAILS.
+
+## Transform whitelist (the ONLY normalizations the tool applies)
+
+The spec names four literal transforms; the real refactor also uses three
+mechanically-equivalent ones. Per the spec, transforms **outside** the four
+literal names are recorded here as **explicit manual rulings with an equivalence
+argument** — they are NOT silent waivers. The tool's canonicalizer implements all
+of them; the equivalence argument for each is below.
+
+| id | transform (base → head) | in spec's literal 4? | ruling / equivalence argument |
+|---|---|---|---|
+| **W1** | `.bind(x)` → `.bind(DbX(x))` | ✅ `DbX(expr)→expr` | `DbX` is a `#[repr(transparent)]`-style newtype whose `Encode` forwards to the inner value's encoder; the bound bytes are identical. Guarded by the 15-name `DB_WRAPPERS` allowlist. |
+| **W2** | `.bind(x)` → `.bind(x.map(DbX))` | ✅ `x.map(DbX)→x` | `Option::map(DbX)` wraps `Some` only; `None`→`NULL` unchanged; `Some(v)` encodes as `v` (W1). |
+| **W3** | `query_*::<_, DbX>` decode type / `let (DbX, …)` | ✅ `DbX→X` in decode | the decode type is a compile-time hint; `DbX::decode` forwards to `X::decode` (RP-R3 pins the byte-for-byte decode). The tool DROPS the explicit turbofish for the AST compare (base used inference) and pins the runtime SQL + binds + fetch separately. |
+| **W4** | `.map(\|w\| w.0)` / trailing `.0` / `.into_iter().map(\|w\| w.0).collect()` | ✅ `.map(\|w\| w.0)` | pure unwrap of the decode wrapper's inner value; no value change. Both scalar (`.0`) and Vec (`.into_iter()…collect()`) forms are the same idiom. |
+| **T3** | `.bind(enum)` → `.bind(enum.as_str())` | ➕ MANUAL RULING | **Equivalence:** for a TEXT enum, `X::from_sql_str(x.as_str()) == x` for all variants (pinned by RP-CS1-5 representation conformance). The bound TEXT bytes are exactly what `DbX::encode` would have emitted. Stripped only when it is the direct argument of a `.bind(..)`. |
+| **T8** | SQL ` as "col: Type"` decode-annotation removed | ➕ MANUAL RULING | **Equivalence:** sqlx's ` as "col: Type"` is a COMPILE-TIME decode hint the `query!`-family never sends to SQLite — the RUNTIME SQL is `col` either way. With the `DbX` wrapper carrying `Decode`, the hint is redundant. Affects **2 files** (`shift_create_primitive.rs`, `shift_transition_service.rs`). The signature extractor strips it from BOTH endpoints, so the compared runtime SQL is annotation-free; a change to a REAL alias (no `:`) is still caught. |
+| **T6** | `use prro::db::types::{…}` import added | ➕ MANUAL RULING | **Equivalence:** add-only import lines (both standalone and nested inside a grouped `use prro::db::{…}`). Dropped from BOTH endpoints before the AST compare; they bring only the `Db*` wrappers into scope. |
+| **T7** | use-site `.0` on a tuple-decoded id (+ removed `*` deref) | ➕ MANUAL RULING | **Equivalence:** in `live_dps_extended_smoke.rs` only, a `query_as` tuple decode flips to a `Db*` element, so the downstream consumer reads `id.0` instead of `id`. This is a value-preserving projection of the same fetched id. This file is the **single manual-ruling file** whose AST compare is allowed a residual (`manual_ruling_files()`); its sqlx signature is still fully pinned. **This is a `#![cfg(feature = "live-dps")]` harness that never runs in CI** — the delta is confined to diagnostic print/read helper call sites, not a fiscal assertion. |
+| **T9** | rustfmt reflow (long line broken; trailing comma) | (formatting) | absorbed by the token compare after clearing trailing commas; not a semantic transform, so not a "ruling". |
+
+## Classification result
+
+| class | count | files |
+|---|---|---|
+| **pure whitelist** (AST reduces to token-equal via W1-W4 + T3/T6/T8/T9) | **78** | all modified files except the one below |
+| **manual ruling** (documented residual: T7) | **1** | `rust/prro/tests/live_dps_extended_smoke.rs` |
+| **genuine drift / non-mechanical change** | **0** | — |
+
+**No hunk in any of the 79 files changes a SQL literal (beyond the T8 annotation
+strip), a fixture value, an assertion, or control flow.** This is proven three
+ways by the tool: (a) the ordered sqlx bind-vector is identical in all 79 files
+(no bind added/dropped/reordered); (b) after canonicalization all 78 pure-whitelist
+files reduce to byte-identical token streams; (c) the one manual-ruling file's
+only residual is the documented T7 use-site `.0`, and its sqlx signature is
+unchanged.
+
+## RED-pin RP-R1-2 (teeth — empirically verified)
+
+Each mutation applied to a working-tree file makes `cs1_live_drift_base_vs_worktree`
+RED (each reverted after). The spec names five teeth; **three were run empirically
+this session** (2026-07-16, `shift_create_primitive.rs`) — the two marked *(argued)*
+are covered by the same two mechanisms one of the run teeth already tripped (SQL
+bytes / AST token), so re-running them adds no new signal:
+
+| tooth | mutation run | RED how | evidence |
+|---|---|---|---|
+| swap two same-type `.bind` | `.bind(FN)` ↔ `.bind(state.as_str())` in the `INSERT INTO shifts` chain | sqlx bind-vector ORDER (`["id","FN","state"]` → `["id","state","FN"]`) + AST token | **run → RED** |
+| change a SQL literal | `VALUES (…, 'ONLINE', …)` → `'OFLINE'` | sqlx SQL bytes + AST token | **run → RED** |
+| change an assertion RHS | `assert_eq!(row.state, ShiftState::Created)` → `::Opened` | AST token | **run → RED** |
+| change a fixture value | e.g. `0` → `1` in an `INSERT … VALUES` literal | sqlx SQL bytes + AST token | *(argued — same path as the SQL-literal tooth)* |
+| change a control-flow condition | e.g. `if …is_some()` → `if …is_none()` | AST token | *(argued — same path as the assertion-RHS tooth)* |
+
+The two run mechanisms (sqlx-signature SQL/bind-vector, and outside-whitelist AST
+token-equality) are exactly the two surfaces the other two teeth would hit: a
+fixture-value edit is a SQL-literal edit (SQL-bytes path, run) and a control-flow
+edit is a non-whitelisted AST node (token path, run).
+
+## How to run
+
+```
+cd rust
+cargo test -p prro --features test-support --test cs1_test_provenance --locked
+```
+
+Green = the CS-1 refactor is provenance-equivalent at the AST + sqlx level and no
+CS-1 test file has drifted in this PR beyond the whitelist.
