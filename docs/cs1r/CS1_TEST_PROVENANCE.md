@@ -39,11 +39,15 @@ against). The 79 modified files ARE the provenance set (pinned as
    `{enclosing_fn, occurrence, runtime_sql_literal_bytes, ordered_normalized_bind_vector, fetch_mode}`
    and asserts the base list == head list. The **bind ORDER** is load-bearing:
    a bind swap/drop, a SQL-literal edit, or a fetch-mode change is RED here even
-   if the AST compare missed it. SQL is compared after stripping the sqlx
-   ` as "alias: Type"` compile-time decode annotation (T8), so the RUNTIME SQL is
-   compared. Bind args are normalized (Db-wrap / `.map(Db)` / `.as_str()`
-   stripped) so a WRAPPER change is not a false-positive but a VALUE change is
-   caught. (~1047 query heads across the 79 files.)
+   if the AST compare missed it. **CS-1R2 A4:** the signature compares the **RAW**
+   runtime SQL (`sql_raw` — the exact bytes SQLite executes). Removing a
+   `col as "alias: Type"` alias from a RUNTIME `sqlx::query*` call DOES change the
+   executed SQL bytes (this is NOT the compile-time `query!` macro), so those
+   changes are NOT hidden — they are pinned in the `RUNTIME_SQL_DELTAS` catalog
+   (3 sites in 2 files); any OTHER SQL edit is RED. Bind args are normalized
+   (Db-wrap / `.map(Db)` / `.as_str()` stripped) so a WRAPPER change is not a
+   false-positive but a VALUE change is caught. (~1047 query heads across the 79
+   files.)
 2. **AST token-equality outside the whitelist.** Both endpoints are parsed via
    `syn`, canonicalized by a `VisitMut` pass that undoes ONLY the whitelisted
    transforms, and compared as token streams. Any residual token divergence that
@@ -65,7 +69,7 @@ of them; the equivalence argument for each is below.
 | **W3** | `query_*::<_, DbX>` decode type / `let (DbX, …)` | ✅ `DbX→X` in decode | the decode type is a compile-time hint; `DbX::decode` forwards to `X::decode` (RP-R3 pins the byte-for-byte decode). The tool DROPS the explicit turbofish for the AST compare (base used inference) and pins the runtime SQL + binds + fetch separately. |
 | **W4** | `.map(\|w\| w.0)` / trailing `.0` / `.into_iter().map(\|w\| w.0).collect()` | ✅ `.map(\|w\| w.0)` | pure unwrap of the decode wrapper's inner value; no value change. Both scalar (`.0`) and Vec (`.into_iter()…collect()`) forms are the same idiom. |
 | **T3** | `.bind(enum)` → `.bind(enum.as_str())` | ➕ MANUAL RULING | **Equivalence:** for a TEXT enum, `X::from_sql_str(x.as_str()) == x` for all variants (pinned by RP-CS1-5 representation conformance). The bound TEXT bytes are exactly what `DbX::encode` would have emitted. Stripped only when it is the direct argument of a `.bind(..)`. |
-| **T8** | SQL ` as "col: Type"` decode-annotation removed | ➕ MANUAL RULING | **Equivalence:** sqlx's ` as "col: Type"` is a COMPILE-TIME decode hint the `query!`-family never sends to SQLite — the RUNTIME SQL is `col` either way. With the `DbX` wrapper carrying `Decode`, the hint is redundant. Affects **2 files** (`shift_create_primitive.rs`, `shift_transition_service.rs`). The signature extractor strips it from BOTH endpoints, so the compared runtime SQL is annotation-free; a change to a REAL alias (no `:`) is still caught. |
+| **T8** | SQL ` as "col: Type"` alias removed on a RUNTIME `query_scalar` | ➕ CATALOGUED RUNTIME-SQL DELTA (A4) | **CS-1R2 A4 correction — the prior "compile-time hint / never sent to SQLite" claim was FALSE for the runtime `sqlx::query*` API** (only the `query!` MACRO strips `as "…: T"` at compile time). For the runtime API the whole string is sent VERBATIM, so removing the alias **changes the executed SQL bytes**. This is a real, catalogued delta, NOT a hide: the fiscal RESULT and persisted representation are identical (the alias only named the output column of a read), but the statement bytes changed. Pinned in `RUNTIME_SQL_DELTAS` (3 sites in 2 files: `shift_transition_service.rs::read_shift_state`, `shift_transition_service.rs::read_node_shift_state`, `shift_create_primitive.rs::read_node_shift_state`). The signature compares the RAW SQL and accepts ONLY these 3 deltas; any other SQL edit (incl. a change to a REAL non-`:` alias) is RED. |
 | **T6** | `use prro::db::types::{…}` import added | ➕ MANUAL RULING | **Equivalence:** add-only import lines (both standalone and nested inside a grouped `use prro::db::{…}`). Dropped from BOTH endpoints before the AST compare; they bring only the `Db*` wrappers into scope. |
 | **T7** | use-site `.0` on a tuple-decoded id (+ removed `*` deref) | ➕ MANUAL RULING | **Equivalence:** in `live_dps_extended_smoke.rs` only, a `query_as` tuple decode flips to a `Db*` element, so the downstream consumer reads `id.0` instead of `id`. This is a value-preserving projection of the same fetched id. This file is the **single manual-ruling file** whose AST compare is allowed a residual (`manual_ruling_files()`); its sqlx signature is still fully pinned. **This is a `#![cfg(feature = "live-dps")]` harness that never runs in CI** — the delta is confined to diagnostic print/read helper call sites, not a fiscal assertion. |
 | **T9** | rustfmt reflow (long line broken; trailing comma) | (formatting) | absorbed by the token compare after clearing trailing commas; not a semantic transform, so not a "ruling". |
@@ -78,13 +82,19 @@ of them; the equivalence argument for each is below.
 | **manual ruling** (documented residual: T7) | **1** | `rust/prro/tests/live_dps_extended_smoke.rs` |
 | **genuine drift / non-mechanical change** | **0** | — |
 
-**No hunk in any of the 79 files changes a SQL literal (beyond the T8 annotation
-strip), a fixture value, an assertion, or control flow.** This is proven three
-ways by the tool: (a) the ordered sqlx bind-vector is identical in all 79 files
-(no bind added/dropped/reordered); (b) after canonicalization all 78 pure-whitelist
-files reduce to byte-identical token streams; (c) the one manual-ruling file's
-only residual is the documented T7 use-site `.0`, and its sqlx signature is
-unchanged.
+**No hunk in any of the 79 files changes a fixture value, an assertion, or
+control flow; and the fiscal result + persisted representation are identical.**
+**CS-1R2 A4 narrowing:** the runtime SQL is NOT byte-identical — 3 runtime
+`query_scalar` column-aliases were cleaned (`col as "alias: Type"` → `col`),
+catalogued verbatim in `RUNTIME_SQL_DELTAS` (2 files). Those aliases only named
+the output column of a read, so the fetched value and the stored bytes are
+unchanged; only the executed statement's alias bytes changed. This is proven by
+the tool: (a) the ordered sqlx bind-vector is identical in all 79 files (no bind
+added/dropped/reordered); (b) after canonicalization all 78 pure-whitelist files
+reduce to byte-identical token streams; (c) the RAW runtime SQL is byte-identical
+in every file EXCEPT the 3 catalogued deltas — any un-catalogued SQL edit is RED;
+(d) the one manual-ruling file's only residual is the documented T7 use-site `.0`,
+pinned by fingerprint, and its sqlx signature is unchanged.
 
 ## RED-pin RP-R1-2 (teeth — empirically verified)
 

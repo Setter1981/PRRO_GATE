@@ -339,6 +339,60 @@ fn a2c_decode_type_is_pinned_in_sig() {
     );
 }
 
+/// CS-1R2 A4 — PERMANENT TEETH: prove the sqlx signature now compares the RAW
+/// runtime SQL (the bytes SQLite executes) and accepts a change ONLY when it is in
+/// the `RUNTIME_SQL_DELTAS` catalog. The old tool stripped the `as "col: Type"`
+/// alias from BOTH endpoints, so an alias removal (a real runtime-SQL byte change)
+/// was HIDDEN. This exercises the tool directly on syn snippets.
+#[test]
+fn a4_runtime_sql_alias_removal_is_catalogued_not_hidden() {
+    let with_alias: syn::File = syn::parse_str(
+        "fn q() { sqlx::query_scalar(\
+         r#\"SELECT state as \"state: ShiftState\" FROM shifts WHERE shift_id = ?\"#)\
+         .bind(id).fetch_one(p); }",
+    )
+    .unwrap();
+    let no_alias: syn::File = syn::parse_str(
+        "fn q() { sqlx::query_scalar::<_, DbShiftState>(\
+         \"SELECT state FROM shifts WHERE shift_id = ?\")\
+         .bind(id).fetch_one(p); }",
+    )
+    .unwrap();
+    // an UNCATALOGUED alias removal (different table) — must diverge.
+    let uncatalogued_base: syn::File = syn::parse_str(
+        "fn q() { sqlx::query_scalar(\
+         r#\"SELECT x as \"x: DocState\" FROM other WHERE id = ?\"#)\
+         .bind(id).fetch_one(p); }",
+    )
+    .unwrap();
+    let uncatalogued_head: syn::File = syn::parse_str(
+        "fn q() { sqlx::query_scalar::<_, DbDocState>(\
+         \"SELECT x FROM other WHERE id = ?\")\
+         .bind(id).fetch_one(p); }",
+    )
+    .unwrap();
+
+    let b = &extract_sqlx_sigs(&with_alias)[0];
+    let h = &extract_sqlx_sigs(&no_alias)[0];
+    // the RAW SQL genuinely differs (the alias IS part of the executed statement)
+    assert_ne!(
+        b.sql_raw, h.sql_raw,
+        "the raw runtime SQL must differ — the alias is executed bytes, not hidden"
+    );
+    // but this specific delta is CATALOGUED → equiv.
+    assert!(
+        b.equiv_across_cs1(h),
+        "the catalogued read_shift_state alias-removal must be accepted"
+    );
+
+    let ub = &extract_sqlx_sigs(&uncatalogued_base)[0];
+    let uh = &extract_sqlx_sigs(&uncatalogued_head)[0];
+    assert!(
+        !ub.equiv_across_cs1(uh),
+        "an UNCATALOGUED runtime-SQL change must be RED (not silently hidden)"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_one(
     path: &str,
@@ -381,8 +435,8 @@ fn check_one(
         for (i, (b, h)) in base_sigs.iter().zip(head_sigs.iter()).enumerate() {
             if !b.equiv_across_cs1(h) {
                 diag.push_str(&format!(
-                    "\n  chain #{i} in fn `{}`:\n    base sql={:?} decode={:?} binds={:?} fetch={:?}\n    head sql={:?} decode={:?} binds={:?} fetch={:?}",
-                    b.enclosing_fn, b.sql, b.decode_type, b.binds, b.fetch_mode, h.sql, h.decode_type, h.binds, h.fetch_mode
+                    "\n  chain #{i} in fn `{}`:\n    base sql_raw={:?} decode={:?} binds={:?} fetch={:?}\n    head sql_raw={:?} decode={:?} binds={:?} fetch={:?}\n  (a runtime-SQL edit must be in RUNTIME_SQL_DELTAS to be accepted — A4)",
+                    b.enclosing_fn, b.sql_raw, b.decode_type, b.binds, b.fetch_mode, h.sql_raw, h.decode_type, h.binds, h.fetch_mode
                 ));
                 break;
             }

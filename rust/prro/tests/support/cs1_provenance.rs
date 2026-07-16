@@ -29,10 +29,15 @@
 //! NOT silent waivers:
 //! - **T3** `.bind(enum) -> .bind(enum.as_str())` (enum bind — the `as_str`
 //!   projection is the value-identity of a TEXT enum: `X::from_sql_str(x.as_str()) == x`)
-//! - **T8** SQL `as "col: Type"` inline decode-annotation strip (the annotation
-//!   is a compile-time sqlx decode hint, not runtime SQL sent to SQLite; the
-//!   signature extractor strips it from BOTH endpoints so the runtime SQL bytes
-//!   compared are annotation-free)
+//! - **T8** SQL `as "col: Type"` alias removal on a runtime `query_scalar`.
+//!   CS-1R2 A4 CORRECTION: for the RUNTIME `sqlx::query*` API (NOT the
+//!   compile-time `query!` macro) the whole string — including `col as
+//!   "alias: Type"` — is sent VERBATIM to SQLite, so removing the alias DOES
+//!   change the executed SQL bytes. The AST canonicalizer still strips it for
+//!   token-legibility, but the sqlx signature now compares the RAW runtime SQL
+//!   (`sql_raw`) and accepts a change ONLY if it is in the `RUNTIME_SQL_DELTAS`
+//!   catalog (3 sites in 2 files); any other SQL edit is RED. So this is a
+//!   CATALOGUED, legible delta — NOT a silent "byte-identical" hide.
 //! - **T6** `use prro::db::types::{...}` import additions (add-only import lines;
 //!   dropped before compare)
 //! - **T7** use-site `.0` on a tuple-decoded id (`live_dps_extended_smoke.rs`
@@ -494,9 +499,20 @@ pub struct SqlxSig {
     pub enclosing_fn: String,
     pub occurrence: usize,
     /// Runtime SQL literal bytes (concatenated string-literal args), with
-    /// `as "col: Type"` decode annotations stripped (T8) so the runtime SQL is
-    /// compared, not the compile-time hint.
+    /// `as "col: Type"` decode annotations stripped (T8) — used for the AST-side
+    /// legibility only.
     pub sql: String,
+    /// CS-1R2 A4 — the RAW runtime SQL literal bytes, EXACTLY as passed to
+    /// `sqlx::query*` (NO alias stripping). For a runtime `sqlx::query_scalar`
+    /// (NOT the compile-time `query!` macro), the whole string — including a
+    /// `col as "alias: Type"` — is sent VERBATIM to SQLite, so removing that
+    /// alias CHANGES the executed SQL bytes. The old tool stripped the alias from
+    /// both endpoints (`strip_sqlx_decode_annotations`) and compared the stripped
+    /// forms, HIDING the change and letting the artifact claim "byte-identical
+    /// SQL" — which is FALSE for the runtime API. `equiv_across_cs1` now compares
+    /// `sql_raw` and only accepts a change that is in the explicit
+    /// `RUNTIME_SQL_DELTAS` catalog; any other SQL edit is RED.
+    pub sql_raw: String,
     /// Kind: `query`, `query_scalar`, `query_as`, `query_scalar_with`, …
     pub query_kind: String,
     /// CS-1R2 A2c — the decode type pinned from the query-head turbofish, with
@@ -514,20 +530,52 @@ pub struct SqlxSig {
     pub fetch_mode: FetchMode,
 }
 
+/// CS-1R2 A4 — the CATALOGUED runtime-SQL deltas. Each is an APPROVED
+/// `(base_raw_sql, head_raw_sql)` pair: CS-1 removed the runtime `col as
+/// "alias: Type"` decode annotation from these three runtime `query_scalar`
+/// literals (the fiscal RESULT and persisted representation are unchanged; only
+/// the executed statement's column-alias bytes changed). These — and ONLY these —
+/// runtime-SQL edits are accepted; any other SQL change is RED. This REPLACES the
+/// old silent hiding: the change is now listed, pinned, and legible, and the
+/// dossier claim is narrowed to "fiscal result + persisted representation
+/// identical; N runtime-query column-aliases cleaned (catalogued)".
+pub const RUNTIME_SQL_DELTAS: &[(&str, &str)] = &[
+    // shift_transition_service.rs :: read_shift_state
+    (
+        "SELECT state as \"state: ShiftState\" FROM shifts WHERE shift_id = ?",
+        "SELECT state FROM shifts WHERE shift_id = ?",
+    ),
+    // shift_transition_service.rs :: read_node_shift_state
+    // shift_create_primitive.rs :: read_node_shift_state (identical literal)
+    (
+        "SELECT shift_state as \"s: ShiftState\" FROM node_state WHERE fiscal_number = ?",
+        "SELECT shift_state FROM node_state WHERE fiscal_number = ?",
+    ),
+];
+
+/// True if `(base, head)` is an APPROVED catalogued runtime-SQL delta (A4).
+fn is_catalogued_sql_delta(base_raw: &str, head_raw: &str) -> bool {
+    RUNTIME_SQL_DELTAS
+        .iter()
+        .any(|(b, h)| *b == base_raw && *h == head_raw)
+}
+
 impl SqlxSig {
-    /// CS-1R2 A2c — compare two signatures across the CS-1 base→head transition.
-    /// Identical to `PartialEq` EXCEPT the decode type is compared with
-    /// EMPTY-IS-WILDCARD semantics: an INFERRED endpoint (`""` — the CS-1 base,
-    /// which always relied on row-type inference) matches an explicit head type
-    /// (`ShiftState`). This is the whitelisted W3/T4 "inferred → explicit `Db*`
-    /// decode type" transform. But two DIFFERENT explicit types
-    /// (`ShiftState` vs `DocState`) diverge — so a decode-type SWAP between two
-    /// pinned types is caught (the head↔worktree teeth in the live-drift leg
-    /// exercises exactly this, where BOTH sides are explicit).
+    /// CS-1R2 A2c/A4 — compare two signatures across the CS-1 base→head
+    /// transition. Identical to `PartialEq` EXCEPT:
+    ///  * the decode type is compared EMPTY-IS-WILDCARD (A2c): an INFERRED
+    ///    endpoint (`""` — the CS-1 base) matches an explicit head type
+    ///    (the whitelisted W3 inferred→explicit `Db*` transform); two DIFFERENT
+    ///    explicit types diverge;
+    ///  * the RAW runtime SQL (A4) must be byte-identical OR an APPROVED
+    ///    catalogued delta (`RUNTIME_SQL_DELTAS`) — any OTHER SQL edit is RED.
+    ///    This is what un-hides the runtime column-alias changes.
     pub fn equiv_across_cs1(&self, other: &SqlxSig) -> bool {
+        let sql_ok =
+            self.sql_raw == other.sql_raw || is_catalogued_sql_delta(&self.sql_raw, &other.sql_raw);
         self.enclosing_fn == other.enclosing_fn
             && self.occurrence == other.occurrence
-            && self.sql == other.sql
+            && sql_ok
             && self.query_kind == other.query_kind
             && self.binds == other.binds
             && self.fetch_mode == other.fetch_mode
@@ -613,13 +661,15 @@ impl SqlxVisitor {
                 Expr::Call(call) => {
                     // The head: `sqlx::query_scalar::<_, T>(SQL)` or `query(SQL)`.
                     if let Some(kind) = query_head_kind(&call.func) {
-                        let sql = call
+                        let sql_raw = call
                             .args
                             .iter()
                             .filter_map(extract_str_lit)
                             .collect::<Vec<_>>()
                             .join("");
-                        let sql = strip_sqlx_decode_annotations(&sql);
+                        // A4: keep the RAW runtime SQL for the catalogued-delta
+                        // compare; the stripped form stays for AST legibility.
+                        let sql = strip_sqlx_decode_annotations(&sql_raw);
                         binds_rev.reverse();
                         let enclosing_fn = self
                             .fn_stack
@@ -637,6 +687,7 @@ impl SqlxVisitor {
                             enclosing_fn,
                             occurrence: occ,
                             sql,
+                            sql_raw,
                             query_kind: kind,
                             decode_type,
                             binds: binds_rev,

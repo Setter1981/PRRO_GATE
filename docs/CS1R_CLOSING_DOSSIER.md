@@ -15,7 +15,10 @@ test RED). The ask: does this close the NO-GO → **CS-1 GO**?
 | R1 | #304 | `60bc305` | RP-CS1-2 (provenance audit + forward inventory gate) + CI matrix |
 
 All test/gate/docs/CI only — **no hot zone touched** (write_path / reconciliation / transports / adapters /
-repositories / migrations untouched); storage/serde bytes byte-identical.
+repositories / migrations untouched); storage/serde bytes byte-identical. **CS-1R2 A4 narrowing:** the
+_runtime SQL_ is NOT byte-identical — 3 test-side runtime `query_scalar` column-aliases were cleaned
+(`col as "alias: Type"` → `col`), catalogued in `RUNTIME_SQL_DELTAS`; the fiscal result + persisted
+representation are unchanged (the aliases only named a read's output column).
 
 ---
 
