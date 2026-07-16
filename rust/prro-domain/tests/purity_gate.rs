@@ -260,6 +260,32 @@ fn accepted_capability_nodes_are_annotated() {
     }
 }
 
+/// CS-1R2 A5 — the lock's `schema` and `root` are now CHECKED, not merely parsed.
+/// Before, `schema` was written by xtask but read nowhere, and `root` was loaded
+/// into the manifest struct but never verified against the live root — so a lock
+/// minted for the WRONG root, or a shape drift, would go unnoticed.
+#[test]
+fn closure_manifest_root_and_schema_are_pinned() {
+    let meta = mg::run_cargo_metadata();
+    let graph = mg::build_graph(&meta);
+    let live_root = mg::normalize_package_id(&graph.workspace_root_id("prro-domain"));
+    let manifest = mg::load_closure_manifest(); // panics on a schema mismatch (A5)
+
+    assert_eq!(
+        manifest.schema,
+        mg::CLOSURE_MANIFEST_SCHEMA,
+        "purity-closure.lock schema must equal the pinned CLOSURE_MANIFEST_SCHEMA",
+    );
+    assert_eq!(
+        manifest.root, live_root,
+        "R2.2 (A5): purity-closure.lock `root` ({}) must equal the live normalized \
+         workspace root for `prro-domain` ({live_root}). A mismatch means the lock \
+         was minted for the wrong crate/version — regenerate with \
+         `cargo xtask update-purity-closure`.",
+        manifest.root,
+    );
+}
+
 // ===========================================================================
 // Forbidden-crate smoke (legible message layered on the exhaustive manifest).
 // ===========================================================================

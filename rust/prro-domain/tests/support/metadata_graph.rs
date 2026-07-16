@@ -479,10 +479,22 @@ impl DirectDepRecord {
 // R2.2 — pinned transitive-closure manifest (`purity-closure.lock`).
 // ---------------------------------------------------------------------------
 
+/// CS-1R2 A5 — the closure-manifest schema version. `xtask` writes `"schema": 1`;
+/// the loader now VALIDATES it (it was written-but-never-read). A future
+/// manifest-shape change must bump BOTH the writer and this constant, so an
+/// old/new mismatch is a loud RED instead of a silently-misparsed lock.
+pub const CLOSURE_MANIFEST_SCHEMA: u64 = 1;
+
 /// The committed closure manifest, deserialized from `purity-closure.lock`.
 /// Two set-equality tables (`nodes` + `edges`) plus the accepted-node
 /// annotations (`getrandom` / `libc`).
 pub struct ClosureManifest {
+    /// CS-1R2 A5 — the manifest `schema` version (validated == CLOSURE_MANIFEST_SCHEMA
+    /// on load; was parsed-nowhere before).
+    pub schema: u64,
+    /// The normalized workspace-root PackageId the lock was minted for. CS-1R2 A5:
+    /// now CHECKED against the live root by `closure_manifest_root_and_schema_are_pinned`
+    /// (it was loaded-but-never-verified before).
     pub root: PackageId,
     /// Accepted capability nodes → their justification annotation.
     /// MUST contain `getrandom` (OS entropy for UUID v7); `libc` if present.
@@ -495,6 +507,14 @@ pub struct ClosureManifest {
 /// per checkout. Normalize it to a path-independent token so the committed lock
 /// matches regardless of where the repo lives. Registry/git ids are already
 /// stable and pass through unchanged.
+///
+/// CS-1R2 A5: keying on the directory BASENAME + version risks a collision (two
+/// sibling crates `../a/foo` and `../b/foo` would both map to
+/// `path+WORKSPACE:foo#1.0` and silently merge in the set-equality diff). We keep
+/// the basename token for a legible, worktree-independent id, but the record-set
+/// normalizers (`normalize_node_records` / `normalize_edge_records`) now ASSERT
+/// the mapping is INJECTIVE over the distinct raw ids, so any such collision is a
+/// loud RED rather than a silent merge — i.e. the full id is honoured.
 pub fn normalize_package_id(id: &str) -> String {
     if let Some(rest) = id.strip_prefix("path+file://") {
         // rest = `/abs/path/to/<crate-dir>#<version>`
@@ -506,6 +526,26 @@ pub fn normalize_package_id(id: &str) -> String {
     id.to_string()
 }
 
+/// CS-1R2 A5 — panic if `normalize_package_id` maps two DISTINCT raw ids to the
+/// same normalized token (a basename+version collision). Called by the record-set
+/// normalizers so a collision is caught loudly instead of silently merging two
+/// crates in the set-equality diff.
+fn assert_normalization_injective<'a>(raw_ids: impl Iterator<Item = &'a str>) {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for raw in raw_ids {
+        let norm = normalize_package_id(raw);
+        if let Some(prev) = seen.insert(norm.clone(), raw.to_string()) {
+            if prev != raw {
+                panic!(
+                    "CS-1R2 A5 PackageId normalization COLLISION: distinct ids \n  `{prev}`\nand\n  \
+                     `{raw}`\nboth normalize to `{norm}`. The basename+version token is not \
+                     unique for this workspace — normalize on the full path instead."
+                );
+            }
+        }
+    }
+}
+
 /// Load and parse the committed `purity-closure.lock` from `prro-domain`'s
 /// manifest dir.
 pub fn load_closure_manifest() -> ClosureManifest {
@@ -514,6 +554,17 @@ pub fn load_closure_manifest() -> ClosureManifest {
         .unwrap_or_else(|e| panic!("cannot read committed closure manifest `{path}`: {e}"));
     let v: Value =
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("`{path}` is not valid JSON: {e}"));
+
+    // CS-1R2 A5 — VALIDATE the schema version (was written by xtask but never read).
+    let schema = v["schema"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("`{path}` is missing an integer `schema` field"));
+    assert_eq!(
+        schema, CLOSURE_MANIFEST_SCHEMA,
+        "purity-closure.lock schema {schema} != expected {CLOSURE_MANIFEST_SCHEMA} — the \
+         manifest shape changed; bump BOTH the xtask writer and CLOSURE_MANIFEST_SCHEMA, \
+         then `cargo xtask update-purity-closure`."
+    );
 
     let root = v["root"].as_str().expect("manifest.root").to_string();
 
@@ -573,6 +624,7 @@ pub fn load_closure_manifest() -> ClosureManifest {
     }
 
     ClosureManifest {
+        schema,
         root,
         acceptance,
         nodes,
@@ -583,6 +635,9 @@ pub fn load_closure_manifest() -> ClosureManifest {
 /// Apply [`normalize_package_id`] to a whole node-record set (for live-vs-lock
 /// comparison, so absolute worktree paths never leak into the diff).
 pub fn normalize_node_records(recs: &BTreeSet<NodeRecord>) -> BTreeSet<NodeRecord> {
+    // A5: a collision here would silently merge two nodes → the set-equality diff
+    // would be wrong. Assert injectivity first.
+    assert_normalization_injective(recs.iter().map(|r| r.package_id.as_str()));
     recs.iter()
         .map(|r| NodeRecord {
             package_id: normalize_package_id(&r.package_id),
@@ -593,6 +648,11 @@ pub fn normalize_node_records(recs: &BTreeSet<NodeRecord>) -> BTreeSet<NodeRecor
 
 /// Apply [`normalize_package_id`] to a whole edge-record set.
 pub fn normalize_edge_records(recs: &BTreeSet<EdgeRecord>) -> BTreeSet<EdgeRecord> {
+    // A5: endpoints on both sides — assert injectivity over all endpoint ids.
+    assert_normalization_injective(
+        recs.iter()
+            .flat_map(|r| [r.from_package_id.as_str(), r.to_package_id.as_str()]),
+    );
     recs.iter()
         .map(|r| EdgeRecord {
             from_package_id: normalize_package_id(&r.from_package_id),

@@ -2340,6 +2340,7 @@ test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_empty	fa
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_too_long	false
 test-support	prro-domain	prro-domain::purity_gate	accepted_capability_nodes_are_annotated	false
 test-support	prro-domain	prro-domain::purity_gate	closure_edge_manifest_is_set_equal	false
+test-support	prro-domain	prro-domain::purity_gate	closure_manifest_root_and_schema_are_pinned	false
 test-support	prro-domain	prro-domain::purity_gate	closure_node_manifest_is_set_equal	false
 test-support	prro-domain	prro-domain::purity_gate	metadata_args_are_pinned	false
 test-support	prro-domain	prro-domain::purity_gate	print_direct_dep_records	true
