@@ -899,6 +899,8 @@ pub enum DispatchPrepared {
 /// performing any I/O and returns [`DispatchPrepared::NeedsBridge`].  All other
 /// commands are dispatched immediately and the responses returned as
 /// [`DispatchPrepared::Done`].
+// Cohesive protocol dispatcher: a single command-match seam kept in one place.
+#[allow(clippy::too_many_lines)]
 pub fn dispatch_prepare(
     session: &mut Session,
     command: &Command,

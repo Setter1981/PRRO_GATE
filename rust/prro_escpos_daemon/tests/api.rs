@@ -168,7 +168,7 @@ async fn print_sends_bytes_over_tcp_to_listener() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let got = received.lock().await.clone();
     // Expected: ESC @ + "ABC" + LF + GS V 01
-    let expected: Vec<u8> = [&[0x1B, 0x40][..], b"ABC", &[b'\n'], &[0x1D, 0x56, 0x01]].concat();
+    let expected: Vec<u8> = [&[0x1B, 0x40][..], b"ABC", b"\n", &[0x1D, 0x56, 0x01]].concat();
     assert_eq!(got, expected);
 }
 
