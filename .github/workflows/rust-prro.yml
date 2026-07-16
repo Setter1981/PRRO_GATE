@@ -102,7 +102,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # fetch-depth: 0 — the CS-1R R1 provenance test (`cs1_test_provenance`)
+      # shells `git show f2c17b1:… / f2628ba:…` to compare the CS-1 base/head
+      # blobs; a shallow (depth-1) checkout lacks those commits and the test
+      # panics. Full history makes both pinned SHAs reachable.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
