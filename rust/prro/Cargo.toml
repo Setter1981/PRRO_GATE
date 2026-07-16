@@ -177,7 +177,11 @@ tower = { version = "0.5", features = ["util"] }
 # CS-1R R4 (RP-R4-1c) also parses `src/db/models/mod.rs` via `syn::parse_file`
 # (needs `full` + `parsing`) to assert no glob re-export + exact legacy
 # export set-equality; `proc-macro2` gives the `Ident`/token surface.
-syn = { version = "2", features = ["full", "extra-traits", "visit", "parsing"] }
+# CS-1R R1.1 (cs1_test_provenance) parses BOTH endpoints of the 79 CS-1 modified
+# test files and canonically NORMALIZES the allowed Db-wrapper transforms via a
+# `syn::visit_mut::VisitMut` pass (needs `visit-mut`) before asserting AST
+# token-equality outside the whitelisted nodes.
+syn = { version = "2", features = ["full", "extra-traits", "visit", "visit-mut", "parsing"] }
 quote = "1"
 proc-macro2 = "1"
 
