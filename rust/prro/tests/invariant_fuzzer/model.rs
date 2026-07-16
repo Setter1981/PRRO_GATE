@@ -821,6 +821,15 @@ impl RefModel {
         self.codes_consumed += 1;
         self.seed = Some(unsigned_hash);
         self.shift_state = ShiftState::OpenedLocalPendingDrain;
+        // W1 cash-on-hand reset (mirrors the ONLINE twin `apply_online_shift_open`
+        // — line 727).  A freshly opened shift starts with opening balance = 0.
+        // HARD ZERO is sound under the CURRENT alphabet: the only closer,
+        // `force_shift_closed` (`SellWithClosedShift`), NEVER persists closing
+        // cash, so the CLOSED-shift carry is always 0 — prod's per-open-shift
+        // `cash_on_hand_for_fn` reads 0 for the fresh shift regardless.  A FUTURE
+        // alphabet with a real offline Z-close that persists `cash_balance_kop`
+        // before a reopen must RE-AUDIT this (switch to a derived opening carry).
+        self.cash_on_hand = 0;
 
         ExpectedOutcome::Mutated(Mutation {
             lnd,
@@ -958,6 +967,19 @@ impl RefModel {
         self.codes_consumed += 1;
         self.seed = Some(unsigned_hash);
         self.shift_state = ShiftState::ClosingLocalPendingDrain;
+        // NOTE (fuzzer-refuted 2026-07-16): do NOT reset `cash_on_hand` here.
+        // An offline Z_REPORT moves the shift to `ClosingLocalPendingDrain`,
+        // which is the SAME shift (same `current_shift_id`) merely pending its
+        // drain-time close — it is NOT yet CLOSED.  Prod's per-open-shift
+        // `cash_on_hand_for_fn` (`cash_ledger.rs:398`) excludes only
+        // {CLOSED, REQUIRES_MANUAL_RECONCILIATION, ERROR, CREATED}, so it STILL
+        // reports this shift's full turnover until the drain actually closes it.
+        // The offline shift-OPEN tail zeroes because THAT mints a brand-new
+        // shift (fresh opening anchor 0); an offline Z-report does not.  A hard
+        // zero here diverges (`harness_offline_seeded` shrinks to
+        // `[Crash(Send), OfflineZReport, XReport]`: real 15000 != model 0).
+        // The eventual close/reset is owned by the drain that transitions
+        // `ClosingLocalPendingDrain → Closed`, not by the Z-report mint.
 
         ExpectedOutcome::Mutated(Mutation {
             lnd,
