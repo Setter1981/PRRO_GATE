@@ -1050,7 +1050,11 @@ test-support	prro	prro::cs1_test_provenance	a4_runtime_sql_alias_removal_is_cata
 test-support	prro	prro::cs1_test_provenance	cs1_immutable_provenance_base_vs_head	false
 test-support	prro	prro::cs1_test_provenance	cs1_live_drift_base_vs_worktree	false
 test-support	prro	prro::cs1_test_provenance	cs1_provenance_set_is_exactly_79	false
+test-support	prro	prro::cs1_test_provenance	pin_loader_reads_only_canonical_path	false
 test-support	prro	prro::cs1_test_provenance	print_manual_residual_fingerprint	true
+test-support	prro	prro::cs1r4_integrity_job_coverage	every_member_has_a_test_leg	false
+test-support	prro	prro::cs1r4_integrity_job_coverage	every_member_is_compiled	false
+test-support	prro	prro::cs1r4_integrity_job_coverage	prro_test_leg_carries_test_support_feature	false
 test-support	prro	prro::derive_tax_summaries	calc_tax_error_propagates_as_typed_result	false
 test-support	prro	prro::derive_tax_summaries	calc_tax_unsupported_txal_propagates	false
 test-support	prro	prro::derive_tax_summaries	empty_items_yields_empty_summaries	false

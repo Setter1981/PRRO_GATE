@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 use prov::{
     extract_sqlx_sigs, git_hash_object, git_show, manual_residual_fingerprint,
     manual_residual_fingerprint_pin, manual_ruling_files, normalize_source, post_cs1_carveout,
-    repo_root, BASE_SHA, HEAD_SHA,
+    repo_root, BASE_SHA, CANONICAL_PIN_DIR, HEAD_SHA, MANUAL_RESIDUAL_FINGERPRINT_FILE,
 };
 
 // CS-1R3 A2 — the pinned EXACT residual fingerprint of the sole manual-ruling file
@@ -155,6 +155,74 @@ fn cs1_provenance_set_is_exactly_79() {
     // No dup.
     let set: BTreeSet<&&str> = CS1_MODIFIED_FILES.iter().collect();
     assert_eq!(set.len(), 79, "duplicate entry in CS1_MODIFIED_FILES");
+}
+
+/// CS-1R4 (auditor finding-7) — PIN-LOADER HARDENING canary. A pin file placed
+/// ANYWHERE outside the ONE canonical path must be IGNORED: the loader resolves the
+/// pin ONLY from the compile-time canonical const (`docs/cs1r/pins/…`) joined to the
+/// repo root — no directory scan, no glob, no env override, no `..` escape. This
+/// canary drops a SPOOFED fingerprint file at a DIFFERENT path (both a sibling name
+/// in the canonical dir and a wholly different dir) and proves the loader still
+/// returns the CANONICAL value, never the spoof. If the loader ever honored an
+/// off-canon pin, this would go RED (the returned value would be the spoof's).
+#[test]
+fn pin_loader_reads_only_canonical_path() {
+    let root = repo_root();
+
+    // The canonical fingerprint value the loader MUST return.
+    let canonical = manual_residual_fingerprint_pin();
+    assert_ne!(canonical, "", "canonical fingerprint must be non-empty");
+
+    let spoof_value = "deadbeefdeadbeefdeadbeefdeadbeef"; // 32 hex, clearly not the pin
+    assert_ne!(
+        canonical, spoof_value,
+        "test invariant: spoof value must differ from the canonical pin"
+    );
+
+    // (a) spoof placed in a DIFFERENT directory (docs/cs1r/pins_spoof/).
+    let spoof_dir = root.join("docs/cs1r/pins_spoof");
+    let spoof_a = spoof_dir.join("manual_residual_fingerprint.txt");
+    // (b) spoof placed as a SIBLING file (different basename) in the canonical dir.
+    let spoof_b = root
+        .join(CANONICAL_PIN_DIR)
+        .join("manual_residual_fingerprint.SPOOF.txt");
+
+    let _guard = SpoofGuard {
+        paths: vec![spoof_a.clone(), spoof_b.clone()],
+        dirs: vec![spoof_dir.clone()],
+    };
+    std::fs::create_dir_all(&spoof_dir).expect("mk spoof dir");
+    std::fs::write(&spoof_a, format!("{spoof_value}\n")).expect("write spoof a");
+    std::fs::write(&spoof_b, format!("{spoof_value}\n")).expect("write spoof b");
+
+    // The loader still returns the CANONICAL value — the spoofs are never read.
+    let after = manual_residual_fingerprint_pin();
+    assert_eq!(
+        after, canonical,
+        "PIN-LOADER HARDENING (finding-7): a spoofed pin outside the canonical path \
+         ({}) must be ignored — the loader read a non-canonical value.",
+        MANUAL_RESIDUAL_FINGERPRINT_FILE,
+    );
+
+    // Sanity: the loader physically refuses a non-canonical arg (the choke point).
+    // We can only exercise the public loader, which is already pinned to the
+    // canonical const; the assert_eq above proves off-canon files are inert.
+}
+
+/// Best-effort cleanup of the spoof files/dirs the canary creates.
+struct SpoofGuard {
+    paths: Vec<std::path::PathBuf>,
+    dirs: Vec<std::path::PathBuf>,
+}
+impl Drop for SpoofGuard {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = std::fs::remove_file(p);
+        }
+        for d in &self.dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 }
 
 /// LEG 1 — immutable provenance: base blob vs head blob. AST-equality (outside
@@ -344,15 +412,16 @@ fn a2c_decode_type_is_pinned_in_sig() {
     );
 }
 
-/// CS-1R3 A4 — PERMANENT TEETH: prove the sqlx signature now compares the RAW
-/// runtime SQL (the bytes SQLite executes, alias included — sqlx sends it verbatim,
-/// the `query!` macro does NOT strip `: Type`) and accepts a change ONLY when it is
-/// in the catalogued deltas (`docs/cs1r/pins/runtime_sql_deltas.tsv`). The old tool
-/// stripped the `as "col: Type"` alias from BOTH endpoints, so an alias removal (a
-/// real runtime-SQL byte change) was HIDDEN. This exercises the tool on syn
-/// snippets.
+/// CS-1R4 — PERMANENT TEETH: the sqlx signature treats a `col as "col: Type"`
+/// DECODE-ANNOTATION removal as a **fiscal-neutral transform class** (like W1-W4/T3)
+/// — it normalizes to equal — while ANY OTHER SQL edit still diverges → RED. There
+/// is NO SQL-byte-identity assertion and NO catalogued diff-set (round-4 auditor:
+/// "don't add SQL machinery"). The tool asserts binds/fetch/decode-type, and the
+/// SQL surface compared is the annotation-stripped `sql`. This exercises the tool on
+/// syn snippets so the teeth is empirical and independent of compilation.
 #[test]
 fn a4_runtime_sql_alias_removal_is_catalogued_not_hidden() {
+    // (1) a pure decode-annotation removal → normalizes equal (fiscal-neutral class).
     let with_alias: syn::File = syn::parse_str(
         "fn q() { sqlx::query_scalar(\
          r#\"SELECT state as \"state: ShiftState\" FROM shifts WHERE shift_id = ?\"#)\
@@ -365,38 +434,46 @@ fn a4_runtime_sql_alias_removal_is_catalogued_not_hidden() {
          .bind(id).fetch_one(p); }",
     )
     .unwrap();
-    // an UNCATALOGUED alias removal (different table) — must diverge.
-    let uncatalogued_base: syn::File = syn::parse_str(
+    let b = &extract_sqlx_sigs(&with_alias)[0];
+    let h = &extract_sqlx_sigs(&no_alias)[0];
+    assert!(
+        b.equiv_across_cs1(h),
+        "a pure `as \"col: Type\"` decode-annotation removal must be accepted as the \
+         fiscal-neutral transform class (annotation-stripped SQL is equal)"
+    );
+
+    // (2) a REAL SQL edit (different table + WHERE) must still diverge — the
+    // annotation-strip does NOT hide a genuine statement change.
+    let real_base: syn::File = syn::parse_str(
         "fn q() { sqlx::query_scalar(\
          r#\"SELECT x as \"x: DocState\" FROM other WHERE id = ?\"#)\
          .bind(id).fetch_one(p); }",
     )
     .unwrap();
-    let uncatalogued_head: syn::File = syn::parse_str(
+    let real_head: syn::File = syn::parse_str(
         "fn q() { sqlx::query_scalar::<_, DbDocState>(\
-         \"SELECT x FROM other WHERE id = ?\")\
+         \"SELECT x FROM DIFFERENT_TABLE WHERE id = ?\")\
          .bind(id).fetch_one(p); }",
     )
     .unwrap();
-
-    let b = &extract_sqlx_sigs(&with_alias)[0];
-    let h = &extract_sqlx_sigs(&no_alias)[0];
-    // the RAW SQL genuinely differs (the alias IS part of the executed statement)
-    assert_ne!(
-        b.sql_raw, h.sql_raw,
-        "the raw runtime SQL must differ — the alias is executed bytes, not hidden"
-    );
-    // but this specific delta is CATALOGUED → equiv.
+    let rb = &extract_sqlx_sigs(&real_base)[0];
+    let rh = &extract_sqlx_sigs(&real_head)[0];
     assert!(
-        b.equiv_across_cs1(h),
-        "the catalogued read_shift_state alias-removal must be accepted"
+        !rb.equiv_across_cs1(rh),
+        "a genuine SQL edit (table/WHERE) beyond the decode-annotation must be RED"
     );
 
-    let ub = &extract_sqlx_sigs(&uncatalogued_base)[0];
-    let uh = &extract_sqlx_sigs(&uncatalogued_head)[0];
+    // (3) a changed LITERAL VALUE inside a SQL string must still diverge (the
+    // annotation-strip only removes `as \"…: …\"`, never a VALUES literal).
+    let val_base: syn::File =
+        syn::parse_str("fn q() { sqlx::query(\"INSERT INTO t VALUES (0)\").execute(p); }").unwrap();
+    let val_head: syn::File =
+        syn::parse_str("fn q() { sqlx::query(\"INSERT INTO t VALUES (1)\").execute(p); }").unwrap();
+    let vb = &extract_sqlx_sigs(&val_base)[0];
+    let vh = &extract_sqlx_sigs(&val_head)[0];
     assert!(
-        !ub.equiv_across_cs1(uh),
-        "an UNCATALOGUED runtime-SQL change must be RED (not silently hidden)"
+        !vb.equiv_across_cs1(vh),
+        "a changed SQL literal value must be RED (annotation-strip does not hide it)"
     );
 }
 
@@ -445,8 +522,8 @@ fn check_one(
         for (i, (b, h)) in base_sigs.iter().zip(head_sigs.iter()).enumerate() {
             if !b.equiv_across_cs1(h) {
                 diag.push_str(&format!(
-                    "\n  chain #{i} in fn `{}`:\n    base sql_raw={:?} decode={:?} binds={:?} fetch={:?}\n    head sql_raw={:?} decode={:?} binds={:?} fetch={:?}\n  (a runtime-SQL edit must be in RUNTIME_SQL_DELTAS to be accepted — A4)",
-                    b.enclosing_fn, b.sql_raw, b.decode_type, b.binds, b.fetch_mode, h.sql_raw, h.decode_type, h.binds, h.fetch_mode
+                    "\n  chain #{i} in fn `{}`:\n    base sql={:?} decode={:?} binds={:?} fetch={:?}\n    head sql={:?} decode={:?} binds={:?} fetch={:?}\n  (only the fiscal-neutral `as \"col: Type\"` decode-annotation removal is normalized — CS-1R4 T8 class; any other SQL edit is RED)",
+                    b.enclosing_fn, b.sql, b.decode_type, b.binds, b.fetch_mode, h.sql, h.decode_type, h.binds, h.fetch_mode
                 ));
                 break;
             }

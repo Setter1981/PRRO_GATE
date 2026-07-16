@@ -49,7 +49,7 @@ jobs:
     outputs:
       inpath: ${{ steps.filter.outputs.inpath }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - id: filter
         shell: bash
         run: |
@@ -77,17 +77,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           # run.sh diffs the PR against origin/main — need its history.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: rust
       # CS-1R R1.2: pin cargo-nextest to 0.9.137 (was `@nextest` = latest) so the
       # runner matches the inventory-gate manifest baseline across all workflows.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
         with:
           tool: nextest@0.9.137
       - name: install cargo-mutants

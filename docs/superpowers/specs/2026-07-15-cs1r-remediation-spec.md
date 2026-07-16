@@ -177,9 +177,17 @@ artifact:
 - **Normalize ONLY the allowed constructions:** `DbX(expr) → expr`; `x.map(DbX) → x`; `DbX → X` in a decode
   type position; the service `.map(|w| w.0)`. **After normalization the AST outside these nodes MUST be
   equal.** "Pure formatting" is accepted **only** when the rustfmt-normalized AST/tokens are equal.
-- For **every sqlx chain** extract a signature `{file, enclosing_fn, occurrence, runtime_sql_literal_bytes,
-  ordered_normalized_bind_expressions, fetch_mode}` and assert the ordered **bind-vector** is unchanged
-  (the bind-ORDER pin), SQL literal bytes unchanged, `fetch_mode` unchanged.
+- For **every sqlx chain** extract a signature `{file, enclosing_fn, occurrence, decode-annotation-stripped SQL,
+  ordered_normalized_bind_expressions, decode_type, fetch_mode}` and assert the ordered **bind-vector** is
+  unchanged (the bind-ORDER pin), `fetch_mode` unchanged, `decode_type` unchanged. **CS-1R4:** the SQL surface
+  compared is the DECODE-ANNOTATION-STRIPPED SQL. The CS-1 source refactor **changed the SQL statement text**
+  (removed `as "col: Type"` decode annotations on some reads) — **a fiscal change is NOT intended; SQL
+  completeness / identity is NOT asserted**. That decode-annotation removal is a fiscal-neutral transform class
+  (it normalizes to equal), while ANY OTHER SQL edit (table / WHERE / literal VALUE / real non-`:` alias) still
+  diverges → RED. Fiscal-neutrality is covered by the behavioral fiscal test suite (RP-CS1-5 + the full `prro`
+  suite). There is NO SQL-byte-identity assertion and NO catalogued diff-set (round-4 auditor: "don't add SQL
+  machinery"); the earlier `sql_raw` byte-compare, the `runtime_sql_deltas.tsv` pin, and the
+  `PRODUCTION_SQL_DELTAS.md` catalog were deleted.
 - **`manual ruling` is NOT a waiver:** a hunk outside the whitelist is either accompanied by an attached
   equivalence proof, or it is **reverted / registered as an intentional drift** — never silently accepted.
 - **Teeth (each → RED):** swap two same-type `.bind`; change a SQL literal; change a fixture value; change a

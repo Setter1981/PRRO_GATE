@@ -107,9 +107,14 @@ split (CS-5); no invented ports / oracle / TransitionPlan.
 >   for all 13 members; `fmt-clippy.yml`; the CS-1R R1.2 inventory gate). The
 >   inventory snapshot is the two literal profile commands in
 >   `scripts/cs1r/mint_manifests.sh`, pinned to `nextest@0.9.137`.
-> - **RP-CS1-6 CI-wiring** is realised + hardened by CS-1R R1.3 and CS-1R2 A1
->   (`scripts/cs1r/manifest_detector_paths.py` machine-asserts the path-detector
->   covers every member + gate input).
+> - **RP-CS1-6 CI-wiring** is realised by CS-1R R1.3 and, as of **CS-1R4**, hardened
+>   by REMOVING the path-detector entirely: the required `x86_64-unknown-linux-gnu`
+>   context runs UNCONDITIONALLY on every push + PR (no `changes` dispatch job to
+>   defeat), and `rust/prro/tests/cs1r4_integrity_job_coverage.rs` asserts the
+>   integrity job covers every workspace member (build∪test) + the required
+>   `test-support` feature. (The old `scripts/cs1r/manifest_detector_paths.py` +
+>   `scripts/cs1r/rust_change_paths.py` detector-consistency machinery was deleted —
+>   there is no detector left to keep consistent.)
 > - **RP-CS1-4 testkit-absence** is enforced by
 >   `rp_cs1_4_contract_dag.rs::prro_testkit_absent_from_production_closures` (A3b).
 
