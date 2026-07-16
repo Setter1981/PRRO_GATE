@@ -1,0 +1,16 @@
+# CS-1R3 A2 — pinned manual-ruling residual fingerprint (DATA, code-owner-gated).
+#
+# The sole manual-ruling CS-1 test file (rust/prro/tests/live_dps_extended_smoke.rs)
+# is allowed to differ from its base after canonicalization ONLY by the documented
+# T7 use-site `.0` residual. This is the EXACT 128-bit FNV-1a fingerprint of the
+# (base-normalized, head-normalized) token pair for that residual. ANY other
+# residual (an assertion RHS flip, a control-flow edit, an added statement) perturbs
+# the head token stream → a different fingerprint → the provenance gate goes RED.
+#
+# This value lives in a DATA file (not next to the oracle) so a re-pin is a visible,
+# CODEOWNER-gated data diff — NOT a self-edit smuggled in alongside a logic change.
+# Re-mint ONLY when the documented T7 residual legitimately changes, via:
+#   cargo test -p prro --features test-support --test cs1_test_provenance \
+#     -- --ignored --nocapture print_manual_residual
+# Format: a single 32-hex-char line (comments `#` and blank lines ignored).
+4b6a3825f97d65880aaa8fd93fbd7d17
