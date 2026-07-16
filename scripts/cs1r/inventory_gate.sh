@@ -66,6 +66,15 @@ python3 "$SCRIPTS/source_inventory.py" --check "$INV_DIR/source_files.sha256" \
   || fail "source inventory drift (control 3)"
 ok "source inventory: no drift, every source test file recorded"
 
+# ── CS-1R2 A1: CI path-detector coverage (member dirs + gate inputs ⊆ detector) ─
+# Runs on the required x86 leg (this gate is invoked by rust-prro.yml's `build`
+# job). RED when a workspace member or gate-input path is NOT covered by the
+# `detect rust changes` grep pattern — closing the #305 skip-the-required-check
+# bypass at the source rather than trusting review.
+CARGO="$CARGO" python3 "$SCRIPTS/manifest_detector_paths.py" \
+  || fail "CI path-detector coverage (A1) — a gated path is not matched by the detector"
+ok "CI path-detector: covers every workspace member + gate input"
+
 # ── control (2): additions-only vs base (PR mode) ────────────────────────────
 if [ "${1:-}" = "--pr" ]; then
   BASE_REF="${2:?--pr requires a base ref}"
