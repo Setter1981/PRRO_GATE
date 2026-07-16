@@ -33,6 +33,14 @@ NOT part of the provenance-equivalence set (there is no base endpoint to compare
 against). The 79 modified files ARE the provenance set (pinned as
 `CS1_MODIFIED_FILES`).
 
+**Scope boundary.** This tool audits ONLY the `rust/prro/tests/*.rs` provenance set.
+The CS-1 refactor ALSO changed the executed SQL statement text in **24 production
+`src/db/repositories/*` read sites** (18 alias-type renames `X`→`DbX`, 6 runtime
+alias removals) — these are **out of this tool's scope** and are separately verified
++ catalogued in **`docs/cs1r/PRODUCTION_SQL_DELTAS.md`** (which also carries the
+`sqlx`-macro-verbatim proof that the `query!` macro does NOT strip `: Type`). Both
+scopes are stated so the reader has the FULL delta surface, not just the test half.
+
 ## What the tool proves (per file, both legs)
 
 1. **sqlx-signature equality.** For every sqlx query chain it extracts
