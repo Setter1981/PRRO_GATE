@@ -344,11 +344,13 @@ fn a2c_decode_type_is_pinned_in_sig() {
     );
 }
 
-/// CS-1R2 A4 — PERMANENT TEETH: prove the sqlx signature now compares the RAW
-/// runtime SQL (the bytes SQLite executes) and accepts a change ONLY when it is in
-/// the `RUNTIME_SQL_DELTAS` catalog. The old tool stripped the `as "col: Type"`
-/// alias from BOTH endpoints, so an alias removal (a real runtime-SQL byte change)
-/// was HIDDEN. This exercises the tool directly on syn snippets.
+/// CS-1R3 A4 — PERMANENT TEETH: prove the sqlx signature now compares the RAW
+/// runtime SQL (the bytes SQLite executes, alias included — sqlx sends it verbatim,
+/// the `query!` macro does NOT strip `: Type`) and accepts a change ONLY when it is
+/// in the catalogued deltas (`docs/cs1r/pins/runtime_sql_deltas.tsv`). The old tool
+/// stripped the `as "col: Type"` alias from BOTH endpoints, so an alias removal (a
+/// real runtime-SQL byte change) was HIDDEN. This exercises the tool on syn
+/// snippets.
 #[test]
 fn a4_runtime_sql_alias_removal_is_catalogued_not_hidden() {
     let with_alias: syn::File = syn::parse_str(

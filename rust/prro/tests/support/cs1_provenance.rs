@@ -30,14 +30,17 @@
 //! - **T3** `.bind(enum) -> .bind(enum.as_str())` (enum bind — the `as_str`
 //!   projection is the value-identity of a TEXT enum: `X::from_sql_str(x.as_str()) == x`)
 //! - **T8** SQL `as "col: Type"` alias removal on a runtime `query_scalar`.
-//!   CS-1R2 A4 CORRECTION: for the RUNTIME `sqlx::query*` API (NOT the
-//!   compile-time `query!` macro) the whole string — including `col as
-//!   "alias: Type"` — is sent VERBATIM to SQLite, so removing the alias DOES
-//!   change the executed SQL bytes. The AST canonicalizer still strips it for
+//!   CS-1R3 A4 CORRECTION: sqlx sends the SQL string — including `col as
+//!   "alias: Type"` — VERBATIM to SQLite for BOTH the runtime `sqlx::query*` API
+//!   AND the compile-time `query!` MACRO; NEITHER strips `: Type` (proven via
+//!   `sqlx-macros-core` `src/query/{input,output}.rs` + the `.sqlx` describe cache
+//!   — see `docs/cs1r/PRODUCTION_SQL_DELTAS.md`). So removing the alias DOES change
+//!   the executed SQL bytes. The AST canonicalizer still strips it for
 //!   token-legibility, but the sqlx signature now compares the RAW runtime SQL
-//!   (`sql_raw`) and accepts a change ONLY if it is in the `RUNTIME_SQL_DELTAS`
-//!   catalog (3 sites in 2 files); any other SQL edit is RED. So this is a
-//!   CATALOGUED, legible delta — NOT a silent "byte-identical" hide.
+//!   (`sql_raw`) and accepts a change ONLY if it is in the catalogued deltas loaded
+//!   from `docs/cs1r/pins/runtime_sql_deltas.tsv` (2 rows / 3 test call sites); any
+//!   other SQL edit is RED. So this is a CATALOGUED, legible delta — NOT a silent
+//!   "byte-identical" hide.
 //! - **T6** `use prro::db::types::{...}` import additions (add-only import lines;
 //!   dropped before compare)
 //! - **T7** use-site `.0` on a tuple-decoded id (`live_dps_extended_smoke.rs`
@@ -502,16 +505,18 @@ pub struct SqlxSig {
     /// `as "col: Type"` decode annotations stripped (T8) — used for the AST-side
     /// legibility only.
     pub sql: String,
-    /// CS-1R2 A4 — the RAW runtime SQL literal bytes, EXACTLY as passed to
-    /// `sqlx::query*` (NO alias stripping). For a runtime `sqlx::query_scalar`
-    /// (NOT the compile-time `query!` macro), the whole string — including a
-    /// `col as "alias: Type"` — is sent VERBATIM to SQLite, so removing that
-    /// alias CHANGES the executed SQL bytes. The old tool stripped the alias from
-    /// both endpoints (`strip_sqlx_decode_annotations`) and compared the stripped
-    /// forms, HIDING the change and letting the artifact claim "byte-identical
-    /// SQL" — which is FALSE for the runtime API. `equiv_across_cs1` now compares
-    /// `sql_raw` and only accepts a change that is in the explicit
-    /// `RUNTIME_SQL_DELTAS` catalog; any other SQL edit is RED.
+    /// CS-1R3 A4 — the RAW runtime SQL literal bytes, EXACTLY as passed to
+    /// `sqlx::query*` (NO alias stripping). sqlx sends the whole string — including
+    /// `col as "alias: Type"` — VERBATIM to SQLite for BOTH the runtime
+    /// `query_scalar`/`query_as` API AND the compile-time `query!` macro; NEITHER
+    /// strips `: Type` (proven via `sqlx-macros-core` + the `.sqlx` describe cache,
+    /// `docs/cs1r/PRODUCTION_SQL_DELTAS.md`). So removing that alias CHANGES the
+    /// executed SQL bytes. The old tool stripped the alias from both endpoints
+    /// (`strip_sqlx_decode_annotations`) and compared the stripped forms, HIDING
+    /// the change and letting the artifact claim "byte-identical SQL" — which is
+    /// FALSE. `equiv_across_cs1` now compares `sql_raw` and only accepts a change
+    /// in the catalogued deltas (`docs/cs1r/pins/runtime_sql_deltas.tsv`); any
+    /// other SQL edit is RED.
     pub sql_raw: String,
     /// Kind: `query`, `query_scalar`, `query_as`, `query_scalar_with`, …
     pub query_kind: String,
