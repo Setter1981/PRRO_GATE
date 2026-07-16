@@ -2341,6 +2341,8 @@ test-support	prro-domain	prro-domain::purity_gate	accepted_capability_nodes_are_
 test-support	prro-domain	prro-domain::purity_gate	closure_edge_manifest_is_set_equal	false
 test-support	prro-domain	prro-domain::purity_gate	closure_node_manifest_is_set_equal	false
 test-support	prro-domain	prro-domain::purity_gate	metadata_args_are_pinned	false
+test-support	prro-domain	prro-domain::purity_gate	print_direct_dep_records	true
+test-support	prro-domain	prro-domain::purity_gate	prro_domain_direct_dep_records_are_pinned	false
 test-support	prro-domain	prro-domain::purity_gate	prro_domain_direct_deps_are_exactly_allowlisted	false
 test-support	prro-domain	prro-domain::purity_gate	prro_domain_reaches_no_forbidden_crate	false
 test-support	prro-domain	prro-domain::purity_gate	rp_r2_c_name_dedup_walker_is_unsound_teeth	false
@@ -2351,6 +2353,7 @@ test-support	prro-domain	prro-domain::rp_cs1_4_contract_dag	contract_crates_are_
 test-support	prro-domain	prro-domain::rp_cs1_4_contract_dag	contract_crates_are_workspace_members	false
 test-support	prro-domain	prro-domain::rp_cs1_4_contract_dag	contract_crates_do_not_depend_on_each_other	false
 test-support	prro-domain	prro-domain::rp_cs1_4_contract_dag	contract_crates_have_empty_direct_deps_phased	false
+test-support	prro-domain	prro-domain::rp_cs1_4_contract_dag	prro_testkit_absent_from_production_closures	false
 test-support	prro-domain	prro-domain::rp_cs1_5_enum_representation	doc_state_representation_locked	false
 test-support	prro-domain	prro-domain::rp_cs1_5_enum_representation	doc_type_representation_locked	false
 test-support	prro-domain	prro-domain::rp_cs1_5_enum_representation	fiscal_mode_representation_locked_lowercase	false

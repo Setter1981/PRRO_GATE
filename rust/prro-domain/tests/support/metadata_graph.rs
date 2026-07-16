@@ -371,6 +371,66 @@ impl Graph {
         }
         DirectDeps { normal, build }
     }
+
+    /// CS-1R2 A3a — the FULL canonical record of every NON-DEV direct dependency
+    /// declaration on a workspace package. `direct_deps` above returns NAMES only,
+    /// so a feature / version-req / source / default-features / rename change on an
+    /// allowlisted direct dep (e.g. adding `rng` to `uuid`) was INVISIBLE to the
+    /// gate. This returns the pinnable record so any such change is RED.
+    pub fn direct_dep_records(&self, meta: &Value, root_name: &str) -> Vec<DirectDepRecord> {
+        let pkg = meta["packages"]
+            .as_array()
+            .expect("packages array")
+            .iter()
+            .find(|p| {
+                p["name"].as_str() == Some(root_name)
+                    && self.workspace_members.iter().any(|m| {
+                        self.packages
+                            .get(m)
+                            .map(|(n, _, _)| n == root_name)
+                            .unwrap_or(false)
+                            && p["id"].as_str() == Some(m.as_str())
+                    })
+            })
+            .unwrap_or_else(|| panic!("workspace package `{root_name}` not found"));
+
+        let mut out = Vec::new();
+        for d in pkg["dependencies"].as_array().expect("dependencies array") {
+            let kind = d.get("kind").and_then(|v| v.as_str()).map(str::to_string);
+            if kind.as_deref() == Some("dev") {
+                continue; // dev deps do not ship downstream
+            }
+            let mut features: Vec<String> = d
+                .get("features")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            features.sort();
+            out.push(DirectDepRecord {
+                name: d["name"].as_str().expect("dep name").to_string(),
+                rename: d.get("rename").and_then(|v| v.as_str()).map(str::to_string),
+                req: d.get("req").and_then(|v| v.as_str()).map(str::to_string),
+                source: d.get("source").and_then(|v| v.as_str()).map(str::to_string),
+                kind,
+                target: d.get("target").and_then(|v| v.as_str()).map(str::to_string),
+                optional: d.get("optional").and_then(|v| v.as_bool()).unwrap_or(false),
+                uses_default_features: d
+                    .get("uses_default_features")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                features,
+            });
+        }
+        // deterministic order for diffable pin: (name, rename, kind, target)
+        out.sort_by(|a, b| {
+            (&a.name, &a.rename, &a.kind, &a.target).cmp(&(&b.name, &b.rename, &b.kind, &b.target))
+        });
+        out
+    }
 }
 
 /// Direct declared deps of a package, split into non-dev (normal/target) and
@@ -378,6 +438,41 @@ impl Graph {
 pub struct DirectDeps {
     pub normal: BTreeSet<String>,
     pub build: BTreeSet<String>,
+}
+
+/// CS-1R2 A3a — the full pinnable record of one NON-DEV direct dependency
+/// declaration (the fields cargo-metadata exposes on `packages[].dependencies[]`).
+/// A feature / version-req / source / default-features / kind / target / rename
+/// change on an allowlisted dep changes this record → the pin RED's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectDepRecord {
+    pub name: String,
+    pub rename: Option<String>,
+    pub req: Option<String>,
+    pub source: Option<String>,
+    pub kind: Option<String>,
+    pub target: Option<String>,
+    pub optional: bool,
+    pub uses_default_features: bool,
+    pub features: Vec<String>,
+}
+
+impl DirectDepRecord {
+    /// A stable one-line canonical rendering for a diffable, human-legible pin.
+    pub fn canonical(&self) -> String {
+        format!(
+            "name={} rename={:?} req={:?} source={:?} kind={:?} target={:?} optional={} default_features={} features={:?}",
+            self.name,
+            self.rename,
+            self.req,
+            self.source,
+            self.kind,
+            self.target,
+            self.optional,
+            self.uses_default_features,
+            self.features,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
