@@ -84,7 +84,16 @@ jobs:
           git fetch --no-tags --depth=1 origin "$base"
           files=$(git diff --name-only "$base" HEAD)
           echo "changed files:"; echo "$files"
-          if echo "$files" | grep -qE '^(rust/prro/|rust/prro_crypto/|rust/prro_escpos/|rust/prro-domain/|rust/prro-testkit/|rust/prro-ingress-contract/|rust/prro-dps-contract/|rust/prro-fleet-contract/|rust/Cargo\.|\.github/workflows/rust-prro\.yml$)'; then
+          # CS-1R2 A1: the detector MUST cover EVERY input the `build` job
+          # gates, else a PR touching only an uncovered path SKIPS the required
+          # x86_64 context (= satisfied) — the exact #305 bypass (only
+          # prro_crypto_v2 / prro_sidecar / maria304 / escpos_daemon + the
+          # cs1r inventory changed, x86_64 skipped, merged green-but-unsound).
+          # Cover ALL of `rust/**` (all 13 workspace members build+test here),
+          # the cs1r inventory gate's scripts + committed manifests, and this
+          # workflow. `scripts/cs1r/manifest_detector_paths.py` asserts this
+          # pattern ⊇ every member dir + every gate-input path (RED on drift).
+          if echo "$files" | grep -qE '^(rust/|scripts/cs1r/|docs/cs1r/inventory/|\.github/workflows/rust-prro\.yml$)'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"

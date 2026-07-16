@@ -15,6 +15,9 @@
 //!      is **∅**. This is PHASED: it changes ONLY via the corresponding port
 //!      spec (specs #3–5 / CS-6). A drift here (a direct dep added ad hoc) is a
 //!      contract violation, not a routine bump.
+//!   5. **A3b (testkit-absence)** — `prro-testkit` (a dev-only shared test
+//!      scaffold) is ABSENT from EVERY production package's non-dev (normal+build)
+//!      closure. The R2 rewrite dropped this walk; it is restored here.
 //!
 //! Walker semantics: `cargo metadata --format-version 1 --all-features --locked`,
 //! following ONLY non-dev edges, PackageId-dedup, root-by-workspace-id — all in
@@ -157,5 +160,46 @@ fn contract_crates_have_empty_direct_deps_phased() {
          non-dev/build dependencies until their port spec (specs #3–5 / CS-6) \
          lands one deliberately. Found: {offenders:?}. This changes ONLY via the \
          corresponding port spec — not an ad-hoc dep add.",
+    );
+}
+
+/// CS-1R2 A3b — RP-CS1-4 testkit-absence. The contract
+/// (`docs/superpowers/specs/2026-07-14-cs1-contract-behaviour-neutral-skeleton.md`
+/// §RP-CS1-4) requires **`prro-testkit` ABSENT from every production package's
+/// normal/build dependency graph** (it is a dev-only shared test scaffold;
+/// `cargo build --workspace` still compiles it as a member — that's fine). The
+/// R2 rewrite DROPPED this walk entirely (grep-empty for `testkit` in the gate),
+/// so `prro-testkit` could enter a production crate's NON-DEV closure unnoticed.
+/// This restores it: for EVERY workspace member except `prro-testkit` itself,
+/// `prro-testkit` must not appear in its non-dev (normal+build) closure.
+///
+/// RP teeth (A3b canary): add `prro-testkit` to `prro`'s `[dependencies]`
+/// (normal, + lock refresh) → `prro`'s non-dev closure now contains it → RED.
+#[test]
+fn prro_testkit_absent_from_production_closures() {
+    const TESTKIT: &str = "prro-testkit";
+    let meta = mg::run_cargo_metadata();
+    let graph = mg::build_graph(&meta);
+    let members = workspace_member_names(&graph, &meta);
+
+    let mut leaks: Vec<String> = Vec::new();
+    for member in &members {
+        // `prro-testkit` itself is the scaffold; skip its own root.
+        if member == TESTKIT {
+            continue;
+        }
+        let root = graph.workspace_root_id(member);
+        let names = graph.non_dev_closure_names(&root);
+        if names.contains(TESTKIT) {
+            leaks.push(member.clone());
+        }
+    }
+
+    assert!(
+        leaks.is_empty(),
+        "RP-CS1-4 testkit-absence (A3b): `prro-testkit` is a DEV-ONLY shared test \
+         scaffold and MUST NOT enter any production package's normal/build \
+         dependency closure (contract §RP-CS1-4). Found it in the NON-DEV closure \
+         of: {leaks:?}. Depend on it via `[dev-dependencies]` only.",
     );
 }

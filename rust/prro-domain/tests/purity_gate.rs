@@ -115,6 +115,52 @@ fn prro_domain_direct_deps_are_exactly_allowlisted() {
     );
 }
 
+/// CS-1R2 A3a — the EXACT full-record pin of `prro-domain`'s NON-DEV direct deps.
+/// `prro_domain_direct_deps_are_exactly_allowlisted` above matches NAMES only —
+/// so a feature / version-req / source / default-features / rename change on an
+/// allowlisted dep (the auditor's `rng`-on-`uuid` canary) stayed GREEN. This pins
+/// every field cargo-metadata exposes on the direct-dep declaration, so any such
+/// change is RED. Re-mint via the ignored `print_direct_dep_records` helper when a
+/// direct dep legitimately changes.
+const DIRECT_DEP_RECORDS: &[&str] = &[
+    "name=serde rename=None req=Some(\"^1\") source=Some(\"registry+https://github.com/rust-lang/crates.io-index\") kind=None target=None optional=false default_features=true features=[\"derive\"]",
+    "name=thiserror rename=None req=Some(\"^1\") source=Some(\"registry+https://github.com/rust-lang/crates.io-index\") kind=None target=None optional=false default_features=true features=[]",
+    "name=uuid rename=None req=Some(\"^1\") source=Some(\"registry+https://github.com/rust-lang/crates.io-index\") kind=None target=None optional=false default_features=true features=[\"serde\", \"v5\", \"v7\"]",
+];
+
+#[test]
+fn prro_domain_direct_dep_records_are_pinned() {
+    let meta = mg::run_cargo_metadata();
+    let graph = mg::build_graph(&meta);
+    let live: Vec<String> = graph
+        .direct_dep_records(&meta, "prro-domain")
+        .iter()
+        .map(|r| r.canonical())
+        .collect();
+    let expected: Vec<String> = DIRECT_DEP_RECORDS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        live, expected,
+        "R2.1 direct-dep FULL-RECORD pin (A3a): a direct dependency's feature set / \
+         version-req / source / default-features / rename / kind / target changed. \
+         The name-only allowlist does NOT catch this (e.g. adding `rng` to `uuid`'s \
+         features grows no closure node). If this change is intentional, re-mint via \
+         `cargo test -p prro-domain --test purity_gate -- --ignored --nocapture \
+         print_direct_dep_records` and review.\n  live    ={live:#?}\n  expected={expected:#?}",
+    );
+}
+
+/// CS-1R2 A3a — MINT helper (ignored): prints the canonical direct-dep records so
+/// `DIRECT_DEP_RECORDS` can be re-pinned when a direct dep legitimately changes.
+#[test]
+#[ignore = "mint helper — prints the pinned direct-dep records"]
+fn print_direct_dep_records() {
+    let meta = mg::run_cargo_metadata();
+    let graph = mg::build_graph(&meta);
+    for r in graph.direct_dep_records(&meta, "prro-domain") {
+        println!("{}", r.canonical());
+    }
+}
+
 // ===========================================================================
 // R2.2 — pinned transitive-closure manifest (node + edge set-equality).
 // ===========================================================================
@@ -212,6 +258,32 @@ fn accepted_capability_nodes_are_annotated() {
              and MUST be annotated \"getrandom syscall ABI\" in purity-closure.lock.",
         );
     }
+}
+
+/// CS-1R2 A5 — the lock's `schema` and `root` are now CHECKED, not merely parsed.
+/// Before, `schema` was written by xtask but read nowhere, and `root` was loaded
+/// into the manifest struct but never verified against the live root — so a lock
+/// minted for the WRONG root, or a shape drift, would go unnoticed.
+#[test]
+fn closure_manifest_root_and_schema_are_pinned() {
+    let meta = mg::run_cargo_metadata();
+    let graph = mg::build_graph(&meta);
+    let live_root = mg::normalize_package_id(&graph.workspace_root_id("prro-domain"));
+    let manifest = mg::load_closure_manifest(); // panics on a schema mismatch (A5)
+
+    assert_eq!(
+        manifest.schema,
+        mg::CLOSURE_MANIFEST_SCHEMA,
+        "purity-closure.lock schema must equal the pinned CLOSURE_MANIFEST_SCHEMA",
+    );
+    assert_eq!(
+        manifest.root, live_root,
+        "R2.2 (A5): purity-closure.lock `root` ({}) must equal the live normalized \
+         workspace root for `prro-domain` ({live_root}). A mismatch means the lock \
+         was minted for the wrong crate/version — regenerate with \
+         `cargo xtask update-purity-closure`.",
+        manifest.root,
+    );
 }
 
 // ===========================================================================

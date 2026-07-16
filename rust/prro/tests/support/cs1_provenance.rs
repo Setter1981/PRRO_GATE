@@ -29,10 +29,15 @@
 //! NOT silent waivers:
 //! - **T3** `.bind(enum) -> .bind(enum.as_str())` (enum bind — the `as_str`
 //!   projection is the value-identity of a TEXT enum: `X::from_sql_str(x.as_str()) == x`)
-//! - **T8** SQL `as "col: Type"` inline decode-annotation strip (the annotation
-//!   is a compile-time sqlx decode hint, not runtime SQL sent to SQLite; the
-//!   signature extractor strips it from BOTH endpoints so the runtime SQL bytes
-//!   compared are annotation-free)
+//! - **T8** SQL `as "col: Type"` alias removal on a runtime `query_scalar`.
+//!   CS-1R2 A4 CORRECTION: for the RUNTIME `sqlx::query*` API (NOT the
+//!   compile-time `query!` macro) the whole string — including `col as
+//!   "alias: Type"` — is sent VERBATIM to SQLite, so removing the alias DOES
+//!   change the executed SQL bytes. The AST canonicalizer still strips it for
+//!   token-legibility, but the sqlx signature now compares the RAW runtime SQL
+//!   (`sql_raw`) and accepts a change ONLY if it is in the `RUNTIME_SQL_DELTAS`
+//!   catalog (3 sites in 2 files); any other SQL edit is RED. So this is a
+//!   CATALOGUED, legible delta — NOT a silent "byte-identical" hide.
 //! - **T6** `use prro::db::types::{...}` import additions (add-only import lines;
 //!   dropped before compare)
 //! - **T7** use-site `.0` on a tuple-decoded id (`live_dps_extended_smoke.rs`
@@ -326,6 +331,34 @@ pub fn git_show(root: &PathBuf, sha: &str, repo_rel_path: &str) -> String {
     String::from_utf8(out.stdout).expect("git blob not utf-8")
 }
 
+/// CS-1R2 A2b — the git blob SHA of a worktree file (`git hash-object <path>`).
+/// Compared against the pinned approved SHA so a mutation to a carved-out file
+/// (which changes its blob) is RED.
+pub fn git_hash_object(root: &PathBuf, abs_path: &std::path::Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["hash-object", "--"])
+        .arg(abs_path)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "git hash-object {} failed to spawn: {e}",
+                abs_path.display()
+            )
+        });
+    assert!(
+        out.status.success(),
+        "git hash-object {} exited non-zero: {}",
+        abs_path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("git hash-object not utf-8")
+        .trim()
+        .to_string()
+}
+
 /// Repo root = the worktree containing this crate. `CARGO_MANIFEST_DIR` is
 /// `<root>/rust/prro`; the repo root is two levels up.
 pub fn repo_root() -> PathBuf {
@@ -345,6 +378,39 @@ pub fn normalize_source(src: &str) -> Result<TokenStream, String> {
     drop_db_types_imports(&mut file);
     Canonicalizer.visit_file_mut(&mut file);
     Ok(file.to_token_stream())
+}
+
+/// CS-1R2 A2a — the EXACT residual fingerprint of a manual-ruling file.
+///
+/// A manual-ruling file (only `live_dps_extended_smoke.rs`) is allowed to differ
+/// from its base after canonicalization ONLY by the documented T7 use-site `.0`
+/// residual. The old gate accepted ANY residual for such a file
+/// (`else if manual.contains(path) { ok }`), so an assertion / logic / SQL change
+/// smuggled into that file passed silently. Instead we pin the EXACT residual:
+/// a stable fingerprint of the (base-normalized, head-normalized) token pair.
+/// The documented T7 `.0` residual reproduces this fingerprint; ANY other change
+/// (assertion RHS flip, control-flow edit, added statement) perturbs the head
+/// token stream → the fingerprint changes → the file is FLAGGED. Deterministic
+/// (syn `to_token_stream` is stable), so it is safe to pin as a constant.
+pub fn manual_residual_fingerprint(base_norm: &str, head_norm: &str) -> String {
+    // A cheap, dependency-free 128-bit FNV-1a fold over both normalized streams,
+    // rendered hex. (No external hash crate in this dev-test module.)
+    fn fnv1a_128(seed: u128, bytes: &[u8]) -> u128 {
+        const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013B;
+        let mut h = seed;
+        for &b in bytes {
+            h ^= b as u128;
+            h = h.wrapping_mul(PRIME);
+        }
+        h
+    }
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    let h = fnv1a_128(OFFSET, base_norm.as_bytes());
+    // domain-separate the two streams with a NUL so a byte shift across the
+    // boundary cannot collide.
+    let h = fnv1a_128(h, b"\0");
+    let h = fnv1a_128(h, head_norm.as_bytes());
+    format!("{h:032x}")
 }
 
 /// Remove `use prro::db::types::…;` items and strip a nested `types::Db*` leaf
@@ -433,15 +499,93 @@ pub struct SqlxSig {
     pub enclosing_fn: String,
     pub occurrence: usize,
     /// Runtime SQL literal bytes (concatenated string-literal args), with
-    /// `as "col: Type"` decode annotations stripped (T8) so the runtime SQL is
-    /// compared, not the compile-time hint.
+    /// `as "col: Type"` decode annotations stripped (T8) — used for the AST-side
+    /// legibility only.
     pub sql: String,
+    /// CS-1R2 A4 — the RAW runtime SQL literal bytes, EXACTLY as passed to
+    /// `sqlx::query*` (NO alias stripping). For a runtime `sqlx::query_scalar`
+    /// (NOT the compile-time `query!` macro), the whole string — including a
+    /// `col as "alias: Type"` — is sent VERBATIM to SQLite, so removing that
+    /// alias CHANGES the executed SQL bytes. The old tool stripped the alias from
+    /// both endpoints (`strip_sqlx_decode_annotations`) and compared the stripped
+    /// forms, HIDING the change and letting the artifact claim "byte-identical
+    /// SQL" — which is FALSE for the runtime API. `equiv_across_cs1` now compares
+    /// `sql_raw` and only accepts a change that is in the explicit
+    /// `RUNTIME_SQL_DELTAS` catalog; any other SQL edit is RED.
+    pub sql_raw: String,
     /// Kind: `query`, `query_scalar`, `query_as`, `query_scalar_with`, …
     pub query_kind: String,
+    /// CS-1R2 A2c — the decode type pinned from the query-head turbofish, with
+    /// each `Db*` wrapper mapped to its domain type (`DbShiftState → ShiftState`)
+    /// so `query_scalar(SQL)` (base, inferred) and
+    /// `query_scalar::<_, DbShiftState>(SQL)` (head, explicit) compare EQUAL —
+    /// but a change to a DIFFERENT decode type (`DbShiftState → DbDocState`, or a
+    /// tuple-arity change) is caught. Empty when the head carried no turbofish at
+    /// EITHER endpoint. The old gate blanket-stripped the whole turbofish, so the
+    /// decode type was pinned NOWHERE.
+    pub decode_type: String,
     /// Ordered normalized bind expressions (Db-wrap / `.map(Db)` / `.as_str()`
     /// stripped) — a bind SWAP or drop changes this vector.
     pub binds: Vec<String>,
     pub fetch_mode: FetchMode,
+}
+
+/// CS-1R2 A4 — the CATALOGUED runtime-SQL deltas. Each is an APPROVED
+/// `(base_raw_sql, head_raw_sql)` pair: CS-1 removed the runtime `col as
+/// "alias: Type"` decode annotation from these three runtime `query_scalar`
+/// literals (the fiscal RESULT and persisted representation are unchanged; only
+/// the executed statement's column-alias bytes changed). These — and ONLY these —
+/// runtime-SQL edits are accepted; any other SQL change is RED. This REPLACES the
+/// old silent hiding: the change is now listed, pinned, and legible, and the
+/// dossier claim is narrowed to "fiscal result + persisted representation
+/// identical; N runtime-query column-aliases cleaned (catalogued)".
+pub const RUNTIME_SQL_DELTAS: &[(&str, &str)] = &[
+    // shift_transition_service.rs :: read_shift_state
+    (
+        "SELECT state as \"state: ShiftState\" FROM shifts WHERE shift_id = ?",
+        "SELECT state FROM shifts WHERE shift_id = ?",
+    ),
+    // shift_transition_service.rs :: read_node_shift_state
+    // shift_create_primitive.rs :: read_node_shift_state (identical literal)
+    (
+        "SELECT shift_state as \"s: ShiftState\" FROM node_state WHERE fiscal_number = ?",
+        "SELECT shift_state FROM node_state WHERE fiscal_number = ?",
+    ),
+];
+
+/// True if `(base, head)` is an APPROVED catalogued runtime-SQL delta (A4).
+fn is_catalogued_sql_delta(base_raw: &str, head_raw: &str) -> bool {
+    RUNTIME_SQL_DELTAS
+        .iter()
+        .any(|(b, h)| *b == base_raw && *h == head_raw)
+}
+
+impl SqlxSig {
+    /// CS-1R2 A2c/A4 — compare two signatures across the CS-1 base→head
+    /// transition. Identical to `PartialEq` EXCEPT:
+    ///  * the decode type is compared EMPTY-IS-WILDCARD (A2c): an INFERRED
+    ///    endpoint (`""` — the CS-1 base) matches an explicit head type
+    ///    (the whitelisted W3 inferred→explicit `Db*` transform); two DIFFERENT
+    ///    explicit types diverge;
+    ///  * the RAW runtime SQL (A4) must be byte-identical OR an APPROVED
+    ///    catalogued delta (`RUNTIME_SQL_DELTAS`) — any OTHER SQL edit is RED.
+    ///    This is what un-hides the runtime column-alias changes.
+    pub fn equiv_across_cs1(&self, other: &SqlxSig) -> bool {
+        let sql_ok =
+            self.sql_raw == other.sql_raw || is_catalogued_sql_delta(&self.sql_raw, &other.sql_raw);
+        self.enclosing_fn == other.enclosing_fn
+            && self.occurrence == other.occurrence
+            && sql_ok
+            && self.query_kind == other.query_kind
+            && self.binds == other.binds
+            && self.fetch_mode == other.fetch_mode
+            && decode_types_compatible(&self.decode_type, &other.decode_type)
+    }
+}
+
+/// EMPTY-IS-WILDCARD decode-type compatibility (see `equiv_across_cs1`).
+pub fn decode_types_compatible(a: &str, b: &str) -> bool {
+    a.is_empty() || b.is_empty() || a == b
 }
 
 /// Walk a file's AST and extract every sqlx query chain signature.
@@ -517,13 +661,15 @@ impl SqlxVisitor {
                 Expr::Call(call) => {
                     // The head: `sqlx::query_scalar::<_, T>(SQL)` or `query(SQL)`.
                     if let Some(kind) = query_head_kind(&call.func) {
-                        let sql = call
+                        let sql_raw = call
                             .args
                             .iter()
                             .filter_map(extract_str_lit)
                             .collect::<Vec<_>>()
                             .join("");
-                        let sql = strip_sqlx_decode_annotations(&sql);
+                        // A4: keep the RAW runtime SQL for the catalogued-delta
+                        // compare; the stripped form stays for AST legibility.
+                        let sql = strip_sqlx_decode_annotations(&sql_raw);
                         binds_rev.reverse();
                         let enclosing_fn = self
                             .fn_stack
@@ -536,11 +682,14 @@ impl SqlxVisitor {
                             *e += 1;
                             v
                         };
+                        let decode_type = query_head_decode_type(&call.func);
                         return Some(SqlxSig {
                             enclosing_fn,
                             occurrence: occ,
                             sql,
+                            sql_raw,
                             query_kind: kind,
+                            decode_type,
                             binds: binds_rev,
                             fetch_mode,
                         });
@@ -564,6 +713,87 @@ fn query_head_kind(func: &Expr) -> Option<String> {
         }
     }
     None
+}
+
+/// CS-1R2 A2c — the decode type carried by a `query*` head's turbofish, rendered
+/// canonically so base (inferred, no turbofish) and head
+/// (`::<_, DbShiftState>` — explicit) compare EQUAL, but a change to a *different*
+/// decode type is caught. Rules:
+///   * no turbofish → `""` (base's inferred form, and head's when still inferred);
+///   * a `_` inference placeholder segment is dropped (base relied on inference
+///     for the row type; head pins the output type — the `_` is not load-bearing);
+///   * each `Db*` wrapper is mapped to its domain type (`DbShiftState → ShiftState`,
+///     `(DbShiftState, String) → (ShiftState, String)`), matching W3, so the
+///     *wrapper* newtype (a pure decode-forwarding shim) is transparent while the
+///     UNDERLYING decode type is pinned.
+///
+/// So `query_scalar::<_, DbShiftState>` and (hypothetical) base
+/// `query_scalar::<_, ShiftState>` render identically to `ShiftState`, but
+/// `query_scalar::<_, DbDocState>` renders `DocState` ≠ `ShiftState` → RED.
+fn query_head_decode_type(func: &Expr) -> String {
+    let Expr::Path(p) = func else {
+        return String::new();
+    };
+    let Some(last) = p.path.segments.last() else {
+        return String::new();
+    };
+    let syn::PathArguments::AngleBracketed(ab) = &last.arguments else {
+        return String::new();
+    };
+    // Canonicalize each generic arg: drop `_` placeholders, collapse each type to
+    // its LAST path segment (so `prro::db::types::DbNodeMode` and a bare
+    // `NodeMode` compare equal — CS-1 qualified the path AND `Db*`-wrapped it),
+    // then map `Db*` → domain (W3). A genuine type SWAP (`NodeMode`→`DocState`)
+    // still differs. Tuples recurse element-wise.
+    let mut parts: Vec<String> = Vec::new();
+    for arg in &ab.args {
+        if let syn::GenericArgument::Type(ty) = arg {
+            if matches!(ty, Type::Infer(_)) {
+                continue; // `_` inference placeholder — not load-bearing.
+            }
+            parts.push(normalize_decode_type(ty));
+        }
+    }
+    parts.join(" , ")
+}
+
+/// Collapse a decode type to a canonical, module-path-independent form: each
+/// path type → its last segment with `Db*`→domain applied; tuples recurse.
+fn normalize_decode_type(ty: &Type) -> String {
+    match ty {
+        Type::Path(tp) => {
+            if let Some(last) = tp.path.segments.last() {
+                let id = last.ident.to_string();
+                let base = strip_db_prefix(&id).unwrap_or(id);
+                if matches!(last.arguments, syn::PathArguments::None) {
+                    base
+                } else {
+                    // a generic leaf (rare): keep only the last segment, Db*-strip
+                    // its ident, render the args verbatim after normalization.
+                    let mut seg = last.clone();
+                    if let Some(inner) = strip_db_prefix(&seg.ident.to_string()) {
+                        seg.ident = syn::Ident::new(&inner, seg.ident.span());
+                    }
+                    let mut only = syn::TypePath {
+                        qself: None,
+                        path: syn::Path {
+                            leading_colon: None,
+                            segments: syn::punctuated::Punctuated::new(),
+                        },
+                    };
+                    only.path.segments.push(seg);
+                    only.to_token_stream().to_string()
+                }
+            } else {
+                ty.to_token_stream().to_string()
+            }
+        }
+        Type::Tuple(tup) => {
+            let elems: Vec<String> = tup.elems.iter().map(normalize_decode_type).collect();
+            format!("({})", elems.join(" , "))
+        }
+        other => other.to_token_stream().to_string(),
+    }
 }
 
 fn extract_str_lit(e: &Expr) -> Option<String> {

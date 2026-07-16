@@ -15,11 +15,14 @@ name = "prro_domain"
 
 [dependencies]
 # CS-1 dependency policy (contract §9): `uuid` is ALLOWED (the UUID-BLOB ids
-# — DocumentId/ShiftId/… — move here in CS-1b′ keeping `now_v7`/`new_v5`/serde
+# — DocumentId/ShiftId/… — moved here in CS-1b′ keeping `now_v7`/`new_v5`/serde
 # unchanged). Every I/O / async-runtime / DB crate is FORBIDDEN
 # (sqlx / tonic / tokio / axum / prost / hyper / reqwest) and the RP-CS1-1
 # purity gate (tests/purity_gate.rs) parses `cargo metadata` to enforce it.
-# NO type has been moved yet — this is the empty scaffolding slice (CS-1a).
+# CS-1R2 A5: the earlier "no type moved yet (CS-1a)" note is stale — CS-1b moved
+# the 8 TEXT-affinity enums (#288) and CS-1b′ moved the id newtypes; the crate is
+# no longer an empty scaffold. The direct-dep set {serde, thiserror, uuid} is
+# pinned by full record in tests/purity_gate.rs (A3a).
 uuid = { version = "1", features = ["v7", "v5", "serde"] }
 
 # CS-1b: the moved TEXT-affinity enums keep BYTE-IDENTICAL serde output

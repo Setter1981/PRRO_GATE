@@ -90,11 +90,35 @@ extraction (CS-7); no adapter migration (CS-6); no transition-table data (CS-2);
 split (CS-5); no invented ports / oracle / TransitionPlan.
 
 ## 7 · RED-pins (rev 2 — executable gates, CS1-V4 + CS1-V5)
+
+> **SUPERSEDED-IN-PART by CS-1R R1/R2 (2026-07-15..16). READ THIS FIRST.** The
+> RP-CS1 gates below describe the *original* CS-1 skeleton design. Where this text
+> conflicts with the shipped gates, the SHIPPED gates win:
+> - **RP-CS1-1 purity is now ALLOWLIST-based, not the 7-name denylist.** The
+>   authoritative gate is `rust/prro-domain/tests/purity_gate.rs` (R2): a pinned
+>   `--all-features` cargo-metadata **transitive-closure manifest**
+>   (`purity-closure.lock`, node+edge set-equality) + an **exact direct-dep
+>   allowlist** `{serde, thiserror, uuid}` pinned by FULL RECORD
+>   (name/rename/req/source/kind/target/default-features/features — CS-1R2 A3a),
+>   NOT merely a 7-name blocklist. The 7 names survive only as a fast, legible
+>   `FORBIDDEN` smoke set layered on top.
+> - **The §7(c) `--workspace` command matrix is superseded by the R1 package-scoped
+>   member×dimension matrix** (`rust-prro.yml` build job runs per-package build+test
+>   for all 13 members; `fmt-clippy.yml`; the CS-1R R1.2 inventory gate). The
+>   inventory snapshot is the two literal profile commands in
+>   `scripts/cs1r/mint_manifests.sh`, pinned to `nextest@0.9.137`.
+> - **RP-CS1-6 CI-wiring** is realised + hardened by CS-1R R1.3 and CS-1R2 A1
+>   (`scripts/cs1r/manifest_detector_paths.py` machine-asserts the path-detector
+>   covers every member + gate input).
+> - **RP-CS1-4 testkit-absence** is enforced by
+>   `rp_cs1_4_contract_dag.rs::prro_testkit_absent_from_production_closures` (A3b).
+
 - **RP-CS1-1 (structural purity — PRIMARY = cargo-metadata, canary = trybuild):** a test parses
   `cargo metadata` and asserts `prro-domain`'s **normal + build + target** dependency edges contain
   none of `sqlx / tonic / tokio / axum / prost / hyper / reqwest` (catches alias / build-dep /
   target-dep evasion that a `use`-level trybuild misses). A `write_tx_conn_compile_fail.rs`-style
-  trybuild stays as a fast canary.
+  trybuild stays as a fast canary. *(Superseded — see banner: the shipped gate is
+  the R2 allowlist + closure manifest, not this denylist.)*
 - **RP-CS1-2 (equivalence — inventory, not a pass-count):**
   **(a) Source inventory** — a locked manifest of the SHA of **every** `.rs` under `tests/`
   recursively (**all 179**, not only the 167 top-level targets) + `src/**` test modules; a

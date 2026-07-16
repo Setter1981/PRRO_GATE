@@ -371,6 +371,66 @@ impl Graph {
         }
         DirectDeps { normal, build }
     }
+
+    /// CS-1R2 A3a — the FULL canonical record of every NON-DEV direct dependency
+    /// declaration on a workspace package. `direct_deps` above returns NAMES only,
+    /// so a feature / version-req / source / default-features / rename change on an
+    /// allowlisted direct dep (e.g. adding `rng` to `uuid`) was INVISIBLE to the
+    /// gate. This returns the pinnable record so any such change is RED.
+    pub fn direct_dep_records(&self, meta: &Value, root_name: &str) -> Vec<DirectDepRecord> {
+        let pkg = meta["packages"]
+            .as_array()
+            .expect("packages array")
+            .iter()
+            .find(|p| {
+                p["name"].as_str() == Some(root_name)
+                    && self.workspace_members.iter().any(|m| {
+                        self.packages
+                            .get(m)
+                            .map(|(n, _, _)| n == root_name)
+                            .unwrap_or(false)
+                            && p["id"].as_str() == Some(m.as_str())
+                    })
+            })
+            .unwrap_or_else(|| panic!("workspace package `{root_name}` not found"));
+
+        let mut out = Vec::new();
+        for d in pkg["dependencies"].as_array().expect("dependencies array") {
+            let kind = d.get("kind").and_then(|v| v.as_str()).map(str::to_string);
+            if kind.as_deref() == Some("dev") {
+                continue; // dev deps do not ship downstream
+            }
+            let mut features: Vec<String> = d
+                .get("features")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            features.sort();
+            out.push(DirectDepRecord {
+                name: d["name"].as_str().expect("dep name").to_string(),
+                rename: d.get("rename").and_then(|v| v.as_str()).map(str::to_string),
+                req: d.get("req").and_then(|v| v.as_str()).map(str::to_string),
+                source: d.get("source").and_then(|v| v.as_str()).map(str::to_string),
+                kind,
+                target: d.get("target").and_then(|v| v.as_str()).map(str::to_string),
+                optional: d.get("optional").and_then(|v| v.as_bool()).unwrap_or(false),
+                uses_default_features: d
+                    .get("uses_default_features")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                features,
+            });
+        }
+        // deterministic order for diffable pin: (name, rename, kind, target)
+        out.sort_by(|a, b| {
+            (&a.name, &a.rename, &a.kind, &a.target).cmp(&(&b.name, &b.rename, &b.kind, &b.target))
+        });
+        out
+    }
 }
 
 /// Direct declared deps of a package, split into non-dev (normal/target) and
@@ -380,14 +440,61 @@ pub struct DirectDeps {
     pub build: BTreeSet<String>,
 }
 
+/// CS-1R2 A3a — the full pinnable record of one NON-DEV direct dependency
+/// declaration (the fields cargo-metadata exposes on `packages[].dependencies[]`).
+/// A feature / version-req / source / default-features / kind / target / rename
+/// change on an allowlisted dep changes this record → the pin RED's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectDepRecord {
+    pub name: String,
+    pub rename: Option<String>,
+    pub req: Option<String>,
+    pub source: Option<String>,
+    pub kind: Option<String>,
+    pub target: Option<String>,
+    pub optional: bool,
+    pub uses_default_features: bool,
+    pub features: Vec<String>,
+}
+
+impl DirectDepRecord {
+    /// A stable one-line canonical rendering for a diffable, human-legible pin.
+    pub fn canonical(&self) -> String {
+        format!(
+            "name={} rename={:?} req={:?} source={:?} kind={:?} target={:?} optional={} default_features={} features={:?}",
+            self.name,
+            self.rename,
+            self.req,
+            self.source,
+            self.kind,
+            self.target,
+            self.optional,
+            self.uses_default_features,
+            self.features,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // R2.2 — pinned transitive-closure manifest (`purity-closure.lock`).
 // ---------------------------------------------------------------------------
+
+/// CS-1R2 A5 — the closure-manifest schema version. `xtask` writes `"schema": 1`;
+/// the loader now VALIDATES it (it was written-but-never-read). A future
+/// manifest-shape change must bump BOTH the writer and this constant, so an
+/// old/new mismatch is a loud RED instead of a silently-misparsed lock.
+pub const CLOSURE_MANIFEST_SCHEMA: u64 = 1;
 
 /// The committed closure manifest, deserialized from `purity-closure.lock`.
 /// Two set-equality tables (`nodes` + `edges`) plus the accepted-node
 /// annotations (`getrandom` / `libc`).
 pub struct ClosureManifest {
+    /// CS-1R2 A5 — the manifest `schema` version (validated == CLOSURE_MANIFEST_SCHEMA
+    /// on load; was parsed-nowhere before).
+    pub schema: u64,
+    /// The normalized workspace-root PackageId the lock was minted for. CS-1R2 A5:
+    /// now CHECKED against the live root by `closure_manifest_root_and_schema_are_pinned`
+    /// (it was loaded-but-never-verified before).
     pub root: PackageId,
     /// Accepted capability nodes → their justification annotation.
     /// MUST contain `getrandom` (OS entropy for UUID v7); `libc` if present.
@@ -400,6 +507,14 @@ pub struct ClosureManifest {
 /// per checkout. Normalize it to a path-independent token so the committed lock
 /// matches regardless of where the repo lives. Registry/git ids are already
 /// stable and pass through unchanged.
+///
+/// CS-1R2 A5: keying on the directory BASENAME + version risks a collision (two
+/// sibling crates `../a/foo` and `../b/foo` would both map to
+/// `path+WORKSPACE:foo#1.0` and silently merge in the set-equality diff). We keep
+/// the basename token for a legible, worktree-independent id, but the record-set
+/// normalizers (`normalize_node_records` / `normalize_edge_records`) now ASSERT
+/// the mapping is INJECTIVE over the distinct raw ids, so any such collision is a
+/// loud RED rather than a silent merge — i.e. the full id is honoured.
 pub fn normalize_package_id(id: &str) -> String {
     if let Some(rest) = id.strip_prefix("path+file://") {
         // rest = `/abs/path/to/<crate-dir>#<version>`
@@ -411,6 +526,26 @@ pub fn normalize_package_id(id: &str) -> String {
     id.to_string()
 }
 
+/// CS-1R2 A5 — panic if `normalize_package_id` maps two DISTINCT raw ids to the
+/// same normalized token (a basename+version collision). Called by the record-set
+/// normalizers so a collision is caught loudly instead of silently merging two
+/// crates in the set-equality diff.
+fn assert_normalization_injective<'a>(raw_ids: impl Iterator<Item = &'a str>) {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for raw in raw_ids {
+        let norm = normalize_package_id(raw);
+        if let Some(prev) = seen.insert(norm.clone(), raw.to_string()) {
+            if prev != raw {
+                panic!(
+                    "CS-1R2 A5 PackageId normalization COLLISION: distinct ids \n  `{prev}`\nand\n  \
+                     `{raw}`\nboth normalize to `{norm}`. The basename+version token is not \
+                     unique for this workspace — normalize on the full path instead."
+                );
+            }
+        }
+    }
+}
+
 /// Load and parse the committed `purity-closure.lock` from `prro-domain`'s
 /// manifest dir.
 pub fn load_closure_manifest() -> ClosureManifest {
@@ -419,6 +554,17 @@ pub fn load_closure_manifest() -> ClosureManifest {
         .unwrap_or_else(|e| panic!("cannot read committed closure manifest `{path}`: {e}"));
     let v: Value =
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("`{path}` is not valid JSON: {e}"));
+
+    // CS-1R2 A5 — VALIDATE the schema version (was written by xtask but never read).
+    let schema = v["schema"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("`{path}` is missing an integer `schema` field"));
+    assert_eq!(
+        schema, CLOSURE_MANIFEST_SCHEMA,
+        "purity-closure.lock schema {schema} != expected {CLOSURE_MANIFEST_SCHEMA} — the \
+         manifest shape changed; bump BOTH the xtask writer and CLOSURE_MANIFEST_SCHEMA, \
+         then `cargo xtask update-purity-closure`."
+    );
 
     let root = v["root"].as_str().expect("manifest.root").to_string();
 
@@ -478,6 +624,7 @@ pub fn load_closure_manifest() -> ClosureManifest {
     }
 
     ClosureManifest {
+        schema,
         root,
         acceptance,
         nodes,
@@ -488,6 +635,9 @@ pub fn load_closure_manifest() -> ClosureManifest {
 /// Apply [`normalize_package_id`] to a whole node-record set (for live-vs-lock
 /// comparison, so absolute worktree paths never leak into the diff).
 pub fn normalize_node_records(recs: &BTreeSet<NodeRecord>) -> BTreeSet<NodeRecord> {
+    // A5: a collision here would silently merge two nodes → the set-equality diff
+    // would be wrong. Assert injectivity first.
+    assert_normalization_injective(recs.iter().map(|r| r.package_id.as_str()));
     recs.iter()
         .map(|r| NodeRecord {
             package_id: normalize_package_id(&r.package_id),
@@ -498,6 +648,11 @@ pub fn normalize_node_records(recs: &BTreeSet<NodeRecord>) -> BTreeSet<NodeRecor
 
 /// Apply [`normalize_package_id`] to a whole edge-record set.
 pub fn normalize_edge_records(recs: &BTreeSet<EdgeRecord>) -> BTreeSet<EdgeRecord> {
+    // A5: endpoints on both sides — assert injectivity over all endpoint ids.
+    assert_normalization_injective(
+        recs.iter()
+            .flat_map(|r| [r.from_package_id.as_str(), r.to_package_id.as_str()]),
+    );
     recs.iter()
         .map(|r| EdgeRecord {
             from_package_id: normalize_package_id(&r.from_package_id),
