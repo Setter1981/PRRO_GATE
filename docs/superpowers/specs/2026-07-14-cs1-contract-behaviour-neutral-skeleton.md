@@ -227,3 +227,56 @@ export-list** (no widening). Three pins guard it (spec §1 R4.5):
   *widening*).
 Teeth: remove a legacy export → RP-R4-1a/1c RED; restore a glob or add an extra export → RP-R4-1c
 RED; a legacy `.bind`/`Type<Sqlite>` compiling again → RP-R4-1b RED.
+
+## 12 · CI command-matrix conformance — the LITERAL per-member table (CS-1R R1.3)
+
+This **amends and makes literal** the RP-CS1-2(c) command matrix and RP-CS1-6 CI-wiring item above:
+it is the normative, package-scoped (NOT literal `--workspace`) `member × {build, test, fmt, clippy}`
+table the CI workflows MUST satisfy. `✅` = a leg present on the line cited; `➕` = a leg CS-1R adds
+(literal command given). 12 workspace members (`xtask` is a dev tool, out of the product matrix).
+
+| member | build | test | fmt | clippy |
+|---|---|---|---|---|
+| `prro` | ✅ `rust-prro.yml` build step | ✅ `nextest run -p prro --features test-support` (+ live-dps build step) | ✅ `fmt-clippy.yml` fmt list | ✅ `fmt-clippy.yml` clippy `-p prro` |
+| `prro-domain` | ✅ via the `prro-domain … contract` nextest leg | ✅ same leg | ✅ fmt list | ✅ clippy `prro-domain` |
+| `prro-testkit` | ✅ via that leg | ✅ that leg | ✅ fmt list | ✅ clippy `prro-testkit` |
+| `prro-ingress-contract` | ✅ via that leg | ✅ that leg | ✅ fmt list | ✅ clippy contract crates |
+| `prro-dps-contract` | ✅ via that leg | ✅ that leg | ✅ fmt list | ✅ clippy contract crates |
+| `prro-fleet-contract` | ✅ via that leg | ✅ that leg | ✅ fmt list | ✅ clippy contract crates |
+| `prro_crypto` | ✅ via the `prro_crypto` nextest leg | ✅ that leg | ✅ fmt list | ✅ clippy `prro_crypto` |
+| `prro_crypto_v2` | ➕ `cargo build -p prro_crypto_v2 --locked` | ➕ `cargo nextest run -p prro_crypto_v2 --locked` | ➕ fmt list | ⛔ **EXCLUDED** — 51 pre-existing `-D warnings` findings in a crypto hot zone; lint-debt PR |
+| `prro_sidecar` | ➕ `cargo build -p prro_sidecar --locked` | ➕ `cargo nextest run -p prro_sidecar --locked` | ➕ fmt list | ➕ `cargo clippy -p prro_sidecar --all-targets --no-deps -- -D warnings` (CLEAN) |
+| `maria304_driver` | ➕ `cargo build -p maria304_driver --locked` | ➕ `cargo nextest run -p maria304_driver --locked` | ➕ fmt list | ⛔ **EXCLUDED** — 1 pre-existing `too_many_lines` in a driver hot path; lint-debt PR |
+| `prro_escpos` | ➕ `cargo build -p prro_escpos --locked` | ➕ `cargo nextest run -p prro_escpos --locked` | ✅ fmt list | ✅ clippy `prro_escpos` |
+| `prro_escpos_daemon` | ➕ `cargo build -p prro_escpos_daemon --locked` | ➕ `cargo nextest run -p prro_escpos_daemon --locked` | ➕ fmt list | ⛔ **EXCLUDED** — 1 pre-existing test-only `byte str` lint; lint-debt PR |
+
+All 12 members carry at least one test target (verified: `prro_crypto_v2` 21 src test-files;
+`prro_sidecar` 1 integration-test dir + 10 src; `maria304_driver` 10 integration-test dirs + 27 src;
+`prro_escpos` / `prro_escpos_daemon` 1 integration-test dir each) — so **no cell is a zero-tests
+exclusion**; every member gets **build + test + fmt** (all verified green: 790 tests pass; fmt clean).
+
+**Clippy cell — three documented exclusions (not silent blanks).** `prro_crypto_v2` (51 findings),
+`maria304_driver` (1 `too_many_lines`), and `prro_escpos_daemon` (1 test-only `byte str`) carry
+**pre-existing** `-D warnings` lint debt. Fixing it means editing crypto CT code and a driver hot
+path — **out of R1.3 scope** (R1.3 is CI-wiring, spec §non-goal "no hot zone touched"; a lint fix in
+crypto is exactly a behaviour-risk edit R1 must not carry). Each is a **deferred lint-debt PR**; the
+build+test legs already lock behaviour for all three. `prro_sidecar` was verified CLEAN and joins the
+clippy gate now. Any future member that cannot satisfy a cell is likewise replaced by an **explicit
+documented exclusion with rationale**, never a silent blank.
+
+**Inventory gate (CS-1R R1.2).** CI wires `scripts/cs1r/inventory_gate.sh --pr <base>` (three-way:
+live `nextest list` == committed manifest per profile, additions-only vs base, every new source test
+file present in `docs/cs1r/inventory/source_files.sha256` in the same PR). `cargo-nextest` is pinned
+to **0.9.137** (was `install-action@nextest` = latest); `cargo` is already `1.95.0` via
+`rust-toolchain.toml`.
+
+**Mutation-diff required + no-op companion.** `mutation-diff.yml` is **path-filtered** (`prro/src/**`
++ mutants config), so making its `mutation diff-gate` check REQUIRED in branch protection would hang
+an out-of-path PR forever on a never-reported status. CS-1R adds an **always-run no-op companion**
+(same job name, reports instantly green when no in-path file changed) so the check can be made
+required without stalling docs-only PRs. **Making the check required is a repo-admin branch-protection
+action — it cannot be done from workflow YAML and MUST be performed by the operator.**
+
+**RED-pins:** RP-R1-1 (delete/rename/`#[ignore]` a test OR add a test absent from the manifest → the
+inventory gate is RED); RP-R1-3 (drop a member from this table OR point a leg at a wrong command → the
+CI matrix diverges from the workflows).
