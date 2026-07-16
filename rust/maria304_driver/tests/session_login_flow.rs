@@ -186,7 +186,7 @@ fn conf_payload_crc_self_verifies_on_the_wire() {
     );
 
     let cmd_bytes = encode_frame("CONf", true).unwrap();
-    assert_eq!(crc16(&cmd_bytes), 0, "request frame must self-verify",);
+    assert_eq!(crc16(&cmd_bytes), 0, "request frame must self-verify");
     let (Frame { text, .. }, _) = decode_frame(&cmd_bytes, true).unwrap();
     let responses = dispatch(
         &mut session,
