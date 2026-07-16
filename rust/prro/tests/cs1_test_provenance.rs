@@ -420,7 +420,7 @@ fn a2c_decode_type_is_pinned_in_sig() {
 /// SQL surface compared is the annotation-stripped `sql`. This exercises the tool on
 /// syn snippets so the teeth is empirical and independent of compilation.
 #[test]
-fn t8_decode_annotation_removal_is_fiscal_neutral_class_not_byte_identity() {
+fn a4_runtime_sql_alias_removal_is_catalogued_not_hidden() {
     // (1) a pure decode-annotation removal → normalizes equal (fiscal-neutral class).
     let with_alias: syn::File = syn::parse_str(
         "fn q() { sqlx::query_scalar(\
