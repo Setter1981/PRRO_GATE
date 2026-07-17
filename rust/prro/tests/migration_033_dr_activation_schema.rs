@@ -9,20 +9,15 @@
 //! fail-fast activation guard that aborts if the table is non-empty.
 //!
 //! Groups:
-//! - `ns_*`  — `node_state` new columns (existence, types, defaults, CHECKs).
-//! - `ag_*`  — `delivery_reservation.authorized_generation` (existence, CHECK >= 1,
-//!              NULL-at-insert, set-once immutable, frozen once set).
-//! - `as_*`  — `delivery_reservation.apply_state` (existence, CHECK vocabulary,
-//!              NULL-at-insert, legal NULL→PENDING_APPLY→APPLIED, illegal jumps,
-//!              frozen once APPLIED).
-//! - `ne_*`  — `delivery_reservation.node_effect` (existence, CHECK vocabulary,
-//!              NULL-at-insert, set at OUTCOME_OBSERVED, frozen once set).
-//! - `fg_*`  — fail-fast guard (non-empty table aborts migration).
-//! - `rg_*`  — 032 regression (all existing triggers/indexes still fire; column
-//!              count correct; static call-graph pin still holds).
+//! - `ns_*` — `node_state` new columns (existence, types, defaults, CHECKs).
+//! - `ag_*` — `delivery_reservation.authorized_generation` (existence, CHECK >= 1, NULL-at-insert, set-once immutable, frozen once set).
+//! - `as_*` — `delivery_reservation.apply_state` (existence, CHECK vocabulary, NULL-at-insert, legal NULL→PENDING_APPLY→APPLIED, illegal jumps, frozen once APPLIED).
+//! - `ne_*` — `delivery_reservation.node_effect` (existence, CHECK vocabulary, NULL-at-insert, set at OUTCOME_OBSERVED, frozen once set).
+//! - `fg_*` — fail-fast guard (non-empty table aborts migration).
+//! - `rg_*` — 032 regression (all existing triggers/indexes still fire; column count correct; static call-graph pin still holds).
 
-use prro::db::repositories::delivery_reservation::{self, NewReservation};
 use prro::db::models::ids::DocumentId;
+use prro::db::repositories::delivery_reservation::{self, NewReservation};
 use prro::db::tx::with_immediate;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -151,13 +146,12 @@ async fn ns01_delivery_generation_column_exists_with_correct_default() {
     seed_node_state(&pool, FN_A).await;
 
     // delivery_generation must exist (DEFAULT 0) and read back as 0 after insert.
-    let val: i64 = sqlx::query_scalar(
-        "SELECT delivery_generation FROM node_state WHERE fiscal_number = ?",
-    )
-    .bind(FN_A)
-    .fetch_one(&pool)
-    .await
-    .expect("delivery_generation column must exist on node_state after migration 033");
+    let val: i64 =
+        sqlx::query_scalar("SELECT delivery_generation FROM node_state WHERE fiscal_number = ?")
+            .bind(FN_A)
+            .fetch_one(&pool)
+            .await
+            .expect("delivery_generation column must exist on node_state after migration 033");
 
     assert_eq!(val, 0, "delivery_generation DEFAULT must be 0");
 }
@@ -178,7 +172,11 @@ async fn ns02_delivery_generation_pragma_type_and_not_null() {
         .expect("delivery_generation column must exist in PRAGMA table_info(node_state)");
 
     // STRICT table: type must be INTEGER
-    assert_eq!(dg.2.to_uppercase(), "INTEGER", "delivery_generation type must be INTEGER");
+    assert_eq!(
+        dg.2.to_uppercase(),
+        "INTEGER",
+        "delivery_generation type must be INTEGER"
+    );
     // NOT NULL
     assert_eq!(dg.3, 1, "delivery_generation must be NOT NULL");
     // DEFAULT 0
@@ -221,7 +219,10 @@ async fn ns04_active_delivery_reservation_id_column_exists_nullable_blob() {
     .await
     .expect("active_delivery_reservation_id column must exist on node_state after migration 033");
 
-    assert!(val.is_none(), "active_delivery_reservation_id must default to NULL");
+    assert!(
+        val.is_none(),
+        "active_delivery_reservation_id must default to NULL"
+    );
 }
 
 #[tokio::test]
@@ -301,7 +302,10 @@ async fn ag01_authorized_generation_column_exists_nullable() {
     .await
     .expect("authorized_generation column must exist on delivery_reservation after migration 033");
 
-    assert!(val.is_none(), "authorized_generation must be NULL at RESERVED_NOT_STARTED");
+    assert!(
+        val.is_none(),
+        "authorized_generation must be NULL at RESERVED_NOT_STARTED"
+    );
 }
 
 #[tokio::test]
@@ -435,15 +439,17 @@ async fn as01_apply_state_column_exists_null_at_insert() {
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
 
-    let val: Option<String> = sqlx::query_scalar(
-        "SELECT apply_state FROM delivery_reservation WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .fetch_one(&pool)
-    .await
-    .expect("apply_state column must exist on delivery_reservation after migration 033");
+    let val: Option<String> =
+        sqlx::query_scalar("SELECT apply_state FROM delivery_reservation WHERE reservation_id = ?")
+            .bind(&[0x01u8; 16][..])
+            .fetch_one(&pool)
+            .await
+            .expect("apply_state column must exist on delivery_reservation after migration 033");
 
-    assert!(val.is_none(), "apply_state must be NULL at RESERVED_NOT_STARTED");
+    assert!(
+        val.is_none(),
+        "apply_state must be NULL at RESERVED_NOT_STARTED"
+    );
 }
 
 #[tokio::test]
@@ -487,13 +493,12 @@ async fn as03_apply_state_legal_null_to_pending_apply() {
     .await
     .expect("NULL→PENDING_APPLY must be a legal apply_state transition");
 
-    let val: Option<String> = sqlx::query_scalar(
-        "SELECT apply_state FROM delivery_reservation WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let val: Option<String> =
+        sqlx::query_scalar("SELECT apply_state FROM delivery_reservation WHERE reservation_id = ?")
+            .bind(&[0x01u8; 16][..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(val.as_deref(), Some("PENDING_APPLY"));
 }
 
@@ -513,21 +518,18 @@ async fn as04_apply_state_legal_pending_apply_to_applied() {
     .expect("NULL→PENDING_APPLY");
 
     // PENDING_APPLY → APPLIED is the second legal step.
-    sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("PENDING_APPLY→APPLIED must be a legal apply_state transition");
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .expect("PENDING_APPLY→APPLIED must be a legal apply_state transition");
 
-    let val: Option<String> = sqlx::query_scalar(
-        "SELECT apply_state FROM delivery_reservation WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let val: Option<String> =
+        sqlx::query_scalar("SELECT apply_state FROM delivery_reservation WHERE reservation_id = ?")
+            .bind(&[0x01u8; 16][..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(val.as_deref(), Some("APPLIED"));
 }
 
@@ -567,13 +569,11 @@ async fn as06_apply_state_illegal_applied_to_pending_apply_regress() {
     .execute(&pool)
     .await
     .expect("NULL→PENDING_APPLY");
-    sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("PENDING_APPLY→APPLIED");
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .expect("PENDING_APPLY→APPLIED");
 
     // Now regress: APPLIED → PENDING_APPLY.
     let err = sqlx::query(
@@ -604,21 +604,18 @@ async fn as07_apply_state_illegal_applied_to_null_regress() {
     .execute(&pool)
     .await
     .expect("NULL→PENDING_APPLY");
-    sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("PENDING_APPLY→APPLIED");
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .expect("PENDING_APPLY→APPLIED");
 
-    let err = sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = NULL WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect_err("APPLIED→NULL must be rejected by apply_state trigger");
+    let err =
+        sqlx::query("UPDATE delivery_reservation SET apply_state = NULL WHERE reservation_id = ?")
+            .bind(&[0x01u8; 16][..])
+            .execute(&pool)
+            .await
+            .expect_err("APPLIED→NULL must be rejected by apply_state trigger");
     assert!(
         err_has(&err, "apply_state") || err_has(&err, "illegal") || err_has(&err, "constraint"),
         "expected apply_state/illegal/constraint error, got: {err}"
@@ -641,13 +638,12 @@ async fn as08_apply_state_illegal_pending_apply_to_null_regress() {
     .await
     .expect("NULL→PENDING_APPLY");
 
-    let err = sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = NULL WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect_err("PENDING_APPLY→NULL regress must be rejected by apply_state trigger");
+    let err =
+        sqlx::query("UPDATE delivery_reservation SET apply_state = NULL WHERE reservation_id = ?")
+            .bind(&[0x01u8; 16][..])
+            .execute(&pool)
+            .await
+            .expect_err("PENDING_APPLY→NULL regress must be rejected by apply_state trigger");
     assert!(
         err_has(&err, "apply_state") || err_has(&err, "illegal") || err_has(&err, "constraint"),
         "expected apply_state/illegal/constraint error, got: {err}"
@@ -662,15 +658,17 @@ async fn ne01_node_effect_column_exists_null_at_insert() {
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
 
-    let val: Option<String> = sqlx::query_scalar(
-        "SELECT node_effect FROM delivery_reservation WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .fetch_one(&pool)
-    .await
-    .expect("node_effect column must exist on delivery_reservation after migration 033");
+    let val: Option<String> =
+        sqlx::query_scalar("SELECT node_effect FROM delivery_reservation WHERE reservation_id = ?")
+            .bind(&[0x01u8; 16][..])
+            .fetch_one(&pool)
+            .await
+            .expect("node_effect column must exist on delivery_reservation after migration 033");
 
-    assert!(val.is_none(), "node_effect must be NULL at RESERVED_NOT_STARTED");
+    assert!(
+        val.is_none(),
+        "node_effect must be NULL at RESERVED_NOT_STARTED"
+    );
 }
 
 #[tokio::test]
@@ -698,27 +696,25 @@ async fn ne03_node_effect_accepts_all_valid_vocabulary_values() {
     // Each of the valid node_effect values (grounded on error_routing.rs) must be accepted.
     // We use a fresh pool per value to avoid fence/immutability collisions.
     let valid_values = [
-        "NodeBlocked",          // -11 ERROR_OFFLINE_168 → NodeMode::Blocked flip
-        "MacReseedPending",     // -12 ERROR_BAD_HASH_PREV → mac_recovery orchestrator
-        "ProbeRequired",        // Decode / -2 close-shift / -15 close-shift → last_chk probe
-        "OperatorEscalation",   // -6 ERROR_NOT_PREV_ZREPORT → operator-recoverable
-        "FnConfigError",        // -13/-14 NOT_REGISTERED → FnConfigError class
-        "WrapperBug",           // Internal / NotFound / FiscalIdMismatch → WrapperBug
-        "NoNodeEffect",         // TerminalReject (clean), TransientRetry (no node impact)
+        "NodeBlocked",        // -11 ERROR_OFFLINE_168 → NodeMode::Blocked flip
+        "MacReseedPending",   // -12 ERROR_BAD_HASH_PREV → mac_recovery orchestrator
+        "ProbeRequired",      // Decode / -2 close-shift / -15 close-shift → last_chk probe
+        "OperatorEscalation", // -6 ERROR_NOT_PREV_ZREPORT → operator-recoverable
+        "FnConfigError",      // -13/-14 NOT_REGISTERED → FnConfigError class
+        "WrapperBug",         // Internal / NotFound / FiscalIdMismatch → WrapperBug
+        "NoNodeEffect",       // TerminalReject (clean), TransientRetry (no node impact)
     ];
     for val in valid_values {
         let (_d, pool) = fresh_pool().await;
         let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
         insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
         advance_to_oo_clean(&pool, 0x01).await;
-        sqlx::query(
-            "UPDATE delivery_reservation SET node_effect = ? WHERE reservation_id = ?",
-        )
-        .bind(val)
-        .bind(&[0x01u8; 16][..])
-        .execute(&pool)
-        .await
-        .unwrap_or_else(|e| panic!("node_effect '{val}' must be accepted; got: {e}"));
+        sqlx::query("UPDATE delivery_reservation SET node_effect = ? WHERE reservation_id = ?")
+            .bind(val)
+            .bind(&[0x01u8; 16][..])
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("node_effect '{val}' must be accepted; got: {e}"));
     }
 }
 
@@ -768,13 +764,12 @@ async fn ne05_node_effect_cannot_be_cleared_once_set() {
     .await
     .expect("setting node_effect to MacReseedPending must be accepted");
 
-    let err = sqlx::query(
-        "UPDATE delivery_reservation SET node_effect = NULL WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect_err("node_effect → NULL (clearing) must be blocked (immutable)");
+    let err =
+        sqlx::query("UPDATE delivery_reservation SET node_effect = NULL WHERE reservation_id = ?")
+            .bind(&[0x01u8; 16][..])
+            .execute(&pool)
+            .await
+            .expect_err("node_effect → NULL (clearing) must be blocked (immutable)");
     assert!(
         err_has(&err, "immutable") || err_has(&err, "constraint"),
         "expected immutable/constraint error, got: {err}"
@@ -806,19 +801,22 @@ async fn fg01_fail_fast_guard_sql_rejects_nonempty_table() {
         .await
         .expect("create temp guard table");
 
-    let err = sqlx::query(
-        "INSERT INTO _fg01_guard (c) SELECT COUNT(*) FROM delivery_reservation",
-    )
-    .execute(&mut *conn)
-    .await
-    .expect_err("guard must reject non-empty delivery_reservation (COUNT(*) = 1, violates CHECK = 0)");
+    let err = sqlx::query("INSERT INTO _fg01_guard (c) SELECT COUNT(*) FROM delivery_reservation")
+        .execute(&mut *conn)
+        .await
+        .expect_err(
+            "guard must reject non-empty delivery_reservation (COUNT(*) = 1, violates CHECK = 0)",
+        );
 
     assert!(
         err_has(&err, "check") || err_has(&err, "constraint"),
         "expected CHECK/constraint from guard, got: {err}"
     );
 
-    sqlx::query("DROP TABLE _fg01_guard").execute(&mut *conn).await.ok();
+    sqlx::query("DROP TABLE _fg01_guard")
+        .execute(&mut *conn)
+        .await
+        .ok();
 }
 
 #[tokio::test]
@@ -832,14 +830,15 @@ async fn fg02_fail_fast_guard_sql_accepts_empty_table() {
         .await
         .expect("create temp guard table");
 
-    sqlx::query(
-        "INSERT INTO _fg02_guard (c) SELECT COUNT(*) FROM delivery_reservation",
-    )
-    .execute(&mut *conn)
-    .await
-    .expect("guard must accept empty delivery_reservation");
+    sqlx::query("INSERT INTO _fg02_guard (c) SELECT COUNT(*) FROM delivery_reservation")
+        .execute(&mut *conn)
+        .await
+        .expect("guard must accept empty delivery_reservation");
 
-    sqlx::query("DROP TABLE _fg02_guard").execute(&mut *conn).await.ok();
+    sqlx::query("DROP TABLE _fg02_guard")
+        .execute(&mut *conn)
+        .await
+        .ok();
 }
 
 // ══════════════════════ rg_* — 032 regression ══════════════════════
@@ -857,20 +856,39 @@ async fn rg01_column_count_is_now_20() {
 
     // All 032 columns still present.
     for col in [
-        "reservation_id", "document_id", "fiscal_number", "attempt_no", "state",
-        "call_started_at", "dps_protocol_id", "protocol_contract_version",
-        "capability_profile_version", "endpoint_config_revision", "envelope_hash",
-        "remote_correlation_id", "submission_certainty", "response_provenance",
-        "routing_class", "created_at", "updated_at",
+        "reservation_id",
+        "document_id",
+        "fiscal_number",
+        "attempt_no",
+        "state",
+        "call_started_at",
+        "dps_protocol_id",
+        "protocol_contract_version",
+        "capability_profile_version",
+        "endpoint_config_revision",
+        "envelope_hash",
+        "remote_correlation_id",
+        "submission_certainty",
+        "response_provenance",
+        "routing_class",
+        "created_at",
+        "updated_at",
     ] {
-        assert!(names.contains(col), "032 column {col} must still exist in 033; have {names:?}");
+        assert!(
+            names.contains(col),
+            "032 column {col} must still exist in 033; have {names:?}"
+        );
     }
     // All 033 new columns present.
     for col in ["authorized_generation", "apply_state", "node_effect"] {
-        assert!(names.contains(col), "033 new column {col} must exist; have {names:?}");
+        assert!(
+            names.contains(col),
+            "033 new column {col} must exist; have {names:?}"
+        );
     }
     assert_eq!(
-        names.len(), 20,
+        names.len(),
+        20,
         "total column count must be 20 (17 from 032 + 3 from 033); have {names:?}"
     );
 }
@@ -1094,7 +1112,9 @@ async fn lc03_authorized_generation_cannot_be_set_at_reserved_not_started() {
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect_err("authorized_generation set at RESERVED_NOT_STARTED must be rejected (field↔state CHECK)");
+    .expect_err(
+        "authorized_generation set at RESERVED_NOT_STARTED must be rejected (field↔state CHECK)",
+    );
     assert!(
         err_has(&err, "check") || err_has(&err, "constraint"),
         "expected a CHECK/constraint (authorized_generation NULL at RNS), got: {err}"

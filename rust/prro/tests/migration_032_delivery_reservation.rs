@@ -224,7 +224,10 @@ async fn s02_column_set_matches_ddl() {
     // is owned by the latest migration's test (migration_033 `rg01` pins 20 after
     // 033 adds authorized_generation / apply_state / node_effect); a later
     // migration extending the table must not force a churn edit here.
-    assert!(names.len() >= 17, "the 032 column set must be present; have {names:?}");
+    assert!(
+        names.len() >= 17,
+        "the 032 column set must be present; have {names:?}"
+    );
 }
 
 #[tokio::test]
