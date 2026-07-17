@@ -771,14 +771,15 @@ async fn tonic_unavailable_routes_to_transport() {
 
 #[tokio::test]
 async fn tonic_unauthenticated_routes_to_transport() {
-    // CS-3 Slice A′: gRPC `Unauthenticated` / `PermissionDenied` mean the DPS peer
-    // RESPONDED over an established TLS session (auth rejection) — a response, not a
-    // transport absence — so they now surface as `DpsError::RemoteStatus`, distinct from
-    // a genuine no-response (`DeadlineExceeded`/`Unavailable` stay `Transport`). The
-    // recovery is UNCHANGED (route_dps_error routes `RemoteStatus` to `TransientRetry`,
-    // exactly as `Transport` did); this only re-types the signal so the CS-3 classifier
-    // can tell a peer response from a channel failure. (Legacy test name retained for
-    // the inventory additions-only gate.)
+    // CS-3 Slice A′ + R1 (TLS trust boundary). The law:
+    //   RemoteStatus ⇔ code ∈ {Unauthenticated, PermissionDenied} ∧ TLS peer-auth proven.
+    // gRPC `Unauthenticated` / `PermissionDenied` promote to `DpsError::RemoteStatus`
+    // (AuthenticatedPeer provenance) ONLY over a TLS-proven channel.  This smoke test
+    // connects over PLAINTEXT `http://` (the in-process mock), so the peer is UNPROVEN —
+    // a plaintext MITM could forge those statuses — and R1 routes them to `Transport`,
+    // NEVER `RemoteStatus`.  This test pins the trust boundary itself; the TLS-proven
+    // mapping (Unproven → Transport vs TlsProven → RemoteStatus, both codes) is unit-tested
+    // in grpc.rs.  Recovery is UNCHANGED (route_dps_error routes both to `TransientRetry`).
     let h = start_mock().await;
     h.state
         .send_chk_v2
@@ -791,8 +792,9 @@ async fn tonic_unauthenticated_routes_to_transport() {
         .await
         .expect_err("Unauthenticated must error");
     assert!(
-        matches!(err, DpsError::RemoteStatus { ref code, .. } if code.contains("Unauthenticated")),
-        "expected RemoteStatus for gRPC Unauthenticated (CS-3 Slice A′), got {err:?}"
+        matches!(err, DpsError::Transport(_)),
+        "plaintext (Unproven) channel must route gRPC Unauthenticated to Transport, not \
+         RemoteStatus (R1 provenance-forgery fix); got {err:?}"
     );
 }
 
