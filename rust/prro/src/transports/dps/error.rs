@@ -8,6 +8,7 @@
 //! and a TCP connect-refused both surface as `Transport`, because
 //! the caller's response is the same — back off + retry.
 
+use prro_domain::delivery::RawResponseDigest;
 use thiserror::Error;
 
 /// Errors returned by every `DpsChannel` method.
@@ -42,7 +43,14 @@ pub enum DpsError {
     /// `route_dps_error` ensures slice E can change it without touching
     /// the `Transport` arm.
     #[error("DPS remote status ({code}): {message}")]
-    RemoteStatus { code: String, message: String },
+    RemoteStatus {
+        code: String,
+        message: String,
+        /// Digest of the raw gRPC status reply (code + message + details). The
+        /// lossless raw-reply evidence (R3): a later Bridge maps this to
+        /// `RemoteStatusEvidence` carrying the SAME digest, never a fabricated one.
+        digest: RawResponseDigest,
+    },
 
     /// A DPS response envelope was successfully decoded but the status
     /// code does not settle submission certainty — forward progress
@@ -59,7 +67,15 @@ pub enum DpsError {
     /// `code` is the raw DPS status integer (`-4` for `ERROR_UNKNOWN`).
     /// `message` carries the server's textual explanation when present.
     #[error("DPS indeterminate (code={code}): {message}")]
-    Indeterminate { code: i32, message: String },
+    Indeterminate {
+        code: i32,
+        message: String,
+        /// Digest of the parsed DPS response envelope. The lossless raw-reply
+        /// evidence (R3): a later Bridge maps this to
+        /// `SendIndeterminate::UnknownStatus` carrying the SAME digest, never a
+        /// fabricated one.
+        digest: RawResponseDigest,
+    },
 
     /// Authorization-class server response, split by the application-
     /// level DPS status code so callers can route per-doc rejects
