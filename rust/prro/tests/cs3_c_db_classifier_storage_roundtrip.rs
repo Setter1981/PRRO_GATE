@@ -32,6 +32,12 @@
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::delivery_reservation::{self, NewReservation};
 use prro::db::tx::with_immediate;
+use prro_domain::delivery::{
+    BoundedText, DpsProtocolBinding, DpsProtocolId, DpsReject, EnvelopeHash, NoResponseCause,
+    PreflightRefusal, ProtocolContractVersion, RawResponseDigest, RemoteStatusEvidence,
+    SendIndeterminate, SendOutcome, SendResponse, SentAccepted, SubmissionEvidence,
+};
+use prro_domain::enums::DocType;
 use sqlx::SqlitePool;
 
 // ─────────────────────────── fixtures (mirrors migration_033_dr_activation_schema.rs) ───
@@ -220,10 +226,48 @@ fn err_has(err: &sqlx::Error, needle: &str) -> bool {
 // Represented as flat structs for the roundtrip driver.
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn binding() -> DpsProtocolBinding {
+    DpsProtocolBinding {
+        protocol_id: DpsProtocolId::FscoZzd,
+        contract_version: ProtocolContractVersion(1),
+        capability_profile_version: None,
+        endpoint_config_revision: None,
+    }
+}
+fn ev_hash() -> EnvelopeHash {
+    EnvelopeHash([0u8; 32])
+}
+fn ev_digest() -> RawResponseDigest {
+    RawResponseDigest([0u8; 32])
+}
+fn not_started_preflight() -> SubmissionEvidence {
+    SubmissionEvidence::NotStarted {
+        reason: PreflightRefusal::PreconditionFailed(BoundedText::from_truncating("guard failed")),
+        binding: binding(),
+        envelope_hash: ev_hash(),
+    }
+}
+fn not_started_signing() -> SubmissionEvidence {
+    SubmissionEvidence::NotStarted {
+        reason: PreflightRefusal::SigningFailed(BoundedText::from_truncating("sign error")),
+        binding: binding(),
+        envelope_hash: ev_hash(),
+    }
+}
+fn started(response: SendResponse) -> SubmissionEvidence {
+    SubmissionEvidence::Started {
+        response,
+        binding: binding(),
+        envelope_hash: ev_hash(),
+    }
+}
+
 /// Mapped ClassifiedOutcome from the normative graph (§2 table).
 /// `routing` = None for the clean-accept row.
 struct GraphRow {
     label: &'static str,
+    evidence: SubmissionEvidence,
+    doc_type: DocType,
     /// submission_certainty wire string
     certainty: &'static str,
     /// response_provenance wire string
@@ -254,6 +298,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // ── NotStarted ──────────────────────────────────────────────────────────
         GraphRow {
             label: "NotStarted/PreconditionFailed → NOT_SUBMITTED/NO_RESPONSE/TransientRetry",
+            evidence: not_started_preflight(),
+            doc_type: DocType::Sell,
             certainty: "NOT_SUBMITTED",
             provenance: "NO_RESPONSE",
             routing: Some("TransientRetry"),
@@ -261,6 +307,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "NotStarted/SigningFailed → NOT_SUBMITTED/NO_RESPONSE/WrapperBug",
+            evidence: not_started_signing(),
+            doc_type: DocType::Sell,
             certainty: "NOT_SUBMITTED",
             provenance: "NO_RESPONSE",
             routing: Some("WrapperBug"),
@@ -269,6 +317,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // ── Started/NoResponse ──────────────────────────────────────────────────
         GraphRow {
             label: "Started/NoResponse(Timeout) → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry",
+            evidence: started(SendResponse::NoResponse(NoResponseCause::Timeout)),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "NO_RESPONSE",
             routing: Some("TransientRetry"),
@@ -276,6 +326,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "Started/NoResponse(Cancelled) → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry",
+            evidence: started(SendResponse::NoResponse(NoResponseCause::Cancelled)),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "NO_RESPONSE",
             routing: Some("TransientRetry"),
@@ -283,6 +335,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "Started/NoResponse(LocalHandshake) → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry",
+            evidence: started(SendResponse::NoResponse(NoResponseCause::LocalHandshakeFailure)),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "NO_RESPONSE",
             routing: Some("TransientRetry"),
@@ -290,6 +344,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "Started/NoResponse(Crashed) → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry (RP4B-1)",
+            evidence: started(SendResponse::NoResponse(NoResponseCause::CrashedBeforeObservation)),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "NO_RESPONSE",
             routing: Some("TransientRetry"),
@@ -298,6 +354,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // ── Started/RemoteStatus ────────────────────────────────────────────────
         GraphRow {
             label: "Started/RemoteStatus(Garbage) → SUBMITTED_UNKNOWN/AUTHENTICATED_PEER/ProbeRequired",
+            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::AuthenticatedPeerGarbage(ev_digest()))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "AUTHENTICATED_PEER",
             routing: Some("ProbeRequired"),
@@ -305,6 +363,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "Started/RemoteStatus(AuthStatus) → SUBMITTED_UNKNOWN/AUTHENTICATED_PEER/ProbeRequired",
+            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(ev_digest()))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "AUTHENTICATED_PEER",
             routing: Some("ProbeRequired"),
@@ -313,6 +373,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // ── Started/Parsed(Accepted) ─────────────────────────────────────────────
         GraphRow {
             label: "Started/Parsed(Accepted) → SUBMITTED/PARSED_DPS_ENVELOPE/NULL",
+            evidence: started(SendResponse::Parsed(SendOutcome::Accepted(SentAccepted::observe("DPS-123").unwrap()))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: None,
@@ -322,6 +384,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::Verify (-1) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Verify/-1) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Verify))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -330,6 +394,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::Type (-5) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Type/-5) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Type))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -338,6 +404,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::NotPrevZReport (-6) → OperatorEscalation / OperatorEscalation
         GraphRow {
             label: "Rejected(NotPrevZReport/-6) → SUBMITTED/PARSED_DPS_ENVELOPE/OperatorEscalation/OperatorEscalation",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotPrevZReport))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("OperatorEscalation"),
@@ -346,6 +414,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::Xml (-7) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Xml/-7) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Xml))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -354,6 +424,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::XmlDate (-8) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlDate/-8) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlDate))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -362,6 +434,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::XmlChk (-9) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlChk/-9) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlChk))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -370,6 +444,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::XmlZReport (-10) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlZReport/-10) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlZReport))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -378,6 +454,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::Offline168 (-11) → TerminalReject / NodeBlocked
         GraphRow {
             label: "Rejected(Offline168/-11) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NodeBlocked",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Offline168))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -386,6 +464,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::BadHashPrev (-12) → MacRecovery / MacReseedPending
         GraphRow {
             label: "Rejected(BadHashPrev/-12) → SUBMITTED/PARSED_DPS_ENVELOPE/MacRecovery/MacReseedPending",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::BadHashPrev))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("MacRecovery"),
@@ -394,6 +474,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::NotRegisteredRro (-13) → FnConfigError / FnConfigError
         GraphRow {
             label: "Rejected(NotRegisteredRro/-13) → SUBMITTED/PARSED_DPS_ENVELOPE/FnConfigError/FnConfigError",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotRegisteredRro))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("FnConfigError"),
@@ -402,6 +484,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::NotRegisteredSigner (-14) → FnConfigError / FnConfigError
         GraphRow {
             label: "Rejected(NotRegisteredSigner/-14) → SUBMITTED/PARSED_DPS_ENVELOPE/FnConfigError/FnConfigError",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotRegisteredSigner))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("FnConfigError"),
@@ -410,6 +494,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::OfflineId (-16) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(OfflineId/-16) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::OfflineId))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -418,6 +504,8 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // DpsReject::Close (non-close doc, §12 R1) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Close/Sell §12R1) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
+            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Close))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
@@ -427,6 +515,13 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // UnknownStatus → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
         GraphRow {
             label: "Indeterminate(Unknown/-4) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/TransientRetry",
+            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
+                SendIndeterminate::UnknownStatus {
+                    raw_code: BoundedText::from_truncating("-4"),
+                    digest: ev_digest(),
+                },
+            ))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TransientRetry"),
@@ -435,6 +530,10 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // SaveError (-3) → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
         GraphRow {
             label: "Indeterminate(SaveError/-3) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/TransientRetry",
+            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
+                SendIndeterminate::SaveError,
+            ))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TransientRetry"),
@@ -443,6 +542,10 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // CloseAmbiguous (ZReport, §12 R1) → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired
         GraphRow {
             label: "Indeterminate(CloseAmbiguous/ZReport) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
+            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
+                SendIndeterminate::CloseAmbiguous,
+            ))),
+            doc_type: DocType::ZReport,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("ProbeRequired"),
@@ -451,6 +554,10 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // CloseAmbiguous (ShiftClose, §12 R1) → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired
         GraphRow {
             label: "Indeterminate(CloseAmbiguous/ShiftClose) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
+            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
+                SendIndeterminate::CloseAmbiguous,
+            ))),
+            doc_type: DocType::ShiftClose,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("ProbeRequired"),
@@ -459,6 +566,10 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // OkButNoFiscalNumber → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired
         GraphRow {
             label: "Indeterminate(OkButNoFiscalNumber) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
+            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
+                SendIndeterminate::OkButNoFiscalNumber { digest: ev_digest() },
+            ))),
+            doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("ProbeRequired"),
@@ -484,6 +595,12 @@ fn normative_graph_rows() -> Vec<GraphRow> {
 /// uses a fresh FN to avoid the fence blocking a second reservation.
 #[tokio::test]
 async fn st01_every_classifier_output_is_033_storable() {
+    // R5: this pin now DRIVES the real `classify()` and stores ITS sealed output — it no
+    // longer stores a hand-copied output table (the checkpoint-audit finding: the pin must
+    // exercise the code under test, not a parallel copy). The normative `certainty/
+    // provenance/routing/node_effect` strings are retained as an INDEPENDENT cross-check.
+    use prro_domain::delivery::classify;
+
     let rows = normative_graph_rows();
     let mut failures: Vec<String> = Vec::new();
 
@@ -494,20 +611,38 @@ async fn st01_every_classifier_output_is_033_storable() {
         let res_byte = (idx as u8).wrapping_add(0xA0);
         let lnd = (idx as i64) + 1;
 
+        // ── Drive the REAL sealed classifier and read its output via the getters. ──
+        let classified = classify(&row.evidence, row.doc_type);
+        let got_cert = classified.certainty().as_str();
+        let got_prov = classified.provenance().as_str();
+        let got_routing: Option<&str> = classified.routing().map(|r| r.as_str());
+        let got_ne = classified.node_effect().as_str();
+
+        // Cross-check the sealed classifier output against the INDEPENDENTLY encoded
+        // normative graph (§2). A classify regression / node_effect drift fails HERE,
+        // before it can be silently stored — this is the teeth (revert classify → RED).
+        if got_cert != row.certainty
+            || got_prov != row.provenance
+            || got_routing != row.routing
+            || got_ne != row.node_effect
+        {
+            failures.push(format!(
+                "\n  CLASSIFY DRIFT [{}]:\n    classify  =(certainty={got_cert}, provenance={got_prov}, routing={got_routing:?}, node_effect={got_ne})\n    normative =(certainty={}, provenance={}, routing={:?}, node_effect={})",
+                row.label, row.certainty, row.provenance, row.routing, row.node_effect
+            ));
+            continue;
+        }
+
         let doc = seed_doc(&pool, FN_A, doc_byte, lnd).await;
         if let Err(e) = insert_res(&pool, new_res(res_byte, doc, FN_A)).await {
             failures.push(format!("\n  FAIL [{}] INSERT failed: {e}", row.label));
             continue;
         }
 
-        // Drive the row to OUTCOME_OBSERVED via the correct path.
-        let result: Result<(), String> = if row.certainty == "NOT_SUBMITTED" {
+        // Store the REAL classifier output (got_*), not a hand-copied string.
+        let result: Result<(), String> = if got_cert == "NOT_SUBMITTED" {
             // RNS → OO directly: no CS step, authorized_generation stays NULL.
-            let rc = row
-                .routing
-                .expect("NOT_SUBMITTED always has a routing class");
-            // Use a direct SQL call returning a Result so failures surface as DRIFT,
-            // not panics.
+            let rc = got_routing.expect("NOT_SUBMITTED always has a routing class");
             let r2 = sqlx::query(
                 "UPDATE delivery_reservation \
                  SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
@@ -518,7 +653,7 @@ async fn st01_every_classifier_output_is_033_storable() {
                  WHERE reservation_id = ?",
             )
             .bind(rc)
-            .bind(row.node_effect)
+            .bind(got_ne)
             .bind(&[res_byte; 16][..])
             .execute(&pool)
             .await;
@@ -543,7 +678,7 @@ async fn st01_every_classifier_output_is_033_storable() {
                 Err(format!("RNS→CS failed: {e}"))
             } else {
                 // Now CS → OO.
-                let oo_result = match row.routing {
+                let oo_result = match got_routing {
                     Some(rc) => {
                         sqlx::query(
                             "UPDATE delivery_reservation \
@@ -554,10 +689,10 @@ async fn st01_every_classifier_output_is_033_storable() {
                                  node_effect = ? \
                              WHERE reservation_id = ?",
                         )
-                        .bind(row.certainty)
-                        .bind(row.provenance)
+                        .bind(got_cert)
+                        .bind(got_prov)
                         .bind(rc)
-                        .bind(row.node_effect)
+                        .bind(got_ne)
                         .bind(&[res_byte; 16][..])
                         .execute(&pool)
                         .await
@@ -572,9 +707,9 @@ async fn st01_every_classifier_output_is_033_storable() {
                                  node_effect = ? \
                              WHERE reservation_id = ?",
                         )
-                        .bind(row.certainty)
-                        .bind(row.provenance)
-                        .bind(row.node_effect)
+                        .bind(got_cert)
+                        .bind(got_prov)
+                        .bind(got_ne)
                         .bind(&[res_byte; 16][..])
                         .execute(&pool)
                         .await
@@ -589,14 +724,35 @@ async fn st01_every_classifier_output_is_033_storable() {
 
         if let Err(msg) = result {
             failures.push(format!("\n  FAIL [{}]: {msg}", row.label));
+            continue;
+        }
+
+        // Roundtrip: read the stored columns back and assert they equal the classifier
+        // output we wrote — proves classify → 033 store → read is lossless (incl node_effect).
+        let stored: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT submission_certainty, response_provenance, routing_class, node_effect \
+             FROM delivery_reservation WHERE reservation_id = ?",
+        )
+        .bind(&[res_byte; 16][..])
+        .fetch_one(&pool)
+        .await
+        .expect("read back stored OUTCOME_OBSERVED row");
+        if stored.0 != got_cert
+            || stored.1 != got_prov
+            || stored.2.as_deref() != got_routing
+            || stored.3.as_deref() != Some(got_ne)
+        {
+            failures.push(format!(
+                "\n  ROUNDTRIP DRIFT [{}]: stored={stored:?} != classify(certainty={got_cert}, provenance={got_prov}, routing={got_routing:?}, node_effect={got_ne})",
+                row.label
+            ));
         }
     }
 
     assert!(
         failures.is_empty(),
-        "st01: the following C-pure classifier outputs were REJECTED by the 033 schema \
-         — this is a C-pure↔033 DRIFT (either the classifier emits an unstorable triple \
-         or 033 is too strict):{}\n",
+        "st01: classify()→033 storage roundtrip failures (classify drift, unstorable output, \
+         or lossy roundtrip):{}\n",
         failures.join("")
     );
 }
