@@ -867,6 +867,13 @@ fn extract_wire_forensics(err: &DpsError) -> (Option<i32>, &'static str, String)
     use crate::transports::dps::error::AuthorizationKind;
     match err {
         DpsError::Transport(msg) => (None, "Transport", msg.clone()),
+        // CS-3 Slice A (behaviour-neutral): a parsed `-4` now surfaces as `Indeterminate`
+        // instead of `Transport`. The persisted `transport_trace.error_kind` /
+        // `outcome_kind` (via wire_decision_to_outcome_kind's "Transport" arm) are
+        // CHECK-constrained, so we keep the forensic tuple IDENTICAL to `Transport`
+        // (no schema drift); `-4`'s distinctness lives in the in-memory `DpsError` type,
+        // which the CS-3 classifier consumes. Forensic distinctness lands with slice E.
+        DpsError::Indeterminate { message, .. } => (None, "Transport", message.clone()),
         DpsError::Server { code, message } => (Some(*code), "Server", message.clone()),
         DpsError::Authorization {
             code,

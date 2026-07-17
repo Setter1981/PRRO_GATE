@@ -299,6 +299,21 @@ pub fn route_dps_error(err: &DpsError, doc_type: DocType, is_live_send: bool) ->
             probe_hint: None,
             mac_recovery_hint: None,
         },
+        // CS-3 Slice A: a parsed DPS `-4` (ERROR_UNKNOWN) now arrives as `Indeterminate`
+        // (it was collapsed into `Transport` at dto.rs). It routes IDENTICALLY to
+        // `Transport` here — same `ErrorRetryable` / `TransientRetry` / audit — so this
+        // slice is behaviour-neutral; the distinct in-memory type only lets the CS-3
+        // classifier map `-4` to `Parsed(Indeterminate)` (the fence / differentiation is
+        // slice E). Kept a SEPARATE arm so E can change it without touching Transport.
+        DpsError::Indeterminate { .. } => RoutingDecision {
+            target_state: DocState::ErrorRetryable,
+            retry_class: RetryClass::TransientRetry,
+            audit_event: AuditEvent::StageSendTransientRetry,
+            audit_severity: Severity::Warning,
+            node_mode_flip: None,
+            probe_hint: None,
+            mac_recovery_hint: None,
+        },
         DpsError::Authorization { kind, .. } => match kind {
             AuthorizationKind::DocumentReject => RoutingDecision {
                 target_state: DocState::Rejected,

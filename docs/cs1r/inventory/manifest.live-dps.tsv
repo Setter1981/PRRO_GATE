@@ -641,6 +641,10 @@ live-dps	prro	prro	services::write_path::stage_send::tests::truncate_msg_caps_at
 live-dps	prro	prro	services::write_path::stage_send::tests::truncate_msg_passes_short_strings_unchanged	false
 live-dps	prro	prro	services::write_path::stage_send::tests::truncate_msg_respects_utf8_boundaries	false
 live-dps	prro	prro	services::write_path::stage_send::tests::wire_decision_to_outcome_kind_maps_per_w10_table	false
+live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_is_not_transport	false
+live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_yields_indeterminate_not_transport	false
+live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_rro_info_response_yields_indeterminate	false
+live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_status_response_yields_indeterminate	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_full_equality	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_length_206	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_sha256	false
