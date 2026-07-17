@@ -30,6 +30,14 @@ prevents the frozen file from cementing an unresolved contract.
 - **A4-4 (immutable protocol binding).** Binding columns snapshot at creation, immutable, carried through every retry; a doc retries only on its bound `dps_protocol_id` — extends frozen invariant #3 to protocol.
 - **A4-5 (cross-protocol forbidden by default — LOCK-READY).** `SubmittedUnknown` on A is never permission to act on B; reconciliation first on the original protocol. Lifted only on ALL of: an official DPS identity/correlation contract, proven cross-protocol consistency/visibility, a declared `ReconciliationCapability`, cross-adapter conformance + negative tests. Until then unknown ⇒ deny. Does not block CS-2.
 - **A4-6 (record-then-apply — LOCK-READY; CS-3 activation contract).** (1) the outcome evidence (the three fields + `remote_correlation_id`, a self-contained `ObservedOutcomeV1`) commits **as authority** first; (2) if projection guards pass → `document` + `node_state` seed + audit + fence-release commit atomically in one `BEGIN IMMEDIATE`; (3) if a guard fails → commit `OUTCOME_RECORDED_PENDING_APPLY`, the fence stays; (4) **only the ledger apply repeats — the DPS wire-call is NEVER repeated, evidence never lost.** The coordinator/actor-mediated form is **CS-4**; CS-3 does the narrower record-then-apply with `ObservedOutcomeV1`.
+  **[AMENDMENT 2026-07-17 · CS-3 kickoff · extends, does not weaken A4-6]** `ObservedOutcomeV1` additionally carries,
+  beyond the three fields + `remote_correlation_id`: (a) a durable **effect/semantic discriminant** — two DPS codes
+  can share a `(certainty, provenance, routing)` triple yet differ in node-effect (`-11 ERROR_OFFLINE_168 → node
+  BLOCKED`, `-6 → operator`), so the effect must be recoverable from the payload alone; and (b) the immutable
+  **`authorized_generation`** (snapshot of `node_state.delivery_generation` at `RN→CALL_STARTED`) so a replayed
+  apply compares the stored generation vs the live one (never node-vs-node, which would be a boot tautology). Both
+  extend the self-contained payload; neither weakens the record-then-apply ordering. See
+  `2026-07-17-cs3-double-issue-keystone-plan.md`.
 
 ## 3 · Migration 032 co-draft rev 4 (governed by §1–§2) — `delivery_reservation` ONLY
 No `ingress_inbox` delta (Spec #3 first). No `generation` (CS-3 activation). No apply-states/payload

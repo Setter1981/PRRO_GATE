@@ -1,13 +1,14 @@
 # Spec #4B — DPS boundary contract (rev 6 — the TYPE realization of locked Spec #2)
 
-**Status: DRAFT rev 6 — the three near-GO closures on rev-5** (auditor): (1) `DpsReject` is now the **complete**
+**Status: 🔒 GO rev 6 — full GO from the external decorrelated audit (2026-07-17); MERGED to `main` #311 (`7ff0cf2`);
+the oracle for CS-3/CS-6.** The three near-GO closures on rev-5 (auditor): (1) `DpsReject` is now the **complete**
 closed set of named verdict codes `proto:41-56` (−5/−6/−7..−10/−11/−16 added — partition completeness); (2) the
 **raw** `DpsSubmissionPort` trait stays in `prro-dps-contract` (adapter depends only on the contract; DAG
 preserved), while the private `AuthorizedSubmission` mint + `submit_authorized` wrapper move to the engine
 (§6, §12 R3); (3) `NotFound` is moved **out** of attributed `ReconcileOutcome` into `FnLiveness` under the
 `Unattributed` path (§5, §6). Everything else is the rev-5 SIMPLIFY body below.
 
-**CONDITIONAL-GO fix (mechanical type mismatch):** `submit_raw` returned `AttemptObservation`, which the raw port
+**Final fix (mechanical type mismatch, auditor-confirmed → full GO):** `submit_raw` returned `AttemptObservation`, which the raw port
 **cannot construct** — the port has only the `BoundSignedEnvelope` (binding + hash), not `reservation_id` /
 `node_generation`. Fixed: `submit_raw -> Result<SendResponse, PortBindingMismatch>` (raw wire response — narrowed from
 `SubmissionEvidence` because the port is always post-CAS, so `NotStarted` is structurally impossible for it); the
