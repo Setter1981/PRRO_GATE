@@ -468,11 +468,15 @@ async fn s11_check_insert_must_be_rns_trigger() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     // INSERT directly as CALL_STARTED → insert_state trigger ABORTs.
+    // authorized_generation is set to keep the 034 RN→CS pairing trigger satisfied
+    // (call_started_at set ⇒ authorized_generation set), so the rejection we observe
+    // is the intended 032 insert_state trigger (state must be RESERVED_NOT_STARTED),
+    // not the pairing guard.
     let err = sqlx::query(
         "INSERT INTO delivery_reservation \
             (reservation_id, document_id, fiscal_number, attempt_no, state, call_started_at, \
-             dps_protocol_id, protocol_contract_version, envelope_hash) \
-         VALUES (?, ?, ?, 1, 'CALL_STARTED', '2026-07-15T00:00:00Z', 'FSCO_ZZD', 1, ?)",
+             authorized_generation, dps_protocol_id, protocol_contract_version, envelope_hash) \
+         VALUES (?, ?, ?, 1, 'CALL_STARTED', '2026-07-15T00:00:00Z', 1, 'FSCO_ZZD', 1, ?)",
     )
     .bind(&[0x01u8; 16][..])
     .bind(doc.as_bytes().to_vec())
@@ -495,7 +499,8 @@ async fn s11_check_insert_must_be_rns_trigger() {
 async fn advance_to_cs(pool: &SqlitePool, res_byte: u8) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'CALL_STARTED', call_started_at = '2026-07-15T00:00:00Z' \
+         SET state = 'CALL_STARTED', call_started_at = '2026-07-15T00:00:00Z', \
+             authorized_generation = 1 \
          WHERE reservation_id = ?",
     )
     .bind(&[res_byte; 16][..])
@@ -537,10 +542,14 @@ async fn s13_matrix_not_submitted_requires_no_call_and_no_response() {
     advance_to_cs(&pool, 0x01).await.unwrap();
     // CS → OO(NOT_SUBMITTED) is illegal both structurally (call_started_at NOT NULL)
     // AND by the transition trigger (CS→OO requires SUBMITTED*).
+    // apply_state + node_effect satisfy 034 H3 (OO completeness) / H4 (clean-accept)
+    // so the row reaches the intended 032 structural CHECK (NOT_SUBMITTED requires
+    // call_started_at NULL / routing NULL is SUBMITTED-only), not the H3 guard.
     let err = sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
-             response_provenance = 'NO_RESPONSE' \
+             response_provenance = 'NO_RESPONSE', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -560,10 +569,13 @@ async fn s14_matrix_submitted_requires_parsed_envelope() {
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
     advance_to_cs(&pool, 0x01).await.unwrap();
     // SUBMITTED with response_provenance != PARSED_DPS_ENVELOPE → CHECK reject.
+    // apply_state + node_effect satisfy 034 H3/H4 so the row reaches the intended
+    // 032 CHECK (SUBMITTED requires PARSED_DPS_ENVELOPE), not the H3 guard.
     let err = sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
-             response_provenance = 'AUTHENTICATED_PEER' \
+             response_provenance = 'AUTHENTICATED_PEER', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -611,10 +623,13 @@ async fn s16_matrix_response_derived_class_needs_parsed_envelope() {
     advance_to_cs(&pool, 0x01).await.unwrap();
     // OO(SUBMITTED_UNKNOWN + NO_RESPONSE) with routing_class = TerminalReject → reject:
     // response-derived classes require SUBMITTED + PARSED_DPS_ENVELOPE.
+    // apply_state + node_effect satisfy 034 H3 (routing NOT NULL ⇒ H4 n/a) so the row
+    // reaches the intended 032 CHECK (response-derived class requires SUBMITTED+PARSED).
     let err = sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TerminalReject' \
+             response_provenance = 'NO_RESPONSE', routing_class = 'TerminalReject', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -635,10 +650,13 @@ async fn s17_matrix_drainchain_requires_submitted_parsed() {
     advance_to_cs(&pool, 0x01).await.unwrap();
     // DrainChainSettleRetry with SUBMITTED_UNKNOWN + NO_RESPONSE → reject
     // (must be a parsed DPS artifact, never pre-call/no-response — rev 5 fix).
+    // apply_state + node_effect satisfy 034 H3 (routing NOT NULL ⇒ H4 n/a) so the row
+    // reaches the intended 032 CHECK (DrainChain class requires SUBMITTED+PARSED).
     let err = sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'DrainChainSettleRetry' \
+             response_provenance = 'NO_RESPONSE', routing_class = 'DrainChainSettleRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -660,8 +678,13 @@ async fn s18_matrix_oo_requires_certainty_and_provenance() {
     advance_to_cs(&pool, 0x01).await.unwrap();
     // CS→OO leaving submission_certainty NULL → transition trigger requires SUBMITTED*
     // (so this is illegal both at the trigger and the OO structural CHECK).
+    // apply_state + node_effect satisfy 034 H3/H4 (routing NULL + NoNodeEffect) so the
+    // row reaches the intended 032 CHECK (OO requires certainty + provenance), not H3.
     let err = sqlx::query(
-        "UPDATE delivery_reservation SET state = 'OUTCOME_OBSERVED' WHERE reservation_id = ?",
+        "UPDATE delivery_reservation \
+         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
+             node_effect = 'NoNodeEffect' \
+         WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
@@ -681,7 +704,8 @@ async fn drive_clean_accept(pool: &SqlitePool, res_byte: u8) {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
-             response_provenance = 'PARSED_DPS_ENVELOPE' \
+             response_provenance = 'PARSED_DPS_ENVELOPE', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[res_byte; 16][..])
@@ -719,7 +743,8 @@ async fn t02_rn_oo_not_submitted_clears_marker_ok() {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry' \
+             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -738,10 +763,15 @@ async fn t03_rn_to_oo_submitted_rejected() {
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
     // RN → OO(SUBMITTED) skips CALL_STARTED → illegal edge (transition trigger).
+    // authorized_generation (034 H2 pairing) + apply_state + node_effect (H3/H4) are all
+    // set so every 034 guard passes and the rejection is the intended 032 transition
+    // trigger (RN→OO skips CALL_STARTED = illegal edge).
     let err = sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
-             response_provenance = 'PARSED_DPS_ENVELOPE', call_started_at = '2026-07-15T00:00:00Z' \
+             response_provenance = 'PARSED_DPS_ENVELOPE', \
+             call_started_at = '2026-07-15T00:00:00Z', authorized_generation = 1, \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -787,7 +817,8 @@ async fn t05_rn_cs_oo_submitted_unknown_ok_and_fences() {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry' \
+             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -834,7 +865,8 @@ async fn f02_second_reservation_blocked_after_submitted_unknown() {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry' \
+             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -863,7 +895,8 @@ async fn f03_second_reservation_blocked_after_submitted_with_routing() {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
-             response_provenance = 'PARSED_DPS_ENVELOPE', routing_class = 'TerminalReject' \
+             response_provenance = 'PARSED_DPS_ENVELOPE', routing_class = 'TerminalReject', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -907,7 +940,8 @@ async fn f05_second_reservation_accepted_after_not_submitted() {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry' \
+             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -996,7 +1030,8 @@ async fn i04_remote_correlation_id_mutation_after_oo_rejected() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             remote_correlation_id = 'corr-1' \
+             remote_correlation_id = 'corr-1', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -1277,7 +1312,8 @@ async fn b01_submitted_unknown_no_response_transient_retry_accepted() {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry' \
+             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -1303,7 +1339,8 @@ async fn n01_sequential_attempts_increment_after_cancel() {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry' \
+             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -1364,6 +1401,16 @@ async fn p01_upgrade_on_nonempty_db_sqlite_master_diff() {
         // table (auto-dropping this trigger), so it belongs in the reservation-object
         // set filtered out of the pre-existing byte-identity comparison.
         "delivery_reservation_apply_state_transition",
+        // 034 adds four more triggers ON delivery_reservation (H2/H3/H4 authority
+        // integrity). Like the 033 trigger, the control DB drops the table and
+        // auto-drops these, so they belong in the filtered-out reservation-object set.
+        // (034's H1 trigger `node_state_delivery_generation_monotone` is ON node_state,
+        // NOT delivery_reservation — it survives in BOTH DBs and stays in the
+        // byte-identity comparison, so it is deliberately NOT listed here.)
+        "delivery_reservation_cs_pairing_insert",
+        "delivery_reservation_cs_pairing_update",
+        "delivery_reservation_oo_completeness",
+        "delivery_reservation_clean_accept_node_effect",
     ]
     .into_iter()
     .collect();

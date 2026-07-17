@@ -110,7 +110,8 @@ async fn insert_res(pool: &SqlitePool, row: NewReservation) -> anyhow::Result<i6
 async fn advance_to_cs(pool: &SqlitePool, res_byte: u8) {
     sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'CALL_STARTED', call_started_at = '2026-07-17T00:00:00Z' \
+         SET state = 'CALL_STARTED', call_started_at = '2026-07-17T00:00:00Z', \
+             authorized_generation = 1 \
          WHERE reservation_id = ?",
     )
     .bind(&[res_byte; 16][..])
@@ -125,7 +126,8 @@ async fn advance_to_oo_clean(pool: &SqlitePool, res_byte: u8) {
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
-             response_provenance = 'PARSED_DPS_ENVELOPE' \
+             response_provenance = 'PARSED_DPS_ENVELOPE', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
          WHERE reservation_id = ?",
     )
     .bind(&[res_byte; 16][..])
@@ -316,8 +318,14 @@ async fn ag02_authorized_generation_check_rejects_zero() {
     // We insert RNS and then try to UPDATE to 0.
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
     // authorized_generation = 0 must violate CHECK.
+    // Do the RN→CS transition with authorized_generation = 0: call_started_at +
+    // authorized_generation set together satisfies the 034 H2 pairing trigger, so the
+    // rejection is the intended range CHECK (authorized_generation NULL or >= 1).
     let err = sqlx::query(
-        "UPDATE delivery_reservation SET authorized_generation = 0 WHERE reservation_id = ?",
+        "UPDATE delivery_reservation \
+         SET state = 'CALL_STARTED', call_started_at = '2026-07-15T00:00:00Z', \
+             authorized_generation = 0 \
+         WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
@@ -334,8 +342,13 @@ async fn ag03_authorized_generation_check_rejects_negative() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // RN→CS with authorized_generation = -1: pairing satisfied, so the rejection is the
+    // intended range CHECK (authorized_generation NULL or >= 1).
     let err = sqlx::query(
-        "UPDATE delivery_reservation SET authorized_generation = -1 WHERE reservation_id = ?",
+        "UPDATE delivery_reservation \
+         SET state = 'CALL_STARTED', call_started_at = '2026-07-15T00:00:00Z', \
+             authorized_generation = -1 \
+         WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
@@ -379,23 +392,17 @@ async fn ag05_authorized_generation_immutable_once_set() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // advance_to_cs sets authorized_generation = 1 (paired with call_started_at per 034 H2).
     advance_to_cs(&pool, 0x01).await;
-    sqlx::query(
-        "UPDATE delivery_reservation SET authorized_generation = 5 WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("initial set of authorized_generation to 5 must be accepted");
 
-    // Attempt to mutate: 5 → 6.
+    // Attempt to mutate: 1 → 6.
     let err = sqlx::query(
         "UPDATE delivery_reservation SET authorized_generation = 6 WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect_err("authorized_generation must be immutable once set (5 → 6 must ABORT)");
+    .expect_err("authorized_generation must be immutable once set (1 → 6 must ABORT)");
     assert!(
         err_has(&err, "immutable") || err_has(&err, "constraint"),
         "expected immutable/constraint error, got: {err}"
@@ -408,26 +415,22 @@ async fn ag06_authorized_generation_cannot_be_cleared_once_set() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // advance_to_cs sets authorized_generation = 1 (paired with call_started_at per 034 H2).
     advance_to_cs(&pool, 0x01).await;
-    sqlx::query(
-        "UPDATE delivery_reservation SET authorized_generation = 3 WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("setting authorized_generation to 3 must be accepted");
 
-    // Clear it: 3 → NULL must be blocked.
+    // Clearing authorized_generation at CALL_STARTED is doubly blocked: 034 H2 pairing
+    // (authorized_generation ↔ call_started_at set together) fires first; the 033
+    // immutability trigger is the fallback guard (teeth survive a 034 revert). Either is correct.
     let err = sqlx::query(
         "UPDATE delivery_reservation SET authorized_generation = NULL WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect_err("clearing authorized_generation (3 → NULL) must be blocked (immutable)");
+    .expect_err("clearing authorized_generation (1 → NULL) must be blocked");
     assert!(
-        err_has(&err, "immutable") || err_has(&err, "constraint"),
-        "expected immutable/constraint error, got: {err}"
+        err_has(&err, "immutable") || err_has(&err, "constraint") || err_has(&err, "pairing"),
+        "expected immutable/constraint/pairing error, got: {err}"
     );
 }
 
@@ -466,13 +469,15 @@ async fn as02_apply_state_check_rejects_bad_value() {
     .execute(&pool)
     .await
     .expect_err("apply_state 'BOGUS_STATE' must be rejected fail-closed");
-    // A bogus value is rejected fail-closed by whichever guard fires first: the
-    // apply_state transition trigger (BEFORE UPDATE) catches NULL→'BOGUS_STATE' as an
-    // illegal transition before the table CHECK vocabulary is even evaluated. Both are
-    // valid rejections (the CHECK is defence-in-depth under the trigger).
+    // A bogus value is rejected fail-closed by whichever guard fires first: after
+    // advance_to_oo_clean apply_state='PENDING_APPLY' (034 H3), so the apply_state
+    // transition trigger (BEFORE UPDATE) catches PENDING_APPLY→'BOGUS_STATE' as an illegal
+    // transition before the table CHECK vocabulary is even evaluated. Both are valid
+    // rejections (the CHECK is defence-in-depth under the trigger).
     assert!(
         err_has(&err, "check") || err_has(&err, "constraint")
-            || err_has(&err, "illegal") || err_has(&err, "apply_state"),
+            || err_has(&err, "illegal") || err_has(&err, "apply_state")
+            || err_has(&err, "abort"),
         "expected a fail-closed rejection (apply_state CHECK vocabulary OR transition trigger), got: {err}"
     );
 }
@@ -482,17 +487,12 @@ async fn as03_apply_state_legal_null_to_pending_apply() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // Under 034 H3 (OO completeness), the NULL→PENDING_APPLY edge is no longer a
+    // standalone update — it happens INSIDE the OO commit: state→OUTCOME_OBSERVED sets
+    // apply_state='PENDING_APPLY' together (apply_state may never rest NULL at OO).
     advance_to_oo_clean(&pool, 0x01).await;
 
-    // NULL → PENDING_APPLY is the first legal step.
-    sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = 'PENDING_APPLY' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("NULL→PENDING_APPLY must be a legal apply_state transition");
-
+    // The OO commit performed the NULL→PENDING_APPLY edge.
     let val: Option<String> =
         sqlx::query_scalar("SELECT apply_state FROM delivery_reservation WHERE reservation_id = ?")
             .bind(&[0x01u8; 16][..])
@@ -507,15 +507,8 @@ async fn as04_apply_state_legal_pending_apply_to_applied() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // advance_to_oo_clean leaves apply_state='PENDING_APPLY' (034 H3 OO completeness).
     advance_to_oo_clean(&pool, 0x01).await;
-
-    sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = 'PENDING_APPLY' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("NULL→PENDING_APPLY");
 
     // PENDING_APPLY → APPLIED is the second legal step.
     sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
@@ -535,11 +528,16 @@ async fn as04_apply_state_legal_pending_apply_to_applied() {
 
 #[tokio::test]
 async fn as05_apply_state_illegal_null_to_applied_jump() {
-    // NULL → APPLIED skips PENDING_APPLY — must be rejected.
+    // APPLIED cannot skip PENDING_APPLY. Under 034 H3, apply_state is 'PENDING_APPLY' the
+    // moment OO is reached (never NULL at OO), so a literal NULL→APPLIED jump at OO is
+    // unreachable. The still-meaningful invariant is that APPLIED can never be reached
+    // WITHOUT first passing through PENDING_APPLY: apply_state may only exist at
+    // OUTCOME_OBSERVED (field↔state CHECK), so trying to set it at CALL_STARTED — the only
+    // point where apply_state is still NULL and could "jump" — is rejected fail-closed.
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
-    advance_to_oo_clean(&pool, 0x01).await;
+    advance_to_cs(&pool, 0x01).await; // CALL_STARTED — apply_state still NULL, not yet OO
 
     let err = sqlx::query(
         "UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?",
@@ -547,10 +545,16 @@ async fn as05_apply_state_illegal_null_to_applied_jump() {
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect_err("NULL→APPLIED (skipping PENDING_APPLY) must be rejected by apply_state trigger");
+    .expect_err(
+        "apply_state='APPLIED' before OUTCOME_OBSERVED must be rejected fail-closed \
+         (field↔state CHECK: apply_state only at OO ⇒ APPLIED cannot skip PENDING_APPLY)",
+    );
     assert!(
-        err_has(&err, "apply_state") || err_has(&err, "illegal") || err_has(&err, "constraint"),
-        "expected apply_state/illegal/constraint error, got: {err}"
+        err_has(&err, "apply_state")
+            || err_has(&err, "illegal")
+            || err_has(&err, "constraint")
+            || err_has(&err, "abort"),
+        "expected apply_state/illegal/constraint/abort error, got: {err}"
     );
 }
 
@@ -560,15 +564,8 @@ async fn as06_apply_state_illegal_applied_to_pending_apply_regress() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // advance_to_oo_clean leaves apply_state='PENDING_APPLY' (034 H3 OO completeness).
     advance_to_oo_clean(&pool, 0x01).await;
-
-    sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = 'PENDING_APPLY' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("NULL→PENDING_APPLY");
     sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
         .bind(&[0x01u8; 16][..])
         .execute(&pool)
@@ -595,15 +592,8 @@ async fn as07_apply_state_illegal_applied_to_null_regress() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // advance_to_oo_clean leaves apply_state='PENDING_APPLY' (034 H3 OO completeness).
     advance_to_oo_clean(&pool, 0x01).await;
-
-    sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = 'PENDING_APPLY' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("NULL→PENDING_APPLY");
     sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
         .bind(&[0x01u8; 16][..])
         .execute(&pool)
@@ -628,15 +618,8 @@ async fn as08_apply_state_illegal_pending_apply_to_null_regress() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // advance_to_oo_clean leaves apply_state='PENDING_APPLY' (034 H3 OO completeness).
     advance_to_oo_clean(&pool, 0x01).await;
-
-    sqlx::query(
-        "UPDATE delivery_reservation SET apply_state = 'PENDING_APPLY' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("NULL→PENDING_APPLY");
 
     let err =
         sqlx::query("UPDATE delivery_reservation SET apply_state = NULL WHERE reservation_id = ?")
@@ -676,10 +659,16 @@ async fn ne02_node_effect_check_rejects_bad_value() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
-    advance_to_oo_clean(&pool, 0x01).await;
+    // Set the bad node_effect AT the OO commit with a non-clean routing_class (034 H4 only
+    // constrains routing NULL), so the rejection is the intended 033 vocab CHECK, not H4.
+    advance_to_cs(&pool, 0x01).await;
 
     let err = sqlx::query(
-        "UPDATE delivery_reservation SET node_effect = 'NOT_IN_VOCAB' WHERE reservation_id = ?",
+        "UPDATE delivery_reservation \
+         SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
+             response_provenance = 'PARSED_DPS_ENVELOPE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NOT_IN_VOCAB' \
+         WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
@@ -708,13 +697,30 @@ async fn ne03_node_effect_accepts_all_valid_vocabulary_values() {
         let (_d, pool) = fresh_pool().await;
         let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
         insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
-        advance_to_oo_clean(&pool, 0x01).await;
-        sqlx::query("UPDATE delivery_reservation SET node_effect = ? WHERE reservation_id = ?")
-            .bind(val)
-            .bind(&[0x01u8; 16][..])
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("node_effect '{val}' must be accepted; got: {e}"));
+        // Under 034 H3/H4, node_effect must be set AT the OO commit (H3: non-NULL at OO)
+        // and is frozen thereafter (033 immutability), so it cannot be applied as a
+        // follow-up UPDATE on top of advance_to_oo_clean. Set it together with state→OO.
+        // H4: a clean accept (routing_class NULL) requires node_effect='NoNodeEffect';
+        // every non-NoNodeEffect value therefore needs a non-clean routing_class.
+        advance_to_cs(&pool, 0x01).await;
+        let routing_class = if val == "NoNodeEffect" {
+            None // clean accept
+        } else {
+            Some("TransientRetry") // non-clean: satisfies H4 + the 032 routing couplings
+        };
+        sqlx::query(
+            "UPDATE delivery_reservation \
+             SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
+                 response_provenance = 'PARSED_DPS_ENVELOPE', \
+                 routing_class = ?, apply_state = 'PENDING_APPLY', node_effect = ? \
+             WHERE reservation_id = ?",
+        )
+        .bind(routing_class)
+        .bind(val)
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("node_effect '{val}' must be accepted at OO commit; got: {e}"));
     }
 }
 
@@ -724,24 +730,32 @@ async fn ne04_node_effect_immutable_once_set() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
-    advance_to_oo_clean(&pool, 0x01).await;
-
+    // Advance to a non-clean OO (routing_class NOT NULL) with node_effect='NodeBlocked', so
+    // the follow-up mutation is not masked by 034 H4 (which only constrains routing NULL);
+    // the rejection is then the intended 033 node_effect immutability trigger.
+    advance_to_cs(&pool, 0x01).await;
     sqlx::query(
-        "UPDATE delivery_reservation SET node_effect = 'NodeBlocked' WHERE reservation_id = ?",
+        "UPDATE delivery_reservation \
+         SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
+             response_provenance = 'PARSED_DPS_ENVELOPE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NodeBlocked' \
+         WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect("initial set of node_effect to NodeBlocked must be accepted");
+    .expect("non-clean OO with node_effect=NodeBlocked is legal");
 
-    // Mutation: NodeBlocked → NoNodeEffect.
+    // Mutation: NodeBlocked → MacReseedPending (frozen once set).
     let err = sqlx::query(
-        "UPDATE delivery_reservation SET node_effect = 'NoNodeEffect' WHERE reservation_id = ?",
+        "UPDATE delivery_reservation SET node_effect = 'MacReseedPending' WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect_err("node_effect must be immutable once set (NodeBlocked → NoNodeEffect must ABORT)");
+    .expect_err(
+        "node_effect must be immutable once set (NodeBlocked → MacReseedPending must ABORT)",
+    );
     assert!(
         err_has(&err, "immutable") || err_has(&err, "constraint"),
         "expected immutable/constraint error, got: {err}"
@@ -754,25 +768,23 @@ async fn ne05_node_effect_cannot_be_cleared_once_set() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
+    // advance_to_oo_clean sets node_effect='NoNodeEffect' at the OO commit (034 H3/H4).
     advance_to_oo_clean(&pool, 0x01).await;
 
-    sqlx::query(
-        "UPDATE delivery_reservation SET node_effect = 'MacReseedPending' WHERE reservation_id = ?",
-    )
-    .bind(&[0x01u8; 16][..])
-    .execute(&pool)
-    .await
-    .expect("setting node_effect to MacReseedPending must be accepted");
-
+    // Clearing node_effect at OUTCOME_OBSERVED is doubly blocked: 034 H3 (OO completeness
+    // requires node_effect non-NULL) fires first; the 033 immutability trigger is the
+    // fallback guard (teeth survive a 034 revert). Either rejection is correct.
     let err =
         sqlx::query("UPDATE delivery_reservation SET node_effect = NULL WHERE reservation_id = ?")
             .bind(&[0x01u8; 16][..])
             .execute(&pool)
             .await
-            .expect_err("node_effect → NULL (clearing) must be blocked (immutable)");
+            .expect_err("node_effect → NULL (clearing) must be blocked");
     assert!(
-        err_has(&err, "immutable") || err_has(&err, "constraint"),
-        "expected immutable/constraint error, got: {err}"
+        err_has(&err, "immutable")
+            || err_has(&err, "constraint")
+            || err_has(&err, "partial authority"),
+        "expected immutable/constraint/H3 error, got: {err}"
     );
 }
 
@@ -925,11 +937,14 @@ async fn rg03_032_insert_state_trigger_still_fires() {
     // The insert_state trigger from 032 must still reject non-RNS inserts.
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
+    // authorized_generation is set to satisfy the 034 RN→CS pairing trigger, so the
+    // rejection is the intended 032 insert_state trigger (state must be RNS on INSERT),
+    // not the pairing guard.
     let err = sqlx::query(
         "INSERT INTO delivery_reservation \
             (reservation_id, document_id, fiscal_number, attempt_no, state, call_started_at, \
-             dps_protocol_id, protocol_contract_version, envelope_hash) \
-         VALUES (?, ?, ?, 1, 'CALL_STARTED', '2026-07-17T00:00:00Z', 'FSCO_ZZD', 1, ?)",
+             authorized_generation, dps_protocol_id, protocol_contract_version, envelope_hash) \
+         VALUES (?, ?, ?, 1, 'CALL_STARTED', '2026-07-17T00:00:00Z', 1, 'FSCO_ZZD', 1, ?)",
     )
     .bind(&[0x01u8; 16][..])
     .bind(doc.as_bytes().to_vec())
@@ -1106,6 +1121,9 @@ async fn lc03_authorized_generation_cannot_be_set_at_reserved_not_started() {
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
 
+    // Setting authorized_generation at RESERVED_NOT_STARTED (call_started_at NULL) is doubly
+    // blocked: 034 H2 pairing fires first; the 033 field↔state CHECK is the fallback guard
+    // (teeth survive a 034 revert). Either rejection is correct.
     let err = sqlx::query(
         "UPDATE delivery_reservation SET authorized_generation = 1 WHERE reservation_id = ?",
     )
@@ -1116,7 +1134,7 @@ async fn lc03_authorized_generation_cannot_be_set_at_reserved_not_started() {
         "authorized_generation set at RESERVED_NOT_STARTED must be rejected (field↔state CHECK)",
     );
     assert!(
-        err_has(&err, "check") || err_has(&err, "constraint"),
-        "expected a CHECK/constraint (authorized_generation NULL at RNS), got: {err}"
+        err_has(&err, "check") || err_has(&err, "constraint") || err_has(&err, "pairing"),
+        "expected a CHECK/constraint/pairing (authorized_generation NULL at RNS), got: {err}"
     );
 }
