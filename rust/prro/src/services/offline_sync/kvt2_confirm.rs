@@ -392,6 +392,19 @@ pub fn classify_check_result(
             reason: Kvt2ConfirmHoldReason::DpsDecode(msg),
             sent_replay_trace_attempt_no,
         },
+        // RA — COMPATIBILITY PROJECTION (not an ideal semantic classification):
+        // R1 `RemoteStatus` / slice-A `Indeterminate` map to the exact SAME
+        // Hold(DpsServer) with the Debug-formatted detail the `Err(other)` catch-all
+        // below already produced — byte-identical `format!("{err:?}")`, so RA is
+        // behaviour-neutral vs the current confirm path.  Handled EXPLICITLY (not
+        // accidentally via the catch-all) so the intent is documented and pinned.
+        // A dedicated `Kvt2ConfirmHoldReason` for these is a FUTURE slice, out of RA scope.
+        Err(err @ (DpsError::RemoteStatus { .. } | DpsError::Indeterminate { .. })) => {
+            Kvt2ConfirmOutcome::Hold {
+                reason: Kvt2ConfirmHoldReason::DpsServer(format!("{err:?}")),
+                sent_replay_trace_attempt_no,
+            }
+        }
         Err(other) => {
             // Defensive catch-all for `DpsError::QueryNotSupported` /
             // `DpsError::Internal` (and any future variant).  Lands as
@@ -2333,5 +2346,33 @@ mod tests {
             map_hold_reason_to_class(&Kvt2ConfirmHoldReason::LastChkDataSignEmpty),
             FailureClass::Internal
         );
+    }
+
+    #[test]
+    fn classify_remote_status_and_indeterminate_hold_dps_server_ra() {
+        // RA all-consumers pin (compatibility projection): R1 `RemoteStatus` / slice-A
+        // `Indeterminate` map to Hold(DpsServer, Debug-formatted) — identical to the
+        // catch-all — so the confirm path is behaviour-neutral vs current main.
+        for err in [
+            DpsError::RemoteStatus {
+                code: "Unauthenticated".into(),
+                message: "creds rejected".into(),
+                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+            },
+            DpsError::Indeterminate {
+                code: -4,
+                message: "server unknown".into(),
+                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+            },
+        ] {
+            let out = classify_check_result(Err(err), Kvt2ConfirmSource::SentFresh, None, false);
+            match out {
+                Kvt2ConfirmOutcome::Hold {
+                    reason: Kvt2ConfirmHoldReason::DpsServer(_),
+                    ..
+                } => {}
+                other => panic!("expected Hold(DpsServer) for RA compat projection, got {other:?}"),
+            }
+        }
     }
 }

@@ -412,7 +412,7 @@ mod tests {
         );
         assert_eq!(
             transport_decision.retry_class, remote_status_decision.retry_class,
-            "RemoteStatus must route identically to Transport (behaviour-neutral slice)"
+            "RemoteStatus must route identically to Transport (compatibility projection; emission is TLS-gated per R1)"
         );
         assert_eq!(
             transport_decision.target_state,

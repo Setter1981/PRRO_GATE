@@ -1,6 +1,6 @@
 //! Typed error surface for the DPS gRPC transport.
 //!
-//! Eight variants cover the failure modes a `DpsChannel` caller has
+//! Ten variants cover the failure modes a `DpsChannel` caller has
 //! to make routing decisions on (retry now, fall back, mark FN
 //! broken, escalate to operator, classify by-id-lookup outcome,
 //! reject unsupported queries).  The categories are protocol-shape,
@@ -43,8 +43,13 @@ pub enum DpsError {
     /// `code` is the tonic `Code` debug string (e.g. `"Unauthenticated"`,
     /// `"PermissionDenied"`).  `message` carries the gRPC status message.
     ///
-    /// **Routing (behaviour-neutral slice A′):** currently routes
+    /// **Routing — compatibility projection:** currently routes
     /// identically to `Transport` — `ErrorRetryable / TransientRetry`.
+    /// This routing arm is a compatibility projection kept identical to
+    /// `Transport`, but the slice is NOT behaviour-neutral overall: R1
+    /// gated emission on proven TLS (a plaintext `Unauthenticated` now
+    /// routes as `Transport`) and consumers (`last_chk_probe` /
+    /// `kvt2_confirm` / `dps_error_class`) observe the distinct type.
     /// Slice E (classifier) will differentiate it into `ProbeRequired`
     /// once the full CS-3 surface is wired.  A separate match arm in
     /// `route_dps_error` ensures slice E can change it without touching
@@ -97,9 +102,10 @@ pub enum DpsError {
     /// StatusResponse / RroInfoResponse status codes for which an
     /// authorization-class destination is documented.  Transport-level
     /// authentication failures (gRPC `Unauthenticated` /
-    /// `PermissionDenied`) are mapped to [`DpsError::Transport`] in
-    /// `grpc.rs::map_tonic_status` — they have no DPS status code and
-    /// would force a synthetic `code = 0` here.
+    /// `PermissionDenied`) map to [`DpsError::RemoteStatus`] over a
+    /// TLS-proven channel, or [`DpsError::Transport`] over a plaintext
+    /// one (R1 trust boundary) — never `Authorization` (they have no
+    /// DPS status code and would force a synthetic `code = 0` here).
     #[error("DPS authorization {kind:?} (code={code}): {message}")]
     Authorization {
         code: i32,

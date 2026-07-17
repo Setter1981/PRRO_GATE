@@ -546,3 +546,32 @@ pub fn spawn_probe_loop(
         }
     })
 }
+
+#[cfg(test)]
+mod ra_tests {
+    use super::*;
+    use crate::transports::dps::error::DpsError;
+
+    #[test]
+    fn dps_error_class_labels_remote_status_and_indeterminate_ra() {
+        // RA all-consumers pin: the taxonomy string is DISTINCT for the CS-3 variants
+        // (NOT collapsed to "Transport") — this is exactly why slice A/A′ was never
+        // behaviour-neutral. Pinned so the taxonomy cannot silently regress.
+        assert_eq!(
+            dps_error_class(&DpsError::RemoteStatus {
+                code: "Unauthenticated".into(),
+                message: "x".into(),
+                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+            }),
+            "RemoteStatus"
+        );
+        assert_eq!(
+            dps_error_class(&DpsError::Indeterminate {
+                code: -4,
+                message: "y".into(),
+                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+            }),
+            "Indeterminate"
+        );
+    }
+}
