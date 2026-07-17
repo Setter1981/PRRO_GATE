@@ -17,8 +17,8 @@
 //! and FAIL (type-not-found or classification mismatch) before the implementation lands.
 
 use prro_domain::delivery::{
-    classify, ActiveRetryClass, BoundedText, ClassifiedOutcome, DpsProtocolBinding, DpsProtocolId,
-    DpsReject, EnvelopeHash, NoResponseCause, PreflightRefusal, ProtocolContractVersion,
+    classify, ActiveRetryClass, BoundedText, DpsProtocolBinding, DpsProtocolId, DpsReject,
+    EnvelopeHash, NoResponseCause, NodeEffect, PreflightRefusal, ProtocolContractVersion,
     RawResponseDigest, RemoteStatusEvidence, ResponseProvenance, SendIndeterminate, SendOutcome,
     SendResponse, SentAccepted, SubmissionCertainty, SubmissionEvidence,
 };
@@ -67,19 +67,29 @@ fn started(response: SendResponse) -> SubmissionEvidence {
     }
 }
 
+struct ExpectedAxes {
+    certainty: SubmissionCertainty,
+    provenance: ResponseProvenance,
+    routing: Option<ActiveRetryClass>,
+    node_effect: NodeEffect,
+}
+
 fn expected(
     certainty: SubmissionCertainty,
     provenance: ResponseProvenance,
     routing: Option<ActiveRetryClass>,
-) -> ClassifiedOutcome {
-    ClassifiedOutcome {
+    node_effect: NodeEffect,
+) -> ExpectedAxes {
+    ExpectedAxes {
         certainty,
         provenance,
         routing,
+        node_effect,
     }
 }
 
 use ActiveRetryClass as ARC;
+use NodeEffect as NE;
 use ResponseProvenance as RP;
 use SubmissionCertainty as SC;
 
@@ -118,7 +128,7 @@ struct GraphRow {
     label: &'static str,
     evidence: SubmissionEvidence,
     doc_type: DocType,
-    expected: ClassifiedOutcome,
+    expected: ExpectedAxes,
 }
 
 fn normative_graph() -> Vec<GraphRow> {
@@ -128,13 +138,13 @@ fn normative_graph() -> Vec<GraphRow> {
             label: "NotStarted/PreconditionFailed → NotSubmitted/NoResponse/TransientRetry",
             evidence: not_started_preflight(),
             doc_type: DocType::Sell,
-            expected: expected(SC::NotSubmitted, RP::NoResponse, Some(ARC::TransientRetry)),
+            expected: expected(SC::NotSubmitted, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         GraphRow {
             label: "NotStarted/SigningFailed → NotSubmitted/NoResponse/WrapperBug",
             evidence: not_started_signing(),
             doc_type: DocType::Sell,
-            expected: expected(SC::NotSubmitted, RP::NoResponse, Some(ARC::WrapperBug)),
+            expected: expected(SC::NotSubmitted, RP::NoResponse, Some(ARC::WrapperBug), NE::WrapperBug),
         },
 
         // ── Started{NoResponse} ─────────────────────────────────────────────
@@ -142,25 +152,25 @@ fn normative_graph() -> Vec<GraphRow> {
             label: "Started/NoResponse(Timeout) → SubmittedUnknown/NoResponse/TransientRetry",
             evidence: started(SendResponse::NoResponse(NoResponseCause::Timeout)),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry)),
+            expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/NoResponse(Cancelled) → SubmittedUnknown/NoResponse/TransientRetry",
             evidence: started(SendResponse::NoResponse(NoResponseCause::Cancelled)),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry)),
+            expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/NoResponse(LocalHandshake) → SubmittedUnknown/NoResponse/TransientRetry",
             evidence: started(SendResponse::NoResponse(NoResponseCause::LocalHandshakeFailure)),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry)),
+            expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/NoResponse(Crashed) → SubmittedUnknown/NoResponse/TransientRetry (RP4B-1)",
             evidence: started(SendResponse::NoResponse(NoResponseCause::CrashedBeforeObservation)),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry)),
+            expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
 
         // ── Started{RemoteStatus} ───────────────────────────────────────────
@@ -168,13 +178,13 @@ fn normative_graph() -> Vec<GraphRow> {
             label: "Started/RemoteStatus(Garbage) → SubmittedUnknown/AuthenticatedPeer/ProbeRequired",
             evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::AuthenticatedPeerGarbage(digest()))),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::AuthenticatedPeer, Some(ARC::ProbeRequired)),
+            expected: expected(SC::SubmittedUnknown, RP::AuthenticatedPeer, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },
         GraphRow {
             label: "Started/RemoteStatus(AuthStatus) → SubmittedUnknown/AuthenticatedPeer/ProbeRequired",
             evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(digest()))),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::AuthenticatedPeer, Some(ARC::ProbeRequired)),
+            expected: expected(SC::SubmittedUnknown, RP::AuthenticatedPeer, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },
 
         // ── Started{Parsed(Accepted)} ───────────────────────────────────────
@@ -184,7 +194,7 @@ fn normative_graph() -> Vec<GraphRow> {
                 SentAccepted::observe("DPS-123").unwrap(),
             ))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, None),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, None, NE::NoNodeEffect),
         },
 
         // ── Started{Parsed(Rejected)} — closed DpsReject variants ──────────
@@ -192,80 +202,80 @@ fn normative_graph() -> Vec<GraphRow> {
             label: "Started/Parsed(Rejected(Verify/-1)) → Submitted/Parsed/TerminalReject (RP4B-3)",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Verify))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(Type/-5)) → Submitted/Parsed/TerminalReject",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Type))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(NotPrevZReport/-6)) → Submitted/Parsed/OperatorEscalation",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotPrevZReport))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::OperatorEscalation)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::OperatorEscalation), NE::OperatorEscalation),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(Xml/-7)) → Submitted/Parsed/TerminalReject",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Xml))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(XmlDate/-8)) → Submitted/Parsed/TerminalReject",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlDate))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(XmlChk/-9)) → Submitted/Parsed/TerminalReject",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlChk))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(XmlZReport/-10)) → Submitted/Parsed/TerminalReject",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlZReport))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(Offline168/-11)) → Submitted/Parsed/TerminalReject",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Offline168))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NodeBlocked),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(BadHashPrev/-12)) → Submitted/Parsed/MacRecovery",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::BadHashPrev))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::MacRecovery)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::MacRecovery), NE::MacReseedPending),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(NotRegisteredRro/-13)) → Submitted/Parsed/FnConfigError",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotRegisteredRro))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::FnConfigError)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::FnConfigError), NE::FnConfigError),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(NotRegisteredSigner/-14)) → Submitted/Parsed/FnConfigError",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotRegisteredSigner))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::FnConfigError)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::FnConfigError), NE::FnConfigError),
         },
         GraphRow {
             label: "Started/Parsed(Rejected(OfflineId/-16)) → Submitted/Parsed/TerminalReject",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::OfflineId))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NoNodeEffect),
         },
         // DpsReject::Close on a non-close doc type → TerminalReject (§12 R1)
         GraphRow {
             label: "Started/Parsed(Rejected(Close)) on Sell → Submitted/Parsed/TerminalReject (§12 R1)",
             evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Close))),
             doc_type: DocType::Sell,
-            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject)),
+            expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, Some(ARC::TerminalReject), NE::NoNodeEffect),
         },
 
         // ── Started{Parsed(Indeterminate)} ──────────────────────────────────
@@ -278,7 +288,7 @@ fn normative_graph() -> Vec<GraphRow> {
                 },
             ))),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::TransientRetry)),
+            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/Parsed(Indeterminate(SaveError/-3)) → SubmittedUnknown/Parsed/TransientRetry (RP4B-3)",
@@ -286,7 +296,7 @@ fn normative_graph() -> Vec<GraphRow> {
                 SendIndeterminate::SaveError,
             ))),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::TransientRetry)),
+            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         // CloseAmbiguous on Z_REPORT → ProbeRequired (§12 R1 / -2/-15 close-shift split)
         GraphRow {
@@ -295,7 +305,7 @@ fn normative_graph() -> Vec<GraphRow> {
                 SendIndeterminate::CloseAmbiguous,
             ))),
             doc_type: DocType::ZReport,
-            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::ProbeRequired)),
+            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },
         // CloseAmbiguous on ShiftClose → ProbeRequired (§12 R1)
         GraphRow {
@@ -304,7 +314,7 @@ fn normative_graph() -> Vec<GraphRow> {
                 SendIndeterminate::CloseAmbiguous,
             ))),
             doc_type: DocType::ShiftClose,
-            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::ProbeRequired)),
+            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },
         GraphRow {
             label: "Started/Parsed(Indeterminate(OkButNoFiscalNumber)) → SubmittedUnknown/Parsed/ProbeRequired",
@@ -312,7 +322,7 @@ fn normative_graph() -> Vec<GraphRow> {
                 SendIndeterminate::OkButNoFiscalNumber { digest: digest() },
             ))),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::ProbeRequired)),
+            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },
     ]
 }
@@ -326,10 +336,17 @@ fn rp4b_2_classify_full_graph_matches_normative() {
 
     for row in &graph {
         let got = classify(&row.evidence, row.doc_type);
-        if got != row.expected {
+        let e = &row.expected;
+        if got.certainty() != e.certainty
+            || got.provenance() != e.provenance
+            || got.routing() != e.routing
+            || got.node_effect() != e.node_effect
+        {
             failures.push(format!(
-                "\n  FAIL [{}]\n    doc_type={:?}\n    expected={:?}\n    got     ={:?}",
-                row.label, row.doc_type, row.expected, got
+                "\n  FAIL [{}]\n    doc_type={:?}\n    expected=(certainty={:?}, provenance={:?}, routing={:?}, node_effect={:?})\n    got     =(certainty={:?}, provenance={:?}, routing={:?}, node_effect={:?})",
+                row.label, row.doc_type,
+                e.certainty, e.provenance, e.routing, e.node_effect,
+                got.certainty(), got.provenance(), got.routing(), got.node_effect(),
             ));
         }
     }
@@ -375,14 +392,15 @@ fn rp4b_3_parsed_rows_are_distinct_from_timeout() {
 
     // -4 and timeout must differ in provenance
     assert_ne!(
-        minus4.provenance, timeout.provenance,
+        minus4.provenance(),
+        timeout.provenance(),
         "RP4B-3: -4 (Parsed) and timeout (NoResponse) must differ in ResponseProvenance"
     );
     // Both -4 and timeout are SubmittedUnknown
-    assert_eq!(minus4.certainty, SC::SubmittedUnknown);
-    assert_eq!(timeout.certainty, SC::SubmittedUnknown);
+    assert_eq!(minus4.certainty(), SC::SubmittedUnknown);
+    assert_eq!(timeout.certainty(), SC::SubmittedUnknown);
     // -1 must be Submitted (not SubmittedUnknown)
-    assert_eq!(minus1.certainty, SC::Submitted);
+    assert_eq!(minus1.certainty(), SC::Submitted);
     // Full triples are all distinct
     assert_ne!(minus4, timeout, "RP4B-3: -4 triple != timeout triple");
     assert_ne!(minus4, minus1, "RP4B-3: -4 triple != -1 triple");
@@ -414,13 +432,13 @@ fn d3_parsed_reject_yields_submitted_not_unknown() {
             DocType::Sell,
         );
         assert_eq!(
-            out.certainty,
+            out.certainty(),
             SC::Submitted,
             "D3: Parsed(Rejected({:?})) must yield Submitted certainty",
             verdict
         );
         assert_eq!(
-            out.provenance,
+            out.provenance(),
             RP::ParsedDpsEnvelope,
             "D3: Parsed(Rejected({:?})) must yield ParsedDpsEnvelope provenance",
             verdict
@@ -449,7 +467,7 @@ fn d3_parsed_indeterminate_yields_submitted_unknown() {
             DocType::Sell,
         );
         assert_eq!(
-            out.certainty,
+            out.certainty(),
             SC::SubmittedUnknown,
             "D3: Parsed(Indeterminate({:?})) must yield SubmittedUnknown",
             ind
@@ -534,21 +552,29 @@ fn active_retry_class_wire_strings_match_error_routing() {
 
 #[test]
 fn observed_outcome_v1_carries_all_fields() {
-    use prro_domain::delivery::{NodeEffect, ObservedOutcomeV1};
+    use prro_domain::delivery::{classify, ObservedOutcomeV1};
 
-    let outcome = ObservedOutcomeV1 {
-        certainty: SC::Submitted,
-        provenance: RP::ParsedDpsEnvelope,
-        routing: Some(ARC::TerminalReject),
-        remote_correlation_id: Some(BoundedText::from_truncating("DPS-123")),
-        node_effect: NodeEffect::NoNodeEffect,
-        authorized_generation: 42,
-    };
-    assert_eq!(outcome.certainty, SC::Submitted);
-    assert_eq!(outcome.authorized_generation, 42);
-    assert_eq!(outcome.node_effect, NodeEffect::NoNodeEffect);
+    // Build a real classifier output (Offline168 → Submitted/Parsed/TerminalReject/NodeBlocked),
+    // then mint the durable record from it. The axes + node_effect come from `classify`,
+    // never hand-assembled (sealed mint).
+    let classified = classify(
+        &started(SendResponse::Parsed(SendOutcome::Rejected(
+            DpsReject::Offline168,
+        ))),
+        DocType::Sell,
+    );
+    let outcome = ObservedOutcomeV1::record(
+        &classified,
+        Some(BoundedText::from_truncating("DPS-123")),
+        42,
+    )
+    .expect("gen 42 >= 1 is valid");
+
+    assert_eq!(outcome.certainty(), SC::Submitted);
+    assert_eq!(outcome.authorized_generation(), 42);
+    assert_eq!(outcome.node_effect(), NE::NodeBlocked);
     assert_eq!(
-        outcome.remote_correlation_id.as_ref().map(|t| t.as_str()),
+        outcome.remote_correlation_id().map(|t| t.as_str()),
         Some("DPS-123")
     );
 }

@@ -348,10 +348,13 @@ pub enum SendOutcome {
 }
 
 /// Proof of DPS acceptance: non-empty fiscal number returned (AL-3).
+///
+/// **Sealed (R2):** the field is private and [`observe`](Self::observe) is the sole
+/// constructor, so a `SentAccepted` with an empty `fiscal_number` is unconstructible —
+/// the empty case is represented by `SendIndeterminate::OkButNoFiscalNumber` instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SentAccepted {
-    /// The DPS-assigned fiscal number (non-empty; the empty case ⇒ `OkButNoFiscalNumber`).
-    pub fiscal_number: String,
+    fiscal_number: String,
 }
 
 impl SentAccepted {
@@ -363,6 +366,11 @@ impl SentAccepted {
         } else {
             Some(Self { fiscal_number: id })
         }
+    }
+
+    /// The DPS-assigned fiscal number (guaranteed non-empty by construction, AL-3).
+    pub fn fiscal_number(&self) -> &str {
+        &self.fiscal_number
     }
 }
 
@@ -448,8 +456,32 @@ pub enum SubmissionEvidence {
 // ─── Reconcile types (§5, B3b/B5) ────────────────────────────────────────────
 
 /// Raw KVT1 quittance data (data_sign bytes, len ≥ 64).
+///
+/// **Sealed (R2):** the byte vector is private and [`new`](Self::new) enforces the
+/// `len >= MIN_LEN` quittance invariant, so a too-short `Kvt1Raw` (which is
+/// `IdMatchedNoQuittance` territory, not a proven quittance) is unconstructible.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Kvt1Raw(pub Vec<u8>);
+pub struct Kvt1Raw(Vec<u8>);
+
+impl Kvt1Raw {
+    /// Minimum `data_sign` length that proves a real KVT1 quittance (AL-2).
+    pub const MIN_LEN: usize = 64;
+
+    /// Construct only if `bytes.len() >= MIN_LEN`. Returns `None` for shorter blobs
+    /// (a short `data_sign` is `IdMatchedNoQuittance`, not a proven quittance).
+    pub fn new(bytes: Vec<u8>) -> Option<Self> {
+        if bytes.len() >= Self::MIN_LEN {
+            Some(Self(bytes))
+        } else {
+            None
+        }
+    }
+
+    /// The raw quittance bytes (guaranteed `len >= MIN_LEN` by construction).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 /// Attributed reconcile outcome — only for doc-level proven matches (RC-1, AL-2).
 ///
@@ -466,16 +498,41 @@ pub enum ReconcileOutcome {
 // ─── Classified outcome (§2 total derivation) ────────────────────────────────
 
 /// Output of the total classifier [`classify`] — the three axes derived from
-/// `SubmissionEvidence` per §2 (D1, D2, D3).
+/// `SubmissionEvidence` per §2 (D1, D2, D3) **plus** the durable `node_effect`
+/// discriminant (A4-6).
+///
+/// **Sealed (R2):** all fields are private and the only constructor is [`classify`]
+/// (same module). No external code can fabricate an illegal `(certainty, provenance,
+/// routing, node_effect)` quadruple; consumers read via the getters. This is what
+/// makes [`ObservedOutcomeV1::record`] a safe mint (it copies a validated quadruple).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassifiedOutcome {
+    certainty: SubmissionCertainty,
+    provenance: ResponseProvenance,
+    routing: Option<ActiveRetryClass>,
+    node_effect: NodeEffect,
+}
+
+impl ClassifiedOutcome {
     /// Submission certainty axis (D3: total function of `SubmissionEvidence`).
-    pub certainty: SubmissionCertainty,
+    pub fn certainty(&self) -> SubmissionCertainty {
+        self.certainty
+    }
     /// Response provenance axis.
-    pub provenance: ResponseProvenance,
+    pub fn provenance(&self) -> ResponseProvenance {
+        self.provenance
+    }
     /// Routing class (CS-3 store API). `None` only for clean acceptance
     /// (routing cleared after a `Submitted`+`Accepted` is applied). (§2 table).
-    pub routing: Option<ActiveRetryClass>,
+    pub fn routing(&self) -> Option<ActiveRetryClass> {
+        self.routing
+    }
+    /// Durable node-effect discriminant (A4-6). The classifier is the single source
+    /// of truth for this — it was previously computed and DISCARDED, forcing every
+    /// consumer to re-derive it (checkpoint-audit finding, R2).
+    pub fn node_effect(&self) -> NodeEffect {
+        self.node_effect
+    }
 }
 
 /// Total classifier: derives the three axes from `SubmissionEvidence` + `DocType` (§2/D3).
@@ -500,6 +557,7 @@ pub fn classify(evidence: &SubmissionEvidence, doc_type: DocType) -> ClassifiedO
                 certainty: SubmissionCertainty::NotSubmitted,
                 provenance: ResponseProvenance::NoResponse,
                 routing: Some(routing),
+                node_effect: node_effect_for_active(routing),
             }
         }
         SubmissionEvidence::Started { response, .. } => classify_started(response, doc_type),
@@ -520,6 +578,7 @@ fn classify_started(response: &SendResponse, doc_type: DocType) -> ClassifiedOut
                 certainty: SubmissionCertainty::SubmittedUnknown,
                 provenance: ResponseProvenance::NoResponse,
                 routing: Some(routing),
+                node_effect: node_effect_for_active(routing),
             }
         }
         // RemoteStatus: authenticated peer replied but NOT with a DPS envelope (B8).
@@ -527,6 +586,7 @@ fn classify_started(response: &SendResponse, doc_type: DocType) -> ClassifiedOut
             certainty: SubmissionCertainty::SubmittedUnknown,
             provenance: ResponseProvenance::AuthenticatedPeer,
             routing: Some(ActiveRetryClass::ProbeRequired),
+            node_effect: node_effect_for_active(ActiveRetryClass::ProbeRequired),
         },
         // Parsed: a real DPS envelope — apply the disjoint algebra (§5).
         SendResponse::Parsed(outcome) => classify_parsed(outcome, doc_type),
@@ -540,14 +600,18 @@ fn classify_parsed(outcome: &SendOutcome, doc_type: DocType) -> ClassifiedOutcom
             certainty: SubmissionCertainty::Submitted,
             provenance: ResponseProvenance::ParsedDpsEnvelope,
             routing: None,
+            node_effect: NodeEffect::NoNodeEffect,
         },
-        // Rejected: a definitive DPS verdict — certainty=Submitted, routing per code.
+        // Rejected: a definitive DPS verdict — certainty=Submitted, routing + effect per code.
+        // The effect comes from `routing_for_reject` (NOT the class default) because
+        // `-11 Offline168` diverges: (TerminalReject, NodeBlocked) vs `-1`'s NoNodeEffect.
         SendOutcome::Rejected(verdict) => {
-            let (routing, _node_effect) = routing_for_reject(verdict, doc_type);
+            let (routing, node_effect) = routing_for_reject(verdict, doc_type);
             ClassifiedOutcome {
                 certainty: SubmissionCertainty::Submitted,
                 provenance: ResponseProvenance::ParsedDpsEnvelope,
                 routing: Some(routing),
+                node_effect,
             }
         }
         // Indeterminate: parsed but doesn't settle certainty.
@@ -557,6 +621,7 @@ fn classify_parsed(outcome: &SendOutcome, doc_type: DocType) -> ClassifiedOutcom
                 certainty: SubmissionCertainty::SubmittedUnknown,
                 provenance: ResponseProvenance::ParsedDpsEnvelope,
                 routing: Some(routing),
+                node_effect: node_effect_for_active(routing),
             }
         }
     }
@@ -601,6 +666,25 @@ fn routing_for_indeterminate(ind: &SendIndeterminate) -> ActiveRetryClass {
     }
 }
 
+/// Default node-effect for a routing class on the NON-reject paths, where the class
+/// alone determines the effect (no code-level ambiguity).
+///
+/// The reject path uses [`routing_for_reject`] instead — that table OVERRIDES
+/// `TerminalReject → NodeBlocked` for `-11 Offline168`, the one DPS code whose node
+/// effect diverges from its routing-class default. For every other reject code (and
+/// every non-reject path) the effect equals this default, so the two sources agree.
+fn node_effect_for_active(class: ActiveRetryClass) -> NodeEffect {
+    match class {
+        ActiveRetryClass::TerminalReject => NodeEffect::NoNodeEffect,
+        ActiveRetryClass::TransientRetry => NodeEffect::NoNodeEffect,
+        ActiveRetryClass::FnConfigError => NodeEffect::FnConfigError,
+        ActiveRetryClass::WrapperBug => NodeEffect::WrapperBug,
+        ActiveRetryClass::ProbeRequired => NodeEffect::ProbeRequired,
+        ActiveRetryClass::MacRecovery => NodeEffect::MacReseedPending,
+        ActiveRetryClass::OperatorEscalation => NodeEffect::OperatorEscalation,
+    }
+}
+
 // ─── ObservedOutcomeV1 (A4-6 + amendment 2026-07-17) ─────────────────────────
 
 /// The self-contained durable record payload committed as authority first
@@ -612,20 +696,80 @@ fn routing_for_indeterminate(ind: &SendIndeterminate) -> ActiveRetryClass {
 /// (b) `authorized_generation` — immutable snapshot of `node_state.delivery_generation`
 ///     at `RN→CALL_STARTED`, so a replayed apply can compare stored vs live
 ///     (never node-vs-node, which would be a tautology).
+/// **Sealed (R2):** all fields are private and the sole constructor is
+/// [`record`](Self::record), which mints FROM a [`ClassifiedOutcome`]. The
+/// `(certainty, provenance, routing, node_effect)` quadruple is therefore always a
+/// real `classify` output (never a hand-assembled illegal combination), and
+/// `node_effect` cannot drift from the classifier because there is no `node_effect`
+/// parameter to inject. `record` also validates `authorized_generation >= 1`
+/// (033 CHECK: NULL-or-`>=1`; at OUTCOME_OBSERVED it is non-NULL).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedOutcomeV1 {
+    certainty: SubmissionCertainty,
+    provenance: ResponseProvenance,
+    routing: Option<ActiveRetryClass>,
+    remote_correlation_id: Option<BoundedText>,
+    node_effect: NodeEffect,
+    authorized_generation: i64,
+}
+
+/// Error minting an [`ObservedOutcomeV1`] via [`ObservedOutcomeV1::record`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedOutcomeError {
+    /// `authorized_generation` was not `>= 1` (033 CHECK; at OO it is non-NULL).
+    NonPositiveGeneration(i64),
+}
+
+impl ObservedOutcomeV1 {
+    /// Sole constructor — mint the durable record FROM a classifier output.
+    ///
+    /// Copies the four axes (incl. `node_effect`) verbatim from `classified`, adds the
+    /// `remote_correlation_id` (known only at the record step, not to the pure classifier)
+    /// and the `authorized_generation` snapshot. Validates `authorized_generation >= 1`.
+    pub fn record(
+        classified: &ClassifiedOutcome,
+        remote_correlation_id: Option<BoundedText>,
+        authorized_generation: i64,
+    ) -> Result<Self, ObservedOutcomeError> {
+        if authorized_generation < 1 {
+            return Err(ObservedOutcomeError::NonPositiveGeneration(
+                authorized_generation,
+            ));
+        }
+        Ok(Self {
+            certainty: classified.certainty,
+            provenance: classified.provenance,
+            routing: classified.routing,
+            remote_correlation_id,
+            node_effect: classified.node_effect,
+            authorized_generation,
+        })
+    }
+
     /// Delivery certainty axis.
-    pub certainty: SubmissionCertainty,
+    pub fn certainty(&self) -> SubmissionCertainty {
+        self.certainty
+    }
     /// Response provenance axis.
-    pub provenance: ResponseProvenance,
+    pub fn provenance(&self) -> ResponseProvenance {
+        self.provenance
+    }
     /// Routing class (None for clean Accepted).
-    pub routing: Option<ActiveRetryClass>,
+    pub fn routing(&self) -> Option<ActiveRetryClass> {
+        self.routing
+    }
     /// DPS remote correlation id (from `CheckAck.id` on acceptance; None otherwise).
-    pub remote_correlation_id: Option<BoundedText>,
-    /// Durable node-effect discriminant (A4-6 amendment — recoverable from payload alone).
-    pub node_effect: NodeEffect,
+    pub fn remote_correlation_id(&self) -> Option<&BoundedText> {
+        self.remote_correlation_id.as_ref()
+    }
+    /// Durable node-effect discriminant (A4-6 — recoverable from the payload alone).
+    pub fn node_effect(&self) -> NodeEffect {
+        self.node_effect
+    }
     /// Snapshot of `node_state.delivery_generation` at `RN→CALL_STARTED`.
     /// The apply CAS compares this stored value vs the CURRENT live generation
     /// (not node-vs-node). A mismatch ⇒ drop; ledger/seed/fence unchanged (RP4B-9).
-    pub authorized_generation: i64,
+    pub fn authorized_generation(&self) -> i64 {
+        self.authorized_generation
+    }
 }
