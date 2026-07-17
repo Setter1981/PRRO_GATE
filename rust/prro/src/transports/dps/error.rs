@@ -21,6 +21,13 @@ pub enum DpsError {
     /// Distinct from [`DpsError::Indeterminate`]: `Transport` means
     /// **no DPS envelope was received at all** — the channel itself
     /// failed before any application-level status could be decoded.
+    ///
+    /// **R1 — this also covers a reply with no *proven authenticated-peer
+    /// provenance*.** A gRPC `Unauthenticated` / `PermissionDenied` over an
+    /// UNPROVEN (plaintext) channel is routed here, NOT to
+    /// [`DpsError::RemoteStatus`]: without a proven TLS peer the status could be
+    /// forged, so no `AuthenticatedPeer` provenance may be claimed.  Only a
+    /// TLS-proven channel promotes those two codes to `RemoteStatus`.
     #[error("DPS transport: {0}")]
     Transport(String),
 

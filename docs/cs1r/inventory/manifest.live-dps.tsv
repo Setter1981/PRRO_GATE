@@ -646,6 +646,8 @@ live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_is_no
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_yields_indeterminate_not_transport	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_rro_info_response_yields_indeterminate	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_status_response_yields_indeterminate	false
+live-dps	prro	prro	transports::dps::grpc::tests::r1_tls_proven_channel_yields_remote_status_for_both_codes	false
+live-dps	prro	prro	transports::dps::grpc::tests::r1_unproven_channel_cannot_forge_authenticated_peer	false
 live-dps	prro	prro	transports::dps::grpc::tests::r3_remote_status_carries_reply_digest_not_fabricated	false
 live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_deadline_exceeded_yields_transport	false
 live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_permission_denied_yields_remote_status	false
