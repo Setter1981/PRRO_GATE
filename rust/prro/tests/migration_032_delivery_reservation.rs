@@ -220,7 +220,11 @@ async fn s02_column_set_matches_ddl() {
     ] {
         assert!(names.contains(col), "column {col} missing; have {names:?}");
     }
-    assert_eq!(names.len(), 17, "unexpected extra columns: {names:?}");
+    // The 17 columns 032 introduced must all be present. The EXACT column count
+    // is owned by the latest migration's test (migration_033 `rg01` pins 20 after
+    // 033 adds authorized_generation / apply_state / node_effect); a later
+    // migration extending the table must not force a churn edit here.
+    assert!(names.len() >= 17, "the 032 column set must be present; have {names:?}");
 }
 
 #[tokio::test]
@@ -1353,6 +1357,10 @@ async fn p01_upgrade_on_nonempty_db_sqlite_master_diff() {
         "delivery_reservation_immutable",
         "delivery_reservation_append_only",
         "delivery_reservation_updated_at",
+        // 033 adds one more trigger ON delivery_reservation; the control DB drops the
+        // table (auto-dropping this trigger), so it belongs in the reservation-object
+        // set filtered out of the pre-existing byte-identity comparison.
+        "delivery_reservation_apply_state_transition",
     ]
     .into_iter()
     .collect();
