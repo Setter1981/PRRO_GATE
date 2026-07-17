@@ -2407,6 +2407,15 @@ live-dps	prro-domain	prro-domain::purity_gate	rp_r2_c_name_dedup_walker_is_unsou
 live-dps	prro-domain	prro-domain::purity_gate	rp_r2_c_packageid_walker_reaches_second_version_sqlx	false
 live-dps	prro-domain	prro-domain::purity_gate	rp_r2_c_root_resolved_by_workspace_id_not_name	false
 live-dps	prro-domain	prro-domain::purity_gate_compile_fail	prro_domain_forbidden_crate_compile_fail	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	active_retry_class_wire_strings_match_error_routing	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	d3_parsed_indeterminate_yields_submitted_unknown	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	d3_parsed_reject_yields_submitted_not_unknown	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	hydrated_retry_class_round_trips_all_8	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	node_effect_discriminates_offline168_from_verify	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	observed_outcome_v1_carries_all_fields	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	rp4b_2_classify_full_graph_matches_normative	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	rp4b_3_parsed_rows_are_distinct_from_timeout	false
+live-dps	prro-domain	prro-domain::rp4b_2_classify_graph_pin	sent_accepted_observe_rejects_empty_id	false
 live-dps	prro-domain	prro-domain::rp_cs1_4_contract_dag	contract_crates_are_io_free	false
 live-dps	prro-domain	prro-domain::rp_cs1_4_contract_dag	contract_crates_are_workspace_members	false
 live-dps	prro-domain	prro-domain::rp_cs1_4_contract_dag	contract_crates_do_not_depend_on_each_other	false

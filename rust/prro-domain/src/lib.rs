@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 pub mod command;
+pub mod delivery;
 pub mod enums;
 pub mod ids;
 
