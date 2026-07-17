@@ -131,7 +131,7 @@ async fn advance_rns_to_oo_not_submitted(
 ) {
     sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'OUTCOME_OBSERVED', \
+         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
              submission_certainty = 'NOT_SUBMITTED', \
              response_provenance = 'NO_RESPONSE', \
              routing_class = ?, \
@@ -163,7 +163,7 @@ async fn advance_cs_to_oo(
         Some(rc) => {
             sqlx::query(
                 "UPDATE delivery_reservation \
-                 SET state = 'OUTCOME_OBSERVED', \
+                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                      submission_certainty = ?, \
                      response_provenance = ?, \
                      routing_class = ?, \
@@ -189,7 +189,7 @@ async fn advance_cs_to_oo(
             // for certainty=SUBMITTED per CHECK `:106`).
             sqlx::query(
                 "UPDATE delivery_reservation \
-                 SET state = 'OUTCOME_OBSERVED', \
+                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                      submission_certainty = ?, \
                      response_provenance = ?, \
                      node_effect = ? \
@@ -510,7 +510,7 @@ async fn st01_every_classifier_output_is_033_storable() {
             // not panics.
             let r2 = sqlx::query(
                 "UPDATE delivery_reservation \
-                 SET state = 'OUTCOME_OBSERVED', \
+                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                      submission_certainty = 'NOT_SUBMITTED', \
                      response_provenance = 'NO_RESPONSE', \
                      routing_class = ?, \
@@ -547,7 +547,7 @@ async fn st01_every_classifier_output_is_033_storable() {
                     Some(rc) => {
                         sqlx::query(
                             "UPDATE delivery_reservation \
-                             SET state = 'OUTCOME_OBSERVED', \
+                             SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                                  submission_certainty = ?, \
                                  response_provenance = ?, \
                                  routing_class = ?, \
@@ -566,7 +566,7 @@ async fn st01_every_classifier_output_is_033_storable() {
                         // Clean accept: routing_class NULL.
                         sqlx::query(
                             "UPDATE delivery_reservation \
-                             SET state = 'OUTCOME_OBSERVED', \
+                             SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                                  submission_certainty = ?, \
                                  response_provenance = ?, \
                                  node_effect = ? \
@@ -697,7 +697,7 @@ async fn st02_stored_columns_read_back_correctly() {
             let rc = routing.expect("NOT_SUBMITTED always has routing");
             sqlx::query(
                 "UPDATE delivery_reservation \
-                 SET state = 'OUTCOME_OBSERVED', \
+                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                      submission_certainty = ?, \
                      response_provenance = 'NO_RESPONSE', \
                      routing_class = ?, \
@@ -728,7 +728,7 @@ async fn st02_stored_columns_read_back_correctly() {
                 Some(rc) => {
                     sqlx::query(
                         "UPDATE delivery_reservation \
-                         SET state = 'OUTCOME_OBSERVED', \
+                         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                              submission_certainty = ?, \
                              response_provenance = ?, \
                              routing_class = ?, \
@@ -747,7 +747,7 @@ async fn st02_stored_columns_read_back_correctly() {
                 None => {
                     sqlx::query(
                         "UPDATE delivery_reservation \
-                         SET state = 'OUTCOME_OBSERVED', \
+                         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                              submission_certainty = ?, \
                              response_provenance = ?, \
                              node_effect = ? \
@@ -815,7 +815,7 @@ async fn tg01_submitted_plus_no_response_rejected() {
 
     let err = sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'OUTCOME_OBSERVED', \
+         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
              submission_certainty = 'SUBMITTED', \
              response_provenance = 'NO_RESPONSE', \
              routing_class = 'TerminalReject', \
@@ -846,7 +846,7 @@ async fn tg02_submitted_unknown_null_routing_rejected() {
 
     let err = sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'OUTCOME_OBSERVED', \
+         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
              submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', \
              node_effect = 'NoNodeEffect' \
@@ -876,7 +876,7 @@ async fn tg03_terminal_reject_with_submitted_unknown_rejected() {
 
     let err = sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'OUTCOME_OBSERVED', \
+         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
              submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'PARSED_DPS_ENVELOPE', \
              routing_class = 'TerminalReject', \
@@ -908,7 +908,7 @@ async fn tg04_probe_required_with_no_response_rejected() {
 
     let err = sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'OUTCOME_OBSERVED', \
+         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
              submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', \
              routing_class = 'ProbeRequired', \
@@ -940,7 +940,7 @@ async fn tg05_mac_recovery_with_submitted_unknown_rejected() {
 
     let err = sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'OUTCOME_OBSERVED', \
+         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
              submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'PARSED_DPS_ENVELOPE', \
              routing_class = 'MacRecovery', \
@@ -1017,7 +1017,7 @@ async fn ne01_routing_for_reject_node_effects_all_033_storable() {
 
         sqlx::query(
             "UPDATE delivery_reservation \
-             SET state = 'OUTCOME_OBSERVED', \
+             SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
                  submission_certainty = 'SUBMITTED', \
                  response_provenance = 'PARSED_DPS_ENVELOPE', \
                  routing_class = ?, \
