@@ -645,6 +645,11 @@ test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_i
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_yields_indeterminate_not_transport	false
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_rro_info_response_yields_indeterminate	false
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_status_response_yields_indeterminate	false
+test-support	prro	prro	transports::dps::grpc::tests::rp4b4_deadline_exceeded_yields_transport	false
+test-support	prro	prro	transports::dps::grpc::tests::rp4b4_permission_denied_yields_remote_status	false
+test-support	prro	prro	transports::dps::grpc::tests::rp4b4_remote_status_retry_class_equals_transport_retry_class	false
+test-support	prro	prro	transports::dps::grpc::tests::rp4b4_unauthenticated_yields_remote_status	false
+test-support	prro	prro	transports::dps::grpc::tests::rp4b4_unavailable_yields_transport	false
 test-support	prro	prro	transports::dps::t112::tests::byte_pin_full_equality	false
 test-support	prro	prro	transports::dps::t112::tests::byte_pin_length_206	false
 test-support	prro	prro	transports::dps::t112::tests::byte_pin_sha256	false

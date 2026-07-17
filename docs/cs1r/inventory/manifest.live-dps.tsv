@@ -645,6 +645,11 @@ live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_is_no
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_yields_indeterminate_not_transport	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_rro_info_response_yields_indeterminate	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_status_response_yields_indeterminate	false
+live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_deadline_exceeded_yields_transport	false
+live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_permission_denied_yields_remote_status	false
+live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_remote_status_retry_class_equals_transport_retry_class	false
+live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_unauthenticated_yields_remote_status	false
+live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_unavailable_yields_transport	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_full_equality	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_length_206	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_sha256	false
