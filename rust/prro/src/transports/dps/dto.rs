@@ -176,9 +176,10 @@ impl From<&CheckSignBlob> for gen::CheckRequest {
 /// - `ErrorVerefy` (-1) → `Authorization`
 /// - `ErrorNotRegisteredRro` (-13) → `Authorization`
 /// - `ErrorNotRegisteredSigner` (-14) → `Authorization`
-/// - `ErrorUnknown` (-4) → `Transport` (retry-class per W0-1 D3; the
-///   wire error is not stable enough to mark the FN broken — back
-///   off + retry)
+/// - `ErrorUnknown` (-4) → `Indeterminate { code: -4 }` (parsed DPS
+///   envelope whose status does not settle submission certainty; slice
+///   A re-types this so later slices can distinguish "possibly
+///   submitted" from "definitely not sent" — retry class unchanged)
 /// - everything else → `Server { code, message }`
 pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAck, DpsError> {
     use gen::check_response::Status;
@@ -212,10 +213,10 @@ pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAc
                 message: format!("{}: {}", st.as_str_name(), r.error_message),
             })
         }
-        Status::ErrorUnknown => Err(DpsError::Transport(format!(
-            "ERROR_UNKNOWN (-4) — retry-class per W0-1 D3: {}",
-            r.error_message
-        ))),
+        Status::ErrorUnknown => Err(DpsError::Indeterminate {
+            code: -4,
+            message: r.error_message,
+        }),
         other => Err(DpsError::Server {
             code: other as i32,
             message: r.error_message,
@@ -258,10 +259,10 @@ pub(crate) fn try_decode_status_response(
                 message: format!("{}: {}", st.as_str_name(), r.error_message),
             })
         }
-        Status::ErrorUnknown => Err(DpsError::Transport(format!(
-            "ERROR_UNKNOWN (-4) — retry-class per W0-1 D3: {}",
-            r.error_message
-        ))),
+        Status::ErrorUnknown => Err(DpsError::Indeterminate {
+            code: -4,
+            message: r.error_message,
+        }),
         other => Err(DpsError::Server {
             code: other as i32,
             message: r.error_message,
@@ -391,12 +392,95 @@ pub(crate) fn try_decode_rro_info_response(r: gen::RroInfoResponse) -> Result<Rr
                 message: st.as_str_name().to_string(),
             })
         }
-        Status::ErrorUnknown => Err(DpsError::Transport(
-            "ERROR_UNKNOWN (-4) on RroInfoResponse — retry-class per W0-1 D3".into(),
-        )),
+        Status::ErrorUnknown => Err(DpsError::Indeterminate {
+            code: -4,
+            message: "ERROR_UNKNOWN (-4) on RroInfoResponse".into(),
+        }),
         other => Err(DpsError::Server {
             code: other as i32,
             message: String::new(),
         }),
+    }
+}
+
+// ─── Unit tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transports::dps::error::DpsError;
+
+    /// RP4B-3 pin: `try_decode_check_response` on a `-4` (ERROR_UNKNOWN)
+    /// CheckResponse must yield `DpsError::Indeterminate { code: -4, .. }`
+    /// — NOT `DpsError::Transport`.  The two types are distinct signals:
+    /// `Transport` = no response (network/TLS/timeout); `Indeterminate` =
+    /// parsed DPS envelope that does not settle submission certainty.
+    ///
+    /// This pin is RED until `DpsError::Indeterminate` is added to
+    /// `error.rs` and the `-4` arm in each decoder is updated.
+    #[test]
+    fn rp4b_3_neg4_check_response_yields_indeterminate_not_transport() {
+        use crate::transports::dps::gen::check_response::Status;
+        let resp = gen::CheckResponse {
+            status: Status::ErrorUnknown as i32,
+            error_message: "transient server error".to_string(),
+            ..Default::default()
+        };
+        let err = try_decode_check_response(resp).expect_err("ErrorUnknown must error");
+        assert!(
+            matches!(err, DpsError::Indeterminate { code: -4, .. }),
+            "expected Indeterminate{{code:-4}}, got {err:?}"
+        );
+    }
+
+    /// RP4B-3 companion: `try_decode_check_response` on a `-4` must NOT
+    /// produce `DpsError::Transport`.  Transport is reserved for
+    /// genuine network/TLS/deadline failures that have no DPS envelope.
+    #[test]
+    fn rp4b_3_neg4_check_response_is_not_transport() {
+        use crate::transports::dps::gen::check_response::Status;
+        let resp = gen::CheckResponse {
+            status: Status::ErrorUnknown as i32,
+            error_message: "transient".to_string(),
+            ..Default::default()
+        };
+        let err = try_decode_check_response(resp).expect_err("ErrorUnknown must error");
+        assert!(
+            !matches!(err, DpsError::Transport(_)),
+            "ERROR_UNKNOWN must NOT produce Transport; got {err:?}"
+        );
+    }
+
+    /// RP4B-3 companion: `try_decode_status_response` on a `-4` must also
+    /// yield `Indeterminate`, not `Transport`.
+    #[test]
+    fn rp4b_3_neg4_status_response_yields_indeterminate() {
+        use crate::transports::dps::gen::status_response::Status;
+        let resp = gen::StatusResponse {
+            status: Status::ErrorUnknown as i32,
+            error_message: "transient".to_string(),
+            ..Default::default()
+        };
+        let err = try_decode_status_response(resp).expect_err("ErrorUnknown must error");
+        assert!(
+            matches!(err, DpsError::Indeterminate { code: -4, .. }),
+            "expected Indeterminate{{code:-4}}, got {err:?}"
+        );
+    }
+
+    /// RP4B-3 companion: `try_decode_rro_info_response` on a `-4` must also
+    /// yield `Indeterminate`, not `Transport`.
+    #[test]
+    fn rp4b_3_neg4_rro_info_response_yields_indeterminate() {
+        use crate::transports::dps::gen::rro_info_response::Status;
+        let resp = gen::RroInfoResponse {
+            status: Status::ErrorUnknown as i32,
+            ..Default::default()
+        };
+        let err = try_decode_rro_info_response(resp).expect_err("ErrorUnknown must error");
+        assert!(
+            matches!(err, DpsError::Indeterminate { code: -4, .. }),
+            "expected Indeterminate{{code:-4}}, got {err:?}"
+        );
     }
 }

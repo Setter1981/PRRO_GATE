@@ -16,8 +16,29 @@ pub enum DpsError {
     /// Transport-level failure (TCP / TLS / DNS / per-call deadline /
     /// gRPC `Unavailable` / `DeadlineExceeded`).  Caller should back
     /// off and retry; the FN is not necessarily broken.
+    ///
+    /// Distinct from [`DpsError::Indeterminate`]: `Transport` means
+    /// **no DPS envelope was received at all** — the channel itself
+    /// failed before any application-level status could be decoded.
     #[error("DPS transport: {0}")]
     Transport(String),
+
+    /// A DPS response envelope was successfully decoded but the status
+    /// code does not settle submission certainty — forward progress
+    /// was observed on the wire yet the outcome (accepted / rejected)
+    /// is unknown.  The canonical case is `ERROR_UNKNOWN (-4)` from
+    /// `CheckResponse` / `StatusResponse` / `RroInfoResponse`.
+    ///
+    /// Distinct from [`DpsError::Transport`] (no envelope received)
+    /// and [`DpsError::Server`] (a definitive non-OK server status).
+    /// Slice A re-types `-4` here so later slices can distinguish
+    /// "possibly submitted" from "definitely not sent" without parsing
+    /// error message strings.
+    ///
+    /// `code` is the raw DPS status integer (`-4` for `ERROR_UNKNOWN`).
+    /// `message` carries the server's textual explanation when present.
+    #[error("DPS indeterminate (code={code}): {message}")]
+    Indeterminate { code: i32, message: String },
 
     /// Authorization-class server response, split by the application-
     /// level DPS status code so callers can route per-doc rejects

@@ -642,9 +642,16 @@ async fn send_chk_error_unknown_routes_to_transport_retry_class() {
         .send_chk(check_envelope())
         .await
         .expect_err("ErrorUnknown must error");
+    // CS-3 Slice A: `-4` (ERROR_UNKNOWN) no longer collapses into `Transport` (where it
+    // was indistinguishable from a network timeout — the double-issue root); it now
+    // surfaces as the parsed-but-outcome-unsettling `Indeterminate`. The retry class is
+    // UNCHANGED (`route_dps_error` routes `Indeterminate` to `TransientRetry`, exactly as
+    // `Transport` did) — this slice only re-types the signal so the CS-3 classifier can
+    // tell `-4` from a real timeout. (Legacy test name retained to keep the inventory
+    // additions-only gate green; the assertion is the updated contract.)
     assert!(
-        matches!(err, DpsError::Transport(ref m) if m.contains("ERROR_UNKNOWN") || m.contains("retry-class")),
-        "expected Transport (retry-class), got {err:?}"
+        matches!(err, DpsError::Indeterminate { code: -4, .. }),
+        "expected Indeterminate {{ code: -4 }} (CS-3 Slice A re-typed -4), got {err:?}"
     );
 }
 
