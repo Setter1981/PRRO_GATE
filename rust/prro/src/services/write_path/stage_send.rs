@@ -867,13 +867,13 @@ fn extract_wire_forensics(err: &DpsError) -> (Option<i32>, &'static str, String)
     use crate::transports::dps::error::AuthorizationKind;
     match err {
         DpsError::Transport(msg) => (None, "Transport", msg.clone()),
-        // CS-3 Slice A′ (behaviour-neutral): `Unauthenticated` / `PermissionDenied` now
+        // CS-3 Slice A′ (RA: forensic tuple is a COMPATIBILITY PROJECTION kept identical to `Transport`; the slice is not behaviour-neutral overall): `Unauthenticated` / `PermissionDenied` now
         // surface as `RemoteStatus` instead of `Transport`.  The persisted
         // `transport_trace.error_kind` / `outcome_kind` are CHECK-constrained, so we keep
         // the forensic tuple IDENTICAL to `Transport` (no schema drift); the in-memory
         // `DpsError::RemoteStatus` type is what the CS-3 classifier (slice E) consumes.
         DpsError::RemoteStatus { message, .. } => (None, "Transport", message.clone()),
-        // CS-3 Slice A (behaviour-neutral): a parsed `-4` now surfaces as `Indeterminate`
+        // CS-3 Slice A (RA: forensic tuple is a COMPATIBILITY PROJECTION kept identical to `Transport`; the slice is not behaviour-neutral overall): a parsed `-4` now surfaces as `Indeterminate`
         // instead of `Transport`. The persisted `transport_trace.error_kind` /
         // `outcome_kind` (via wire_decision_to_outcome_kind's "Transport" arm) are
         // CHECK-constrained, so we keep the forensic tuple IDENTICAL to `Transport`
@@ -2582,6 +2582,26 @@ mod tests {
             assert_eq!(code, exp_code, "{err:?}");
             assert_eq!(kind, exp_kind, "{err:?}");
         }
+    }
+
+    #[test]
+    fn extract_wire_forensics_remote_status_and_indeterminate_project_to_transport_ra() {
+        // RA all-consumers pin (compatibility projection): R1 `RemoteStatus` and slice-A
+        // `Indeterminate` keep the SAME forensic tuple as `Transport` — (None, "Transport",
+        // message) — because `transport_trace.error_kind`/`outcome_kind` are CHECK-constrained.
+        // This is a compatibility projection, not an ideal classification.
+        let rs = extract_wire_forensics(&DpsError::RemoteStatus {
+            code: "Unauthenticated".into(),
+            message: "creds rejected".into(),
+            digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+        });
+        assert_eq!(rs, (None, "Transport", "creds rejected".to_string()));
+        let ind = extract_wire_forensics(&DpsError::Indeterminate {
+            code: -4,
+            message: "server unknown".into(),
+            digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+        });
+        assert_eq!(ind, (None, "Transport", "server unknown".to_string()));
     }
 
     #[test]

@@ -510,6 +510,7 @@ live-dps	prro	prro	services::offline_sync::backoff::tests::compute_backoff_windo
 live-dps	prro	prro	services::offline_sync::backoff::tests::compute_backoff_window_schedule_matches_doc	false
 live-dps	prro	prro	services::offline_sync::backoff::tests::on_advance_resets_state	false
 live-dps	prro	prro	services::offline_sync::backoff::tests::on_hold_increments_counter_and_pushes_next_eligible	false
+live-dps	prro	prro	services::offline_sync::kvt2_confirm::tests::classify_remote_status_and_indeterminate_hold_dps_server_ra	false
 live-dps	prro	prro	services::offline_sync::kvt2_confirm::tests::err_authorization_returns_hold_dps_authorization	false
 live-dps	prro	prro	services::offline_sync::kvt2_confirm::tests::err_decode_returns_hold_dps_decode	false
 live-dps	prro	prro	services::offline_sync::kvt2_confirm::tests::err_mismatch_returns_structural_drift_kvt1_reentry	false
@@ -527,6 +528,7 @@ live-dps	prro	prro	services::offline_sync::kvt2_confirm::tests::ok_with_data_sig
 live-dps	prro	prro	services::offline_sync::kvt2_confirm::tests::ok_with_data_sign_returns_acked_sent_fresh	false
 live-dps	prro	prro	services::offline_sync::kvt2_confirm::tests::ok_with_data_sign_returns_acked_sent_replay_threads_trace_attempt_no	false
 live-dps	prro	prro	services::offline_sync::kvt2_confirm::tests::ok_with_empty_data_sign_returns_hold_data_sign_empty	false
+live-dps	prro	prro	services::offline_sync::return_online_probe::ra_tests::dps_error_class_labels_remote_status_and_indeterminate_ra	false
 live-dps	prro	prro	services::reconciliation::boot_phase::tests::answered_wire_contact_classifies_buckets	false
 live-dps	prro	prro	services::reconciliation::boot_phase::tests::classify_send_dispatch_maps_every_variant	false
 live-dps	prro	prro	services::reconciliation::boot_phase::tests::emit_dispatch_error_idempotent_under_repeated_calls	false
@@ -534,9 +536,11 @@ live-dps	prro	prro	services::reconciliation::boot_phase::tests::emit_dispatch_er
 live-dps	prro	prro	services::reconciliation::guard::tests::for_integration_test_only_compiles_and_borrows	false
 live-dps	prro	prro	services::reconciliation::guard::tests::from_app_mutex_compiles_inside_crate	false
 live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_decode_escalate_on_decode_error	false
+live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_indeterminate_projects_to_unexpected_ra	false
 live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_match_when_ack_id_equals_expected	false
 live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_mismatch_when_ack_id_differs	false
 live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_not_found_on_dps_not_found	false
+live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_remote_status_projects_to_unexpected_ra	false
 live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_transport_retry_on_transport_error	false
 live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_unexpected_on_non_query_dps_error	false
 live-dps	prro	prro	services::time_budget::tests::admission_refuses_session_and_month_at_boundaries	false
@@ -636,6 +640,7 @@ live-dps	prro	prro	services::write_path::stage_send::tests::envelope_hash_is_det
 live-dps	prro	prro	services::write_path::stage_send::tests::envelope_hash_reflects_check_sign_drift	false
 live-dps	prro	prro	services::write_path::stage_send::tests::envelope_hash_reflects_non_cms_field_drift	false
 live-dps	prro	prro	services::write_path::stage_send::tests::extract_wire_forensics_carries_status_code_and_kind_per_variant	false
+live-dps	prro	prro	services::write_path::stage_send::tests::extract_wire_forensics_remote_status_and_indeterminate_project_to_transport_ra	false
 live-dps	prro	prro	services::write_path::stage_send::tests::now_db_format_matches_sqlite_current_timestamp_shape	false
 live-dps	prro	prro	services::write_path::stage_send::tests::truncate_msg_caps_at_512_bytes	false
 live-dps	prro	prro	services::write_path::stage_send::tests::truncate_msg_passes_short_strings_unchanged	false
