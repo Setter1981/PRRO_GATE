@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/sealed_compile_fail/construct_sealed_types.rs:26:28
+   |
+26 |     let _short_quittance = Kvt1Raw(vec![0u8; 8]);
+   |                            ^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/delivery/mod.rs
+   |
+   | pub struct Kvt1Raw(Vec<u8>);
+   |                    ^^^^^^^ private field
