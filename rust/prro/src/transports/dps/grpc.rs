@@ -113,19 +113,31 @@ impl GrpcDpsChannel {
 
 /// Map a `tonic::Status` (gRPC-level error) to a `DpsError`.
 ///
-/// All gRPC-level statuses (transport, deadline, auth) map to
-/// [`DpsError::Transport`].  The application-level
-/// [`DpsError::Authorization`] variant is reserved for documented DPS
-/// status codes carried inside `CheckResponse` / `StatusResponse` /
-/// `RroInfoResponse`, with a typed `AuthorizationKind` (per ADR-M3-A6
-/// prereq).  gRPC `Unauthenticated` / `PermissionDenied` have no DPS
-/// status code and would force a synthetic `code = 0` if mapped to
-/// `Authorization`; routing them as `Transport` keeps the
-/// `DpsError::Authorization` shape clean for the W7/W10 routing layer
-/// and matches the actual recovery action ("back off + retry the
-/// channel" — the wrapper, not the document).
+/// Split by `s.code()` (CS-3 Slice A′):
+/// - `Unauthenticated | PermissionDenied` → [`DpsError::RemoteStatus`]:
+///   these two codes UNAMBIGUOUSLY mean the peer responded over an
+///   established TLS session (the WAF / gateway returned a status, not
+///   a transport silence).  They have no DPS application envelope and
+///   no DPS status code, so they cannot map to [`DpsError::Authorization`]
+///   (which requires a typed `AuthorizationKind` from a parsed envelope).
+///   A separate variant lets slice E (classifier) differentiate them
+///   from genuine transport absences without parsing error strings.
+/// - **Everything else** (DeadlineExceeded, Unavailable, Internal,
+///   Unknown, connection errors, …) → [`DpsError::Transport`], exactly
+///   as before.  These are genuinely ambiguous or represent no peer
+///   response at all; conservative `Transport` treatment is correct.
+///
+/// The application-level [`DpsError::Authorization`] variant remains
+/// reserved for documented DPS status codes from parsed
+/// `CheckResponse` / `StatusResponse` / `RroInfoResponse` envelopes.
 fn map_tonic_status(s: Status) -> DpsError {
-    DpsError::Transport(format!("gRPC {:?}: {}", s.code(), s.message()))
+    match s.code() {
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => DpsError::RemoteStatus {
+            code: format!("{:?}", s.code()),
+            message: s.message().to_string(),
+        },
+        _ => DpsError::Transport(format!("gRPC {:?}: {}", s.code(), s.message())),
+    }
 }
 
 #[async_trait]
@@ -197,5 +209,95 @@ impl DpsChannel for GrpcDpsChannel {
             .map_err(map_tonic_status)?;
         let ack = try_decode_check_response(resp.into_inner())?;
         decode_offline_codes(&ack.data_sign)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transports::dps::error::DpsError;
+
+    // RP4B-4: map_tonic_status split — Unauthenticated / PermissionDenied
+    // MUST yield RemoteStatus; deadline / unavailable MUST yield Transport.
+
+    #[test]
+    fn rp4b4_unauthenticated_yields_remote_status() {
+        let s = Status::unauthenticated("invalid token");
+        let err = map_tonic_status(s);
+        assert!(
+            matches!(err, DpsError::RemoteStatus { .. }),
+            "expected RemoteStatus, got {err:?}"
+        );
+        if let DpsError::RemoteStatus { code, message } = err {
+            assert_eq!(code, "Unauthenticated");
+            assert_eq!(message, "invalid token");
+        }
+    }
+
+    #[test]
+    fn rp4b4_permission_denied_yields_remote_status() {
+        let s = Status::permission_denied("cert mismatch");
+        let err = map_tonic_status(s);
+        assert!(
+            matches!(err, DpsError::RemoteStatus { .. }),
+            "expected RemoteStatus, got {err:?}"
+        );
+        if let DpsError::RemoteStatus { code, message } = err {
+            assert_eq!(code, "PermissionDenied");
+            assert_eq!(message, "cert mismatch");
+        }
+    }
+
+    #[test]
+    fn rp4b4_deadline_exceeded_yields_transport() {
+        let s = Status::deadline_exceeded("timeout");
+        let err = map_tonic_status(s);
+        assert!(
+            matches!(err, DpsError::Transport(_)),
+            "expected Transport, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rp4b4_unavailable_yields_transport() {
+        let s = Status::unavailable("connection refused");
+        let err = map_tonic_status(s);
+        assert!(
+            matches!(err, DpsError::Transport(_)),
+            "expected Transport, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rp4b4_remote_status_retry_class_equals_transport_retry_class() {
+        // Behaviour-preservation: route_dps_error(RemoteStatus) must
+        // yield the same retry_class as route_dps_error(Transport).
+        use crate::db::models::enums::DocType;
+        use crate::services::write_path::error_routing::route_dps_error;
+        let transport_decision = route_dps_error(
+            &DpsError::Transport("TLS reset".into()),
+            DocType::Sell,
+            true,
+        );
+        let remote_status_decision = route_dps_error(
+            &DpsError::RemoteStatus {
+                code: "Unauthenticated".into(),
+                message: "invalid token".into(),
+            },
+            DocType::Sell,
+            true,
+        );
+        assert_eq!(
+            transport_decision.retry_class, remote_status_decision.retry_class,
+            "RemoteStatus must route identically to Transport (behaviour-neutral slice)"
+        );
+        assert_eq!(
+            transport_decision.target_state,
+            remote_status_decision.target_state,
+        );
+        assert_eq!(
+            transport_decision.audit_event,
+            remote_status_decision.audit_event,
+        );
     }
 }

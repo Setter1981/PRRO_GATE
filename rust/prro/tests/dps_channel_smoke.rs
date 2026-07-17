@@ -771,11 +771,14 @@ async fn tonic_unavailable_routes_to_transport() {
 
 #[tokio::test]
 async fn tonic_unauthenticated_routes_to_transport() {
-    // Per ADR-M3-A6 prereq, gRPC `Unauthenticated` / `PermissionDenied`
-    // are transport-level (no DPS status code, no AuthorizationKind);
-    // they map to DpsError::Transport so that the W7/W10 routing layer
-    // sees a single transport-class signal for "back off + retry the
-    // channel" rather than a synthetic Authorization with code=0.
+    // CS-3 Slice A′: gRPC `Unauthenticated` / `PermissionDenied` mean the DPS peer
+    // RESPONDED over an established TLS session (auth rejection) — a response, not a
+    // transport absence — so they now surface as `DpsError::RemoteStatus`, distinct from
+    // a genuine no-response (`DeadlineExceeded`/`Unavailable` stay `Transport`). The
+    // recovery is UNCHANGED (route_dps_error routes `RemoteStatus` to `TransientRetry`,
+    // exactly as `Transport` did); this only re-types the signal so the CS-3 classifier
+    // can tell a peer response from a channel failure. (Legacy test name retained for
+    // the inventory additions-only gate.)
     let h = start_mock().await;
     h.state
         .send_chk_v2
@@ -788,8 +791,8 @@ async fn tonic_unauthenticated_routes_to_transport() {
         .await
         .expect_err("Unauthenticated must error");
     assert!(
-        matches!(err, DpsError::Transport(ref m) if m.contains("Unauthenticated")),
-        "expected Transport for gRPC Unauthenticated, got {err:?}"
+        matches!(err, DpsError::RemoteStatus { ref code, .. } if code.contains("Unauthenticated")),
+        "expected RemoteStatus for gRPC Unauthenticated (CS-3 Slice A′), got {err:?}"
     );
 }
 

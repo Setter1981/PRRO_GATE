@@ -23,6 +23,27 @@ pub enum DpsError {
     #[error("DPS transport: {0}")]
     Transport(String),
 
+    /// The DPS peer responded over an established TLS session, but NOT
+    /// with a DPS application envelope — e.g. a gRPC `Unauthenticated`
+    /// or `PermissionDenied` status emitted by the WAF / gateway before
+    /// any fiscal application logic ran.
+    ///
+    /// Distinct from [`DpsError::Transport`] (no response reached the
+    /// peer at all — TCP / TLS / DNS / deadline) and from
+    /// [`DpsError::Indeterminate`] (a parsed DPS envelope was received).
+    ///
+    /// `code` is the tonic `Code` debug string (e.g. `"Unauthenticated"`,
+    /// `"PermissionDenied"`).  `message` carries the gRPC status message.
+    ///
+    /// **Routing (behaviour-neutral slice A′):** currently routes
+    /// identically to `Transport` — `ErrorRetryable / TransientRetry`.
+    /// Slice E (classifier) will differentiate it into `ProbeRequired`
+    /// once the full CS-3 surface is wired.  A separate match arm in
+    /// `route_dps_error` ensures slice E can change it without touching
+    /// the `Transport` arm.
+    #[error("DPS remote status ({code}): {message}")]
+    RemoteStatus { code: String, message: String },
+
     /// A DPS response envelope was successfully decoded but the status
     /// code does not settle submission certainty — forward progress
     /// was observed on the wire yet the outcome (accepted / rejected)

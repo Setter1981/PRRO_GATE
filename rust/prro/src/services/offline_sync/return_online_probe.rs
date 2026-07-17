@@ -80,6 +80,11 @@ use crate::transports::dps::error::{AuthorizationKind, DpsError};
 fn dps_error_class(err: &DpsError) -> &'static str {
     match err {
         DpsError::Transport(_) => "Transport",
+        // CS-3 Slice A′: distinct per-variant audit class (this fn is a forensic string
+        // key, not routing/CHECK-constrained — the doc invites extension). Behaviour is
+        // unaffected; probe-failure audit payloads gain an accurate "RemoteStatus" label
+        // distinguishing gRPC auth-rejection from genuine transport absence.
+        DpsError::RemoteStatus { .. } => "RemoteStatus",
         // CS-3 Slice A: distinct per-variant audit class (this fn is a forensic string
         // key, not routing/CHECK-constrained — the doc invites extension). Behaviour is
         // unaffected; only the probe-failure audit payload gains an accurate `-4` label.
