@@ -132,12 +132,34 @@ impl GrpcDpsChannel {
 /// `CheckResponse` / `StatusResponse` / `RroInfoResponse` envelopes.
 fn map_tonic_status(s: Status) -> DpsError {
     match s.code() {
-        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => DpsError::RemoteStatus {
-            code: format!("{:?}", s.code()),
-            message: s.message().to_string(),
-        },
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+            // R3: fingerprint the actual status reply as lossless raw-reply evidence.
+            let digest = status_digest(&s);
+            DpsError::RemoteStatus {
+                code: format!("{:?}", s.code()),
+                message: s.message().to_string(),
+                digest,
+            }
+        }
         _ => DpsError::Transport(format!("gRPC {:?}: {}", s.code(), s.message())),
     }
+}
+
+/// SHA-256 digest of a gRPC status reply (code + message + details) — the lossless
+/// raw-reply evidence for [`DpsError::RemoteStatus`] (R3).  For an authenticated-peer
+/// error status the status IS the reply, so this fingerprints it deterministically
+/// and distinctly, letting a later Bridge carry the SAME digest into
+/// `RemoteStatusEvidence` rather than fabricating one.
+fn status_digest(s: &Status) -> prro_domain::delivery::RawResponseDigest {
+    use prro_domain::delivery::RawResponseDigest;
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(format!("{:?}", s.code()).as_bytes());
+    h.update([0u8]);
+    h.update(s.message().as_bytes());
+    h.update([0u8]);
+    h.update(s.details());
+    RawResponseDigest(h.finalize().into())
 }
 
 #[async_trait]
@@ -228,7 +250,7 @@ mod tests {
             matches!(err, DpsError::RemoteStatus { .. }),
             "expected RemoteStatus, got {err:?}"
         );
-        if let DpsError::RemoteStatus { code, message } = err {
+        if let DpsError::RemoteStatus { code, message, .. } = err {
             assert_eq!(code, "Unauthenticated");
             assert_eq!(message, "invalid token");
         }
@@ -242,10 +264,31 @@ mod tests {
             matches!(err, DpsError::RemoteStatus { .. }),
             "expected RemoteStatus, got {err:?}"
         );
-        if let DpsError::RemoteStatus { code, message } = err {
+        if let DpsError::RemoteStatus { code, message, .. } = err {
             assert_eq!(code, "PermissionDenied");
             assert_eq!(message, "cert mismatch");
         }
+    }
+
+    /// R3 (lossless raw-reply seam): `RemoteStatus` carries a `RawResponseDigest`
+    /// derived from the ACTUAL gRPC status reply, so the Bridge maps it losslessly
+    /// (no fabricated digest). Different replies → different digests; identical
+    /// replies → identical digest (deterministic). Teeth: a constant/fabricated
+    /// digest would fail the `assert_ne!`.
+    #[test]
+    fn r3_remote_status_carries_reply_digest_not_fabricated() {
+        let mk = |msg: &str| match map_tonic_status(Status::unauthenticated(msg)) {
+            DpsError::RemoteStatus { digest, .. } => digest,
+            other => panic!("expected RemoteStatus, got {other:?}"),
+        };
+        let da = mk("reply A");
+        let db = mk("reply B");
+        let da2 = mk("reply A");
+        assert_ne!(da, db, "different replies must yield different digests");
+        assert_eq!(
+            da, da2,
+            "identical replies must yield identical digest (deterministic)"
+        );
     }
 
     #[test]
@@ -283,6 +326,7 @@ mod tests {
             &DpsError::RemoteStatus {
                 code: "Unauthenticated".into(),
                 message: "invalid token".into(),
+                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
             },
             DocType::Sell,
             true,

@@ -641,10 +641,12 @@ test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_cap
 test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_passes_short_strings_unchanged	false
 test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_respects_utf8_boundaries	false
 test-support	prro	prro	services::write_path::stage_send::tests::wire_decision_to_outcome_kind_maps_per_w10_table	false
+test-support	prro	prro	transports::dps::dto::tests::r3_indeterminate_carries_reply_digest_not_fabricated	false
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_is_not_transport	false
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_yields_indeterminate_not_transport	false
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_rro_info_response_yields_indeterminate	false
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_status_response_yields_indeterminate	false
+test-support	prro	prro	transports::dps::grpc::tests::r3_remote_status_carries_reply_digest_not_fabricated	false
 test-support	prro	prro	transports::dps::grpc::tests::rp4b4_deadline_exceeded_yields_transport	false
 test-support	prro	prro	transports::dps::grpc::tests::rp4b4_permission_denied_yields_remote_status	false
 test-support	prro	prro	transports::dps::grpc::tests::rp4b4_remote_status_retry_class_equals_transport_retry_class	false

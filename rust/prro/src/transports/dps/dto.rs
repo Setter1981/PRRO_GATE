@@ -167,6 +167,20 @@ impl From<&CheckSignBlob> for gen::CheckRequest {
     }
 }
 
+/// SHA-256 digest of a decoded DPS response envelope (re-encoded canonically via
+/// prost).  Captures the parsed reply as lossless raw-reply evidence for
+/// [`DpsError::Indeterminate`] (R3): deterministic, and distinct for distinct
+/// replies — so a later Bridge maps `Indeterminate` to
+/// `SendIndeterminate::UnknownStatus` carrying the SAME digest, never a fabricated
+/// one.  A re-encode (not the wire bytes) is used because tonic decodes the
+/// protobuf before this layer; prost's encoding is canonical/deterministic, so the
+/// digest is a stable fingerprint of the response content.
+fn response_digest<M: prost::Message>(m: &M) -> prro_domain::delivery::RawResponseDigest {
+    use prro_domain::delivery::RawResponseDigest;
+    use sha2::{Digest, Sha256};
+    RawResponseDigest(Sha256::digest(m.encode_to_vec()).into())
+}
+
 /// Dispatch a `gen::CheckResponse` onto either `Ok(CheckAck)` or a
 /// typed `DpsError`.  Status-code mapping (per W0-1 review):
 ///
@@ -213,10 +227,16 @@ pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAc
                 message: format!("{}: {}", st.as_str_name(), r.error_message),
             })
         }
-        Status::ErrorUnknown => Err(DpsError::Indeterminate {
-            code: -4,
-            message: r.error_message,
-        }),
+        Status::ErrorUnknown => {
+            // R3: capture the parsed reply as lossless raw-reply evidence BEFORE
+            // moving `error_message` out of `r`.
+            let digest = response_digest(&r);
+            Err(DpsError::Indeterminate {
+                code: -4,
+                message: r.error_message,
+                digest,
+            })
+        }
         other => Err(DpsError::Server {
             code: other as i32,
             message: r.error_message,
@@ -259,10 +279,16 @@ pub(crate) fn try_decode_status_response(
                 message: format!("{}: {}", st.as_str_name(), r.error_message),
             })
         }
-        Status::ErrorUnknown => Err(DpsError::Indeterminate {
-            code: -4,
-            message: r.error_message,
-        }),
+        Status::ErrorUnknown => {
+            // R3: capture the parsed reply as lossless raw-reply evidence BEFORE
+            // moving `error_message` out of `r`.
+            let digest = response_digest(&r);
+            Err(DpsError::Indeterminate {
+                code: -4,
+                message: r.error_message,
+                digest,
+            })
+        }
         other => Err(DpsError::Server {
             code: other as i32,
             message: r.error_message,
@@ -392,10 +418,15 @@ pub(crate) fn try_decode_rro_info_response(r: gen::RroInfoResponse) -> Result<Rr
                 message: st.as_str_name().to_string(),
             })
         }
-        Status::ErrorUnknown => Err(DpsError::Indeterminate {
-            code: -4,
-            message: "ERROR_UNKNOWN (-4) on RroInfoResponse".into(),
-        }),
+        Status::ErrorUnknown => {
+            // R3: lossless raw-reply digest of the RroInfoResponse envelope.
+            let digest = response_digest(&r);
+            Err(DpsError::Indeterminate {
+                code: -4,
+                message: "ERROR_UNKNOWN (-4) on RroInfoResponse".into(),
+                digest,
+            })
+        }
         other => Err(DpsError::Server {
             code: other as i32,
             message: String::new(),
@@ -448,6 +479,35 @@ mod tests {
         assert!(
             !matches!(err, DpsError::Transport(_)),
             "ERROR_UNKNOWN must NOT produce Transport; got {err:?}"
+        );
+    }
+
+    /// R3 (lossless raw-reply seam): `Indeterminate` carries a `RawResponseDigest`
+    /// derived from the ACTUAL parsed envelope, so the Bridge maps it losslessly
+    /// (no fabricated digest). Different replies → different digests; identical
+    /// replies → identical digest (deterministic). Teeth: a constant/fabricated
+    /// digest would fail the `assert_ne!`.
+    #[test]
+    fn r3_indeterminate_carries_reply_digest_not_fabricated() {
+        use crate::transports::dps::gen::check_response::Status;
+        let mk = |msg: &str| {
+            let resp = gen::CheckResponse {
+                status: Status::ErrorUnknown as i32,
+                error_message: msg.to_string(),
+                ..Default::default()
+            };
+            match try_decode_check_response(resp) {
+                Err(DpsError::Indeterminate { digest, .. }) => digest,
+                other => panic!("expected Indeterminate, got {other:?}"),
+            }
+        };
+        let da = mk("reply A");
+        let db = mk("reply B");
+        let da2 = mk("reply A");
+        assert_ne!(da, db, "different replies must yield different digests");
+        assert_eq!(
+            da, da2,
+            "identical replies must yield identical digest (deterministic)"
         );
     }
 
