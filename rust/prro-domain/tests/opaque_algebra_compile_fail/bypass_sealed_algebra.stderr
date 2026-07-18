@@ -65,3 +65,34 @@ note: constructor is not visible here due to private fields
    |
    | pub struct UnknownStatusCode(i32);
    |                              ^^^ private field
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:28:28
+   |
+28 |     let _bypass_response = SendResponse(unimplemented!());
+   |                            ^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/delivery/mod.rs
+   |
+   | pub struct SendResponse(SendResponseInner);
+   |                         ^^^^^^^^^^^^^^^^^ private field
+help: you might have meant to use an associated function to build this type
+   |
+28 -     let _bypass_response = SendResponse(unimplemented!());
+28 +     let _bypass_response = SendResponse::parsed(_);
+   |
+28 -     let _bypass_response = SendResponse(unimplemented!());
+28 +     let _bypass_response = SendResponse::no_response(_);
+   |
+28 -     let _bypass_response = SendResponse(unimplemented!());
+28 +     let _bypass_response = SendResponse::remote_status(_);
+   |
+
+warning: unreachable call
+  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:28:28
+   |
+28 |     let _bypass_response = SendResponse(unimplemented!());
+   |                            ^^^^^^^^^^^^ ---------------- any code following this expression is unreachable
+   |                            |
+   |                            unreachable call

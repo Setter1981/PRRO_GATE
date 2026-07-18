@@ -534,6 +534,14 @@ mod tests {
     /// declared §4.6 deltas (empty-id, unknown-non-zero, TLS-RemoteStatus) an EXACT pair. Break the
     /// mapper or the domain routing → a row flips → RED. This lives here because only `grpc`'s test
     /// module can reach the private `map_tonic_status`/`observe_tonic_status`/`PeerAuth`.
+    ///
+    /// **Scope (honest, consolidated-audit minor):** equivalence is proven at the
+    /// `{retry_class, node-Blocked}` granularity — the two comparable axes. The live `RoutingDecision`
+    /// carries only `node_mode_flip: Option<NodeMode>` (Blocked or nothing), so the shadow's FINER
+    /// `node_effect` axis (`MacReseedPending`/`OperatorEscalation`/…) has NO live counterpart to
+    /// compare against; it is validated by the domain's own `routing_for_reject`/`node_effect_for_active`
+    /// tests, and exercised for real when D/E consumes the shadow. This is NOT a full-outcome
+    /// (target_state-level) equivalence claim.
     #[test]
     fn pin_d_section_4_6_drift_pin() {
         use crate::db::models::enums::NodeMode;

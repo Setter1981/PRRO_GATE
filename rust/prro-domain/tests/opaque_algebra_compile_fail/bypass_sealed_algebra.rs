@@ -6,7 +6,7 @@
 //! `SendOutcome::{accepted, ok_but_no_fiscal_number, from_server_code, missing_status}` (the old
 //! `from_dps_status` was retired) — none of which bypass the private inner field below.
 
-use prro_domain::delivery::{SendIndeterminate, SendOutcome, UnknownStatusCode};
+use prro_domain::delivery::{SendIndeterminate, SendOutcome, SendResponse, UnknownStatusCode};
 
 fn main() {
     // 1. `SendOutcome` wraps a PRIVATE inner enum — external tuple construction is a
@@ -21,4 +21,9 @@ fn main() {
     // 3. `UnknownStatusCode`'s field is PRIVATE — only the domain's own `from_server_code` mints a
     //    code proven not to be a named `DpsReject` (the checkpoint's `UnknownStatus("-1")`).
     let _bypass_code = UnknownStatusCode(-1);
+
+    // 4. CS-3 3.2 PR4 pin A made `SendResponse` opaque (private `SendResponseInner`) — external
+    //    tuple construction must be a privacy error too, so unsealing it turns THIS canary RED
+    //    (the seal is claimed in the type docstring; this pins it empirically).
+    let _bypass_response = SendResponse(unimplemented!());
 }

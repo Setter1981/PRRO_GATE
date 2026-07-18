@@ -389,6 +389,9 @@ const MAPPER_CTORS: &[(&str, &str)] = &[
     ("SendOutcome", "from_server_code"),
 ];
 
+/// The two gated delivery types (whose ctors are the mapper-only symbols).
+const MAPPER_TYPES: &[&str] = &["SendResponse", "SendOutcome"];
+
 /// The gated `(Type, ctor)` a path's LAST TWO segments name, if any.
 fn matched_mapper_ctor(path: &syn::Path) -> Option<(&'static str, &'static str)> {
     let mut rev = path.segments.iter().rev();
@@ -398,6 +401,30 @@ fn matched_mapper_ctor(path: &syn::Path) -> Option<(&'static str, &'static str)>
         .iter()
         .copied()
         .find(|(t, c)| *t == prev && *c == last)
+}
+
+fn is_mapper_ctor_name(ident: &str) -> bool {
+    MAPPER_CTORS.iter().any(|(_, c)| *c == ident)
+}
+fn is_mapper_type_name(ident: &str) -> bool {
+    MAPPER_TYPES.contains(&ident)
+}
+/// The last path-segment ident of a `Type::…` (for qself / type-alias inspection).
+fn type_last_seg(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
+        _ => None,
+    }
+}
+/// A delivery type RENAMED by a `use` tree (`SendResponse as X`), if any. A plain (un-renamed)
+/// import of the TYPE is legitimate (services name `SendResponse` in signatures) and returns None.
+fn renamed_mapper_type(tree: &syn::UseTree) -> Option<&'static str> {
+    match tree {
+        syn::UseTree::Path(p) => renamed_mapper_type(&p.tree),
+        syn::UseTree::Rename(r) => MAPPER_TYPES.iter().copied().find(|t| r.ident == t),
+        syn::UseTree::Group(g) => g.items.iter().find_map(renamed_mapper_type),
+        _ => None,
+    }
 }
 
 struct MapperCtorScan<'a> {
@@ -434,9 +461,43 @@ impl<'ast, 'a> Visit<'ast> for MapperCtorScan<'a> {
                 self.flag(format!(
                     "`{t}::{c}(...)` delivery authority-ctor called outside the engine mapper"
                 ));
+            } else if let Some(qself) = &p.qself {
+                // Qualified `<Type>::ctor(...)` / `<Type as Tr>::ctor(...)` — syn puts the type in
+                // `qself`, leaving `path == [ctor]` (single segment) so the two-segment match misses.
+                let ctor = p.path.segments.last().map(|s| s.ident.to_string());
+                if let (Some(ctor), Some(ty)) = (ctor, type_last_seg(&qself.ty)) {
+                    if is_mapper_ctor_name(&ctor) && is_mapper_type_name(&ty) {
+                        self.flag(format!(
+                            "`<{ty}>::{ctor}(...)` delivery ctor (qualified/qself form) called outside the engine mapper"
+                        ));
+                    }
+                }
             }
         }
         syn::visit::visit_expr_call(self, node);
+    }
+    // `use ...::SendResponse as X` — aliasing a delivery type so its ctors can be called through the
+    // alias (bypassing the two-segment match). Plain (un-renamed) type imports are legitimate and
+    // NOT flagged (services name `SendResponse` in signatures).
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        if let Some(ty) = renamed_mapper_type(&node.tree) {
+            self.flag(format!(
+                "`use ... {ty} as ...` aliases a delivery type outside the engine mapper (gate bypass)"
+            ));
+        }
+        syn::visit::visit_item_use(self, node);
+    }
+    // `type X = SendResponse;` — a local alias to call `X::parsed(...)` through.
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        if let Some(ty) = type_last_seg(&node.ty) {
+            if is_mapper_type_name(&ty) {
+                self.flag(format!(
+                    "`type {} = {ty}` aliases a delivery type outside the engine mapper (gate bypass)",
+                    node.ident
+                ));
+            }
+        }
+        syn::visit::visit_item_type(self, node);
     }
     // Macro laundering: a macro whose (space-normalized) token-tree emits a `Type::ctor`.
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -579,5 +640,69 @@ fn mapper_ctor_macro_laundering_is_caught() {
     assert!(
         v.iter().any(|x| x.detail.contains("SendResponse::parsed")),
         "a macro emitting SendResponse::parsed must be caught: {v:#?}"
+    );
+}
+
+// ── gate-B bypass hardening (consolidated-audit MAJOR): the three vectors that defeat a naive
+//    two-segment match — qualified `<Type>::ctor`, aliased `use ... as`, and `type X = Type`. ──
+
+#[test]
+fn qself_form_delivery_ctor_is_caught() {
+    // `<SendResponse>::parsed(...)` — syn puts the type in qself, leaving a single-segment path.
+    let snippet = r#"
+        fn forge(o: SendOutcome) -> SendResponse {
+            <SendResponse>::parsed(o)
+        }
+    "#;
+    let v = scan_mapper_ctors(snippet, "<qself>");
+    assert!(
+        v.iter()
+            .any(|x| x.detail.contains("qualified/qself") && x.detail.contains("SendResponse")),
+        "qself-form <SendResponse>::parsed must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn aliased_use_of_delivery_type_is_caught() {
+    let snippet = r#"
+        use prro_domain::delivery::SendResponse as SR;
+        fn forge(o: SendOutcome) -> SR { SR::parsed(o) }
+    "#;
+    let v = scan_mapper_ctors(snippet, "<alias>");
+    assert!(
+        v.iter()
+            .any(|x| x.detail.contains("aliases a delivery type")
+                && x.detail.contains("SendResponse")),
+        "aliased `use SendResponse as SR` must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn type_alias_of_delivery_type_is_caught() {
+    let snippet = r#"
+        type SR = SendResponse;
+        fn forge(o: SendOutcome) -> SR { SR::parsed(o) }
+    "#;
+    let v = scan_mapper_ctors(snippet, "<type_alias>");
+    assert!(
+        v.iter()
+            .any(|x| x.detail.contains("aliases a delivery type")
+                && x.detail.contains("SendResponse")),
+        "`type SR = SendResponse` must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn plain_type_import_and_signature_is_not_flagged() {
+    // A services file legitimately NAMES SendResponse (import + signature). A plain (un-renamed)
+    // import + a type mention must NOT false-positive — only aliasing/constructing does.
+    let snippet = r#"
+        use prro_domain::delivery::SendResponse;
+        fn sig(x: &SendResponse) -> Option<SendResponse> { None }
+    "#;
+    let v = scan_mapper_ctors(snippet, "<plain_use>");
+    assert!(
+        v.is_empty(),
+        "a plain type import + signature must not be flagged: {v:#?}"
     );
 }
