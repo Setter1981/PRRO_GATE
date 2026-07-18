@@ -12,8 +12,8 @@
 //! the illegal construction genuinely cannot be written.
 
 use prro_domain::delivery::{
-    ClassifiedOutcome, Kvt1Raw, NodeEffect, ObservedOutcomeV1, ResponseProvenance, SentAccepted,
-    SubmissionCertainty,
+    AuthorizedGeneration, ClassifiedOutcome, Kvt1Raw, NodeEffect, ObservedOutcomeV1,
+    ResponseProvenance, SentAccepted, SubmissionCertainty,
 };
 
 fn main() {
@@ -34,14 +34,18 @@ fn main() {
         node_effect: NodeEffect::NoNodeEffect,
     };
 
-    // 4. ObservedOutcomeV1 hand-assembled with an illegal combo + negative generation
-    //    — bypasses `record()`'s validation and the classifier-sourced quadruple.
+    // 4. ObservedOutcomeV1 hand-assembled with an illegal axis combo (Submitted + NoResponse
+    //    + a NotStarted generation that contradicts the certainty) — bypasses `record()`'s
+    //    validation and the classifier-sourced quadruple. (A negative generation is no longer
+    //    even expressible: `AuthorizedGeneration::Started` wraps a `PositiveGeneration >= 1`.)
+    //    The value type-checks, so the ONLY reason this is rejected is the private fields —
+    //    which keeps the teeth honest (unseal the fields → this line compiles).
     let _forged_record = ObservedOutcomeV1 {
         certainty: SubmissionCertainty::Submitted,
         provenance: ResponseProvenance::NoResponse,
         routing: None,
         remote_correlation_id: None,
         node_effect: NodeEffect::NoNodeEffect,
-        authorized_generation: -5,
+        authorized_generation: AuthorizedGeneration::NotStarted,
     };
 }

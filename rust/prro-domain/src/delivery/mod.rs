@@ -336,15 +336,109 @@ impl SendResponse {
     }
 }
 
-/// Closed enum: the send-phase outcome (§5, B3). Disjoint by construction.
+/// The send-phase outcome (§5, B3) — **opaque + sealed (Bridge-0.1)**.
+///
+/// Constructible ONLY via [`from_dps_status`](Self::from_dps_status), the single honest
+/// total mapping from a raw DPS status + the store-owned `doc_type`. No illegal
+/// cross-product is buildable (e.g. `Rejected(Close)` on a close doc type, or
+/// `UnknownStatus` holding a named code). Read it via [`kind`](Self::kind).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SendOutcome {
-    /// DPS accepted the document (non-empty `id`) — certainty = `Submitted`.
+pub struct SendOutcome(SendOutcomeInner);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SendOutcomeInner {
     Accepted(SentAccepted),
+    Rejected(DpsReject),
+    Indeterminate(SendIndeterminate),
+}
+
+/// Borrowed view of a sealed [`SendOutcome`] — read (match) but never construct.
+#[derive(Debug)]
+pub enum SendOutcomeKind<'a> {
+    /// DPS accepted the document (non-empty `id`) — certainty = `Submitted`.
+    Accepted(&'a SentAccepted),
     /// DPS issued a definitive verdict on THIS document — certainty = `Submitted`.
     Rejected(DpsReject),
     /// Parsed but does NOT establish processing certainty — `SubmittedUnknown`.
-    Indeterminate(SendIndeterminate),
+    Indeterminate(&'a SendIndeterminate),
+}
+
+/// A raw DPS reply status handed to [`SendOutcome::from_dps_status`] (Bridge-0.1).
+/// The engine builds this from the wire facts; the domain owns the total mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawDpsStatus<'a> {
+    /// Status OK — carries the server fiscal id (empty ⇒ `OkButNoFiscalNumber`).
+    Ok { fiscal_id: &'a str },
+    /// A non-OK DPS status code (as emitted on the wire).
+    Error(i32),
+}
+
+impl SendOutcome {
+    /// Read the sealed outcome for matching.
+    pub fn kind(&self) -> SendOutcomeKind<'_> {
+        match &self.0 {
+            SendOutcomeInner::Accepted(a) => SendOutcomeKind::Accepted(a),
+            SendOutcomeInner::Rejected(r) => SendOutcomeKind::Rejected(*r),
+            SendOutcomeInner::Indeterminate(i) => SendOutcomeKind::Indeterminate(i),
+        }
+    }
+
+    /// The SOLE honest, total constructor (Bridge-0.1). Maps a raw DPS status +
+    /// the STORE-OWNED `doc_type` to a sealed outcome:
+    /// - OK + non-empty id → `Accepted`; OK + empty id → `OkButNoFiscalNumber`.
+    /// - `-1..-16` named codes → the matching `DpsReject` verdict.
+    /// - `-2/-15` split STRICTLY by doc type: close/Z ⇒ `CloseAmbiguous`, else `Close`.
+    /// - `-3` → `SaveError`; `-4` and every other unrecognized code → `UnknownStatus`.
+    ///
+    /// Correction 1 (Bridge-0.1): `doc_type` is supplied by the engine from the durable
+    /// store, NEVER carried on the wire — a wire-carried doc type would just move forgery.
+    pub fn from_dps_status(
+        status: RawDpsStatus<'_>,
+        doc_type: DocType,
+        digest: RawResponseDigest,
+    ) -> SendOutcome {
+        let is_close_shift = matches!(doc_type, DocType::ShiftClose | DocType::ZReport);
+        let inner = match status {
+            RawDpsStatus::Ok { fiscal_id } => match SentAccepted::observe(fiscal_id) {
+                Some(accepted) => SendOutcomeInner::Accepted(accepted),
+                None => SendOutcomeInner::Indeterminate(SendIndeterminate(
+                    SendIndeterminateInner::OkButNoFiscalNumber { digest },
+                )),
+            },
+            RawDpsStatus::Error(code) => match code {
+                -1 => SendOutcomeInner::Rejected(DpsReject::Verify),
+                -5 => SendOutcomeInner::Rejected(DpsReject::Type),
+                -6 => SendOutcomeInner::Rejected(DpsReject::NotPrevZReport),
+                -7 => SendOutcomeInner::Rejected(DpsReject::Xml),
+                -8 => SendOutcomeInner::Rejected(DpsReject::XmlDate),
+                -9 => SendOutcomeInner::Rejected(DpsReject::XmlChk),
+                -10 => SendOutcomeInner::Rejected(DpsReject::XmlZReport),
+                -11 => SendOutcomeInner::Rejected(DpsReject::Offline168),
+                -12 => SendOutcomeInner::Rejected(DpsReject::BadHashPrev),
+                -13 => SendOutcomeInner::Rejected(DpsReject::NotRegisteredRro),
+                -14 => SendOutcomeInner::Rejected(DpsReject::NotRegisteredSigner),
+                -16 => SendOutcomeInner::Rejected(DpsReject::OfflineId),
+                // §12 R1 — the -2/-15 split is doc-type dependent and lives HERE (the sole
+                // constructor), so `Close` vs `CloseAmbiguous` can never be mismatched.
+                -2 | -15 if is_close_shift => SendOutcomeInner::Indeterminate(SendIndeterminate(
+                    SendIndeterminateInner::CloseAmbiguous,
+                )),
+                -2 | -15 => SendOutcomeInner::Rejected(DpsReject::Close),
+                -3 => SendOutcomeInner::Indeterminate(SendIndeterminate(
+                    SendIndeterminateInner::SaveError,
+                )),
+                // -4 (canonical ERROR_UNKNOWN) + every other unrecognized code. Sealed
+                // `UnknownStatusCode` guarantees this can never hold a named DpsReject code.
+                other => SendOutcomeInner::Indeterminate(SendIndeterminate(
+                    SendIndeterminateInner::UnknownStatus {
+                        code: UnknownStatusCode(other),
+                        digest,
+                    },
+                )),
+            },
+        };
+        SendOutcome(inner)
+    }
 }
 
 /// Proof of DPS acceptance: non-empty fiscal number returned (AL-3).
@@ -413,21 +507,75 @@ pub enum DpsReject {
     Close,
 }
 
-/// Parsed but indeterminate outcomes — the sole free-form arm is `UnknownStatus` (B3).
+/// Parsed but indeterminate outcomes — **opaque + sealed (Bridge-0.1)**.
+///
+/// Constructible only inside a [`SendOutcome`] via [`SendOutcome::from_dps_status`], so
+/// `UnknownStatus` can never hold a named `DpsReject` code and `CloseAmbiguous` can never
+/// arise on a non-close doc type. Read via [`kind`](Self::kind).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SendIndeterminate {
-    /// Any code NOT in `DpsReject` + `-4 ERROR_UNKNOWN`.
-    /// The sole free-form arm — no other indeterminate variant has a raw code.
+pub struct SendIndeterminate(SendIndeterminateInner);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SendIndeterminateInner {
     UnknownStatus {
-        raw_code: BoundedText,
+        code: UnknownStatusCode,
         digest: RawResponseDigest,
+    },
+    SaveError,
+    CloseAmbiguous,
+    OkButNoFiscalNumber {
+        digest: RawResponseDigest,
+    },
+}
+
+/// Borrowed view of a sealed [`SendIndeterminate`] — read (match) but never construct.
+#[derive(Debug)]
+pub enum SendIndeterminateKind<'a> {
+    /// Any code NOT in `DpsReject` (incl. `-4 ERROR_UNKNOWN`). `code` is the raw status.
+    UnknownStatus {
+        code: i32,
+        digest: &'a RawResponseDigest,
     },
     /// -3 ERROR_SAVE — transient server error, retry is safe.
     SaveError,
-    /// -2 ERROR_CHECK / -15 ERROR_NOT_OPEN_SHIFT on close/Z-report doc type ONLY (§12 R1).
+    /// -2 ERROR_CHECK / -15 ERROR_NOT_OPEN_SHIFT on a close/Z-report doc type ONLY (§12 R1).
     CloseAmbiguous,
     /// DPS returned status OK but `id` was empty — cannot prove acceptance.
-    OkButNoFiscalNumber { digest: RawResponseDigest },
+    OkButNoFiscalNumber { digest: &'a RawResponseDigest },
+}
+
+impl SendIndeterminate {
+    /// Read the sealed indeterminate outcome for matching.
+    pub fn kind(&self) -> SendIndeterminateKind<'_> {
+        match &self.0 {
+            SendIndeterminateInner::UnknownStatus { code, digest } => {
+                SendIndeterminateKind::UnknownStatus {
+                    code: code.0,
+                    digest,
+                }
+            }
+            SendIndeterminateInner::SaveError => SendIndeterminateKind::SaveError,
+            SendIndeterminateInner::CloseAmbiguous => SendIndeterminateKind::CloseAmbiguous,
+            SendIndeterminateInner::OkButNoFiscalNumber { digest } => {
+                SendIndeterminateKind::OkButNoFiscalNumber { digest }
+            }
+        }
+    }
+}
+
+/// A DPS status code PROVEN not to be a named [`DpsReject`] (Bridge-0.1).
+///
+/// Private field: only [`SendOutcome::from_dps_status`] mints one (for `-4` and truly
+/// unrecognized codes), so `UnknownStatus` can never carry a code that has a dedicated
+/// verdict — the checkpoint's `UnknownStatus("-1")` illegal state is now unconstructible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownStatusCode(i32);
+
+impl UnknownStatusCode {
+    /// The raw status code (guaranteed not a named `DpsReject`).
+    pub fn get(self) -> i32 {
+        self.0
+    }
 }
 
 /// Closed enum of submission evidence (§3, SE-1/SE-2).
@@ -594,9 +742,9 @@ fn classify_started(response: &SendResponse, doc_type: DocType) -> ClassifiedOut
 }
 
 fn classify_parsed(outcome: &SendOutcome, doc_type: DocType) -> ClassifiedOutcome {
-    match outcome {
+    match outcome.kind() {
         // Accepted: the only clean terminal — routing cleared (§2 table, NULL clean-accept).
-        SendOutcome::Accepted(_) => ClassifiedOutcome {
+        SendOutcomeKind::Accepted(_) => ClassifiedOutcome {
             certainty: SubmissionCertainty::Submitted,
             provenance: ResponseProvenance::ParsedDpsEnvelope,
             routing: None,
@@ -605,8 +753,8 @@ fn classify_parsed(outcome: &SendOutcome, doc_type: DocType) -> ClassifiedOutcom
         // Rejected: a definitive DPS verdict — certainty=Submitted, routing + effect per code.
         // The effect comes from `routing_for_reject` (NOT the class default) because
         // `-11 Offline168` diverges: (TerminalReject, NodeBlocked) vs `-1`'s NoNodeEffect.
-        SendOutcome::Rejected(verdict) => {
-            let (routing, node_effect) = routing_for_reject(verdict, doc_type);
+        SendOutcomeKind::Rejected(verdict) => {
+            let (routing, node_effect) = routing_for_reject(&verdict, doc_type);
             ClassifiedOutcome {
                 certainty: SubmissionCertainty::Submitted,
                 provenance: ResponseProvenance::ParsedDpsEnvelope,
@@ -615,7 +763,7 @@ fn classify_parsed(outcome: &SendOutcome, doc_type: DocType) -> ClassifiedOutcom
             }
         }
         // Indeterminate: parsed but doesn't settle certainty.
-        SendOutcome::Indeterminate(ind) => {
+        SendOutcomeKind::Indeterminate(ind) => {
             let routing = routing_for_indeterminate(ind);
             ClassifiedOutcome {
                 certainty: SubmissionCertainty::SubmittedUnknown,
@@ -658,11 +806,11 @@ pub fn routing_for_reject(
 }
 
 fn routing_for_indeterminate(ind: &SendIndeterminate) -> ActiveRetryClass {
-    match ind {
-        SendIndeterminate::UnknownStatus { .. } => ActiveRetryClass::TransientRetry,
-        SendIndeterminate::SaveError => ActiveRetryClass::TransientRetry,
-        SendIndeterminate::CloseAmbiguous => ActiveRetryClass::ProbeRequired,
-        SendIndeterminate::OkButNoFiscalNumber { .. } => ActiveRetryClass::ProbeRequired,
+    match ind.kind() {
+        SendIndeterminateKind::UnknownStatus { .. } => ActiveRetryClass::TransientRetry,
+        SendIndeterminateKind::SaveError => ActiveRetryClass::TransientRetry,
+        SendIndeterminateKind::CloseAmbiguous => ActiveRetryClass::ProbeRequired,
+        SendIndeterminateKind::OkButNoFiscalNumber { .. } => ActiveRetryClass::ProbeRequired,
     }
 }
 
@@ -685,6 +833,64 @@ fn node_effect_for_active(class: ActiveRetryClass) -> NodeEffect {
     }
 }
 
+// ─── AuthorizedGeneration — total generation witness (Bridge-0.1) ────────────
+
+/// A validated positive delivery-generation snapshot (`>= 1`).
+///
+/// Private field + validating [`new`](Self::new): a non-positive generation is
+/// unconstructible, so [`AuthorizedGeneration::Started`] always carries a real counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositiveGeneration(i64);
+
+impl PositiveGeneration {
+    /// Construct only if `n >= 1`. Returns `None` otherwise.
+    pub fn new(n: i64) -> Option<Self> {
+        if n >= 1 {
+            Some(Self(n))
+        } else {
+            None
+        }
+    }
+    /// The snapshot value (guaranteed `>= 1`).
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// The authorized-generation witness paired with a delivery outcome (Bridge-0.1).
+///
+/// **Total over legal outcomes.** A `NOT_SUBMITTED` outcome never crossed
+/// `CALL_STARTED`, so it has NO generation (`NotStarted` → DB `NULL`); a `Started`-path
+/// outcome carries the immutable `node_state.delivery_generation` snapshot taken at
+/// `RN→CALL_STARTED` (`Started(n>=1)` → DB `n`). The prior `i64 (>=1)` field could NOT
+/// represent a legal `NotSubmitted` record — the checkpoint hole this closes.
+///
+/// **Correction (Bridge-0.1):** this type is only the *shape*. The *truth* — that a
+/// `Started` witness corresponds to a durable `CALL_STARTED` marker — is minted in the
+/// engine/store layer against durable state, NOT in this pure crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizedGeneration {
+    /// No `CALL_STARTED` (a `NotStarted` submission / `NOT_SUBMITTED` outcome). DB `NULL`.
+    NotStarted,
+    /// The `RN→CALL_STARTED` generation snapshot (`>= 1`). DB non-`NULL`.
+    Started(PositiveGeneration),
+}
+
+impl AuthorizedGeneration {
+    /// DB projection: `None` for `NotStarted` (NULL column), `Some(n)` for `Started`.
+    pub fn as_db_value(self) -> Option<i64> {
+        match self {
+            Self::NotStarted => None,
+            Self::Started(g) => Some(g.get()),
+        }
+    }
+
+    /// `true` iff the attempt crossed `CALL_STARTED` (a `Started` witness).
+    pub fn is_started(self) -> bool {
+        matches!(self, Self::Started(_))
+    }
+}
+
 // ─── ObservedOutcomeV1 (A4-6 + amendment 2026-07-17) ─────────────────────────
 
 /// The self-contained durable record payload committed as authority first
@@ -701,8 +907,9 @@ fn node_effect_for_active(class: ActiveRetryClass) -> NodeEffect {
 /// `(certainty, provenance, routing, node_effect)` quadruple is therefore always a
 /// real `classify` output (never a hand-assembled illegal combination), and
 /// `node_effect` cannot drift from the classifier because there is no `node_effect`
-/// parameter to inject. `record` also validates `authorized_generation >= 1`
-/// (033 CHECK: NULL-or-`>=1`; at OUTCOME_OBSERVED it is non-NULL).
+/// parameter to inject. `record` enforces the generation↔certainty invariant
+/// ([`AuthorizedGeneration`]): a `NotSubmitted` outcome must be `NotStarted`, a
+/// `SubmittedUnknown`/`Submitted` outcome must be `Started` — total over legal outcomes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedOutcomeV1 {
     certainty: SubmissionCertainty,
@@ -710,14 +917,19 @@ pub struct ObservedOutcomeV1 {
     routing: Option<ActiveRetryClass>,
     remote_correlation_id: Option<BoundedText>,
     node_effect: NodeEffect,
-    authorized_generation: i64,
+    authorized_generation: AuthorizedGeneration,
 }
 
 /// Error minting an [`ObservedOutcomeV1`] via [`ObservedOutcomeV1::record`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservedOutcomeError {
-    /// `authorized_generation` was not `>= 1` (033 CHECK; at OO it is non-NULL).
-    NonPositiveGeneration(i64),
+    /// The generation witness contradicts the outcome's certainty: a `NotSubmitted`
+    /// outcome must pair with `NotStarted` (it never crossed `CALL_STARTED`), and a
+    /// `SubmittedUnknown`/`Submitted` outcome must pair with `Started` (it did).
+    GenerationCertaintyMismatch {
+        certainty: SubmissionCertainty,
+        generation_started: bool,
+    },
 }
 
 impl ObservedOutcomeV1 {
@@ -725,16 +937,21 @@ impl ObservedOutcomeV1 {
     ///
     /// Copies the four axes (incl. `node_effect`) verbatim from `classified`, adds the
     /// `remote_correlation_id` (known only at the record step, not to the pure classifier)
-    /// and the `authorized_generation` snapshot. Validates `authorized_generation >= 1`.
+    /// and the [`AuthorizedGeneration`] witness. Enforces the generation↔certainty
+    /// invariant — a `NotSubmitted` outcome must be `NotStarted`; a `SubmittedUnknown` /
+    /// `Submitted` outcome must be `Started`. Total over both legal pairings; a mismatch
+    /// (the only illegal input the types still allow) is rejected.
     pub fn record(
         classified: &ClassifiedOutcome,
         remote_correlation_id: Option<BoundedText>,
-        authorized_generation: i64,
+        authorized_generation: AuthorizedGeneration,
     ) -> Result<Self, ObservedOutcomeError> {
-        if authorized_generation < 1 {
-            return Err(ObservedOutcomeError::NonPositiveGeneration(
-                authorized_generation,
-            ));
+        let is_not_submitted = classified.certainty == SubmissionCertainty::NotSubmitted;
+        if is_not_submitted == authorized_generation.is_started() {
+            return Err(ObservedOutcomeError::GenerationCertaintyMismatch {
+                certainty: classified.certainty,
+                generation_started: authorized_generation.is_started(),
+            });
         }
         Ok(Self {
             certainty: classified.certainty,
@@ -766,10 +983,11 @@ impl ObservedOutcomeV1 {
     pub fn node_effect(&self) -> NodeEffect {
         self.node_effect
     }
-    /// Snapshot of `node_state.delivery_generation` at `RN→CALL_STARTED`.
-    /// The apply CAS compares this stored value vs the CURRENT live generation
-    /// (not node-vs-node). A mismatch ⇒ drop; ledger/seed/fence unchanged (RP4B-9).
-    pub fn authorized_generation(&self) -> i64 {
+    /// The [`AuthorizedGeneration`] witness (`NotStarted` for a `NOT_SUBMITTED` record,
+    /// else the `Started` snapshot of `node_state.delivery_generation` at
+    /// `RN→CALL_STARTED`). The apply CAS compares the stored `Started` value vs the
+    /// CURRENT live generation (not node-vs-node); a mismatch ⇒ drop (RP4B-9).
+    pub fn authorized_generation(&self) -> AuthorizedGeneration {
         self.authorized_generation
     }
 }

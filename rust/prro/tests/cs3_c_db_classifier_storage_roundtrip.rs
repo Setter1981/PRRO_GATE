@@ -33,9 +33,10 @@ use prro::db::models::ids::DocumentId;
 use prro::db::repositories::delivery_reservation::{self, NewReservation};
 use prro::db::tx::with_immediate;
 use prro_domain::delivery::{
-    BoundedText, DpsProtocolBinding, DpsProtocolId, DpsReject, EnvelopeHash, NoResponseCause,
-    PreflightRefusal, ProtocolContractVersion, RawResponseDigest, RemoteStatusEvidence,
-    SendIndeterminate, SendOutcome, SendResponse, SentAccepted, SubmissionEvidence,
+    classify, AuthorizedGeneration, BoundedText, DpsProtocolBinding, DpsProtocolId, EnvelopeHash,
+    NoResponseCause, ObservedOutcomeV1, PositiveGeneration, PreflightRefusal,
+    ProtocolContractVersion, RawDpsStatus, RawResponseDigest, RemoteStatusEvidence, SendOutcome,
+    SendResponse, SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
 use sqlx::SqlitePool;
@@ -262,6 +263,17 @@ fn started(response: SendResponse) -> SubmissionEvidence {
     }
 }
 
+/// Build a `Started{Parsed}` evidence from a raw DPS status via the SOLE sealed
+/// constructor. `dt` MUST equal the row's classify doc_type (the `-2/-15` close split
+/// happens inside `from_dps_status`).
+fn parsed(status: RawDpsStatus<'_>, dt: DocType) -> SubmissionEvidence {
+    started(SendResponse::Parsed(SendOutcome::from_dps_status(
+        status,
+        dt,
+        ev_digest(),
+    )))
+}
+
 /// Mapped ClassifiedOutcome from the normative graph (§2 table).
 /// `routing` = None for the clean-accept row.
 struct GraphRow {
@@ -373,138 +385,138 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // ── Started/Parsed(Accepted) ─────────────────────────────────────────────
         GraphRow {
             label: "Started/Parsed(Accepted) → SUBMITTED/PARSED_DPS_ENVELOPE/NULL",
-            evidence: started(SendResponse::Parsed(SendOutcome::Accepted(SentAccepted::observe("DPS-123").unwrap()))),
+            evidence: parsed(RawDpsStatus::Ok { fiscal_id: "DPS-123" }, DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: None,
             node_effect: "NoNodeEffect",
         },
-        // ── Started/Parsed(Rejected) — per routing_for_reject ──────────────────
-        // DpsReject::Verify (-1) → TerminalReject / NoNodeEffect
+        // ── Started/Parsed(Rejected) — named codes via from_dps_status ─────────
+        // -1 Verify → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Verify/-1) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Verify))),
+            evidence: parsed(RawDpsStatus::Error(-1), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
             node_effect: "NoNodeEffect",
         },
-        // DpsReject::Type (-5) → TerminalReject / NoNodeEffect
+        // -5 Type → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Type/-5) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Type))),
+            evidence: parsed(RawDpsStatus::Error(-5), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
             node_effect: "NoNodeEffect",
         },
-        // DpsReject::NotPrevZReport (-6) → OperatorEscalation / OperatorEscalation
+        // -6 NotPrevZReport → OperatorEscalation / OperatorEscalation
         GraphRow {
             label: "Rejected(NotPrevZReport/-6) → SUBMITTED/PARSED_DPS_ENVELOPE/OperatorEscalation/OperatorEscalation",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotPrevZReport))),
+            evidence: parsed(RawDpsStatus::Error(-6), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("OperatorEscalation"),
             node_effect: "OperatorEscalation",
         },
-        // DpsReject::Xml (-7) → TerminalReject / NoNodeEffect
+        // -7 Xml → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Xml/-7) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Xml))),
+            evidence: parsed(RawDpsStatus::Error(-7), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
             node_effect: "NoNodeEffect",
         },
-        // DpsReject::XmlDate (-8) → TerminalReject / NoNodeEffect
+        // -8 XmlDate → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlDate/-8) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlDate))),
+            evidence: parsed(RawDpsStatus::Error(-8), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
             node_effect: "NoNodeEffect",
         },
-        // DpsReject::XmlChk (-9) → TerminalReject / NoNodeEffect
+        // -9 XmlChk → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlChk/-9) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlChk))),
+            evidence: parsed(RawDpsStatus::Error(-9), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
             node_effect: "NoNodeEffect",
         },
-        // DpsReject::XmlZReport (-10) → TerminalReject / NoNodeEffect
+        // -10 XmlZReport → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlZReport/-10) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::XmlZReport))),
+            evidence: parsed(RawDpsStatus::Error(-10), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
             node_effect: "NoNodeEffect",
         },
-        // DpsReject::Offline168 (-11) → TerminalReject / NodeBlocked
+        // -11 Offline168 → TerminalReject / NodeBlocked
         GraphRow {
             label: "Rejected(Offline168/-11) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NodeBlocked",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Offline168))),
+            evidence: parsed(RawDpsStatus::Error(-11), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
             node_effect: "NodeBlocked",
         },
-        // DpsReject::BadHashPrev (-12) → MacRecovery / MacReseedPending
+        // -12 BadHashPrev → MacRecovery / MacReseedPending
         GraphRow {
             label: "Rejected(BadHashPrev/-12) → SUBMITTED/PARSED_DPS_ENVELOPE/MacRecovery/MacReseedPending",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::BadHashPrev))),
+            evidence: parsed(RawDpsStatus::Error(-12), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("MacRecovery"),
             node_effect: "MacReseedPending",
         },
-        // DpsReject::NotRegisteredRro (-13) → FnConfigError / FnConfigError
+        // -13 NotRegisteredRro → FnConfigError / FnConfigError
         GraphRow {
             label: "Rejected(NotRegisteredRro/-13) → SUBMITTED/PARSED_DPS_ENVELOPE/FnConfigError/FnConfigError",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotRegisteredRro))),
+            evidence: parsed(RawDpsStatus::Error(-13), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("FnConfigError"),
             node_effect: "FnConfigError",
         },
-        // DpsReject::NotRegisteredSigner (-14) → FnConfigError / FnConfigError
+        // -14 NotRegisteredSigner → FnConfigError / FnConfigError
         GraphRow {
             label: "Rejected(NotRegisteredSigner/-14) → SUBMITTED/PARSED_DPS_ENVELOPE/FnConfigError/FnConfigError",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::NotRegisteredSigner))),
+            evidence: parsed(RawDpsStatus::Error(-14), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("FnConfigError"),
             node_effect: "FnConfigError",
         },
-        // DpsReject::OfflineId (-16) → TerminalReject / NoNodeEffect
+        // -16 OfflineId → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(OfflineId/-16) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::OfflineId))),
+            evidence: parsed(RawDpsStatus::Error(-16), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TerminalReject"),
             node_effect: "NoNodeEffect",
         },
-        // DpsReject::Close (non-close doc, §12 R1) → TerminalReject / NoNodeEffect
+        // -2 on a non-close doc (§12 R1) → Rejected(Close) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Close/Sell §12R1) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: started(SendResponse::Parsed(SendOutcome::Rejected(DpsReject::Close))),
+            evidence: parsed(RawDpsStatus::Error(-2), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -512,63 +524,50 @@ fn normative_graph_rows() -> Vec<GraphRow> {
             node_effect: "NoNodeEffect",
         },
         // ── Started/Parsed(Indeterminate) ──────────────────────────────────────
-        // UnknownStatus → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
+        // -4 UnknownStatus → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
         GraphRow {
             label: "Indeterminate(Unknown/-4) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/TransientRetry",
-            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
-                SendIndeterminate::UnknownStatus {
-                    raw_code: BoundedText::from_truncating("-4"),
-                    digest: ev_digest(),
-                },
-            ))),
+            evidence: parsed(RawDpsStatus::Error(-4), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TransientRetry"),
             node_effect: "NoNodeEffect",
         },
-        // SaveError (-3) → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
+        // -3 SaveError → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
         GraphRow {
             label: "Indeterminate(SaveError/-3) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/TransientRetry",
-            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
-                SendIndeterminate::SaveError,
-            ))),
+            evidence: parsed(RawDpsStatus::Error(-3), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("TransientRetry"),
             node_effect: "NoNodeEffect",
         },
-        // CloseAmbiguous (ZReport, §12 R1) → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired
+        // -2 on Z_REPORT (§12 R1) → CloseAmbiguous → SUBMITTED_UNKNOWN / PARSED / ProbeRequired
         GraphRow {
             label: "Indeterminate(CloseAmbiguous/ZReport) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
-            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
-                SendIndeterminate::CloseAmbiguous,
-            ))),
+            evidence: parsed(RawDpsStatus::Error(-2), DocType::ZReport),
             doc_type: DocType::ZReport,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("ProbeRequired"),
             node_effect: "ProbeRequired",
         },
-        // CloseAmbiguous (ShiftClose, §12 R1) → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired
+        // -2 on ShiftClose (§12 R1) → CloseAmbiguous → SUBMITTED_UNKNOWN / PARSED / ProbeRequired
         GraphRow {
             label: "Indeterminate(CloseAmbiguous/ShiftClose) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
-            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
-                SendIndeterminate::CloseAmbiguous,
-            ))),
+            evidence: parsed(RawDpsStatus::Error(-2), DocType::ShiftClose),
             doc_type: DocType::ShiftClose,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: Some("ProbeRequired"),
             node_effect: "ProbeRequired",
         },
-        // OkButNoFiscalNumber → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired
+        // OK + empty id → OkButNoFiscalNumber → SUBMITTED_UNKNOWN / PARSED / ProbeRequired
         GraphRow {
             label: "Indeterminate(OkButNoFiscalNumber) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
-            evidence: started(SendResponse::Parsed(SendOutcome::Indeterminate(
-                SendIndeterminate::OkButNoFiscalNumber { digest: ev_digest() },
-            ))),
+            evidence: parsed(RawDpsStatus::Ok { fiscal_id: "" }, DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -595,12 +594,12 @@ fn normative_graph_rows() -> Vec<GraphRow> {
 /// uses a fresh FN to avoid the fence blocking a second reservation.
 #[tokio::test]
 async fn st01_every_classifier_output_is_033_storable() {
-    // R5: this pin now DRIVES the real `classify()` and stores ITS sealed output — it no
-    // longer stores a hand-copied output table (the checkpoint-audit finding: the pin must
-    // exercise the code under test, not a parallel copy). The normative `certainty/
-    // provenance/routing/node_effect` strings are retained as an INDEPENDENT cross-check.
-    use prro_domain::delivery::classify;
-
+    // R5: this pin DRIVES the real `classify()` (not a hand-copied output table), and the
+    // normative strings stay an INDEPENDENT cross-check.
+    // Bridge-0.1 (finding-2): the durable row is now minted THROUGH
+    // `ObservedOutcomeV1::record` — the checkpoint found st01 wrote the classify output
+    // STRAIGHT to SQL, so `record()`'s NOT_SUBMITTED totality (NotStarted → NULL generation)
+    // was never exercised end-to-end. Routing storage through `record` removes that bypass.
     let rows = normative_graph_rows();
     let mut failures: Vec<String> = Vec::new();
 
@@ -639,85 +638,108 @@ async fn st01_every_classifier_output_is_033_storable() {
             continue;
         }
 
-        // Store the REAL classifier output (got_*), not a hand-copied string.
-        let result: Result<(), String> = if got_cert == "NOT_SUBMITTED" {
-            // RNS → OO directly: no CS step, authorized_generation stays NULL.
-            let rc = got_routing.expect("NOT_SUBMITTED always has a routing class");
-            let r2 = sqlx::query(
+        // ── Bridge-0.1: mint the durable record THROUGH ObservedOutcomeV1::record. ──
+        // The generation witness is derived from the evidence discriminant: the engine/
+        // store mints it from durable CALL_STARTED state, and here the evidence IS that
+        // state (NotStarted evidence ⇒ no CALL_STARTED ⇒ NotStarted witness ⇒ NULL column).
+        let generation = match &row.evidence {
+            SubmissionEvidence::NotStarted { .. } => AuthorizedGeneration::NotStarted,
+            SubmissionEvidence::Started { .. } => {
+                AuthorizedGeneration::Started(PositiveGeneration::new(1).unwrap())
+            }
+        };
+        // record() is TOTAL over legal outcomes and enforces the generation↔certainty
+        // invariant. This is the call the checkpoint found bypassed.
+        let record = match ObservedOutcomeV1::record(&classified, None, generation) {
+            Ok(r) => r,
+            Err(e) => {
+                failures.push(format!("\n  RECORD MINT [{}] failed: {e:?}", row.label));
+                continue;
+            }
+        };
+        let rec_cert = record.certainty().as_str();
+        let rec_prov = record.provenance().as_str();
+        let rec_routing: Option<&str> = record.routing().map(|r| r.as_str());
+        let rec_ne = record.node_effect().as_str();
+        // The nullable authorized_generation column comes STRAIGHT from the record witness:
+        // NotStarted → None → NULL (the NOT_SUBMITTED totality the checkpoint flagged).
+        let rec_gen: Option<i64> = record.authorized_generation().as_db_value();
+
+        // Store the record's fields. A NULL generation ⇒ NOT_SUBMITTED ⇒ RNS → OO directly;
+        // a Some generation ⇒ RNS → CS(authorized_generation) → OO.
+        let result: Result<(), String> = if rec_gen.is_none() {
+            let rc = rec_routing.expect("NOT_SUBMITTED always has a routing class");
+            sqlx::query(
                 "UPDATE delivery_reservation \
                  SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                     submission_certainty = 'NOT_SUBMITTED', \
-                     response_provenance = 'NO_RESPONSE', \
+                     submission_certainty = ?, \
+                     response_provenance = ?, \
                      routing_class = ?, \
                      node_effect = ? \
                  WHERE reservation_id = ?",
             )
+            .bind(rec_cert)
+            .bind(rec_prov)
             .bind(rc)
-            .bind(got_ne)
+            .bind(rec_ne)
             .bind(&[res_byte; 16][..])
             .execute(&pool)
-            .await;
-            match r2 {
-                Ok(_) => Ok(()),
-                Err(e) => Err(format!("RNS→OO NOT_SUBMITTED failed: {e}")),
-            }
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("RNS→OO NOT_SUBMITTED failed: {e}"))
         } else {
-            // RNS → CS → OO: authorized_generation set at CS step.
-            let advance_cs_result = sqlx::query(
+            let cs = sqlx::query(
                 "UPDATE delivery_reservation \
                  SET state = 'CALL_STARTED', \
                      call_started_at = '2026-07-17T00:00:00Z', \
-                     authorized_generation = 1 \
+                     authorized_generation = ? \
                  WHERE reservation_id = ?",
             )
+            .bind(rec_gen)
             .bind(&[res_byte; 16][..])
             .execute(&pool)
             .await;
-
-            if let Err(e) = advance_cs_result {
-                Err(format!("RNS→CS failed: {e}"))
-            } else {
-                // Now CS → OO.
-                let oo_result = match got_routing {
-                    Some(rc) => {
-                        sqlx::query(
-                            "UPDATE delivery_reservation \
-                             SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                                 submission_certainty = ?, \
-                                 response_provenance = ?, \
-                                 routing_class = ?, \
-                                 node_effect = ? \
-                             WHERE reservation_id = ?",
-                        )
-                        .bind(got_cert)
-                        .bind(got_prov)
-                        .bind(rc)
-                        .bind(got_ne)
-                        .bind(&[res_byte; 16][..])
-                        .execute(&pool)
-                        .await
-                    }
-                    None => {
-                        // Clean accept: routing_class NULL.
-                        sqlx::query(
-                            "UPDATE delivery_reservation \
-                             SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                                 submission_certainty = ?, \
-                                 response_provenance = ?, \
-                                 node_effect = ? \
-                             WHERE reservation_id = ?",
-                        )
-                        .bind(got_cert)
-                        .bind(got_prov)
-                        .bind(got_ne)
-                        .bind(&[res_byte; 16][..])
-                        .execute(&pool)
-                        .await
-                    }
-                };
-                match oo_result {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(format!("CS→OO failed: {e}")),
+            match cs {
+                Err(e) => Err(format!("RNS→CS failed: {e}")),
+                Ok(_) => {
+                    let oo = match rec_routing {
+                        Some(rc) => {
+                            sqlx::query(
+                                "UPDATE delivery_reservation \
+                                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
+                                     submission_certainty = ?, \
+                                     response_provenance = ?, \
+                                     routing_class = ?, \
+                                     node_effect = ? \
+                                 WHERE reservation_id = ?",
+                            )
+                            .bind(rec_cert)
+                            .bind(rec_prov)
+                            .bind(rc)
+                            .bind(rec_ne)
+                            .bind(&[res_byte; 16][..])
+                            .execute(&pool)
+                            .await
+                        }
+                        None => {
+                            // Clean accept: routing_class NULL.
+                            sqlx::query(
+                                "UPDATE delivery_reservation \
+                                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
+                                     submission_certainty = ?, \
+                                     response_provenance = ?, \
+                                     node_effect = ? \
+                                 WHERE reservation_id = ?",
+                            )
+                            .bind(rec_cert)
+                            .bind(rec_prov)
+                            .bind(rec_ne)
+                            .bind(&[res_byte; 16][..])
+                            .execute(&pool)
+                            .await
+                        }
+                    };
+                    oo.map(|_| ()).map_err(|e| format!("CS→OO failed: {e}"))
                 }
             }
         };
@@ -727,24 +749,35 @@ async fn st01_every_classifier_output_is_033_storable() {
             continue;
         }
 
-        // Roundtrip: read the stored columns back and assert they equal the classifier
-        // output we wrote — proves classify → 033 store → read is lossless (incl node_effect).
-        let stored: (String, String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT submission_certainty, response_provenance, routing_class, node_effect \
-             FROM delivery_reservation WHERE reservation_id = ?",
+        // Roundtrip: read the stored columns (incl. authorized_generation) back and assert
+        // they equal the record we minted — proves classify → record → 033 store → read is
+        // lossless, and that record()'s NOT_SUBMITTED → NULL generation survives end-to-end.
+        let stored: (String, String, Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT submission_certainty, response_provenance, routing_class, node_effect, \
+                        authorized_generation \
+                 FROM delivery_reservation WHERE reservation_id = ?",
         )
         .bind(&[res_byte; 16][..])
         .fetch_one(&pool)
         .await
         .expect("read back stored OUTCOME_OBSERVED row");
-        if stored.0 != got_cert
-            || stored.1 != got_prov
-            || stored.2.as_deref() != got_routing
-            || stored.3.as_deref() != Some(got_ne)
+        if stored.0 != rec_cert
+            || stored.1 != rec_prov
+            || stored.2.as_deref() != rec_routing
+            || stored.3.as_deref() != Some(rec_ne)
+            || stored.4 != rec_gen
         {
             failures.push(format!(
-                "\n  ROUNDTRIP DRIFT [{}]: stored={stored:?} != classify(certainty={got_cert}, provenance={got_prov}, routing={got_routing:?}, node_effect={got_ne})",
+                "\n  ROUNDTRIP DRIFT [{}]: stored={stored:?} != record(certainty={rec_cert}, provenance={rec_prov}, routing={rec_routing:?}, node_effect={rec_ne}, generation={rec_gen:?})",
                 row.label
+            ));
+        }
+        // Totality witness: a NOT_SUBMITTED record carries NO generation (NotStarted → NULL)
+        // end-to-end — the completeness the checkpoint flagged as unexercised (finding-2).
+        if rec_cert == "NOT_SUBMITTED" && stored.4.is_some() {
+            failures.push(format!(
+                "\n  TOTALITY [{}]: NOT_SUBMITTED must store NULL authorized_generation, got {:?}",
+                row.label, stored.4
             ));
         }
     }

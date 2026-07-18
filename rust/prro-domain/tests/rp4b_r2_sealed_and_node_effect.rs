@@ -12,11 +12,11 @@
 //! `ObservedOutcomeV1::record` exist — must fail to compile, then pass.
 
 use prro_domain::delivery::{
-    classify, ActiveRetryClass as ARC, BoundedText, DpsProtocolBinding, DpsProtocolId, DpsReject,
-    EnvelopeHash, Kvt1Raw, NoResponseCause, NodeEffect as NE, ObservedOutcomeV1, PreflightRefusal,
-    ProtocolContractVersion, RawResponseDigest, RemoteStatusEvidence, ResponseProvenance as RP,
-    SendIndeterminate, SendOutcome, SendResponse, SentAccepted, SubmissionCertainty as SC,
-    SubmissionEvidence,
+    classify, ActiveRetryClass as ARC, AuthorizedGeneration, BoundedText, DpsProtocolBinding,
+    DpsProtocolId, DpsReject, EnvelopeHash, Kvt1Raw, NoResponseCause, NodeEffect as NE,
+    ObservedOutcomeV1, PositiveGeneration, PreflightRefusal, ProtocolContractVersion, RawDpsStatus,
+    RawResponseDigest, RemoteStatusEvidence, ResponseProvenance as RP, SendOutcome, SendResponse,
+    SentAccepted, SubmissionCertainty as SC, SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
 
@@ -47,8 +47,45 @@ fn not_started(reason: PreflightRefusal) -> SubmissionEvidence {
     }
 }
 
+fn dg() -> RawResponseDigest {
+    RawResponseDigest([0u8; 32])
+}
+
+/// Build a `Started{Parsed}` evidence from a raw DPS status via the SOLE sealed
+/// constructor (the `-2/-15` close split happens inside `from_dps_status`, so `dt`
+/// must match the classify doc_type).
+fn parsed(status: RawDpsStatus<'_>, dt: DocType) -> SubmissionEvidence {
+    started(SendResponse::Parsed(SendOutcome::from_dps_status(
+        status,
+        dt,
+        dg(),
+    )))
+}
+
+/// Test-local inverse of the wire matrix: map a named `DpsReject` back to its raw DPS
+/// code so the existing verdict-named call sites keep reading naturally. The forward
+/// direction (code → verdict) is pinned independently by `rp4b_31_opaque_algebra`.
+fn code_for(v: DpsReject) -> i32 {
+    match v {
+        DpsReject::Verify => -1,
+        DpsReject::Type => -5,
+        DpsReject::NotPrevZReport => -6,
+        DpsReject::Xml => -7,
+        DpsReject::XmlDate => -8,
+        DpsReject::XmlChk => -9,
+        DpsReject::XmlZReport => -10,
+        DpsReject::Offline168 => -11,
+        DpsReject::BadHashPrev => -12,
+        DpsReject::NotRegisteredRro => -13,
+        DpsReject::NotRegisteredSigner => -14,
+        DpsReject::OfflineId => -16,
+        DpsReject::Close => -2,
+    }
+}
+
 fn parsed_reject(v: DpsReject) -> SubmissionEvidence {
-    started(SendResponse::Parsed(SendOutcome::Rejected(v)))
+    // Non-close doc so -2 maps to Rejected(Close); named codes are doc-type-independent.
+    parsed(RawDpsStatus::Error(code_for(v)), DocType::Sell)
 }
 
 // ─── R2-A: classify RETURNS node_effect on EVERY path (the keystone) ─────────
@@ -112,28 +149,22 @@ fn classify_surfaces_node_effect_on_all_paths() {
 
     // Accepted → clean (routing None) → NoNodeEffect.
     let accepted = classify(
-        &started(SendResponse::Parsed(SendOutcome::Accepted(
-            SentAccepted::observe("DPS-1").unwrap(),
-        ))),
+        &parsed(RawDpsStatus::Ok { fiscal_id: "DPS-1" }, DocType::Sell),
         DocType::Sell,
     );
     assert_eq!(accepted.routing(), None);
     assert_eq!(accepted.node_effect(), NE::NoNodeEffect);
 
-    // Indeterminate(CloseAmbiguous) → ProbeRequired → ProbeRequired.
+    // Indeterminate(CloseAmbiguous, -2 on a close doc) → ProbeRequired → ProbeRequired.
     let close = classify(
-        &started(SendResponse::Parsed(SendOutcome::Indeterminate(
-            SendIndeterminate::CloseAmbiguous,
-        ))),
-        DocType::Sell,
+        &parsed(RawDpsStatus::Error(-2), DocType::ZReport),
+        DocType::ZReport,
     );
     assert_eq!(close.node_effect(), NE::ProbeRequired);
 
     // Indeterminate(SaveError, -3) → TransientRetry → NoNodeEffect.
     let save = classify(
-        &started(SendResponse::Parsed(SendOutcome::Indeterminate(
-            SendIndeterminate::SaveError,
-        ))),
+        &parsed(RawDpsStatus::Error(-3), DocType::Sell),
         DocType::Sell,
     );
     assert_eq!(save.node_effect(), NE::NoNodeEffect);
@@ -147,28 +178,57 @@ fn classify_surfaces_node_effect_on_all_paths() {
 #[test]
 fn record_copies_node_effect_from_classified() {
     let classified = classify(&parsed_reject(DpsReject::Offline168), DocType::Sell);
-    let rec = ObservedOutcomeV1::record(&classified, Some(BoundedText::from_truncating("corr")), 5)
-        .expect("gen >= 1 is valid");
+    // Offline168 → Submitted, so a Started generation is required (invariant).
+    let gen = AuthorizedGeneration::Started(PositiveGeneration::new(5).unwrap());
+    let rec =
+        ObservedOutcomeV1::record(&classified, Some(BoundedText::from_truncating("corr")), gen)
+            .expect("Submitted + Started is a valid pairing");
 
     assert_eq!(rec.certainty(), SC::Submitted);
     assert_eq!(rec.provenance(), RP::ParsedDpsEnvelope);
     assert_eq!(rec.routing(), Some(ARC::TerminalReject));
     assert_eq!(rec.node_effect(), NE::NodeBlocked); // copied from classify, not injected
-    assert_eq!(rec.authorized_generation(), 5);
+    assert_eq!(rec.authorized_generation().as_db_value(), Some(5));
     assert_eq!(
         rec.remote_correlation_id().map(|t| t.as_str()),
         Some("corr")
     );
 }
 
-/// `record` rejects a non-positive authorized_generation (033 CHECK: NULL or >= 1;
-/// at OO it is non-NULL, so >= 1).
+/// A non-positive generation is unconstructible at the TYPE level (`PositiveGeneration`),
+/// so `record` never sees one — the old `>= 1` runtime check is now a type invariant.
+/// (Legacy name kept for the additions-only inventory gate.)
 #[test]
 fn record_rejects_non_positive_generation() {
-    let classified = classify(&parsed_reject(DpsReject::Verify), DocType::Sell);
-    assert!(ObservedOutcomeV1::record(&classified, None, 0).is_err());
-    assert!(ObservedOutcomeV1::record(&classified, None, -1).is_err());
-    assert!(ObservedOutcomeV1::record(&classified, None, 1).is_ok());
+    assert!(PositiveGeneration::new(0).is_none());
+    assert!(PositiveGeneration::new(-1).is_none());
+    assert!(PositiveGeneration::new(1).is_some());
+}
+
+/// Bridge-0.1: `record` is TOTAL over legal outcomes and enforces the
+/// generation↔certainty invariant. A `NotSubmitted` outcome MUST be `NotStarted`
+/// (it never crossed CALL_STARTED); a `Submitted*` outcome MUST be `Started`.
+#[test]
+fn record_enforces_generation_certainty_invariant() {
+    let started = AuthorizedGeneration::Started(PositiveGeneration::new(1).unwrap());
+
+    // Submitted (Verify reject) — Started ok, NotStarted rejected.
+    let submitted = classify(&parsed_reject(DpsReject::Verify), DocType::Sell);
+    assert!(ObservedOutcomeV1::record(&submitted, None, started).is_ok());
+    assert!(ObservedOutcomeV1::record(&submitted, None, AuthorizedGeneration::NotStarted).is_err());
+
+    // NotSubmitted (preflight NotStarted evidence) — NotStarted ok, Started rejected.
+    let not_submitted = classify(
+        &not_started(PreflightRefusal::PreconditionFailed(
+            BoundedText::from_truncating("guard"),
+        )),
+        DocType::Sell,
+    );
+    assert_eq!(not_submitted.certainty(), SC::NotSubmitted);
+    assert!(
+        ObservedOutcomeV1::record(&not_submitted, None, AuthorizedGeneration::NotStarted).is_ok()
+    );
+    assert!(ObservedOutcomeV1::record(&not_submitted, None, started).is_err());
 }
 
 // ─── R2-C: Kvt1Raw sealed — non-empty / length invariant ─────────────────────
