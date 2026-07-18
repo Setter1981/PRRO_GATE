@@ -365,3 +365,219 @@ fn ordinary_carry_of_a_digest_is_not_flagged() {
         "carrying a digest/id must not be flagged: {v:#?}"
     );
 }
+
+// ─── CS-3 3.2 PR4 pin C — the §4.4 "one engine-mapper" placement gate (gate-B) ────────────────
+//
+// Sibling to the mint gate above, but a DIFFERENT allowed path and symbol set. The delivery-contract
+// AUTHORITY CTORS — `SendResponse::{parsed,no_response,remote_status}` and
+// `SendOutcome::{accepted,ok_but_no_fiscal_number,missing_status,from_server_code}` — are `pub` in
+// prro-domain (Rust can't cross-crate sibling-seal them), so the guarantee "the engine can only
+// FORWARD transport-minted evidence, never fabricate a SendResponse/SendOutcome" rests on THIS gate:
+// under `prro/src/**` they may be CALLED ONLY inside the one engine-mapper file
+// `services/write_path/shadow_map.rs` (+ `#[cfg(test)]`). A stray `SendResponse::parsed(...)` in any
+// other `services/*` file would silently reopen the fabrication surface — this turns that RED.
+
+/// `(Type, ctor)` pairs of the gated delivery authority ctors. The TWO-segment (`Type::ctor`) match
+/// disambiguates from any unrelated `parsed`/`accepted`/… ident (no bare-ident collision).
+const MAPPER_CTORS: &[(&str, &str)] = &[
+    ("SendResponse", "parsed"),
+    ("SendResponse", "no_response"),
+    ("SendResponse", "remote_status"),
+    ("SendOutcome", "accepted"),
+    ("SendOutcome", "ok_but_no_fiscal_number"),
+    ("SendOutcome", "missing_status"),
+    ("SendOutcome", "from_server_code"),
+];
+
+/// The gated `(Type, ctor)` a path's LAST TWO segments name, if any.
+fn matched_mapper_ctor(path: &syn::Path) -> Option<(&'static str, &'static str)> {
+    let mut rev = path.segments.iter().rev();
+    let last = rev.next()?.ident.to_string();
+    let prev = rev.next()?.ident.to_string();
+    MAPPER_CTORS
+        .iter()
+        .copied()
+        .find(|(t, c)| *t == prev && *c == last)
+}
+
+struct MapperCtorScan<'a> {
+    file: &'a str,
+    violations: Vec<Violation>,
+}
+
+impl<'a> MapperCtorScan<'a> {
+    fn flag(&mut self, detail: String) {
+        self.violations.push(Violation {
+            file: self.file.to_string(),
+            detail,
+        });
+    }
+}
+
+impl<'ast, 'a> Visit<'ast> for MapperCtorScan<'a> {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if is_test_item(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if is_test_item(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_fn(self, node);
+    }
+    // `SendResponse::parsed(...)` / `SendOutcome::from_server_code(...)` — associated-fn call.
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(p) = &*node.func {
+            if let Some((t, c)) = matched_mapper_ctor(&p.path) {
+                self.flag(format!(
+                    "`{t}::{c}(...)` delivery authority-ctor called outside the engine mapper"
+                ));
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+    // Macro laundering: a macro whose (space-normalized) token-tree emits a `Type::ctor`.
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let toks = node.tokens.to_string().replace(' ', "");
+        if let Some((t, c)) = MAPPER_CTORS
+            .iter()
+            .copied()
+            .find(|(t, c)| toks.contains(&format!("{t}::{c}")))
+        {
+            self.flag(format!(
+                "macro token-tree emits `{t}::{c}` outside the engine mapper (macro laundering)"
+            ));
+        }
+        syn::visit::visit_macro(self, node);
+    }
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        let toks = node.mac.tokens.to_string().replace(' ', "");
+        if let Some((t, c)) = MAPPER_CTORS
+            .iter()
+            .copied()
+            .find(|(t, c)| toks.contains(&format!("{t}::{c}")))
+        {
+            self.flag(format!(
+                "macro_rules! definition emits `{t}::{c}` outside the engine mapper (laundering)"
+            ));
+        }
+        syn::visit::visit_item_macro(self, node);
+    }
+}
+
+fn scan_mapper_ctors(text: &str, file_name: &str) -> Vec<Violation> {
+    let parsed = match syn::parse_file(text) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut scan = MapperCtorScan {
+        file: file_name,
+        violations: Vec::new(),
+    };
+    scan.visit_file(&parsed);
+    scan.violations
+}
+
+#[test]
+fn production_src_constructs_delivery_only_in_engine_mapper() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mapper = src_root
+        .join("services")
+        .join("write_path")
+        .join("shadow_map.rs");
+    let mut files = Vec::new();
+    collect_rs_files(&src_root, &mut files);
+    assert!(!files.is_empty());
+    // The mapper file MUST exist — a moved/renamed mapper must fail loud, not silently vacate the gate.
+    assert!(
+        files.contains(&mapper),
+        "engine-mapper file {} not found — the placement gate would be vacuous",
+        mapper.display()
+    );
+
+    let mut all = Vec::new();
+    for path in &files {
+        // The ONLY allowed construction site: the one engine-mapper file.
+        if *path == mapper {
+            continue;
+        }
+        let text = fs::read_to_string(path).expect("read .rs");
+        let rel = path
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        all.extend(scan_mapper_ctors(&text, &rel));
+    }
+    assert!(
+        all.is_empty(),
+        "delivery authority ctors {MAPPER_CTORS:?} may be constructed ONLY in \
+         prro/src/services/write_path/shadow_map.rs — the engine must FORWARD transport-minted \
+         evidence, never fabricate a SendResponse/SendOutcome. Violations: {all:#?}"
+    );
+}
+
+// ─── gate-B synthetic positive/negative controls (production src stays GREEN) ──────────
+
+#[test]
+fn services_construction_of_send_response_is_caught() {
+    let snippet = r#"
+        fn forge(o: SendOutcome) -> SendResponse {
+            SendResponse::parsed(o)
+        }
+    "#;
+    let v = scan_mapper_ctors(snippet, "<services_send_response>");
+    assert!(
+        v.iter().any(|x| x.detail.contains("SendResponse::parsed")),
+        "an engine-side SendResponse::parsed must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn services_construction_of_send_outcome_is_caught() {
+    let snippet = r#"
+        fn forge(code: NonOkStatusCode, dt: DocType, d: DecodedResponseDigest) -> SendOutcome {
+            SendOutcome::from_server_code(code, dt, d)
+        }
+    "#;
+    let v = scan_mapper_ctors(snippet, "<services_send_outcome>");
+    assert!(
+        v.iter()
+            .any(|x| x.detail.contains("SendOutcome::from_server_code")),
+        "an engine-side SendOutcome::from_server_code must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn unrelated_ctor_name_is_not_flagged() {
+    // A bare `parsed`/`accepted` ident, a method call, or a `parsed` on ANOTHER type must NOT
+    // false-positive — the gate keys on the two-segment `SendResponse::`/`SendOutcome::` pair.
+    let snippet = r#"
+        fn other(json: Value) {
+            let _ = SomeOther::parsed(x);
+            let _ = json.accepted();
+            let _ = missing_status(y);
+        }
+    "#;
+    let v = scan_mapper_ctors(snippet, "<unrelated>");
+    assert!(
+        v.is_empty(),
+        "unrelated parsed/accepted idents must not be flagged: {v:#?}"
+    );
+}
+
+#[test]
+fn mapper_ctor_macro_laundering_is_caught() {
+    let snippet = r#"
+        fn f() {
+            let _ = some_macro!(SendResponse::parsed(o));
+        }
+    "#;
+    let v = scan_mapper_ctors(snippet, "<mapper_macro>");
+    assert!(
+        v.iter().any(|x| x.detail.contains("SendResponse::parsed")),
+        "a macro emitting SendResponse::parsed must be caught: {v:#?}"
+    );
+}
