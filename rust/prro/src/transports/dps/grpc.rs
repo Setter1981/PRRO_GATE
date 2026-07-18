@@ -524,4 +524,225 @@ mod tests {
             remote_status_decision.audit_event,
         );
     }
+
+    /// CS-3 3.2 PR4 pin D — the §4.6 drift-pin (the keystone proof). For ONE wire input, co-derive
+    /// BOTH the LIVE outcome (`route_send_result`, the incumbent) AND the SHADOW outcome
+    /// (`map_send_reply` → `classify`, the new path) from the SAME single decode — the sound
+    /// co-derivation point is `observe_check_reply` / (`observe_tonic_status` + `map_tonic_status`),
+    /// NOT a StubDpsChannel (whose degraded default would give a false-green). Both are NORMALIZED to
+    /// a common `Norm`; unchanged rows must be EQUAL (two independent computations agree), the three
+    /// declared §4.6 deltas (empty-id, unknown-non-zero, TLS-RemoteStatus) an EXACT pair. Break the
+    /// mapper or the domain routing → a row flips → RED. This lives here because only `grpc`'s test
+    /// module can reach the private `map_tonic_status`/`observe_tonic_status`/`PeerAuth`.
+    #[test]
+    fn pin_d_section_4_6_drift_pin() {
+        use crate::db::models::enums::NodeMode;
+        use crate::services::write_path::error_routing::{
+            route_send_result, RetryClass, WireDecision,
+        };
+        use crate::services::write_path::shadow_map::map_send_reply;
+        use prro_domain::delivery::{
+            classify, ActiveRetryClass, ClassifiedOutcome, DpsProtocolBinding, DpsProtocolId,
+            EnvelopeHash, NodeEffect, ProtocolContractVersion, SendResponse, SubmissionEvidence,
+        };
+        use prro_domain::enums::DocType;
+
+        // ── the common normalized outcome (§4.6) ──
+        #[derive(Debug, PartialEq, Eq)]
+        enum Nc {
+            TerminalReject,
+            TransientRetry,
+            FnConfigError,
+            WrapperBug,
+            ProbeRequired,
+            MacRecovery,
+            OperatorEscalation,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        enum Norm {
+            Sent,
+            GuardEmptyId,
+            Retry { class: Nc, blocked: bool },
+        }
+        fn nc_live(c: RetryClass) -> Nc {
+            match c {
+                RetryClass::TerminalReject => Nc::TerminalReject,
+                RetryClass::TransientRetry => Nc::TransientRetry,
+                RetryClass::FnConfigError => Nc::FnConfigError,
+                RetryClass::WrapperBug => Nc::WrapperBug,
+                RetryClass::ProbeRequired => Nc::ProbeRequired,
+                RetryClass::MacRecovery => Nc::MacRecovery,
+                RetryClass::OperatorEscalation => Nc::OperatorEscalation,
+                RetryClass::DrainChainSettleRetry => {
+                    panic!("drain class is not an online-send outcome")
+                }
+            }
+        }
+        fn nc_shadow(c: ActiveRetryClass) -> Nc {
+            match c {
+                ActiveRetryClass::TerminalReject => Nc::TerminalReject,
+                ActiveRetryClass::TransientRetry => Nc::TransientRetry,
+                ActiveRetryClass::FnConfigError => Nc::FnConfigError,
+                ActiveRetryClass::WrapperBug => Nc::WrapperBug,
+                ActiveRetryClass::ProbeRequired => Nc::ProbeRequired,
+                ActiveRetryClass::MacRecovery => Nc::MacRecovery,
+                ActiveRetryClass::OperatorEscalation => Nc::OperatorEscalation,
+            }
+        }
+        fn normalize_live(wd: WireDecision) -> Norm {
+            match wd {
+                WireDecision::Sent { server_fiscal_no } => {
+                    // The stage_send EmptyServerFiscalNo guard turns an empty id into a refusal.
+                    if server_fiscal_no.is_empty() {
+                        Norm::GuardEmptyId
+                    } else {
+                        Norm::Sent
+                    }
+                }
+                WireDecision::Routed(rd) => Norm::Retry {
+                    class: nc_live(rd.retry_class),
+                    blocked: rd.node_mode_flip == Some(NodeMode::Blocked),
+                },
+            }
+        }
+        fn normalize_shadow(co: ClassifiedOutcome) -> Norm {
+            match co.routing() {
+                None => Norm::Sent, // clean Accepted — the only routing-cleared outcome
+                Some(c) => Norm::Retry {
+                    class: nc_shadow(c),
+                    blocked: co.node_effect() == NodeEffect::NodeBlocked,
+                },
+            }
+        }
+        fn started(response: SendResponse) -> SubmissionEvidence {
+            SubmissionEvidence::Started {
+                response,
+                binding: DpsProtocolBinding {
+                    protocol_id: DpsProtocolId::FscoZzd,
+                    contract_version: ProtocolContractVersion(1),
+                    capability_profile_version: None,
+                    endpoint_config_revision: None,
+                },
+                envelope_hash: EnvelopeHash([0u8; 32]),
+            }
+        }
+        fn chk(status: i32, id: &str) -> crate::transports::dps::gen::CheckResponse {
+            crate::transports::dps::gen::CheckResponse {
+                id: id.to_string(),
+                status,
+                id_sign: Vec::new(),
+                data_sign: Vec::new(),
+                error_message: String::new(),
+            }
+        }
+
+        // Co-derive Live + Shadow from ONE CheckResponse (the OK / DPS-status rows).
+        let drift_check = |status: i32, id: &str, dt: DocType| -> (Norm, Norm) {
+            let (legacy, raw, _diag) = observe_check_reply(chk(status, id));
+            let live = normalize_live(route_send_result(legacy, dt, true));
+            let shadow = normalize_shadow(classify(&started(map_send_reply(&raw, dt))));
+            (live, shadow)
+        };
+        // Co-derive Live + Shadow from ONE tonic Status (the transport-error rows).
+        let drift_status = |s: Status, pa: PeerAuth, dt: DocType| -> (Norm, Norm) {
+            let (raw, _diag) = observe_tonic_status(&s, pa); // borrow first…
+            let legacy: Result<CheckAck, DpsError> = Err(map_tonic_status(s, pa)); // …then move
+            let live = normalize_live(route_send_result(legacy, dt, true));
+            let shadow = normalize_shadow(classify(&started(map_send_reply(&raw, dt))));
+            (live, shadow)
+        };
+
+        let sell = DocType::Sell;
+        let z = DocType::ZReport;
+
+        // ── EQUAL rows: two INDEPENDENT computations must agree (no hardcoded expectation) ──
+        let equal_rows: &[(i32, &str, DocType)] = &[
+            (1, "DPS-1", sell), // OK + id → Sent
+            (-1, "", sell),
+            (-5, "", sell),
+            (-6, "", sell),
+            (-7, "", sell),
+            (-8, "", sell),
+            (-9, "", sell),
+            (-10, "", sell),
+            (-11, "", sell), // + NodeBlocked, both sides
+            (-12, "", sell),
+            (-13, "", sell),
+            (-14, "", sell),
+            (-16, "", sell),
+            (-2, "", sell), // non-close → TerminalReject
+            (-15, "", sell),
+            (-2, "", z), // close/Z → ProbeRequired
+            (-15, "", z),
+            (-3, "", sell),
+            (-4, "", sell),
+            (0, "", sell), // status==0 → both ProbeRequired (Live Decode, Shadow MissingStatus)
+        ];
+        for &(status, id, dt) in equal_rows {
+            let (live, shadow) = drift_check(status, id, dt);
+            assert_eq!(
+                live, shadow,
+                "§4.6 EQUAL row status={status} id={id:?} dt={dt:?}: live {live:?} != shadow {shadow:?}"
+            );
+        }
+        // Other tonic Status + genuine absence → both TransientRetry (equal).
+        for s in [
+            Status::internal("x"),
+            Status::deadline_exceeded("t"),
+            Status::unavailable("u"),
+        ] {
+            let code = s.code();
+            let (live, shadow) = drift_status(s, PeerAuth::Unproven, sell);
+            assert_eq!(live, shadow, "§4.6 EQUAL tonic row {code:?}");
+        }
+
+        // ── The THREE declared §4.6 deltas: EXACT pair (they legitimately differ) ──
+        // Delta 1 — empty-id: Live guards (EmptyServerFiscalNo), Shadow probes (OkButNoFiscalNumber).
+        let (live, shadow) = drift_check(1, "", sell);
+        assert_eq!(live, Norm::GuardEmptyId, "delta empty-id live");
+        assert_eq!(
+            shadow,
+            Norm::Retry {
+                class: Nc::ProbeRequired,
+                blocked: false
+            },
+            "delta empty-id shadow"
+        );
+        // Delta 2 — unknown non-zero: Live Decode→ProbeRequired, Shadow UnknownStatus→TransientRetry.
+        let (live, shadow) = drift_check(-17, "", sell);
+        assert_eq!(
+            live,
+            Norm::Retry {
+                class: Nc::ProbeRequired,
+                blocked: false
+            },
+            "delta unknown-non-zero live"
+        );
+        assert_eq!(
+            shadow,
+            Norm::Retry {
+                class: Nc::TransientRetry,
+                blocked: false
+            },
+            "delta unknown-non-zero shadow"
+        );
+        // Delta 3 — TLS RemoteStatus: Live TransientRetry (compat projection), Shadow ProbeRequired.
+        let (live, shadow) = drift_status(Status::unauthenticated("x"), PeerAuth::TlsProven, sell);
+        assert_eq!(
+            live,
+            Norm::Retry {
+                class: Nc::TransientRetry,
+                blocked: false
+            },
+            "delta TLS-RemoteStatus live"
+        );
+        assert_eq!(
+            shadow,
+            Norm::Retry {
+                class: Nc::ProbeRequired,
+                blocked: false
+            },
+            "delta TLS-RemoteStatus shadow"
+        );
+    }
 }
