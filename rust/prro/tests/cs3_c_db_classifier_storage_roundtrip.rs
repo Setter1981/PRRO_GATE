@@ -1,6 +1,6 @@
 //! CS-3 Slice C-DB — C-pure classifier ↔ migration 033 storage roundtrip.
 //!
-//! **Purpose:** prove that every `classify(evidence, doc_type)` output is
+//! **Purpose:** prove that every `classify(evidence)` output is
 //! storable in the real 033 `delivery_reservation` schema — and that the schema
 //! is tight (a selection of CHECK-forbidden combos the classifier never emits
 //! are rejected).
@@ -611,7 +611,9 @@ async fn st01_every_classifier_output_is_033_storable() {
         let lnd = (idx as i64) + 1;
 
         // ── Drive the REAL sealed classifier and read its output via the getters. ──
-        let classified = classify(&row.evidence, row.doc_type);
+        // (Bridge-0.1 3.1b: `classify` takes no doc_type — the -2/-15 split is baked into
+        // the outcome at `from_dps_status`, so row.doc_type is used only at construction.)
+        let classified = classify(&row.evidence);
         let got_cert = classified.certainty().as_str();
         let got_prov = classified.provenance().as_str();
         let got_routing: Option<&str> = classified.routing().map(|r| r.as_str());

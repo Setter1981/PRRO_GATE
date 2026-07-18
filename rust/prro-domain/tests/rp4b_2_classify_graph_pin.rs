@@ -18,10 +18,10 @@
 
 use prro_domain::delivery::{
     classify, ActiveRetryClass, AuthorizedGeneration, BoundedText, DpsProtocolBinding,
-    DpsProtocolId, DpsReject, EnvelopeHash, NoResponseCause, NodeEffect, PositiveGeneration,
-    PreflightRefusal, ProtocolContractVersion, RawDpsStatus, RawResponseDigest,
-    RemoteStatusEvidence, ResponseProvenance, SendOutcome, SendResponse, SentAccepted,
-    SubmissionCertainty, SubmissionEvidence,
+    DpsProtocolId, EnvelopeHash, NoResponseCause, NodeEffect, PositiveGeneration, PreflightRefusal,
+    ProtocolContractVersion, RawDpsStatus, RawResponseDigest, RemoteStatusEvidence,
+    ResponseProvenance, SendOutcome, SendResponse, SentAccepted, SubmissionCertainty,
+    SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
 
@@ -332,7 +332,7 @@ fn rp4b_2_classify_full_graph_matches_normative() {
     let mut failures: Vec<String> = Vec::new();
 
     for row in &graph {
-        let got = classify(&row.evidence, row.doc_type);
+        let got = classify(&row.evidence);
         let e = &row.expected;
         if got.certainty() != e.certainty
             || got.provenance() != e.provenance
@@ -365,20 +365,11 @@ fn rp4b_2_classify_full_graph_matches_normative() {
 #[test]
 fn rp4b_3_parsed_rows_are_distinct_from_timeout() {
     // -4 → Parsed (SubmittedUnknown + ParsedDpsEnvelope)
-    let minus4 = classify(
-        &parsed(RawDpsStatus::Error(-4), DocType::Sell),
-        DocType::Sell,
-    );
+    let minus4 = classify(&parsed(RawDpsStatus::Error(-4), DocType::Sell));
     // Bare timeout → NoResponse (SubmittedUnknown + NoResponse)
-    let timeout = classify(
-        &started(SendResponse::NoResponse(NoResponseCause::Timeout)),
-        DocType::Sell,
-    );
+    let timeout = classify(&started(SendResponse::NoResponse(NoResponseCause::Timeout)));
     // -1 Verify → Submitted + ParsedDpsEnvelope + TerminalReject
-    let minus1 = classify(
-        &parsed(RawDpsStatus::Error(-1), DocType::Sell),
-        DocType::Sell,
-    );
+    let minus1 = classify(&parsed(RawDpsStatus::Error(-1), DocType::Sell));
 
     // -4 and timeout must differ in provenance
     assert_ne!(
@@ -405,10 +396,7 @@ fn d3_parsed_reject_yields_submitted_not_unknown() {
     // (-2 on a non-close doc → Rejected(Close); the close-doc split → CloseAmbiguous is
     // Indeterminate and covered separately.)
     for code in [-1, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -16, -2] {
-        let out = classify(
-            &parsed(RawDpsStatus::Error(code), DocType::Sell),
-            DocType::Sell,
-        );
+        let out = classify(&parsed(RawDpsStatus::Error(code), DocType::Sell));
         assert_eq!(
             out.certainty(),
             SC::Submitted,
@@ -435,7 +423,7 @@ fn d3_parsed_indeterminate_yields_submitted_unknown() {
         (RawDpsStatus::Error(-4), DocType::Sell),    // UnknownStatus
     ];
     for &(status, dt) in cases {
-        let out = classify(&parsed(status, dt), dt);
+        let out = classify(&parsed(status, dt));
         assert_eq!(
             out.certainty(),
             SC::SubmittedUnknown,
@@ -526,10 +514,7 @@ fn observed_outcome_v1_carries_all_fields() {
     // Build a real classifier output (Offline168 → Submitted/Parsed/TerminalReject/NodeBlocked),
     // then mint the durable record from it. The axes + node_effect come from `classify`,
     // never hand-assembled (sealed mint).
-    let classified = classify(
-        &parsed(RawDpsStatus::Error(-11), DocType::Sell),
-        DocType::Sell,
-    );
+    let classified = classify(&parsed(RawDpsStatus::Error(-11), DocType::Sell));
     let outcome = ObservedOutcomeV1::record(
         &classified,
         Some(BoundedText::from_truncating("DPS-123")),
@@ -550,19 +535,20 @@ fn observed_outcome_v1_carries_all_fields() {
 
 #[test]
 fn node_effect_discriminates_offline168_from_verify() {
-    use prro_domain::delivery::{routing_for_reject, NodeEffect};
-
-    let (r_offline168, e_offline168) = routing_for_reject(&DpsReject::Offline168, DocType::Sell);
-    let (r_verify, e_verify) = routing_for_reject(&DpsReject::Verify, DocType::Sell);
+    // Via the PUBLIC classifier (routing_for_reject is now a private helper): -11 Offline168
+    // and -1 Verify share TerminalReject routing but differ in node_effect.
+    let offline168 = classify(&parsed(RawDpsStatus::Error(-11), DocType::Sell));
+    let verify = classify(&parsed(RawDpsStatus::Error(-1), DocType::Sell));
 
     // Both are TerminalReject routing...
-    assert_eq!(r_offline168, ARC::TerminalReject);
-    assert_eq!(r_verify, ARC::TerminalReject);
+    assert_eq!(offline168.routing(), Some(ARC::TerminalReject));
+    assert_eq!(verify.routing(), Some(ARC::TerminalReject));
     // ...but the node effects DIFFER (this is why the discriminant is needed).
-    assert_eq!(e_offline168, NodeEffect::NodeBlocked);
-    assert_eq!(e_verify, NodeEffect::NoNodeEffect);
+    assert_eq!(offline168.node_effect(), NE::NodeBlocked);
+    assert_eq!(verify.node_effect(), NE::NoNodeEffect);
     assert_ne!(
-        e_offline168, e_verify,
+        offline168.node_effect(),
+        verify.node_effect(),
         "NodeEffect must discriminate -11 from -1"
     );
 }

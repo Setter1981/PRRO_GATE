@@ -15,3 +15,15 @@ fn opaque_algebra_bypass_compile_fail() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs");
 }
+
+/// Bridge-0.1 (3.1b) — doc_type single-source canary. `classify` takes ONLY the sealed
+/// evidence; the `-2/-15` close split is consumed once, at `from_dps_status`. Passing a
+/// second, independent `doc_type` to `classify` (the re-binding vector: a Sell-built
+/// outcome re-classified as ZReport) is an arity error, so it cannot be written.
+///
+/// TEETH: re-add a `doc_type` parameter to `classify` → the fixture compiles → canary RED.
+#[test]
+fn doc_type_cannot_be_rebound_at_classify_compile_fail() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/opaque_algebra_compile_fail/rebind_doc_type.rs");
+}

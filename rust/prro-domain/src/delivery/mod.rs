@@ -683,18 +683,23 @@ impl ClassifiedOutcome {
     }
 }
 
-/// Total classifier: derives the three axes from `SubmissionEvidence` + `DocType` (§2/D3).
+/// Total classifier: derives the three axes + `node_effect` from `SubmissionEvidence` (§2/D3).
+///
+/// **`doc_type` is single-source (Bridge-0.1 3.1b):** `classify` takes NO `doc_type`. The
+/// only doc-type-dependent decision — the `-2/-15` close/non-close split (§12 R1) — is
+/// consumed exactly ONCE, at [`SendOutcome::from_dps_status`] construction, and is already
+/// encoded in the outcome variant (`Rejected(Close)` on non-close ⇒
+/// `Submitted / ParsedDpsEnvelope / TerminalReject`; `Indeterminate(CloseAmbiguous)` on
+/// close/Z ⇒ `SubmittedUnknown / ParsedDpsEnvelope / ProbeRequired`). The classifier has no
+/// doc-type-dependent logic left, so a sealed outcome can never be re-bound to a foreign
+/// doc-type context (the checkpoint's re-binding vector). See the `rebind_doc_type` canary.
 ///
 /// **Total** over all `SubmissionEvidence` variants (D3):
 /// - `NotStarted` ⇒ `NotSubmitted / NoResponse / routing` (preflight or cancel).
 /// - `Started{Parsed(Accepted)}` ⇒ `Submitted / ParsedDpsEnvelope / None`.
 /// - `Started{Parsed(Rejected(_))}` ⇒ `Submitted / ParsedDpsEnvelope / routing`.
 /// - Every other `Started` ⇒ `SubmittedUnknown / provenance / routing`.
-///
-/// The `-2/-15` split on `DocType` (§12 R1): close/Z ⇒ `CloseAmbiguous` ⇒
-/// `SubmittedUnknown / ParsedDpsEnvelope / ProbeRequired`; other ⇒ `DpsReject::Close` ⇒
-/// `Submitted / ParsedDpsEnvelope / TerminalReject`.
-pub fn classify(evidence: &SubmissionEvidence, doc_type: DocType) -> ClassifiedOutcome {
+pub fn classify(evidence: &SubmissionEvidence) -> ClassifiedOutcome {
     match evidence {
         SubmissionEvidence::NotStarted { reason, .. } => {
             let routing = match reason {
@@ -708,11 +713,11 @@ pub fn classify(evidence: &SubmissionEvidence, doc_type: DocType) -> ClassifiedO
                 node_effect: node_effect_for_active(routing),
             }
         }
-        SubmissionEvidence::Started { response, .. } => classify_started(response, doc_type),
+        SubmissionEvidence::Started { response, .. } => classify_started(response),
     }
 }
 
-fn classify_started(response: &SendResponse, doc_type: DocType) -> ClassifiedOutcome {
+fn classify_started(response: &SendResponse) -> ClassifiedOutcome {
     match response {
         // NoResponse: bytes may or may not have left — SubmittedUnknown (B4/RP4B-1).
         SendResponse::NoResponse(cause) => {
@@ -737,11 +742,11 @@ fn classify_started(response: &SendResponse, doc_type: DocType) -> ClassifiedOut
             node_effect: node_effect_for_active(ActiveRetryClass::ProbeRequired),
         },
         // Parsed: a real DPS envelope — apply the disjoint algebra (§5).
-        SendResponse::Parsed(outcome) => classify_parsed(outcome, doc_type),
+        SendResponse::Parsed(outcome) => classify_parsed(outcome),
     }
 }
 
-fn classify_parsed(outcome: &SendOutcome, doc_type: DocType) -> ClassifiedOutcome {
+fn classify_parsed(outcome: &SendOutcome) -> ClassifiedOutcome {
     match outcome.kind() {
         // Accepted: the only clean terminal — routing cleared (§2 table, NULL clean-accept).
         SendOutcomeKind::Accepted(_) => ClassifiedOutcome {
@@ -754,7 +759,7 @@ fn classify_parsed(outcome: &SendOutcome, doc_type: DocType) -> ClassifiedOutcom
         // The effect comes from `routing_for_reject` (NOT the class default) because
         // `-11 Offline168` diverges: (TerminalReject, NodeBlocked) vs `-1`'s NoNodeEffect.
         SendOutcomeKind::Rejected(verdict) => {
-            let (routing, node_effect) = routing_for_reject(&verdict, doc_type);
+            let (routing, node_effect) = routing_for_reject(&verdict);
             ClassifiedOutcome {
                 certainty: SubmissionCertainty::Submitted,
                 provenance: ResponseProvenance::ParsedDpsEnvelope,
@@ -776,13 +781,13 @@ fn classify_parsed(outcome: &SendOutcome, doc_type: DocType) -> ClassifiedOutcom
 }
 
 /// Map a `DpsReject` verdict to its `(ActiveRetryClass, NodeEffect)`.
-/// `doc_type` is not needed here because `DpsReject::Close` already encodes the
-/// non-close branch (the close branch becomes `SendIndeterminate::CloseAmbiguous`
-/// before this function is called, at the ingress adapter level).
-pub fn routing_for_reject(
-    verdict: &DpsReject,
-    _doc_type: DocType,
-) -> (ActiveRetryClass, NodeEffect) {
+///
+/// **Private + doc-type-free (Bridge-0.1 3.1b):** this is an internal helper of [`classify`],
+/// not a public seam. It needs no `doc_type` because `DpsReject::Close` already encodes the
+/// non-close branch — the close branch became `SendIndeterminate::CloseAmbiguous` at
+/// [`SendOutcome::from_dps_status`] construction (the single doc_type source). Keeping it
+/// private + paramless removes the vestigial `doc_type` seam that allowed re-binding.
+fn routing_for_reject(verdict: &DpsReject) -> (ActiveRetryClass, NodeEffect) {
     match verdict {
         DpsReject::Verify => (ActiveRetryClass::TerminalReject, NodeEffect::NoNodeEffect),
         DpsReject::Type => (ActiveRetryClass::TerminalReject, NodeEffect::NoNodeEffect),
