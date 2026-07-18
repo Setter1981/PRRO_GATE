@@ -135,7 +135,10 @@ pub struct RroInfo {
 use super::digest_framing::{DigestFramer, MsgType};
 use super::error::{AuthorizationKind, DpsError};
 use super::gen;
-use prro_domain::delivery::DecodedResponseDigest;
+use super::raw_reply::{RawSendReply, WireDiagnostics};
+use prro_domain::delivery::{
+    BoundedText, DecodedResponseDigest, NonEmptyFiscalNumber, NonOkStatusCode,
+};
 
 impl From<DpsCheckType> for gen::check::Type {
     fn from(t: DpsCheckType) -> Self {
@@ -286,6 +289,61 @@ pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAc
             message: r.error_message,
         }),
     }
+}
+
+// ── CS-3 3.2 PR2 pin3 — the shadow projection (spec §4.2/§4.3) ────────────────────────
+//
+// `send_chk_observed`'s override projects ONE decoded `gen::CheckResponse` into BOTH the legacy
+// `Result<CheckAck, DpsError>` (byte-identical to `try_decode_check_response`) AND the total
+// transport-minted `RawSendReply`. The shadow is minted from the RAW reply, NEVER from the
+// collapsed `DpsError` — that is the ONLY place the digest survives (spec digest-gap: `Server`/
+// `Decode`/`Authorization` carry none). Uniform transport view: any non-Ok/non-Unknown code is a
+// `ServerCode` (no domain routing) — it DIVERGES from the legacy classification by design (the
+// shadow drives nothing in 3.2; teeth assert neutrality only on the legacy `.0`).
+
+/// Total transport-minted evidence for one decoded `CheckResponse` — dispatches on the RAW status
+/// so the digest is framed from live fields. `Status::try_from` fails only for a code outside the
+/// declared `-16..=1` enum (proto-unrecognized) → the indeterminate `MissingStatus` posture, NOT a
+/// confident `ServerCode` (an unknown code is not a known server verdict).
+pub(in crate::transports::dps) fn raw_reply_from_check_response(
+    r: &gen::CheckResponse,
+) -> RawSendReply {
+    use gen::check_response::Status;
+    match Status::try_from(r.status) {
+        Err(_) => RawSendReply::missing_status(decoded_digest_check(r)),
+        Ok(Status::Ok) => match NonEmptyFiscalNumber::from_transport(r.id.clone()) {
+            // Non-empty id IS the transport-proven acceptance evidence (D-4) — no digest.
+            Some(id) => RawSendReply::accepted(id),
+            // OK but empty id: captures what the legacy `Ok(CheckAck{id:""})` erases.
+            None => RawSendReply::ok_no_fiscal_id(decoded_digest_check(r)),
+        },
+        Ok(Status::Unknown) => RawSendReply::missing_status(decoded_digest_check(r)),
+        Ok(other) => RawSendReply::server_code(
+            NonOkStatusCode::from_transport(other as i32)
+                .expect("Ok(1)/Unknown(0) handled above; every other Status variant is non-0/1"),
+            decoded_digest_check(r),
+        ),
+    }
+}
+
+/// Single-decode dual projection (spec §4.2). OWNS the borrow-then-move ordering so no caller can
+/// reorder: the shadow (`raw`/`diag`) is built while `r` is still owned (they read `r.id` /
+/// `r.error_message` / frame the digest), THEN `try_decode_check_response(r)` consumes `r` — the
+/// legacy `.0` is produced by the SAME call on the SAME reply as today's `send_chk`, so it is
+/// byte-identical. `WireDiagnostics` is the non-authority forensic sidecar (status_code is
+/// forensic-only; it does not imply an error).
+pub(in crate::transports::dps) fn observe_check_reply(
+    r: gen::CheckResponse,
+) -> (Result<CheckAck, DpsError>, RawSendReply, WireDiagnostics) {
+    let raw = raw_reply_from_check_response(&r);
+    let diag = WireDiagnostics {
+        status_code: Some(r.status),
+        grpc_code: None,
+        message: (!r.error_message.is_empty())
+            .then(|| BoundedText::from_truncating(r.error_message.clone())),
+    };
+    let legacy = try_decode_check_response(r);
+    (legacy, raw, diag)
 }
 
 /// Same dispatch shape for `StatusResponse` — the proto's status enum
@@ -552,6 +610,151 @@ mod tests {
             da, da2,
             "identical replies must yield identical digest (deterministic)"
         );
+    }
+
+    // ── CS-3 3.2 PR2 pin3 — shadow projection teeth (spec §4.3 / §6) ─────────────────────
+    // These run crate-internal so they can recompute `decoded_digest_check` and match on the
+    // opaque `RawSendReplyKind` — the wire-level double-issue canary lives in dps_channel_smoke.rs.
+
+    use crate::transports::dps::raw_reply::RawSendReplyKind;
+
+    fn chk(status: i32, id: &str, msg: &str) -> gen::CheckResponse {
+        gen::CheckResponse {
+            id: id.to_string(),
+            status,
+            id_sign: b"<id-sign>".to_vec(),
+            data_sign: b"<data-sign>".to_vec(),
+            error_message: msg.to_string(),
+        }
+    }
+
+    /// Tooth #8 (exhaustive mapping): every declared status + unknown-non-zero maps to the spec
+    /// §4.3 `RawSendReply` variant. Break any arm → RED.
+    #[test]
+    fn pin3_raw_reply_mapping_is_exhaustive() {
+        use crate::transports::dps::gen::check_response::Status;
+        assert!(matches!(
+            raw_reply_from_check_response(&chk(Status::Ok as i32, "DPS-9", "")).kind(),
+            RawSendReplyKind::Accepted { .. }
+        ));
+        assert!(matches!(
+            raw_reply_from_check_response(&chk(Status::Ok as i32, "", "")).kind(),
+            RawSendReplyKind::OkNoFiscalId { .. }
+        ));
+        assert!(matches!(
+            raw_reply_from_check_response(&chk(Status::Unknown as i32, "", "")).kind(),
+            RawSendReplyKind::MissingStatus { .. }
+        ));
+        // every declared negative verdict -1..-16 → ServerCode{that code}
+        for code in [
+            -1i32, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16,
+        ] {
+            match raw_reply_from_check_response(&chk(code, "", "boom")).kind() {
+                RawSendReplyKind::ServerCode { code: c, .. } => assert_eq!(c.get(), code),
+                other => panic!("status {code} → expected ServerCode, got {other:?}"),
+            }
+        }
+        // unknown non-zero (outside the declared enum) → MissingStatus (indeterminate posture, NOT
+        // a confident ServerCode — an unrecognized code is not a known server verdict).
+        for code in [-17i32, -99, 2, 7, 12_345] {
+            assert!(
+                matches!(
+                    raw_reply_from_check_response(&chk(code, "", "?")).kind(),
+                    RawSendReplyKind::MissingStatus { .. }
+                ),
+                "unknown non-zero {code} must map to MissingStatus"
+            );
+        }
+    }
+
+    /// Tooth #3 (free -4 cross-mint): `observe_check_reply` mints the digest ONCE per reply; the
+    /// legacy `Indeterminate.digest` and the shadow `ServerCode.digest` are byte-equal (both
+    /// `decoded_digest_check(&r)`). Cross-validates two independent mint sites on one reply.
+    #[test]
+    fn pin3_neg4_legacy_and_shadow_share_one_digest_mint() {
+        use crate::transports::dps::gen::check_response::Status;
+        let (legacy, raw, _diag) = observe_check_reply(chk(Status::ErrorUnknown as i32, "", "srv"));
+        let legacy_digest = match legacy {
+            Err(DpsError::Indeterminate { digest, .. }) => digest,
+            other => panic!("expected Indeterminate, got {other:?}"),
+        };
+        match raw.kind() {
+            RawSendReplyKind::ServerCode { code, digest } => {
+                assert_eq!(code.get(), -4);
+                assert_eq!(
+                    *digest, legacy_digest,
+                    "same reply → one digest mint carried by both legacy and shadow"
+                );
+            }
+            other => panic!("expected ServerCode, got {other:?}"),
+        }
+    }
+
+    /// Tooth #4/#2 (digest-gap + not-fabricated): a `-2` reply → legacy `DpsError::Server` carries
+    /// NO digest, yet the shadow `ServerCode` carries the REAL framed digest (equal to an
+    /// independent `decoded_digest_check` recompute). Project the shadow from the collapsed
+    /// `DpsError` (no digest) or hash a constant → RED.
+    #[test]
+    fn pin3_digest_gap_shadow_carries_real_digest_where_legacy_server_has_none() {
+        use crate::transports::dps::gen::check_response::Status;
+        let r = chk(Status::ErrorCheck as i32, "", "check failed");
+        let recomputed = decoded_digest_check(&r);
+        let (legacy, raw, _diag) = observe_check_reply(r);
+        assert!(
+            matches!(legacy, Err(DpsError::Server { code: -2, .. })),
+            "legacy must be Server{{-2}} (a variant with NO digest field)"
+        );
+        match raw.kind() {
+            RawSendReplyKind::ServerCode { code, digest } => {
+                assert_eq!(code.get(), -2);
+                assert_eq!(
+                    *digest, recomputed,
+                    "shadow must carry the real framed digest, not a fabricated/constant one"
+                );
+            }
+            other => panic!("expected ServerCode, got {other:?}"),
+        }
+    }
+
+    /// Tooth #5 (empty-id split): OK + empty id → shadow `OkNoFiscalId(digest)` even though legacy
+    /// is `Ok(CheckAck{id:""})`. Collapsing the split to always-`Accepted` →
+    /// `NonEmptyFiscalNumber::from_transport("")` is `None` → cannot build `accepted` → RED.
+    #[test]
+    fn pin3_ok_empty_id_splits_to_ok_no_fiscal_id() {
+        use crate::transports::dps::gen::check_response::Status;
+        let (legacy, raw, _diag) = observe_check_reply(chk(Status::Ok as i32, "", ""));
+        assert!(
+            matches!(&legacy, Ok(ack) if ack.id.is_empty()),
+            "legacy Ok with empty id"
+        );
+        assert!(matches!(raw.kind(), RawSendReplyKind::OkNoFiscalId { .. }));
+    }
+
+    /// Tooth #7 (byte-neutrality of the legacy leg): `observe_check_reply(r).0` is byte-identical
+    /// to `try_decode_check_response(r)` across the full status matrix — the shadow can diverge, the
+    /// legacy leg cannot. Any decoder drift in the split → RED.
+    #[test]
+    fn pin3_legacy_leg_is_byte_identical_to_try_decode() {
+        use crate::transports::dps::gen::check_response::Status;
+        let cases = [
+            chk(Status::Ok as i32, "DPS-1", ""),
+            chk(Status::Ok as i32, "", ""),
+            chk(Status::Unknown as i32, "", ""),
+            chk(Status::ErrorVerefy as i32, "", "v"),
+            chk(Status::ErrorCheck as i32, "", "c"),
+            chk(Status::ErrorUnknown as i32, "", "u"),
+            chk(Status::ErrorNotRegisteredRro as i32, "", "r"),
+            chk(Status::ErrorNotRegisteredSigner as i32, "", "s"),
+            chk(-99, "", "unknown-nonzero"),
+        ];
+        for r in cases {
+            let expected = format!("{:?}", try_decode_check_response(r.clone()));
+            let actual = format!("{:?}", observe_check_reply(r).0);
+            assert_eq!(
+                actual, expected,
+                "legacy leg must equal try_decode_check_response byte-for-byte"
+            );
+        }
     }
 
     /// RP4B-3 companion: `try_decode_status_response` on a `-4` must also

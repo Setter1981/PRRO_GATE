@@ -12,14 +12,19 @@
 //! status code / gRPC code / message that the authoritative evidence drops, for trace + the live
 //! `-12` MAC hint, WITHOUT being part of the delivery contract.
 
-// Wired into `send_chk_observed` (the single-RPC fan-out) by PR2 pin 3; until then the type is
-// exercised only by the in-module tests, so the non-test build sees it as unused.
+// PR2 pin3 wires the mint (dto.rs/grpc.rs) + the degraded default (`observe_from_legacy`) + the
+// stage_send fan-out. The READ accessors (`kind` / `RawSendReplyKind` / `evidence` / `diagnostics`)
+// are consumed by the PR4 engine mapper; until then only the in-module + smoke tests read them, so
+// the non-test build still sees them as unused.
 #![allow(dead_code)]
 
 use prro_domain::delivery::{
     BoundedText, DecodedResponseDigest, GrpcStatusDigest, NoResponseCause, NonEmptyFiscalNumber,
     NonOkStatusCode,
 };
+
+use super::dto::CheckAck;
+use super::error::DpsError;
 
 /// Total evidence of one returned wire observation — opaque, transport-minted (module-sealed).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +159,26 @@ impl RawSendObservation {
     }
 }
 
+/// DEGRADED shadow projection for the `DpsChannel::send_chk_observed` DEFAULT body (mock/test
+/// channels only). It sees the reply ALREADY collapsed to `Result<CheckAck, DpsError>`, so it
+/// CANNOT frame a real digest (the raw fields are gone). It therefore emits ONLY `Accepted` (when
+/// the legacy `Ok(ack)` carries a non-empty id) or `NoResponse{CallFailedWithoutTrustedDpsEnvelope}`
+/// — it NEVER fabricates a `ServerCode`/`OkNoFiscalId`/digest, so a default (mock) observation can
+/// never masquerade as full-fidelity evidence to a live consumer. The same-reply/digest teeth
+/// (which need real digests) run against the `GrpcDpsChannel` override, never this default.
+pub(in crate::transports::dps) fn observe_from_legacy(
+    legacy: &Result<CheckAck, DpsError>,
+) -> RawSendObservation {
+    let evidence = match legacy {
+        Ok(ack) => match NonEmptyFiscalNumber::from_transport(ack.id.clone()) {
+            Some(id) => RawSendReply::accepted(id),
+            None => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+        },
+        Err(_) => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+    };
+    RawSendObservation::new(evidence, WireDiagnostics::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +239,43 @@ mod tests {
             RawSendReplyKind::NoResponse { .. }
         ));
         assert_eq!(obs.diagnostics().grpc_code.as_deref(), Some("Unavailable"));
+    }
+
+    /// Tooth #9 (degraded-default honesty): the DEFAULT-body projector emits ONLY `Accepted`
+    /// (non-empty id) or `NoResponse` — NEVER a fabricated `ServerCode`/`OkNoFiscalId`/digest, so a
+    /// mock observation can never masquerade as full-fidelity evidence. The same-reply/digest teeth
+    /// (which need REAL digests) therefore run against the `GrpcDpsChannel` override, never this.
+    #[test]
+    fn observe_from_legacy_is_honestly_degraded() {
+        let ok_id = Ok(CheckAck {
+            id: "DPS-7".into(),
+            id_sign: vec![],
+            data_sign: vec![],
+        });
+        assert!(matches!(
+            observe_from_legacy(&ok_id).evidence().kind(),
+            RawSendReplyKind::Accepted { .. }
+        ));
+
+        // Ok but empty id → NoResponse (NOT OkNoFiscalId — no digest survives the collapse).
+        let ok_empty = Ok(CheckAck {
+            id: String::new(),
+            id_sign: vec![],
+            data_sign: vec![],
+        });
+        assert!(matches!(
+            observe_from_legacy(&ok_empty).evidence().kind(),
+            RawSendReplyKind::NoResponse { .. }
+        ));
+
+        // Any Err → NoResponse, never a fabricated ServerCode/digest.
+        let err: Result<CheckAck, DpsError> = Err(DpsError::Server {
+            code: -2,
+            message: "x".into(),
+        });
+        assert!(matches!(
+            observe_from_legacy(&err).evidence().kind(),
+            RawSendReplyKind::NoResponse { .. }
+        ));
     }
 }

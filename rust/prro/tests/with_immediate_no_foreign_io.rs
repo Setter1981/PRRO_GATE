@@ -37,6 +37,11 @@ const SUBSTRATE_METHODS: &[&str] = &[
     "unwrap_envelope",
     "fetch_cert_by_ski",
     "send_chk",
+    // CS-3 3.2 PR2 pin3: the single-RPC fan-out is a real network RPC (one `send_chk_v2`), so it
+    // must be denied inside a `with_immediate` SQLite tx exactly like `send_chk` (frozen invariant
+    // #1). The scanner matches the METHOD-CALL NAME, and "send_chk_observed" != "send_chk", so it
+    // needs its own entry.
+    "send_chk_observed",
     "last_chk",
     "ping",
     "status_rro",
@@ -260,6 +265,32 @@ fn case_1_substrate_method_saved_then_awaited_is_caught() {
             .iter()
             .any(|v| v.detail.contains("fetch_cert_by_ski")),
         "stored-future variant must still be caught: {violations:#?}"
+    );
+}
+
+#[test]
+fn case_1_send_chk_observed_inside_closure_is_caught() {
+    // CS-3 3.2 PR2 pin3 positive control: the single-RPC fan-out is a real network RPC and MUST
+    // be caught inside a `with_immediate` closure body (frozen invariant #1). This proves the new
+    // "send_chk_observed" SUBSTRATE_METHODS entry is load-bearing — remove it and this goes RED.
+    let snippet = r#"
+        async fn _scenario(pool: &sqlx::SqlitePool, dps: &dyn DpsChannel) {
+            with_immediate(pool, move |_tx| {
+                Box::pin(async move {
+                    let _ = dps.send_chk_observed(envelope).await;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        }
+    "#;
+    let violations = scan_source(snippet, "<case_send_chk_observed>");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.detail.contains("send_chk_observed")),
+        "send_chk_observed inside with_immediate must be caught: {violations:#?}"
     );
 }
 

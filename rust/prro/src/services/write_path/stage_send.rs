@@ -1552,14 +1552,21 @@ async fn run_one_attempt(
 
     // ── 4a — wire send OUTSIDE any lock ──────────────────────────────
     //
-    // W3 static scanner enforces that `send_chk` is not reachable from
-    // inside any `with_immediate` closure body; the runtime
+    // W3 static scanner enforces that `send_chk` / `send_chk_observed`
+    // are not reachable from inside any `with_immediate` closure body;
+    // the runtime
     // task_local guard panics in debug if a foreign-IO call happens
     // inside a BEGIN IMMEDIATE scope.  This call site is at module
     // top level, between the two `with_immediate` blocks above and
     // below.
     let wire_call_started_at = now_db_format();
-    let wire_result = dps_channel.send_chk(envelope.clone()).await;
+    // CS-3 3.2 PR2 pin3: the single-RPC fan-out. `wire_result` (the tuple `.0`) is byte-identical
+    // to the former `send_chk(...)` — for `GrpcDpsChannel` it is the SAME decode on the SAME single
+    // `send_chk_v2` reply, so routing/audit/CAS are unchanged. `wire_observation` is the total
+    // transport-minted shadow; in 3.2 it is bound READ-ONLY and drives NOTHING (no record, no
+    // second wire, no `-12` change) — it is wired live in PR4/Bridge.
+    let (wire_result, wire_observation) = dps_channel.send_chk_observed(envelope.clone()).await;
+    let _ = &wire_observation;
     let wire_call_finished_at = now_db_format();
 
     // W10.2: dispatch on the typed routing surface.  `is_live_send=true`

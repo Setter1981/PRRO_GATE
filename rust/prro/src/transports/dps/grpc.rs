@@ -21,13 +21,14 @@ use tonic::Status;
 use super::channel::DpsChannel;
 use super::digest_framing::{DigestFramer, MsgType};
 use super::dto::{
-    decode_offline_codes, try_decode_check_response, try_decode_rro_info_response,
-    try_decode_status_response, CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse,
-    RroInfo, StatusSnapshot,
+    decode_offline_codes, observe_check_reply, try_decode_check_response,
+    try_decode_rro_info_response, try_decode_status_response, CheckAck, CheckEnvelope,
+    CheckSignBlob, OfflineCodesResponse, RroInfo, StatusSnapshot,
 };
 use super::error::DpsError;
 use super::gen::chk_income_service_client::ChkIncomeServiceClient;
-use prro_domain::delivery::GrpcStatusDigest;
+use super::raw_reply::{RawSendObservation, RawSendReply, WireDiagnostics};
+use prro_domain::delivery::{BoundedText, GrpcStatusDigest, NoResponseCause};
 
 /// Whether this channel proved TLS peer-authentication at connect time (R1).
 ///
@@ -195,6 +196,35 @@ fn status_digest(s: &Status) -> GrpcStatusDigest {
     GrpcStatusDigest::from_transport_digest(f.finalize())
 }
 
+/// CS-3 3.2 PR2 pin3 — the transport-error leg of the shadow projection (spec §4.3 branches 8/9).
+/// Mirrors `map_tonic_status`'s EXACT TLS gate (R1 trust boundary): only a `TlsProven`
+/// `Unauthenticated`/`PermissionDenied` yields `RemoteAuthStatus` (an authenticated non-DPS peer);
+/// a plaintext MITM could forge those, so over an `Unproven` channel they collapse to the
+/// same `NoResponse{CallFailed…}` as every other transport absence — no `AuthenticatedPeer` claim
+/// without a proven TLS peer. `WireDiagnostics` preserves the gRPC code/message for trace/audit
+/// (non-authority). Borrows `&s` so the caller can move the `Status` into `map_tonic_status` after.
+fn observe_tonic_status(s: &Status, peer_auth: PeerAuth) -> (RawSendReply, WireDiagnostics) {
+    let evidence = match s.code() {
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+            if peer_auth == PeerAuth::TlsProven =>
+        {
+            RawSendReply::remote_auth_status(status_digest(s))
+        }
+        tonic::Code::DeadlineExceeded => RawSendReply::no_response(NoResponseCause::Timeout),
+        tonic::Code::Cancelled => RawSendReply::no_response(NoResponseCause::Cancelled),
+        tonic::Code::Unavailable => {
+            RawSendReply::no_response(NoResponseCause::LocalHandshakeFailure)
+        }
+        _ => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+    };
+    let diag = WireDiagnostics {
+        status_code: None,
+        grpc_code: Some(format!("{:?}", s.code())),
+        message: Some(BoundedText::from_truncating(s.message())),
+    };
+    (evidence, diag)
+}
+
 #[async_trait]
 impl DpsChannel for GrpcDpsChannel {
     async fn send_chk(&self, envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
@@ -206,6 +236,33 @@ impl DpsChannel for GrpcDpsChannel {
             .await
             .map_err(|s| map_tonic_status(s, self.peer_auth))?;
         try_decode_check_response(resp.into_inner())
+    }
+
+    /// CS-3 3.2 PR2 pin3 — the single-RPC fan-out (spec §4.2). Production override of the
+    /// `DpsChannel` default: EXACTLY ONE physical `send_chk_v2` RPC + ONE decode, projected into
+    /// BOTH the legacy `Result<CheckAck, DpsError>` (byte-identical to `send_chk` — same decode on
+    /// the same reply) AND the total transport-minted `RawSendObservation`. A second wire call
+    /// would be a fiscal double-issue; there is none — no retry/fallback in either arm.
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (Result<CheckAck, DpsError>, RawSendObservation) {
+        crate::db::tx::assert_not_in_with_immediate("send_chk_observed");
+        let req = self.request(envelope.into());
+        match self.client().send_chk_v2(req).await {
+            Ok(resp) => {
+                let (legacy, raw, diag) = observe_check_reply(resp.into_inner());
+                (legacy, RawSendObservation::new(raw, diag))
+            }
+            Err(status) => {
+                // Build the shadow FIRST (borrows `&status`), THEN move `status` into
+                // `map_tonic_status` — so `map_tonic_status` and its 6 other callers stay
+                // byte-untouched (no `&Status` widening).
+                let (raw, diag) = observe_tonic_status(&status, self.peer_auth);
+                let legacy = Err(map_tonic_status(status, self.peer_auth));
+                (legacy, RawSendObservation::new(raw, diag))
+            }
+        }
     }
 
     async fn last_chk(&self, fn_sign: &CheckSignBlob) -> Result<CheckAck, DpsError> {
@@ -385,6 +442,53 @@ mod tests {
             matches!(err, DpsError::Transport(_)),
             "expected Transport, got {err:?}"
         );
+    }
+
+    /// CS-3 3.2 PR2 pin3 tooth #6 — the transport-error shadow (`observe_tonic_status`) mirrors
+    /// `map_tonic_status`'s EXACT TLS gate (R1). A `TlsProven` Unauthenticated/PermissionDenied →
+    /// `RemoteAuthStatus`; the SAME codes over an `Unproven` channel → `NoResponse{CallFailed…}`
+    /// (a plaintext MITM cannot forge AuthenticatedPeer provenance). Flip the `peer_auth` gate →
+    /// RED. Genuine transport absences map to their typed `NoResponse` causes.
+    #[test]
+    fn pin3_observe_tonic_status_mirrors_r1_tls_gate() {
+        use crate::transports::dps::raw_reply::RawSendReplyKind;
+        use prro_domain::delivery::NoResponseCause;
+
+        for s in [Status::unauthenticated("x"), Status::permission_denied("y")] {
+            let code = s.code();
+            let (raw, _diag) = observe_tonic_status(&s, PeerAuth::TlsProven);
+            assert!(
+                matches!(raw.kind(), RawSendReplyKind::RemoteAuthStatus { .. }),
+                "TlsProven {code:?} must yield RemoteAuthStatus"
+            );
+        }
+        for s in [
+            Status::unauthenticated("forged"),
+            Status::permission_denied("forged"),
+        ] {
+            let code = s.code();
+            let (raw, _diag) = observe_tonic_status(&s, PeerAuth::Unproven);
+            assert!(
+                matches!(raw.kind(), RawSendReplyKind::NoResponse { .. }),
+                "Unproven {code:?} must NOT yield RemoteAuthStatus (provenance forgery)"
+            );
+        }
+        let expectations = [
+            (Status::deadline_exceeded("t"), NoResponseCause::Timeout),
+            (Status::cancelled("c"), NoResponseCause::Cancelled),
+            (
+                Status::unavailable("u"),
+                NoResponseCause::LocalHandshakeFailure,
+            ),
+        ];
+        for (s, want) in expectations {
+            let code = s.code();
+            let (raw, _diag) = observe_tonic_status(&s, PeerAuth::TlsProven);
+            assert!(
+                matches!(raw.kind(), RawSendReplyKind::NoResponse { cause } if cause == want),
+                "{code:?} → expected NoResponse({want:?})"
+            );
+        }
     }
 
     #[test]
