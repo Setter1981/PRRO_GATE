@@ -1,186 +1,183 @@
 # CS-3 Bridge-0.1 (3.2) — transport/engine seam + honest decoded-content digest
 
-**Status:** DRAFT **rev 2** for adversarial gate. rev 1 → NOT-YET (5 composition class-B,
-closed here as point-fix, no redesign). **Base:** `origin/main 2dbae3c`.
-**Predecessors:** #4B rev-6, #4A A4-6, [[project_digest_decoded_content_decision]],
-`project_cs3_bridge0_foundation_repair`.
+**Status:** DRAFT **rev 3** for adversarial gate. rev 1 → NOT-YET (5 class-B, all closed in
+rev 2); rev 2 → NOT-YET (6 class-B, closed here). Point-fix, no redesign. **Base:**
+`origin/main 2dbae3c`. **Predecessors:** #4B rev-6, #4A A4-6,
+[[project_digest_decoded_content_decision]], `project_cs3_bridge0_foundation_repair`.
 
-**Scope pin (rev 2, blocker 2):** 3.2 is **foundation-only**. It ends at a *pure, read-only*
-derivation
+**Scope pin (foundation-only).** 3.2 ends at a *pure, read-only* derivation
 > `RawSendReply (+ store doc_type) → SendResponse → ClassifiedOutcome`
-built **alongside** the live `CheckAck`/`DpsError`/`route_dps_error` path, which keeps
-driving production. 3.2 does **NOT**: mint `ObservedOutcomeV1`, call `record`, change any
-production routing, apply any behaviour delta, or retire the old path. The authoritative
-durable `record`, the routing cutover, and killing the live `-12 → Resigned → continue`
-second wire (blind-resend) all require store-minted `AuthorizedGeneration` and belong to
-**Bridge + D/E**. Extending 3.2 into a cutover would force it to grow into D/E (not
-recommended).
+built **alongside** the live `CheckAck`/`DpsError`/`route_dps_error` path, which keeps driving
+production. 3.2 mints **no** `ObservedOutcomeV1`, calls **no** `record` (needs D's
+store-minted `AuthorizedGeneration`), changes **no** routing, applies **no** behaviour delta,
+retires nothing, and does **not** touch the live `-12` second wire. Authoritative record,
+routing cutover, `DpsChannel → DpsSubmissionPort`, and blind-resend kill are **Bridge + D/E**.
 
-All file:line anchors are on `2dbae3c`, re-verified by the author (rev-1 Class-A corrected).
+All file:line anchors on `2dbae3c`, re-verified by the author (rev-1/rev-2 Class-A corrected).
 
 ---
 
 ## §1 Problem
 
-The digest cannot be locked in isolation from **who mints it**, **which returned-reply
-branches must carry it**, and **where fabrication is forbidden** — and the sealing
-guarantee cannot be stated without a **crate/module placement** that Rust actually enforces.
-Today the DPS reply is split across two incompatible hierarchies, the digest is partly
-absent / partly mislabeled "raw" / **publicly fabricable**, and the domain surfaces
-(`SendResponse`) are **not** sealed. 3.2 unifies the *returned* reply into one total type,
-sealed by a placement Rust can enforce, feeding the (already-built, unconsumed) domain
-classifier — read-only.
+The digest can't be locked apart from **who mints it**, **which returned branches carry it**,
+**where fabrication is forbidden**, and a **crate/module placement Rust actually enforces** —
+and the transport must yield the shadow evidence from the **same single RPC** as the live
+reply, or the implementer double-issues. Today the reply is split across two hierarchies, the
+digest is partly absent / mislabeled "raw" / **publicly fabricable**, `SendResponse` is a
+**public** enum, and the digest **cannot even be minted in `prro-domain`** (purity-gate bans
+`prost`/`tonic`). 3.2 unifies the *returned* reply into one sealed type feeding the domain
+classifier, read-only.
 
-**Non-goal (containment §7):** byte-exact wire proof (custom tonic codec) is a separate
-future forensic slice. Not CS-3. Its absence makes one rev-1 branch unreachable (§4.3).
-
----
-
-## §2 Current architecture (grounded; rev-1 Class-A corrected)
-
-**Crate graph (blocker 1).** `prro-domain` is a **separate crate** (pure; no prost/sqlx).
-The digest type + its carriers (`SendIndeterminate`, `RemoteStatusEvidence`, `SendResponse`)
-live there. The **mint** (`response_digest`, `status_digest`) and the whole transport
-(`prro/src/transports/dps/*`) and engine (`prro/src/services/*`) live in the **`prro`**
-crate. Consequence: a domain type minted from `prro` needs a `prro`-reachable constructor,
-and **any `prro` module (transport OR engine) can then call it** — cross-crate privacy
-stops other crates, not sibling modules. This is the core of blocker 1.
-
-**Two parallel hierarchies today:**
-
-- **Transport → live path.** `grpc.rs` methods (`send_chk` :202, `last_chk` :213,
-  `status_rro` :235, `info_rro` :246) → `map_tonic_status(status, peer_auth)` (grpc.rs:166)
-  + `try_decode_{check,status,rro_info}_response` (dto.rs:198 / :250 / **:368**) collapse the
-  reply to `Result<CheckAck, DpsError>`. `CheckAck` (dto.rs:66) = `{id, id_sign, data_sign}`,
-  **no digest**; empty id rejected by a stage_send guard (stage_send.rs:1583) *after* the
-  wire. `DpsError` (error.rs:14) = **10 variants**, **not `#[non_exhaustive]`**. Routed by
-  `route_send_result` (error_routing.rs:263) → `WireDecision{Sent|Routed}`; `route_dps_error`
-  (error_routing.rs:289, **exhaustive, no `_`**) → `RoutingDecision{target_state, retry_class,
-  audit_event, audit_severity, node_mode_flip, probe_hint, mac_recovery_hint}`
-  (error_routing.rs:58); `route_server_code` (:426). Worker surface `StageSendOutcome`
-  (stage_send.rs:573); `extract_wire_forensics` (stage_send.rs:866) projects
-  `RemoteStatus`/`Indeterminate` → `"Transport"`.
-
-- **Domain algebra — sealed *outcome*, but UNSEALED *response*, zero prod consumers.**
-  `SendOutcome` (mod.rs:346) IS sealed (opaque + `from_dps_status` sole ctor). **But
-  `SendResponse` (mod.rs:321) is a PUBLIC enum with PUBLIC variants** `{NoResponse,
-  RemoteStatus, Parsed}` — rev-1 wrongly called it "already sealed" (Class-A). `classify`
-  (mod.rs:702, 1-arg), `ClassifiedOutcome`, `ObservedOutcomeV1` (mod.rs:919) / `record`
-  (mod.rs:949), `ActiveRetryClass` (mod.rs:172, 7), `NodeEffect` (mod.rs:248, 7) — none wired.
-
-**Digest today (the dishonesty):**
-
-- `RawResponseDigest(pub [u8; 32])` — **public field** (mod.rs:109); any crate/module writes
-  `RawResponseDigest([0u8;32])`.
-- `response_digest` (dto.rs:178) = `SHA-256(prost.encode_to_vec())` of the **decoded** envelope;
-  its doc (dto.rs:170-177) says both "a re-encode (not the wire bytes)" **and** "lossless
-  raw-reply" — contradictory. `status_digest` (grpc.rs:188) = `SHA-256(code ‖ 0 ‖ message ‖ 0 ‖
-  details)` of the gRPC status — a **different kind**, squeezed into the same type. Neither has
-  a versioned/length-prefixed framing or domain separation.
-- **Zero-digest sites = 15** (rev-1 said "11 + fixtures" — Class-A): 11 in-fn test sites
-  (grpc.rs:408; stage_send.rs:2596/2602; error_routing.rs:1031; last_chk_probe.rs:313/335;
-  kvt2_confirm.rs:2360/2365; return_online_probe.rs:564/572) + 4 fixtures (cs3_c_db `ev_digest`
-  dto:242; rp4b_2 `digest`; rp4b_31 `dg`; rp4b_r2 `dg`). All test scope, but the public field
-  is what permits them.
-
-**doc_type already store-owned.** `fiscal_documents.doc_type` → `fetch_send_inputs_tx`
-(**fiscal_documents.rs:1909**, callsite **stage_send.rs:1248**) → `SendInputs.doc_type` →
-`route_send_result` (stage_send.rs:1576). `transport_trace` (transport_trace.rs:232) has no
-`doc_type`; W9 JOINs it. Never read from the wire.
-
-**Invariants in force (§5).** R1 TLS: `PeerAuth{TlsProven,Unproven}` (grpc.rs:39),
-`scheme_str()=="https"` (grpc.rs:102), `RemoteStatus` only when `TlsProven` (grpc.rs:169).
-Network-outside-tx: wire at stage_send.rs:1562 in "4a" outside `with_immediate`; runtime
-`assert_not_in_with_immediate` (tx.rs:65) + `with_immediate_no_foreign_io` syn-scan.
-Transport identity-blind: `CheckEnvelope` (dto.rs:32) has no `reservation_id`.
+**Non-goal (containment §7):** byte-exact wire proof (custom tonic codec) is a future forensic
+slice — its absence makes the rev-1 `AuthenticatedPeerGarbage` branch unreachable (removed §4.3).
 
 ---
 
-## §3 Proposed sequence (one spec → whole-composition gate → 5 sub-PRs)
+## §2 Current architecture (grounded; rev-1/rev-2 Class-A corrected)
 
-3.2 is additive and ends at a pure derivation (scope pin). Sub-PRs:
+**Crate graph (blocker B1/B2).** `prro-domain` is a **separate, pure crate**: its ONLY deps
+are `{uuid, serde}` and the `purity_gate` (purity_gate.rs:46) **forbids** `prost, tonic, tokio,
+sqlx, …`. So the digest **framing+SHA cannot live in the domain**. The transport
+(`prro/src/transports/dps/*`) and engine (`prro/src/services/*`) both live in the **`prro`**
+crate — so cross-crate privacy stops *other crates*, never sibling modules within `prro`.
 
-1. **contract/digest types + ownership** — sealed `DecodedResponseDigest` + `GrpcStatusDigest`
-   (D-1) in prro-domain (private field, versioned+length-prefixed framing); **opaque**
-   `SendResponse` (private inner + `kind()` view); delete `RawResponseDigest` (D-3). **NOT
-   byte-neutral** (D-3): derived `Debug` changes strings (e.g. kvt2_confirm `format!("{err:?}")`)
-   — declared, pinned.
-2. **total typed transport evidence** — `transports::dps` emits a **total** `RawSendObservation
-   {evidence: RawSendReply, diagnostics: WireDiagnostics}` for every **returned call
-   observation** (§4.2–4.3). `RawSendReply` is an **opaque struct + private inner** in
-   `transports::dps` (module privacy seals construction to that module even within `prro`).
-   Digests minted at this single seam. Old `CheckAck`/`DpsError` retained (compat).
-3. **all-consumers propagation + behaviour-delta table** — audit every consumer (§4.6);
-   publish the **full behaviour-delta table now** (applied at Bridge, not 3.2); add pins;
-   note (do not yet apply) catch-all hardening.
+**Two parallel hierarchies:**
+
+- **Transport → live path.** `grpc.rs` methods (`send_chk` :202, `last_chk` :213, `status_rro`
+  :235, `info_rro` :246) → `map_tonic_status(status, peer_auth)` (grpc.rs:166) +
+  `try_decode_{check,status,rro_info}_response` (dto.rs:198 / :250 / **:368**) → `Result<CheckAck,
+  DpsError>`. `CheckAck` (dto.rs:66) = `{id, id_sign, data_sign}`, no digest; empty id rejected
+  post-wire (stage_send.rs:1583). `DpsError` (error.rs:14) = **10 variants, not
+  `#[non_exhaustive]`**. `route_send_result` (error_routing.rs:263) → `WireDecision`;
+  `route_dps_error` (:289, exhaustive) → `RoutingDecision` (:58); `route_server_code` (:426).
+  `StageSendOutcome` (stage_send.rs:573); `extract_wire_forensics` (:866) projects
+  RemoteStatus/Indeterminate → `"Transport"`; the live `-12` handler reads the **full**
+  `DpsError::Server{message}` for `mac_recovery_hint` (error_routing.rs:253).
+
+- **Domain algebra — sealed *outcome*, UNSEALED *response*, zero prod consumers.** `SendOutcome`
+  (mod.rs:346) is opaque. **`SendResponse` (mod.rs:321) is a PUBLIC enum with PUBLIC variants**
+  (Class-A). Its digest-bearing carriers are **incomplete**: `SendIndeterminateInner`
+  (mod.rs:519) = `UnknownStatus{code,digest}`, `SaveError` (**no digest**), `CloseAmbiguous`
+  (**no digest**), `OkButNoFiscalNumber{digest}`; `SendOutcomeInner::Rejected(DpsReject)` where
+  `DpsReject` (mod.rs:477) is **payload-less** (**no digest**). `classify` (mod.rs:702, 1-arg),
+  `ObservedOutcomeV1`/`record` (mod.rs:919/949) — unwired.
+
+**Digest today.** `RawResponseDigest(pub [u8;32])` — public field (mod.rs:109). `response_digest`
+(dto.rs:178) = `SHA-256(prost.encode_to_vec())` (decoded; self-contradictory "re-encode" +
+"lossless raw" doc); `status_digest` (grpc.rs:188) = `SHA-256(code‖0‖message‖0‖details)` — a
+different kind, same type, **no** versioned/length-prefixed framing. **Zero-digest sites = 15
+(10 in `/src/` + 5 fixtures)** (rev-2 Class-A: was "11+4").
+
+**doc_type store-owned.** `fiscal_documents.doc_type` → `fetch_send_inputs_tx`
+(**fiscal_documents.rs:1909**, callsite **stage_send.rs:1248**) → engine. Never from wire.
+
+**Invariants (§5).** R1 TLS `PeerAuth` (grpc.rs:39/:102/:169); network-outside-tx (stage_send.rs
+:1562 "4a", tx.rs:65 + syn-scan); transport identity-blind (`CheckEnvelope` dto.rs:32).
+
+---
+
+## §3 Sequence (one spec → whole-composition gate → 5 sub-PRs)
+
+Additive; ends at the pure derivation.
+
+1. **contract/digest types + ownership** — `DecodedResponseDigest` + `GrpcStatusDigest` (D-1,
+   §4.1, opaque `[u8;32]` in domain, framing+SHA in transport); **opaque** `SendResponse`;
+   **digest fields added** to `Rejected`/`SaveError`/`CloseAmbiguous`/`MissingStatus` carriers
+   (§4.1b); delete `RawResponseDigest` (D-3). **Not byte-neutral** (Debug string change,
+   e.g. kvt2_confirm `{err:?}`) — declared + pinned.
+2. **single-RPC total transport evidence** — the seam `send_chk_observed` (§4.2) does **one**
+   physical call + **one** decode, yielding BOTH the legacy `Result<CheckAck,DpsError>` and a
+   total `RawSendObservation`; wire-count canary. `RawSendReply` opaque struct + private inner
+   in `transports::dps`.
+3. **all-consumers propagation + old→target pair graph** — audit every consumer; publish the
+   authoritative **old→target routing pair graph** (§4.6) — the drift-pin oracle; note (don't
+   apply) catch-all hardening.
 4. **engine-owned pure mapping** — engine joins `RawSendReply` + store `doc_type` →
-   `SendResponse` → `classify` → `ClassifiedOutcome`, **read-only, alongside** the live
-   `route_dps_error`. Cross-check the derived `ClassifiedOutcome` against the live
-   `RoutingDecision` (drift-pin). **No `ObservedOutcomeV1`, no `record`, no routing change.**
-5. **integration teeth + checkpoint** — §6 teeth; general re-checkpoint before Bridge.
-
-Each sub-PR reverts independently. `ObservedOutcomeV1`/`record`/routing-cutover/blind-resend
-kill → **Bridge + D/E**.
+   `SendResponse` → `classify` → `ClassifiedOutcome`, **read-only, alongside** the live path;
+   drift-pin cross-checks against the §4.6 pair graph (equality on unchanged rows, exact pair on
+   deltas). No `ObservedOutcomeV1`, no `record`, no routing change.
+5. **integration teeth + checkpoint** — §6; re-checkpoint before Bridge.
 
 ---
 
 ## §4 Contracts & tables (load-bearing)
 
-### 4.1 Sealed digest types + honest enforcement (blocker 1, D-1, D-3, teeth §6)
+### 4.1 Sealed digest types — implementable under the purity-gate (blocker B2, B1)
+
+Domain holds an **opaque 32-byte value only** (no `prost`/`tonic`/`sha2` — purity-gate):
 
 ```text
-DecodedResponseDigest(private [u8;32])   // decoded DPS envelope content (D-1)
-GrpcStatusDigest(private [u8;32])         // gRPC transport-status content
+// prro-domain::delivery — opaque wrappers, private field, NO hashing here
+struct DecodedResponseDigest([u8;32] /* private */)   // D-1
+struct GrpcStatusDigest([u8;32] /* private */)
+impl each { fn from_transport_digest(bytes:[u8;32]) -> Self  /* the ONLY ctor, source-gated */
+            fn as_bytes(&self) -> &[u8;32] }
 ```
 
-- **Framing (byte-exact, blocker 5):**
-  `SHA-256( DOMAIN_TAG_v1 ‖ msg_type_u8 ‖ schema_version_u32_be ‖ Σ len_u32_be(field) ‖ field )`
-  where content fields are the **known decoded** prost fields in a fixed order; status fields
-  are `code`, `message`, `details`. Fixed versioned prefix + length-prefixed fields (no
-  ambiguous concatenation). Claim: **collision-resistant fingerprint of decoded content** —
-  NOT "distinct wire replies always differ" (a re-encode drops unknown fields / encoding
-  quirks; §1 non-goal).
-- **Ownership (honest, blocker 1):** private field ⇒ **cross-crate** Rust privacy stops every
-  crate except prro-domain from constructing one. That is **not enough**: the mint must run in
-  `prro` (needs prost), and any `prro` module could then call a domain constructor. So:
-  - the ONLY mint API is `DecodedResponseDigest::of_decoded(&M)` / `GrpcStatusDigest::of_status(&Status)`
-    (prro-domain, `pub`), and
-  - a **source/AST allowlist gate** (a syn-scan sibling of `with_immediate_no_foreign_io`)
-    forbids calling either mint outside `prro/src/transports/dps/*`. **External trybuild does
-    NOT prove sibling-module sealing** (blocker 5) — the source gate is the real enforcement.
-- **No default/zero/synthetic:** no `Default`, no public field, no `[0u8;32]`. The 15 zero
-  sites are rewired to a real content minter. **Test minter placement (blocker 5):** exposed
-  via `prro-testkit` (a dev-dep both prro-domain unit tests and `prro/tests/*` integration
-  tests can reach) as `testkit::decoded_digest_of(&[u8])` — **not** `#[cfg(test)]` in
-  prro-domain (unreachable from downstream integration tests).
+- **Framing + SHA live in `prro::transports::dps`** (which already deps `sha2`/`prost`). The
+  transport computes the framed hash and calls `from_transport_digest(bytes)`.
+- **Byte-exact framing (normative, blocker B5):**
+  ```
+  digest = SHA-256(  DOMAIN_TAG                      // b"PRRO-DPS-DIGEST\x01"  (16 bytes, literal)
+                   ‖ msg_type : u8                   // Check=0x01 Status=0x02 RroInfo=0x03 GrpcStatus=0x10
+                   ‖ schema_version : u32 big-endian // DpsProtocolBinding.contract_version
+                   ‖ for field in FIXED ORDER (proto field-number ascending; gRPC: code,message,details):
+                        len(field) : u32 big-endian ‖ field_bytes )
+  ```
+  Encoding: integer scalars → `i64` big-endian (8 bytes); `string`/`bytes` → raw bytes; every
+  field length-prefixed (`u32` be). No ambiguous concatenation. Claim: **collision-resistant
+  fingerprint of the KNOWN decoded content** — NOT "distinct wire replies always differ"
+  (unknown fields / encoding quirks are out of scope, §1).
+- **No default/zero/synthetic:** no `Default`, no public field, no `[0u8;32]`. The 15 zero sites
+  rewire to a real content minter exposed via **`prro-testkit`** (`testkit::decoded_digest_of
+  (msg_type, schema, &[fields])`), reachable from both prro-domain unit tests and `prro/tests/*`
+  — **not** `#[cfg(test)]` in prro-domain (unreachable downstream).
 
-### 4.2 Total transport evidence: `RawSendObservation` (blocker 3, 4)
+### 4.1b Digest must survive into the domain carriers (blocker B3)
 
-Transport-minted, **doc_type-free**, total ONLY over **returned call observations** (a call
-that came back with a `Response` or a `Status`). Crash/drop is **not** here (§4.3 note).
+Today `Rejected(DpsReject)`, `SaveError`, `CloseAmbiguous` are digest-less, so branches 3–5
+would drop the digest before any carrier — making §6.5 untestable. 3.2 gives every
+digest-bearing branch a carrier field:
 
 ```text
-struct RawSendReply(RawSendReplyInner)          // OPAQUE; private inner enum
-                                                //   defined in prro::transports::dps → module-sealed
-enum RawSendReplyInner {                        //   (engine, a sibling module, cannot construct it)
+SendOutcomeInner::Rejected { verdict: DpsReject, digest: DecodedResponseDigest }
+SendIndeterminateInner:: UnknownStatus { code, digest }      // exists
+                       | SaveError      { digest }            // NEW field
+                       | CloseAmbiguous { digest }            // NEW field
+                       | MissingStatus  { digest }            // NEW variant (D-2, status==0)
+                       | OkButNoFiscalNumber { digest }        // exists
+SendOutcomeInner::Accepted(SentAccepted)                      // NO digest (D-4)
+```
+
+`from_dps_status` threads the transport-minted digest into each digest-bearing variant;
+`Accepted` carries none (D-4). `.kind()` views expose the digest read-only.
+
+### 4.2 Single-RPC fan-out seam (blocker B4) + total evidence
+
+```text
+// prro::transports::dps — ONE physical wire call, ONE decode, TWO projections
+fn send_chk_observed(env: CheckEnvelope) -> (Result<CheckAck, DpsError>, RawSendObservation)
+
+struct RawSendReply(RawSendReplyInner)      // OPAQUE; private inner; module-sealed to transports::dps
+enum RawSendReplyInner {
   Accepted { fiscal_id: NonEmptyId },                          // OK + non-empty id; NO digest
   OkNoFiscalId { digest: DecodedResponseDigest },              // OK + empty id
-  ServerCode  { raw_code: i32, digest: DecodedResponseDigest },// any non-OK, non-zero code
-  MissingStatus { digest: DecodedResponseDigest },             // status == 0 (proto default) (D-2)
+  ServerCode  { raw_code: i32, digest: DecodedResponseDigest },// non-OK, non-zero code
+  MissingStatus { digest: DecodedResponseDigest },             // status == 0 (D-2)
   RemoteAuthStatus { grpc: GrpcStatusDigest },                 // TLS-proven Unauth/PermDenied
   NoResponse { cause: NoResponseCause },                       // NO digest
 }
 struct RawSendObservation { evidence: RawSendReply, diagnostics: WireDiagnostics }
-struct WireDiagnostics {                        // NON-AUTHORITY forensic sidecar (blocker 4)
-  status_code: Option<i32>, grpc_code: Option<String>, message: Option<BoundedText>,
-}                                               //   preserves what evidence drops: trace + MAC hint + audit
+struct WireDiagnostics { status_code: Option<i32>, grpc_code: Option<String>,
+                         message: Option<BoundedText> }        // SHADOW forensic only (see B6 note)
 ```
 
-`NoResponseCause` (domain) gains **`CallFailedWithoutTrustedReply`** (blocker 3): a reply/status
-arrived but **without trusted provenance** (plaintext Unauth/PermDenied, post-connect failure,
-untrusted non-DPS status). It is **not** a genuine local absence — but classifies the same
-(`SubmittedUnknown`), so no blind resend. The engine boot-recovery edge keeps minting
-`CrashedBeforeObservation` (below).
+`send_chk_observed` performs exactly one `dps_channel` call and one decode, then projects the
+**same** decoded reply into (legacy, raw). The legacy tuple keeps driving production
+unchanged; `RawSendObservation` feeds the read-only shadow. `NoResponseCause` (domain) gains
+**`CallFailedWithoutTrustedReply`** (untrusted reply: plaintext Unauth/PermDenied, post-connect
+failure, non-DPS status over Unproven — *not* a genuine local absence; classifies
+`SubmittedUnknown`).
 
 ### 4.3 Normative mapping: returned observation → `RawSendReply` → `SendResponse`
 
@@ -188,160 +185,155 @@ Total over **returned observations**. Engine joins store `doc_type` only in the 
 
 | # | returned observation | `RawSendReply` | digest | → `SendResponse` (engine + doc_type) |
 |---|---|---|---|---|
-| 1 | `Response` OK, id non-empty | `Accepted{fiscal_id}` | none | `Parsed(from_dps_status(Ok{id}, dt))` → `Accepted` |
-| 2 | `Response` OK, id empty | `OkNoFiscalId{d}` | content | `Parsed(from_dps_status(Ok{""}, dt, d))` → `OkButNoFiscalNumber` |
-| 3 | `Response` named code (-1,-5,-6,-7..-10,-11,-12,-13,-14,-16) | `ServerCode{code,d}` | content | `Parsed(from_dps_status(Error(code), dt, d))` → `Rejected(verdict)` |
-| 4 | `Response` code -2/-15 | `ServerCode{code,d}` | content | `from_dps_status` splits by `dt`: close/Z → `CloseAmbiguous`; else → `Rejected(Close)` |
-| 5 | `Response` code -3 | `ServerCode{-3,d}` | content | `Parsed(...)` → `SaveError` |
-| 6 | `Response` unknown **non-zero** i32 | `ServerCode{code,d}` | content | `Parsed(from_dps_status(Error(code)))` → `UnknownStatus{code,d}` |
-| 7 | `Response` **status == 0** (proto default) | `MissingStatus{d}` (D-2) | content | dedicated indeterminate → **ProbeRequired** |
-| 8 | gRPC `Unauthenticated`/`PermissionDenied`, **TlsProven** | `RemoteAuthStatus{g}` | grpc | `RemoteStatus(RemoteAuthStatus(g))` |
-| 9 | untrusted reply: plaintext Unauth/PermDenied · post-connect failure · non-DPS status over Unproven | `NoResponse{CallFailedWithoutTrustedReply}` | **none** | `NoResponse(CallFailedWithoutTrustedReply)` |
-| 10 | genuine absence: timeout · cancel · local-handshake fail (no session / no return) | `NoResponse{Timeout\|Cancelled\|LocalHandshakeFailure}` | **none** | `NoResponse(cause)` |
+| 1 | `Response` OK, id non-empty | `Accepted{fiscal_id}` | none | `Parsed(Accepted)` |
+| 2 | `Response` OK, id empty | `OkNoFiscalId{d}` | content | `Parsed(OkButNoFiscalNumber{d})` |
+| 3 | `Response` named code (-1,-5,-6,-7..-10,-11,-12,-13,-14,-16) | `ServerCode{code,d}` | content | `Parsed(Rejected{verdict, d})` |
+| 4 | `Response` code -2/-15 | `ServerCode{code,d}` | content | by `dt`: close/Z → `CloseAmbiguous{d}`; else → `Rejected{Close, d}` |
+| 5 | `Response` code -3 | `ServerCode{-3,d}` | content | `Parsed(SaveError{d})` |
+| 6 | `Response` unknown **non-zero** i32 | `ServerCode{code,d}` | content | `Parsed(UnknownStatus{code,d})` |
+| 7 | `Response` **status == 0** | `MissingStatus{d}` (D-2) | content | `Parsed(MissingStatus{d})` → ProbeRequired |
+| 8 | gRPC Unauth/PermDenied, **TlsProven** | `RemoteAuthStatus{g}` | grpc | `RemoteStatus(RemoteAuthStatus(g))` |
+| 9 | untrusted reply: plaintext Unauth/PermDenied · post-connect failure · non-DPS status over Unproven | `NoResponse{CallFailedWithoutTrustedReply}` | none | `NoResponse(CallFailedWithoutTrustedReply)` |
+| 10 | genuine absence: timeout · cancel · local-handshake fail | `NoResponse{Timeout\|Cancelled\|LocalHandshakeFailure}` | none | `NoResponse(cause)` |
 
-**Removed vs rev 1 (blocker 3):**
-- **`AuthenticatedPeerGarbage` deleted** — unreachable honestly: tonic collapses a prost decode
-  failure to `Status::Internal`, indistinguishable from a server-sent `Internal`, raw body
-  already lost. Reintroduced only with the future custom codec (§1 non-goal). `RemoteStatusEvidence`
-  keeps the variant *future-unpopulated*.
-- **`CrashedBeforeObservation` is NOT a transport branch** — a crash/drop returns no
-  `RawSendReply`. It is an **engine boot-recovery edge**: boot mints
-  `SubmissionEvidence::Started{ NoResponse(CrashedBeforeObservation) }` from the durable
-  `CALL_STARTED` marker. Documented here; owned by W9/boot, not the transport table.
+**Not in this table (blocker B3):**
+- **`AuthenticatedPeerGarbage` — removed entirely** (not "future-unpopulated"): tonic collapses a
+  prost decode failure to `Status::Internal`, indistinguishable from a server `Internal`, raw
+  body lost. The `RemoteStatusEvidence` variant is deleted until the future codec (§1).
+- **`CrashedBeforeObservation` is an engine boot-recovery edge**, not a returned observation:
+  boot mints `SubmissionEvidence::Started{NoResponse(CrashedBeforeObservation)}` from durable
+  `CALL_STARTED`. (Row 10 is genuine-absence-with-a-completed-call; it does **not** cover crash.)
 
-**Digest-per-branch rule:** 2–7 carry `DecodedResponseDigest`; 8 carries `GrpcStatusDigest`;
-**1, 9, 10 carry NO digest** (type-level — the variant has no digest field). No branch both
-lacks a real reply and carries a digest.
+**Digest-per-branch:** 2–7 → `DecodedResponseDigest`; 8 → `GrpcStatusDigest`; **1, 9, 10 → no
+digest field** (type-level).
 
-### 4.4 Crate/module placement + sealing (blocker 1)
+### 4.4 Placement + sealing — Rust where possible, source-gate where not (blocker B1)
 
-| item | crate::module | field/variant vis | who constructs | enforced by |
+| item | crate::module | vis | who constructs | enforced by |
 |---|---|---|---|---|
-| `DecodedResponseDigest` / `GrpcStatusDigest` | `prro-domain::delivery` | private | `of_decoded` / `of_status` | cross-crate privacy (other crates) **+ source-allowlist gate** (transport-only within prro) |
-| `RawSendReply` (opaque) + inner | `prro::transports::dps` | private inner | that module only | **module privacy** (sibling engine module cannot construct — compile-time) |
-| `RawSendObservation` / `WireDiagnostics` | `prro::transports::dps` | private inner (evidence) | that module only | module privacy |
-| `SendResponse` (now opaque) | `prro-domain::delivery` | private inner + `kind()` | `from_dps_status` seam only | privacy + trybuild |
-| `SendOutcome` (already opaque) | `prro-domain::delivery` | private inner | `from_dps_status` | privacy + trybuild (3.1) |
+| `DecodedResponseDigest`/`GrpcStatusDigest` | `prro-domain::delivery` | private field, sole `from_transport_digest` | transport seam | cross-crate privacy (other crates) **+ workspace source-gate** (transport-only within prro) |
+| `RawSendReply` (opaque) + inner | `prro::transports::dps` | private inner | that module | **module privacy** (compile-time; sibling engine cannot construct) |
+| `SendResponse` (now opaque) + `SendOutcome`/`SentAccepted` authority ctors | `prro-domain::delivery` | private inner; `from_dps_status`/`no_response`/`remote_status`/`observe` are `pub` | ONE engine mapper | privacy stops *literals*; **the workspace source-gate is the real fence** |
 
-**Precise guarantee (not overclaimed).** The engine IS the sanctioned mapper — it legitimately
-*constructs* `SendResponse` from a `RawSendReply` (via `from_dps_status` for `Parsed`, and
-`SendResponse::{no_response, remote_status}` constructors for the others). What it **cannot** do
-is **inject a fresh digest**: a `DecodedResponseDigest`/`GrpcStatusDigest` is only obtainable by
-*reading it out of* the opaque, transport-minted `RawSendReply` (a borrowed/consuming view) — the
-mint (`of_decoded`/`of_status`) is source-gated to `transports::dps`, so the engine never holds a
-constructible digest to inject. So: `RawSendReply` opaqueness is **compile-time** (module
-privacy); `SendResponse` opaqueness stops *non-engine* fabrication (compile-time); the
-**transport-only digest provenance** is the **source-allowlist gate** (Rust cannot sibling-seal a
-cross-crate mint). No claim rests on external trybuild proving sibling sealing.
+**Precise guarantee (blocker B1, corrected).** Rust privacy forbids external *literals* but
+**not calls** to the public authority ctors (`from_dps_status`, `SendResponse::{no_response,
+remote_status}`, `SentAccepted::observe`). `Accepted` is the sharpest gap — it has **no digest**,
+so the digest source-gate cannot see it. Therefore the **source/AST allowlist gate is
+workspace-wide over ALL authority ctors AND the digest mint**, permitting exactly **one** engine
+mapper callsite (e.g. `services/write_path/shadow_map.rs`) plus the transport mint site; every
+other `services/*` callsite is RED. The engine is the *sanctioned mapper* — it constructs
+`SendResponse` — but can only carry the transport-minted digest read out of the opaque
+`RawSendReply` (it never holds a constructible digest to inject). Nothing rests on external
+trybuild proving sibling sealing (teeth §6.3/6.4).
 
 ### 4.5 Single doc_type source
 
-`fiscal_documents.doc_type` → `fetch_send_inputs_tx` (fiscal_documents.rs:1909, callsite
-stage_send.rs:1248) → engine → `from_dps_status(raw, store_doc_type, digest)`. `RawSendReply`
-never carries doc_type. W9 JOINs `doc_type` (transport_trace has none).
+`fiscal_documents.doc_type` → `fetch_send_inputs_tx` (fiscal_documents.rs:1909 / stage_send.rs:1248)
+→ engine → `from_dps_status(raw, store_doc_type, digest)`. `RawSendReply` never carries doc_type.
 
-### 4.6 Full behaviour-delta table (blocker 4 — documented NOW, applied at Bridge)
+### 4.6 Old→target routing pair graph (blocker B5 — the drift-pin oracle)
 
-3.2 applies **none** of these (scope pin). They are the deltas the eventual Bridge cutover
-will make; the `WireDiagnostics` sidecar preserves the data the live path needs meanwhile.
+3.2 applies **none** of these; this is the authoritative graph the §6.10 drift-pin checks:
+**equality** on unchanged rows, **exact (old,target) pair** on declared deltas. "Behaviour-neutral"
+in 3.2 means **the shadow does not drive production state** (read-only) — *not* "its result equals
+the incumbent".
 
-| input | live path today | Bridge target (via SendResponse/classify) | forensic preserved by |
+| input | live `RoutingDecision` (unchanged in 3.2) | shadow-derived `ClassifiedOutcome` (target) | drift-pin |
 |---|---|---|---|
-| TLS `RemoteStatus` | `route_dps_error` → TransientRetry (compat, error_routing.rs:314) | `RemoteStatus` → **ProbeRequired** | `WireDiagnostics.grpc_code` |
-| `MissingStatus` (status 0) | `Decode` → ProbeRequired | dedicated indeterminate → **ProbeRequired** (consistent) | digest + diagnostics |
-| OK + empty id | stage_send guard `EmptyServerFiscalNo` after wire (stage_send.rs:1583) | `OkButNoFiscalNumber` (typed, pre-classify) | — |
-| `-12 ERROR_BAD_HASH_PREV` | Server → MacRecovery, `mac_recovery_hint` from **message**, **live second wire** (`Resigned → continue`) | `BadHashPrev` → MacRecovery; **second-wire kill is D/E, not 3.2** | `WireDiagnostics.message` feeds the existing hint |
-| `-4` / unknown code | Indeterminate/Server → TransientRetry | `UnknownStatus{code,digest}` → TransientRetry | digest + diagnostics |
+| named rejects -1/-5/-7../-16, -13/-14, -11, -12, -6 | as today (error_routing.rs:426) | same routing class + node_effect | **equal** |
+| TLS `RemoteStatus` | TransientRetry (compat, :314) | **ProbeRequired** | exact pair (delta) |
+| unknown non-zero code | `Decode`→ProbeRequired *(via -4=Indeterminate)* / Server→… | `UnknownStatus`→**TransientRetry** | exact pair (delta) |
+| `MissingStatus` (status 0) | `Decode`→ProbeRequired | `MissingStatus`→ProbeRequired | **equal** |
+| OK + empty id | stage_send `EmptyServerFiscalNo` guard (post-wire) | `OkButNoFiscalNumber`→ProbeRequired | exact pair (not equal to the guard) |
 
-`route_dps_error`'s `mac_recovery_hint` (regex over the raw message) and the audit
-event/severity/probe-reason are **not** authority in `ClassifiedOutcome`; they are read from
-`WireDiagnostics` so the live path is unchanged during 3.2.
+The live `mac_recovery_hint`/audit event/severity/probe-reason are **not** authority in
+`ClassifiedOutcome`; the live path keeps reading them from `DpsError` (unchanged).
 
 ---
 
 ## §5 Invariants (must not weaken)
 
-1. **R1 TLS provenance** — branch 8 (`RemoteAuthStatus`, `GrpcStatusDigest`) reachable ONLY
-   when `TlsProven` (grpc.rs:169); plaintext → branch 9 (`CallFailedWithoutTrustedReply`, no
-   digest). `scheme_str()=="https"` unchanged.
-2. **Network outside SQLite tx** — `RawSendObservation` minted in "4a" (stage_send.rs:1562);
-   digest/decode never move inside a tx; `assert_not_in_with_immediate` + syn-scan intact.
-3. **Bridge/engine cannot fabricate evidence** — scoped to §4.4 mechanisms: module privacy
-   seals `RawSendReply`/`SendResponse`; the source-allowlist gate seals the cross-crate digest
-   mint. **No claim rests on external trybuild proving sibling sealing.**
+1. **R1 TLS provenance** — branch 8 reachable ONLY when `TlsProven` (grpc.rs:169); plaintext →
+   branch 9 (no digest).
+2. **Network outside SQLite tx** — `send_chk_observed` runs in "4a" (stage_send.rs:1562); one
+   physical call; digest/decode never inside a tx; `assert_not_in_with_immediate` + syn-scan intact.
+3. **Engine cannot inject a fabricated digest** — via §4.4: opaque `RawSendReply` (module
+   privacy) + workspace source-gate over all authority ctors + digest mint. The engine is the
+   sanctioned mapper; it carries transport-minted digests only.
 4. **Transport has no reservation identity** — `RawSendReply`/`RawSendObservation`/`CheckEnvelope`
    carry no `reservation_id`.
-5. **No 3.2 behaviour delta / no authoritative record** — 3.2 changes no production routing,
-   mints no `ObservedOutcomeV1`, calls no `record` (needs store-minted `AuthorizedGeneration`
-   from D), and does **not** touch the live `-12` second wire. PR4 derivation is read-only,
-   cross-checked against the live `RoutingDecision`. Deltas of §4.6 land at Bridge.
+5. **No 3.2 behaviour delta / no authoritative record** — no production routing change, no
+   `ObservedOutcomeV1`, no `record` (needs D), no `-12` second-wire change. PR4 is read-only,
+   cross-checked against the §4.6 pair graph. Deltas land at Bridge.
+6. **Exactly one wire call per stage-4 attempt** — `send_chk_observed` is one physical RPC;
+   the shadow must never trigger a second DPS call (blocker B4). Wire-count canary (§6.11).
 
 ---
 
 ## §6 Teeth (empirical; revert → RED)
 
-1. **Exhaustive mapping** — table-driven over §4.3 (every returned-observation branch ×
-   relevant doc_types) asserts wire→`RawSendReply`→`SendResponse`; a missing/renamed branch
-   fails. Includes the two REMOVED cases as explicit "unreachable/engine-edge" assertions.
-2. **trybuild: cross-crate fabrication forbidden** — `DecodedResponseDigest([0u8;32])`,
-   `GrpcStatusDigest(_)`, `SendResponse::Parsed(_)` from **another crate** must not compile.
-   Make a field/ctor `pub` → RED.
-3. **source-allowlist gate: transport-only mint (blocker 1/5)** — a syn-scan test asserts
-   `of_decoded`/`of_status`/`RawSendReply` construction appear ONLY under
-   `prro/src/transports/dps/*`. Add a call from `services/*` → gate RED. (This — not trybuild —
-   is the sibling-module proof.)
-4. **module-privacy: sibling engine cannot build `RawSendReply`** — a `prro`-internal
-   `compile_fail` (or the source gate) shows a `services` module constructing `RawSendReply`
-   fails. Make the inner `pub(crate)` → RED.
-5. **same-digest propagation + independent preimage (blocker 5)** — mint at the seam, read off
-   the domain carrier: byte-identical. PLUS an **independent golden preimage**: recompute
-   `H(framing(fields))` in the test from raw fields and assert `== carrier.digest`; a
-   mismatch (or a constant/re-framed digest) → RED. Proves `digest == H(reply fields)`, not
-   just "stable".
-6. **unknown-code + digest** — non-zero unknown i32 → `ServerCode{raw_code,digest}` →
-   `UnknownStatus` preserving BOTH; drop either → RED.
-7. **empty-id + digest** — OK+empty → `OkNoFiscalId{real digest}` → `OkButNoFiscalNumber`,
-   unconstructible without a transport-minted digest; zero/absent → won't compile.
-8. **no-response-has-no-digest (renamed from rev-1 "wrong-binding→zero-wire", blocker 5)** —
-   branches 1/9/10 have **no digest field** (type-level); attaching a digest won't compile.
-   *This does not count wire calls*; the real wire-call-binding pin (RP4B-5) stays **Bridge**.
-9. **TLS/plaintext matrix** — over `TlsProven`, Unauth/PermDenied → branch 8 (grpc digest);
-   over plaintext → branch 9 (no digest). Flip the guard → RED (R1 forgery canary, #322).
-10. **all-consumers pins + PR4 drift** — one pin per §4.6 consumer for each evidence branch;
-    PR4 cross-checks derived `ClassifiedOutcome` vs live `RoutingDecision` (any divergence in
-    the read-only path → RED, since 3.2 must be behaviour-neutral).
+1. **Exhaustive mapping** — table over §4.3 (every returned-observation branch × doc_types);
+   missing/renamed branch fails. The two removed cases asserted as unreachable/engine-edge.
+2. **trybuild: cross-crate literal forbidden** — `DecodedResponseDigest([0;32])`,
+   `SendResponse::Parsed(_)` **literal** from another crate must not compile.
+3. **source-gate: transport-only mint (B1/B2)** — syn-scan: `from_transport_digest` and the
+   framing SHA appear ONLY under `transports::dps`. A call elsewhere → gate RED.
+4. **source-gate: one engine mapper (B1)** — the authority ctors (`from_dps_status`,
+   `SendResponse::{no_response,remote_status}`, `SentAccepted::observe`) and `RawSendReply`
+   construction appear ONLY at the single allowed mapper + transport. **Direct `Accepted` /
+   `SendResponse` from any other `services/*` → RED.**
+5. **same-digest propagation + independent golden preimage (B5)** — digest read off the carrier
+   equals the seam value; PLUS recompute `SHA-256(framing(fields))` independently in the test and
+   assert `== carrier.digest`; a constant/re-framed/mismatched digest → RED. Proves
+   `digest == H(framing(fields))`, not "stable".
+6. **unknown-code + digest** — non-zero unknown → `ServerCode{code,d}` → `UnknownStatus{code,d}`
+   preserving both; drop either → RED.
+7. **rejected/save/close carry digest (B3)** — `Rejected{verdict,d}`, `SaveError{d}`,
+   `CloseAmbiguous{d}`, `MissingStatus{d}` each round-trip the seam digest; a digest-less variant
+   → won't compile / RED.
+8. **empty-id + digest** — OK+empty → `OkButNoFiscalNumber{real digest}`; unconstructible without
+   a transport-minted digest.
+9. **no-response-has-no-digest** (renamed from rev-1 "wrong-binding→zero-wire", B5) — branches
+   1/9/10 have **no digest field** (type-level). *Does not count wire calls*; the wire-binding pin
+   (RP4B-5) stays **Bridge**.
+10. **drift-pin over the §4.6 pair graph (B5)** — equality on unchanged rows, exact (old,target)
+    on delta rows; a derived class that neither equals nor matches its declared pair → RED. (Not
+    "derived==live" universally.)
+11. **TLS/plaintext matrix + wire-count (B4)** — TlsProven Unauth → branch 8; plaintext → branch
+    9; flip guard → RED (#322). Plus: `send_chk_observed` issues exactly **one** wire call
+    (mock counter) — a second call → RED.
 
 ---
 
 ## §7 Containment
 
-- **Foundation-only, additive.** `RawSendReply`/digests/opaque-`SendResponse`/`classify`
-  derivation are built **beside** the live `CheckAck`/`DpsError`/`route_dps_error` path, which
-  keeps driving production unchanged. **No production routing change, no `ObservedOutcomeV1`,
-  no `record`, no old-path retirement, no behaviour delta** in 3.2.
-- **No partial production cutover.** The `DpsChannel → DpsSubmissionPort` swap, the
-  authoritative `record` (needs D's store-minted `AuthorizedGeneration`), and the `-12`
-  blind-resend kill are **Bridge + D/E**. 3.2 ends at PR5's checkpoint with the pure derivation
-  proven and cross-checked, old path intact.
-- **Each sub-PR reverts independently.** PR1 is **not** byte-neutral (Debug string change,
-  D-3) — declared + pinned; PR2/PR4 are behaviour-neutral (additive/read-only); PR3 is
-  doc+pins; PR5 is teeth.
+- **Foundation-only, additive.** Built beside the live path, which drives production unchanged.
+  No routing change, no `ObservedOutcomeV1`, no `record`, no retirement, no behaviour delta.
+- **No partial cutover.** Port swap, authoritative `record` (needs D), and `-12` blind-resend
+  kill are Bridge + D/E. 3.2 ends at PR5's checkpoint, old path intact.
+- **Each sub-PR reverts independently.** PR1 is **not** byte-neutral (Debug string change, D-3) —
+  declared + pinned; PR2/PR4 additive/read-only; PR3 doc+pins; PR5 teeth.
 
----
+## D-1…D-4 (adopted)
 
-## D-1…D-4 (auditor rulings, adopted)
+- **D-1** `DecodedResponseDigest`. **D-2** dedicated `MissingStatus`→ProbeRequired.
+- **D-3** delete `RawResponseDigest` in PR1; **not** byte-neutral (Debug strings) — declared+pinned.
+- **D-4** `Accepted` no digest — GO (opaque `RawSendReply` + sealed `NonEmptyId`; reconciliation
+  uses the fiscal id + a later `last_chk`, not a send-response fingerprint).
 
-- **D-1:** `DecodedResponseDigest` (precise > ambiguous `ResponseContentDigest`).
-- **D-2:** dedicated `MissingStatus` (status 0) → ProbeRequired; do **not** reuse `UnknownStatus`.
-- **D-3:** delete `RawResponseDigest` in **PR1** (after the ownership fix) — no private alias
-  (it would keep mixing two digest classes). PR1 is **not** byte-neutral: derived `Debug`
-  changes strings (≥ kvt2_confirm `format!("{err:?}")`) — declared + pinned.
-- **D-4:** Accepted carries **no** digest — **GO**, conditioned on `RawSendReply` being truly
-  opaque and `NonEmptyId` sealed (reconciliation uses the fiscal id + a later `last_chk`, not a
-  send-response fingerprint).
+## B6 note — MAC-hint (blocker B6)
 
-## Class-A corrections (rev 1 → rev 2)
+`WireDiagnostics.message: Option<BoundedText>` truncates at 512 bytes; the live `-12`
+`mac_recovery_hint` regex needs the **full** message. **Resolution:** the live path is unchanged
+in 3.2 — it keeps reading the full `DpsError::Server{message}` for its hint. `WireDiagnostics`
+is a **shadow** sidecar only; extracting a typed fixed-size MAC hint *before* truncation is
+**deferred to D/E** (where the shadow becomes authoritative). rev-2's "feeds the existing hint"
+claim is **retracted**.
 
-`SendResponse` was **not** sealed (public enum) — now made opaque in PR1 · zero-digest sites =
-**15** (not "11 + fixtures") · `try_decode_rro_info_response` = **dto.rs:368** · `fetch_send_inputs_tx`
-= **fiscal_documents.rs:1909** / callsite **stage_send.rs:1248**.
+## Class-A corrections (cumulative)
+
+`SendResponse` was not sealed (public enum) — opaque in PR1 · zero-digest sites = **15 (10 in
+`/src/` + 5 fixtures)** · `try_decode_rro_info_response` = **dto.rs:368** · `fetch_send_inputs_tx`
+= **fiscal_documents.rs:1909 / stage_send.rs:1248** · row 10 is a completed-call genuine absence
+(crash/dropped-future belongs to boot recovery, not a returned observation) · digest mint cannot
+live in prro-domain (purity-gate bans prost/tonic).
