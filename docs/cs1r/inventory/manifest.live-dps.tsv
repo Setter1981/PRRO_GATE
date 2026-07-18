@@ -1108,7 +1108,9 @@ live-dps	prro	prro::digest_mint_source_gate	macro_invocation_laundering_is_caugh
 live-dps	prro	prro::digest_mint_source_gate	ordinary_carry_of_a_digest_is_not_flagged	false
 live-dps	prro	prro::digest_mint_source_gate	production_src_mints_digest_only_in_transport_decoder	false
 live-dps	prro	prro::digest_mint_source_gate	reexport_of_mint_is_caught	false
+live-dps	prro	prro::digest_mint_source_gate	reexport_of_provenance_mint_is_caught	false
 live-dps	prro	prro::digest_mint_source_gate	services_call_of_mint_is_caught	false
+live-dps	prro	prro::digest_mint_source_gate	services_call_of_provenance_mint_is_caught	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_expired_when_past_not_after	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_ok_when_more_than_30_days_remain	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_warn_when_less_than_30_days_remain	false
