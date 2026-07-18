@@ -108,6 +108,48 @@ impl BoundedText {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawResponseDigest(pub [u8; 32]);
 
+/// Digest of a **decoded** DPS response envelope's KNOWN content (CS-3 3.2, spec §4.1).
+///
+/// **Sealed:** the field is private; the sole constructor
+/// [`from_transport_digest`](Self::from_transport_digest) takes an already-framed 32-byte hash.
+/// The versioned, length-prefixed framing + SHA-256 live in the transport decoder
+/// (`prro::transports::dps::digest_framing`) — the only place that can compute the bytes — and a
+/// workspace source-gate (PR1 pin 5) additionally restricts the constructor to that decoder, so the
+/// engine can only *carry* a transport-minted digest, never fabricate one. This is a
+/// *decoded-content* fingerprint, NOT a raw-wire proof ([[project_digest_decoded_content_decision]]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedResponseDigest([u8; 32]);
+
+impl DecodedResponseDigest {
+    /// The SOLE constructor: the framed 32-byte hash computed by the transport decoder.
+    pub fn from_transport_digest(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    /// The 32-byte digest (read-only).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Digest of a gRPC transport-status reply (`{code, message, details}`, spec §4.1).
+///
+/// A DISTINCT type from [`DecodedResponseDigest`] because it fingerprints a different kind of reply
+/// (a non-DPS gRPC status), with its own message-type tag in the framing. Same sealing: private
+/// field + transport-only `from_transport_digest`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrpcStatusDigest([u8; 32]);
+
+impl GrpcStatusDigest {
+    /// The SOLE constructor: the framed 32-byte hash computed by the transport decoder.
+    pub fn from_transport_digest(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    /// The 32-byte digest (read-only).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 // ─── The three orthogonal delivery axes (§2) ─────────────────────────────────
 
 /// Axis 1 — did the submission definitely reach DPS? (D3: total over `SubmissionEvidence`)
