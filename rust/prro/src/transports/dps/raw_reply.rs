@@ -278,4 +278,97 @@ mod tests {
             RawSendReplyKind::NoResponse { .. }
         ));
     }
+
+    /// PR4 §4.3 — the engine mapper `map_send_reply` maps every `RawSendReply` arm to the correct
+    /// `SendResponse`. Total over the 6 arms; the code×doc_type `-2/-15` split checked both ways.
+    /// (Lives here because only `transports::dps` can mint a `RawSendReply`; the mapper output is
+    /// read via the domain's opaque `kind()` views.) Break any mapper arm → RED.
+    #[test]
+    fn pr4_map_send_reply_covers_section_4_3() {
+        use crate::services::write_path::shadow_map::map_send_reply;
+        use prro_domain::delivery::{
+            DpsReject, RemoteStatusEvidence, SendIndeterminateKind, SendOutcomeKind,
+            SendResponseKind,
+        };
+        use prro_domain::enums::DocType;
+
+        let sell = DocType::Sell;
+        let id = |s: &str| NonEmptyFiscalNumber::from_transport(s.to_string()).unwrap();
+        let code = |c: i32| NonOkStatusCode::from_transport(c).unwrap();
+
+        // Row 1 — Accepted → Parsed(Accepted{that id}).
+        match map_send_reply(&RawSendReply::accepted(id("DPS-9")), sell).kind() {
+            SendResponseKind::Parsed(o) => assert!(
+                matches!(o.kind(), SendOutcomeKind::Accepted(a) if a.fiscal_number() == "DPS-9")
+            ),
+            other => panic!("row1: {other:?}"),
+        }
+        // Row 2 — OkNoFiscalId → Parsed(OkButNoFiscalNumber).
+        assert!(matches!(
+            map_send_reply(&RawSendReply::ok_no_fiscal_id(dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                    if matches!(i.kind(), SendIndeterminateKind::OkButNoFiscalNumber { .. }))
+        ));
+        // Row 3 — named -1 → Parsed(Rejected{Verify}).
+        assert!(matches!(
+            map_send_reply(&RawSendReply::server_code(code(-1), dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Rejected { verdict: DpsReject::Verify, .. })
+        ));
+        // Row 4 — -2 non-close → Rejected(Close); -2 close/Z → CloseAmbiguous (doc_type split).
+        assert!(matches!(
+            map_send_reply(&RawSendReply::server_code(code(-2), dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Rejected { verdict: DpsReject::Close, .. })
+        ));
+        assert!(matches!(
+            map_send_reply(&RawSendReply::server_code(code(-2), dg()), DocType::ZReport).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                    if matches!(i.kind(), SendIndeterminateKind::CloseAmbiguous { .. }))
+        ));
+        // Row 5 — -3 → SaveError.
+        assert!(matches!(
+            map_send_reply(&RawSendReply::server_code(code(-3), dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                    if matches!(i.kind(), SendIndeterminateKind::SaveError { .. }))
+        ));
+        // Row 6 — -4 and every unknown non-zero → UnknownStatus.
+        for c in [-4i32, -17, 2, 12_345] {
+            assert!(
+                matches!(
+                    map_send_reply(&RawSendReply::server_code(code(c), dg()), sell).kind(),
+                    SendResponseKind::Parsed(o)
+                        if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                            if matches!(i.kind(), SendIndeterminateKind::UnknownStatus { .. }))
+                ),
+                "row6 code {c}"
+            );
+        }
+        // Row 7 — MissingStatus → Parsed(MissingStatus).
+        assert!(matches!(
+            map_send_reply(&RawSendReply::missing_status(dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                    if matches!(i.kind(), SendIndeterminateKind::MissingStatus { .. }))
+        ));
+        // Row 8 — RemoteAuthStatus → RemoteStatus (DIRECT), forwarding the SAME grpc digest.
+        match map_send_reply(&RawSendReply::remote_auth_status(grpc()), sell).kind() {
+            SendResponseKind::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(g)) => {
+                assert_eq!(
+                    g,
+                    &grpc(),
+                    "row8 must forward the transport-minted grpc digest"
+                )
+            }
+            other => panic!("row8: {other:?}"),
+        }
+        // Rows 9/10 — NoResponse → NoResponse (DIRECT), forwarding the SAME cause.
+        match map_send_reply(&RawSendReply::no_response(NoResponseCause::Timeout), sell).kind() {
+            SendResponseKind::NoResponse(c) => assert_eq!(*c, NoResponseCause::Timeout),
+            other => panic!("row10: {other:?}"),
+        }
+    }
 }

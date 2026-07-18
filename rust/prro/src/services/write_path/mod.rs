@@ -19,6 +19,8 @@ pub(crate) mod inline_map;
 pub use auto_z::{run_auto_z_if_over_limit, AutoZOutcome};
 pub mod kvt2_advance;
 pub mod mac_recovery;
+/// CS-3 3.2 PR4 — the §4.4-gated engine mapper (`RawSendReply` + doc_type → `SendResponse`).
+pub(crate) mod shadow_map;
 pub mod signer_guard;
 pub mod stage_acquire;
 pub mod stage_finalize;

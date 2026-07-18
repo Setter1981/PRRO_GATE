@@ -476,8 +476,10 @@ impl SendResponse {
 
 /// The send-phase outcome (§5, B3) — **opaque + sealed (Bridge-0.1)**.
 ///
-/// Constructible ONLY via [`from_dps_status`](Self::from_dps_status), the single honest
-/// total mapping from a raw DPS status + the store-owned `doc_type`. No illegal
+/// Constructible ONLY via the CS-3 3.2 PR4 mapper-gated ctors [`accepted`](Self::accepted) /
+/// [`ok_but_no_fiscal_number`](Self::ok_but_no_fiscal_number) / [`missing_status`](Self::missing_status)
+/// / [`from_server_code`](Self::from_server_code) (the old `from_dps_status` was retired), each
+/// consuming transport-minted evidence + the store-owned `doc_type`. No illegal
 /// cross-product is buildable (e.g. `Rejected(Close)` on a close doc type, or
 /// `UnknownStatus` holding a named code). Read it via [`kind`](Self::kind).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -669,7 +671,7 @@ pub enum DpsReject {
 
 /// Parsed but indeterminate outcomes — **opaque + sealed (Bridge-0.1)**.
 ///
-/// Constructible only inside a [`SendOutcome`] via [`SendOutcome::from_dps_status`], so
+/// Constructible only inside a [`SendOutcome`] via its authority ctors, so
 /// `UnknownStatus` can never hold a named `DpsReject` code and `CloseAmbiguous` can never
 /// arise on a non-close doc type. Read via [`kind`](Self::kind).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -744,7 +746,7 @@ impl SendIndeterminate {
 
 /// A DPS status code PROVEN not to be a named [`DpsReject`] (Bridge-0.1).
 ///
-/// Private field: only [`SendOutcome::from_dps_status`] mints one (for `-4` and truly
+/// Private field: only [`SendOutcome::from_server_code`] mints one (for `-4` and truly
 /// unrecognized codes), so `UnknownStatus` can never carry a code that has a dedicated
 /// verdict — the checkpoint's `UnknownStatus("-1")` illegal state is now unconstructible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -866,7 +868,7 @@ impl ClassifiedOutcome {
 ///
 /// **`doc_type` is single-source (Bridge-0.1 3.1b):** `classify` takes NO `doc_type`. The
 /// only doc-type-dependent decision — the `-2/-15` close/non-close split (§12 R1) — is
-/// consumed exactly ONCE, at [`SendOutcome::from_dps_status`] construction, and is already
+/// consumed exactly ONCE, at [`SendOutcome::from_server_code`] construction, and is already
 /// encoded in the outcome variant (`Rejected(Close)` on non-close ⇒
 /// `Submitted / ParsedDpsEnvelope / TerminalReject`; `Indeterminate(CloseAmbiguous)` on
 /// close/Z ⇒ `SubmittedUnknown / ParsedDpsEnvelope / ProbeRequired`). The classifier has no
@@ -967,7 +969,7 @@ fn classify_parsed(outcome: &SendOutcome) -> ClassifiedOutcome {
 /// **Private + doc-type-free (Bridge-0.1 3.1b):** this is an internal helper of [`classify`],
 /// not a public seam. It needs no `doc_type` because `DpsReject::Close` already encodes the
 /// non-close branch — the close branch became `SendIndeterminate::CloseAmbiguous` at
-/// [`SendOutcome::from_dps_status`] construction (the single doc_type source). Keeping it
+/// [`SendOutcome::from_server_code`] construction (the single doc_type source). Keeping it
 /// private + paramless removes the vestigial `doc_type` seam that allowed re-binding.
 fn routing_for_reject(verdict: &DpsReject) -> (ActiveRetryClass, NodeEffect) {
     match verdict {
