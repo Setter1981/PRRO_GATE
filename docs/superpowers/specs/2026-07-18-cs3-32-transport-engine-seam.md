@@ -1,8 +1,7 @@
 # CS-3 Bridge-0.1 (3.2) — transport/engine seam + honest decoded-content digest
 
-**Status:** DRAFT **rev 5** for adversarial spot-gate. rev 1 → 5 class-B (closed); rev 2 → 6
-(closed); rev 3 → 5 (closed); rev 4 → 4 (closed here). Point-fix, no redesign. **Base:**
-`origin/main 2dbae3c`.
+**Status:** DRAFT **rev 6** for adversarial spot-gate. class-B per round: 5 / 6 / 5 / 4 / 3 (rev-5's
+3 closed here). Point-fix, no redesign. **Base:** `origin/main 2dbae3c`.
 **Predecessors:** #4B rev-6, #4A A4-6, [[project_digest_decoded_content_decision]],
 `project_cs3_bridge0_foundation_repair`.
 
@@ -124,7 +123,9 @@ enc(nested msg)   = block(nested.fields)   // recursive, no tag/version prefix
 Per-message field tables (fixed order) = the §2 proto lists **in full** — `CheckResponse` (5
 fields), `StatusResponse` (5), `RroInfoResponse` (**16**, incl. `operators#13` recursive +
 `tins#14`/`lnum#15`/`name_pay#16`), and `GrpcStatus{code,message,details}` (msg_type `0x10`).
-`Operator` framed recursively. Claim: **collision-resistant fingerprint of the KNOWN decoded
+`Operator` framed recursively. **`GrpcStatus.code` is encoded as the canonical gRPC numeric code
+(`tonic::Code as i32`) → `i64` big-endian — NOT the `Debug` string** the current `status_digest`
+uses (grpc.rs:188); `message` and `details` are `enc(string)`/`enc(bytes)`. Claim: **collision-resistant fingerprint of the KNOWN decoded
 content** — NOT "distinct wire replies always differ". PR1 covers **all four** messages, each with
 golden preimage vectors (§6.5) — a reply differing only in a late/added field (e.g. `name_pay`) must
 yield a distinct digest.
@@ -153,7 +154,8 @@ that carries a digest **only where one exists** (no `Option`/fictitious) and who
 struct NonEmptyFiscalNumber(String /*private, non-empty*/);  // proves the id came OFF a parsed reply
 struct NonOkStatusCode(i32 /*private, != 0 && != 1*/);       // a real non-OK / non-UNKNOWN DPS code
 
-enum ParsedReply {                              // built by the TRANSPORT decoder from the reply
+struct ParsedReply(ParsedReplyInner);           // OPAQUE; minted ONLY by the transport decoder (§4.4 gate)
+enum ParsedReplyInner {                          // private inner — engine cannot construct a variant
   Accepted { fiscal_id: NonEmptyFiscalNumber },                // NO digest
   Replied  { code: RepliedCode, digest: DecodedResponseDigest },
 }
@@ -225,15 +227,20 @@ grpc; 1,9,10 none (type-level).
 | authority ctors: `from_parsed`, `SendResponse::{parsed,no_response,remote_status}` (`SentAccepted::observe` is **not** an engine-mapper ctor — the id arrives pre-validated as `NonEmptyFiscalNumber`) | `prro-domain` | pub | ONE engine mapper file | symbol source-gate |
 
 **Symbol source-gate (wrapper-proof, B3).** A syn-scan (sibling of `with_immediate_no_foreign_io`)
-with **per-symbol allowlists**: `from_transport_digest` + framing + `RawSendReply` construction →
-allowed ONLY in `transports::dps` decoder; `from_parsed`/`no_response`/`remote_status`/`observe` →
-allowed ONLY in the single engine mapper file (e.g. `services/write_path/shadow_map.rs`). The gate
-**also forbids** re-export (`pub use`), wrappers that forward a gated symbol, and function-pointer
-capture (`&from_transport_digest`), so a `mint_for_engine` wrapper in the allowed module cannot
-launder the mint to the engine. **`prro-testkit` is an explicit test-only allowlist entry.**
-Precise guarantee: the engine is the sanctioned mapper (it *constructs* `SendResponse`) but can
-only carry a digest read out of the opaque `RawSendReply` — it never obtains a constructible
-digest to inject. Nothing rests on external trybuild proving sibling sealing.
+with **per-symbol allowlists**. **Decoder-only** (`transports::dps`): `from_transport_digest`,
+`NonEmptyFiscalNumber::from_transport`, `NonOkStatusCode::from_transport`, framing, **and both
+`RawSendReply` and `ParsedReply` construction** (`ParsedReply` is an **opaque struct with a private
+inner enum**, minted only here — §4.1c). **Engine-mapper-only** (one file, e.g.
+`services/write_path/shadow_map.rs`): `SendOutcome::from_parsed`, `SendResponse::{parsed,
+no_response, remote_status}`. **`SentAccepted::observe` is NOT a mapper ctor** — the id arrives
+pre-validated as `NonEmptyFiscalNumber`, so `observe` stays wherever it is today, never in the
+mapper allowlist. The gate **also forbids** re-export (`pub use`), forwarding wrappers, and
+function-pointer capture of any gated symbol — so a `mint_for_engine` wrapper in the allowed module
+cannot launder the mint. **`prro-testkit` is an explicit test-only allowlist entry.** Precise
+guarantee: the engine mapper *constructs* `SendResponse` but can only forward evidence
+(digest/id/code) read out of the opaque, transport-minted `RawSendReply`/`ParsedReply` — it never
+obtains a constructible digest, id, code, or `ParsedReply` to inject. Nothing rests on external
+trybuild proving sibling sealing.
 
 ### 4.5 Single doc_type source
 
@@ -296,15 +303,21 @@ crash/drop (boot edge). Three declared deltas: **empty-id, unknown-non-zero, TLS
 2. **trybuild: cross-crate literal** — digest / `SendResponse` literal from another crate → won't
    compile.
 3. **symbol source-gate: transport-only mint (+ macro/re-export laundering)** —
-   `from_transport_digest`/`from_transport`/framing/`RawSendReply` ctor appear ONLY in the decoder;
-   a call / wrapper / `pub use` / fn-pointer / **`#[macro_export] macro_rules!` that expands to a
-   gated symbol** elsewhere → gate RED (the scan resolves macro expansions + re-exports, not just
-   literal callsites).
-4. **symbol source-gate: one engine mapper** — `from_parsed`/`no_response`/`remote_status`/`observe`
-   ONLY in the mapper file; **direct `Accepted`/`SendResponse` from any other `services/*` → RED**.
+   `from_transport_digest`/`from_transport`/framing/`RawSendReply`/`ParsedReply` ctor appear ONLY in
+   the decoder. The gate is **syntactic** (syn does not expand macros): it **forbids any
+   `macro_rules!` / `#[macro_export]` / token-tree that mentions a gated symbol**, plus `pub use` /
+   forwarding wrapper / fn-pointer capture, anywhere outside the decoder → RED. Canary: a
+   `#[macro_export] macro_rules!` in the decoder that emits the mint, invoked from `services/*`,
+   must be caught by the syntactic ban (proven, not assumed).
+4. **symbol source-gate: one engine mapper** — `from_parsed` / `SendResponse::{parsed, no_response,
+   remote_status}` appear ONLY in the mapper file; `ParsedReply`/digest/`from_transport` construction
+   ONLY in the decoder; **`SentAccepted::observe` is NOT in the mapper allowlist**. Direct
+   `ParsedReply` / `SendResponse::*` / `Accepted` construction from any other `services/*` → RED.
 5. **same-digest + independent golden preimage (B2/B5)** — carrier digest == seam value; PLUS the
-   test recomputes `SHA-256(framing(fields))` from raw fields **for all three messages** and asserts
-   `==`; a constant / re-framed / wrong-version digest → RED. Proves `digest == H(framing(fields))`.
+   test recomputes `SHA-256(framing(fields))` from raw fields **for all four messages
+   (CheckResponse/StatusResponse/RroInfoResponse + GrpcStatus, the latter using the canonical
+   numeric code)** and asserts `==`; a constant / re-framed / wrong-version / Debug-coded digest →
+   RED. Proves `digest == H(framing(fields))`.
 6. **rejected/save/close/missing carry digest (B3)** — each round-trips the seam digest.
 7. **Accepted has no digest, honestly built (B1)** — `ParsedReply::Accepted` has no digest field;
    `from_parsed(Accepted,dt)` builds `Accepted`; adding an `Option<digest>` or a fabricated digest
@@ -317,11 +330,13 @@ crash/drop (boot edge). Three declared deltas: **empty-id, unknown-non-zero, TLS
 11. **TLS/plaintext + composition wire-count + shadow-derivation (B4)** — TlsProven→branch 8,
     plaintext/other-status→branch 9, flip guard → RED (#322). **Wire-count runs the full stage-4
     composition against a mock DPS server** and asserts (a) exactly ONE real RPC — a second call
-    (e.g. stage_send invoking both old `send_chk` and the new seam) → RED; **and (b) the shadow
-    `ClassifiedOutcome`+digest are derived from the SAME unique reply** — the mock embeds a unique
-    fiscal-id/field marker that must surface in BOTH the legacy outcome AND the shadow digest;
-    deleting `shadow_map` (so no shadow is produced) → RED (a mere one-RPC count would otherwise
-    stay green).
+    (e.g. stage_send invoking both old `send_chk` and the new seam) → RED; **and (b) the shadow is
+    derived from the SAME unique reply**, proven on a **digest-bearing** reply (D-4-compatible:
+    `Accepted` has no digest). The mock returns `-3 ERROR_SAVE` with a **unique `error_message`
+    marker**; the test then asserts: the legacy `DpsError::Server` carries that marker; the shadow
+    carrier digest equals the **independent** `SHA-256(framing(that reply))`; the shadow
+    classification is `SaveError → TransientRetry`; RPC count == 1. Deleting `shadow_map` (no shadow
+    produced) → RED — a mere one-RPC count would otherwise stay green.
 
 ---
 
