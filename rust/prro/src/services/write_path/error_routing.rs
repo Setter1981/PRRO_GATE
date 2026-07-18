@@ -1028,7 +1028,7 @@ mod tests {
             DpsError::RemoteStatus {
                 code: "Unauthenticated".into(),
                 message: "invalid token".into(),
-                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+                digest: prro_domain::delivery::GrpcStatusDigest::from_transport_digest([0xAB; 32]),
             },
             DpsError::Authorization {
                 code: -1,

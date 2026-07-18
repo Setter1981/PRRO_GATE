@@ -19,6 +19,7 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Status;
 
 use super::channel::DpsChannel;
+use super::digest_framing::{DigestFramer, MsgType};
 use super::dto::{
     decode_offline_codes, try_decode_check_response, try_decode_rro_info_response,
     try_decode_status_response, CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse,
@@ -26,6 +27,7 @@ use super::dto::{
 };
 use super::error::DpsError;
 use super::gen::chk_income_service_client::ChkIncomeServiceClient;
+use prro_domain::delivery::GrpcStatusDigest;
 
 /// Whether this channel proved TLS peer-authentication at connect time (R1).
 ///
@@ -180,21 +182,17 @@ fn map_tonic_status(s: Status, peer_auth: PeerAuth) -> DpsError {
     }
 }
 
-/// SHA-256 digest of a gRPC status reply (code + message + details) — the lossless
-/// raw-reply evidence for [`DpsError::RemoteStatus`] (R3).  For an authenticated-peer
-/// error status the status IS the reply, so this fingerprints it deterministically
-/// and distinctly, letting a later Bridge carry the SAME digest into
-/// `RemoteStatusEvidence` rather than fabricating one.
-fn status_digest(s: &Status) -> prro_domain::delivery::RawResponseDigest {
-    use prro_domain::delivery::RawResponseDigest;
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(format!("{:?}", s.code()).as_bytes());
-    h.update([0u8]);
-    h.update(s.message().as_bytes());
-    h.update([0u8]);
-    h.update(s.details());
-    RawResponseDigest(h.finalize().into())
+/// Byte-exact framed digest of a gRPC status reply (`{code, message, details}`) — the
+/// decoded-content evidence for [`DpsError::RemoteStatus`] (CS-3 3.2, spec §4.1). For an
+/// authenticated-peer error status the status IS the reply. `code` is the **canonical gRPC numeric
+/// code** (`tonic::Code as i32` → `i64`-be), NOT a `Debug` string. This is the SOLE mint of a
+/// `GrpcStatusDigest` (source-gated to this decoder module — PR1 pin 5).
+fn status_digest(s: &Status) -> GrpcStatusDigest {
+    let mut f = DigestFramer::new(MsgType::GrpcStatus);
+    f.field_int(s.code() as i32 as i64)
+        .field_str(s.message())
+        .field_bytes(s.details());
+    GrpcStatusDigest::from_transport_digest(f.finalize())
 }
 
 #[async_trait]
@@ -309,11 +307,10 @@ mod tests {
         }
     }
 
-    /// R3 (lossless raw-reply seam): `RemoteStatus` carries a `RawResponseDigest`
-    /// derived from the ACTUAL gRPC status reply, so the Bridge maps it losslessly
-    /// (no fabricated digest). Different replies → different digests; identical
-    /// replies → identical digest (deterministic). Teeth: a constant/fabricated
-    /// digest would fail the `assert_ne!`.
+    /// CS-3 3.2: `RemoteStatus` carries a `GrpcStatusDigest` — the byte-exact framed fingerprint of
+    /// the ACTUAL gRPC status reply (canonical numeric code, §4.1), so the Bridge carries the
+    /// transport-minted digest, never a fabricated one. Distinct status content → distinct digest;
+    /// identical content → identical digest. Teeth: a constant/fabricated digest fails the `assert_ne!`.
     #[test]
     fn r3_remote_status_carries_reply_digest_not_fabricated() {
         let mk =
@@ -405,7 +402,7 @@ mod tests {
             &DpsError::RemoteStatus {
                 code: "Unauthenticated".into(),
                 message: "invalid token".into(),
-                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+                digest: prro_domain::delivery::GrpcStatusDigest::from_transport_digest([0xAB; 32]),
             },
             DocType::Sell,
             true,

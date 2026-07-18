@@ -33,10 +33,10 @@ use prro::db::models::ids::DocumentId;
 use prro::db::repositories::delivery_reservation::{self, NewReservation};
 use prro::db::tx::with_immediate;
 use prro_domain::delivery::{
-    classify, AuthorizedGeneration, BoundedText, DpsProtocolBinding, DpsProtocolId, EnvelopeHash,
-    NoResponseCause, ObservedOutcomeV1, PositiveGeneration, PreflightRefusal,
-    ProtocolContractVersion, RawDpsStatus, RawResponseDigest, RemoteStatusEvidence, SendOutcome,
-    SendResponse, SubmissionEvidence,
+    classify, AuthorizedGeneration, BoundedText, DecodedResponseDigest, DpsProtocolBinding,
+    DpsProtocolId, EnvelopeHash, GrpcStatusDigest, NoResponseCause, ObservedOutcomeV1,
+    PositiveGeneration, PreflightRefusal, ProtocolContractVersion, RawDpsStatus,
+    RemoteStatusEvidence, SendOutcome, SendResponse, SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
 use sqlx::SqlitePool;
@@ -238,8 +238,12 @@ fn binding() -> DpsProtocolBinding {
 fn ev_hash() -> EnvelopeHash {
     EnvelopeHash([0u8; 32])
 }
-fn ev_digest() -> RawResponseDigest {
-    RawResponseDigest([0u8; 32])
+fn ev_digest() -> DecodedResponseDigest {
+    DecodedResponseDigest::from_transport_digest([0xAB; 32])
+}
+
+fn grpc_ev_digest() -> GrpcStatusDigest {
+    GrpcStatusDigest::from_transport_digest([0xAB; 32])
 }
 fn not_started_preflight() -> SubmissionEvidence {
     SubmissionEvidence::NotStarted {
@@ -366,7 +370,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // ── Started/RemoteStatus ────────────────────────────────────────────────
         GraphRow {
             label: "Started/RemoteStatus(Garbage) → SUBMITTED_UNKNOWN/AUTHENTICATED_PEER/ProbeRequired",
-            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::AuthenticatedPeerGarbage(ev_digest()))),
+            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::AuthenticatedPeerGarbage(grpc_ev_digest()))),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "AUTHENTICATED_PEER",
@@ -375,7 +379,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "Started/RemoteStatus(AuthStatus) → SUBMITTED_UNKNOWN/AUTHENTICATED_PEER/ProbeRequired",
-            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(ev_digest()))),
+            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(grpc_ev_digest()))),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "AUTHENTICATED_PEER",

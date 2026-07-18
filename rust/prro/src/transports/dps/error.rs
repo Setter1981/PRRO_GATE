@@ -8,7 +8,7 @@
 //! and a TCP connect-refused both surface as `Transport`, because
 //! the caller's response is the same — back off + retry.
 
-use prro_domain::delivery::RawResponseDigest;
+use prro_domain::delivery::{DecodedResponseDigest, GrpcStatusDigest};
 use thiserror::Error;
 
 /// Errors returned by every `DpsChannel` method.
@@ -61,7 +61,7 @@ pub enum DpsError {
         /// Digest of the raw gRPC status reply (code + message + details). The
         /// lossless raw-reply evidence (R3): a later Bridge maps this to
         /// `RemoteStatusEvidence` carrying the SAME digest, never a fabricated one.
-        digest: RawResponseDigest,
+        digest: GrpcStatusDigest,
     },
 
     /// A DPS response envelope was successfully decoded but the status
@@ -86,7 +86,7 @@ pub enum DpsError {
         /// evidence (R3): a later Bridge maps this to
         /// `SendIndeterminate::UnknownStatus` carrying the SAME digest, never a
         /// fabricated one.
-        digest: RawResponseDigest,
+        digest: DecodedResponseDigest,
     },
 
     /// Authorization-class server response, split by the application-
