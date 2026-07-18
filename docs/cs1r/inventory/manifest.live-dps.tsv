@@ -650,11 +650,17 @@ live-dps	prro	prro	transports::dps::digest_framing::tests::check_response_shape_
 live-dps	prro	prro	transports::dps::digest_framing::tests::distinct_content_yields_distinct_digest	false
 live-dps	prro	prro	transports::dps::digest_framing::tests::grpc_status_uses_numeric_code_not_debug	false
 live-dps	prro	prro	transports::dps::digest_framing::tests::repeated_nested_operators_are_recursive_and_counted	false
+live-dps	prro	prro	transports::dps::dto::tests::pin3_digest_gap_shadow_carries_real_digest_where_legacy_server_has_none	false
+live-dps	prro	prro	transports::dps::dto::tests::pin3_legacy_leg_is_byte_identical_to_try_decode	false
+live-dps	prro	prro	transports::dps::dto::tests::pin3_neg4_legacy_and_shadow_share_one_digest_mint	false
+live-dps	prro	prro	transports::dps::dto::tests::pin3_ok_empty_id_splits_to_ok_no_fiscal_id	false
+live-dps	prro	prro	transports::dps::dto::tests::pin3_raw_reply_mapping_is_exhaustive	false
 live-dps	prro	prro	transports::dps::dto::tests::r3_indeterminate_carries_reply_digest_not_fabricated	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_is_not_transport	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_yields_indeterminate_not_transport	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_rro_info_response_yields_indeterminate	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_status_response_yields_indeterminate	false
+live-dps	prro	prro	transports::dps::grpc::tests::pin3_observe_tonic_status_mirrors_r1_tls_gate	false
 live-dps	prro	prro	transports::dps::grpc::tests::r1_tls_proven_channel_yields_remote_status_for_both_codes	false
 live-dps	prro	prro	transports::dps::grpc::tests::r1_unproven_channel_cannot_forge_authenticated_peer	false
 live-dps	prro	prro	transports::dps::grpc::tests::r3_remote_status_carries_reply_digest_not_fabricated	false
@@ -663,6 +669,9 @@ live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_permission_denied_yields_
 live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_remote_status_retry_class_equals_transport_retry_class	false
 live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_unauthenticated_yields_remote_status	false
 live-dps	prro	prro	transports::dps::grpc::tests::rp4b4_unavailable_yields_transport	false
+live-dps	prro	prro	transports::dps::raw_reply::tests::every_variant_round_trips_through_kind	false
+live-dps	prro	prro	transports::dps::raw_reply::tests::observation_carries_evidence_and_diagnostics	false
+live-dps	prro	prro	transports::dps::raw_reply::tests::observe_from_legacy_is_honestly_degraded	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_full_equality	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_length_206	false
 live-dps	prro	prro	transports::dps::t112::tests::byte_pin_sha256	false
@@ -1099,7 +1108,9 @@ live-dps	prro	prro::digest_mint_source_gate	macro_invocation_laundering_is_caugh
 live-dps	prro	prro::digest_mint_source_gate	ordinary_carry_of_a_digest_is_not_flagged	false
 live-dps	prro	prro::digest_mint_source_gate	production_src_mints_digest_only_in_transport_decoder	false
 live-dps	prro	prro::digest_mint_source_gate	reexport_of_mint_is_caught	false
+live-dps	prro	prro::digest_mint_source_gate	reexport_of_provenance_mint_is_caught	false
 live-dps	prro	prro::digest_mint_source_gate	services_call_of_mint_is_caught	false
+live-dps	prro	prro::digest_mint_source_gate	services_call_of_provenance_mint_is_caught	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_expired_when_past_not_after	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_ok_when_more_than_30_days_remain	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_warn_when_less_than_30_days_remain	false
@@ -1140,6 +1151,8 @@ live-dps	prro	prro::dps_channel_smoke	send_chk_error_not_registered_signer_route
 live-dps	prro	prro::dps_channel_smoke	send_chk_error_unknown_routes_to_transport_retry_class	false
 live-dps	prro	prro::dps_channel_smoke	send_chk_error_verefy_routes_to_authorization	false
 live-dps	prro	prro::dps_channel_smoke	send_chk_happy_returns_check_ack	false
+live-dps	prro	prro::dps_channel_smoke	send_chk_observed_issues_exactly_one_rpc	false
+live-dps	prro	prro::dps_channel_smoke	send_chk_observed_legacy_leg_matches_send_chk_on_same_reply	false
 live-dps	prro	prro::dps_channel_smoke	send_chk_status_unknown_routes_to_decode	false
 live-dps	prro	prro::dps_channel_smoke	status_rro_error_not_registered_rro_routes_to_authorization	false
 live-dps	prro	prro::dps_channel_smoke	status_rro_happy_returns_status_snapshot	false
@@ -2174,6 +2187,7 @@ live-dps	prro	prro::webcheck_replay	teeth_injected_chain_break_is_caught	false
 live-dps	prro	prro::webcheck_replay	teeth_injected_lnd_gap_is_caught	false
 live-dps	prro	prro::webcheck_replay	teeth_injected_state_class_is_caught	false
 live-dps	prro	prro::webcheck_replay	z_report_is_exported_not_replayed	false
+live-dps	prro	prro::with_immediate_no_foreign_io	case_1_send_chk_observed_inside_closure_is_caught	false
 live-dps	prro	prro::with_immediate_no_foreign_io	case_1_substrate_method_inside_closure_is_caught	false
 live-dps	prro	prro::with_immediate_no_foreign_io	case_1_substrate_method_saved_then_awaited_is_caught	false
 live-dps	prro	prro::with_immediate_no_foreign_io	case_1_ufcs_substrate_call_is_caught	false
@@ -2455,6 +2469,10 @@ live-dps	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_too_long	fal
 live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	digest_types_cannot_be_fabricated_by_literal_compile_fail	false
 live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	doc_type_cannot_be_rebound_at_classify_compile_fail	false
 live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	opaque_algebra_bypass_compile_fail	false
+live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	provenance_types_cannot_be_fabricated_by_literal_compile_fail	false
+live-dps	prro-domain	prro-domain::pr2_provenance_types	call_failed_without_trusted_dps_envelope_classifies_submitted_unknown	false
+live-dps	prro-domain	prro-domain::pr2_provenance_types	non_empty_fiscal_number_rejects_empty	false
+live-dps	prro-domain	prro-domain::pr2_provenance_types	non_ok_status_code_rejects_ok_and_unknown	false
 live-dps	prro-domain	prro-domain::purity_gate	accepted_capability_nodes_are_annotated	false
 live-dps	prro-domain	prro-domain::purity_gate	closure_edge_manifest_is_set_equal	false
 live-dps	prro-domain	prro-domain::purity_gate	closure_manifest_root_and_schema_are_pinned	false

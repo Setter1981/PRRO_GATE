@@ -13,6 +13,7 @@ use super::dto::{
     CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse, RroInfo, StatusSnapshot,
 };
 use super::error::DpsError;
+use super::raw_reply::RawSendObservation;
 
 /// `Send + Sync` so impls can be wrapped in `Arc<dyn DpsChannel>` and
 /// shared across worker tasks.  All five wire RPCs are unary (W0-1
@@ -22,6 +23,31 @@ pub trait DpsChannel: Send + Sync {
     /// `sendChkV2` — submit a CMS-signed receipt.  Maps the `Check`
     /// proto + `CheckResponse` proto onto the typed envelope/ack pair.
     async fn send_chk(&self, envelope: CheckEnvelope) -> Result<CheckAck, DpsError>;
+
+    /// CS-3 3.2 PR2 pin3 — the single-RPC fan-out (spec §4.2): submit a receipt with EXACTLY ONE
+    /// wire call and return BOTH the legacy `Result` AND the total transport-minted
+    /// `RawSendObservation` (the typed delivery evidence the Bridge/engine will map in PR4).
+    ///
+    /// **DEGRADED default (mock/test channels only).** It calls `send_chk` once, then
+    /// back-projects the already-collapsed `Result<CheckAck, DpsError>` via `observe_from_legacy`
+    /// — which can only emit `Accepted`/`NoResponse` (no real digest survives the collapse), so a
+    /// default observation can never masquerade as full fidelity. Production `GrpcDpsChannel`
+    /// OVERRIDES this with the lossless single-decode body. The dependency is one-way
+    /// (`send_chk_observed` default → `send_chk`, which overrides nothing) — no mutual-default
+    /// recursion.
+    ///
+    /// **RETURN-TYPE PIN:** keep the tuple `(Result<…>, RawSendObservation)`. It MUST NOT be
+    /// "simplified" to `Result<(CheckAck, RawSendObservation), DpsError>` — that would DROP the
+    /// observation on the `Err` arm, which is the most reconciliation-valuable shadow
+    /// (`NoResponse`/`RemoteAuthStatus`). `?` on the tuple is a compile error, by design.
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (Result<CheckAck, DpsError>, RawSendObservation) {
+        let legacy = self.send_chk(envelope).await;
+        let observation = super::raw_reply::observe_from_legacy(&legacy);
+        (legacy, observation)
+    }
 
     /// `lastChk` — fetch the last receipt the server has on file for
     /// the FN encoded in `fn_sign`.  Used by recovery and by the

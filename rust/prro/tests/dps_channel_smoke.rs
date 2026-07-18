@@ -67,7 +67,7 @@ use prro::transports::dps::gen::{
 };
 use prro::transports::dps::{
     AuthorizationKind, CheckEnvelope, CheckSignBlob, DpsChannel, DpsCheckType, DpsError,
-    GrpcDpsChannel,
+    GrpcDpsChannel, RawSendReplyKind,
 };
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -981,4 +981,73 @@ async fn grpc_timeout_metadata_set_on_every_rpc() {
         });
         assert_grpc_timeout_shape(timeout);
     }
+}
+
+// ─── CS-3 3.2 PR2 pin3 — the single-RPC fan-out, WIRE-level teeth ──────────────────────
+
+/// Tooth #1 — the double-issue canary. `send_chk_observed` must perform EXACTLY ONE physical
+/// `send_chk_v2` RPC. The mock records every inbound call in arrival order, so a second physical
+/// call (a fiscal double-issue) would make `captured.len() == 2`. Revert the override / stage_send
+/// to call BOTH `send_chk` and `send_chk_observed` → count 2 → RED.
+#[tokio::test]
+async fn send_chk_observed_issues_exactly_one_rpc() {
+    let h = start_mock().await;
+    h.state
+        .send_chk_v2
+        .lock()
+        .unwrap()
+        .push_back(Ok(ok_check_response("FN-OBS-1")));
+    let ch = channel(&h.endpoint).await;
+
+    let (legacy, obs) = ch.send_chk_observed(check_envelope()).await;
+
+    // Exactly ONE physical RPC hit the server — the cardinal double-issue guard.
+    let captured = h.state.captured.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "exactly one physical send_chk_v2 RPC; got {captured:?}"
+    );
+    // Legacy leg is the ordinary CheckAck…
+    assert_eq!(legacy.expect("Ok").id, "FN-OBS-1");
+    // …and the shadow proves acceptance from the SAME single reply.
+    assert!(matches!(
+        obs.evidence().kind(),
+        RawSendReplyKind::Accepted { .. }
+    ));
+}
+
+/// Tooth #7 (wire) — the override's legacy leg is byte-identical to `send_chk` on the SAME scripted
+/// reply. Script the same error twice; call `send_chk` and `send_chk_observed` once each; assert
+/// the two `Result`s are Debug-equal, and exactly two physical RPCs total (one per method — no
+/// hidden extra call inside the fan-out).
+#[tokio::test]
+async fn send_chk_observed_legacy_leg_matches_send_chk_on_same_reply() {
+    let h = start_mock().await;
+    {
+        let mut q = h.state.send_chk_v2.lock().unwrap();
+        q.push_back(Ok(err_check_response(
+            check_response::Status::ErrorSave,
+            "ERROR_SAVE marker",
+        )));
+        q.push_back(Ok(err_check_response(
+            check_response::Status::ErrorSave,
+            "ERROR_SAVE marker",
+        )));
+    }
+    let ch = channel(&h.endpoint).await;
+
+    let via_send_chk = ch.send_chk(check_envelope()).await;
+    let (via_observed, _obs) = ch.send_chk_observed(check_envelope()).await;
+
+    assert_eq!(
+        format!("{via_send_chk:?}"),
+        format!("{via_observed:?}"),
+        "override legacy leg must equal send_chk byte-for-byte on the same reply"
+    );
+    assert_eq!(
+        h.state.captured.lock().unwrap().len(),
+        2,
+        "one physical RPC per method call — no hidden extra RPC in the fan-out"
+    );
 }

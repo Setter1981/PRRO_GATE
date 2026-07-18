@@ -1,19 +1,25 @@
-//! CS-3 3.2 PR1 pin5 — digest-mint source-gate (spec §4.4, auditor condition a).
+//! CS-3 3.2 — cross-crate transport-only MINT source-gate (spec §4.4, auditor condition a).
 //!
-//! Rust privacy cannot sibling-seal a **cross-crate** constructor: `DecodedResponseDigest::
-//! from_transport_digest` / `GrpcStatusDigest::from_transport_digest` are `pub` (the transport
-//! decoder, in the `prro` crate, must call the type defined in `prro-domain`). So the *transport-only
-//! provenance* — "the engine can only CARRY a transport-minted digest, never fabricate one" — is
-//! carried by THIS static gate, not by privacy. Sibling lint to `with_immediate_no_foreign_io.rs`
-//! (same syn 2 + visitor pattern).
+//! Rust privacy cannot sibling-seal a **cross-crate** constructor. Two families of transport-only
+//! mints live in `prro-domain` yet must be minted ONLY by the `prro` transport decoder:
+//!   * the DIGEST mints — `DecodedResponseDigest::from_transport_digest` /
+//!     `GrpcStatusDigest::from_transport_digest` (PR1 pin5);
+//!   * the PROVENANCE mints — `NonEmptyFiscalNumber::from_transport` /
+//!     `NonOkStatusCode::from_transport` (PR2 pin4). These are `pub` (the decoder in `prro` must
+//!     call the type defined in `prro-domain`), so "a non-empty fiscal id / non-OK code PROVES
+//!     transport provenance, not just form" (the D-4 argument that lets `Accepted` carry no digest)
+//!     is carried by THIS static gate, not by privacy — otherwise the engine could
+//!     `NonEmptyFiscalNumber::from_transport("forged")` and inject provenance it never observed.
+//!
+//! Sibling lint to `with_immediate_no_foreign_io.rs` (same syn 2 + visitor pattern).
 //!
 //! Forbidden ANYWHERE under `prro/src/**` EXCEPT `prro/src/transports/dps/**` (the sole decoder mint
-//! site) and EXCEPT `#[cfg(test)]` / `#[test]` items (test doubles use a real content minter):
-//! - a call to `from_transport_digest` (assoc-fn or method syntax);
-//! - a `macro_rules!` / macro invocation / `#[macro_export]` whose token-tree MENTIONS the symbol
+//! site) and EXCEPT `#[cfg(test)]` / `#[test]` items (test doubles use a real minter):
+//! - a call to any gated symbol (assoc-fn or method syntax);
+//! - a `macro_rules!` / macro invocation / `#[macro_export]` whose token-tree MENTIONS a symbol
 //!   (syn does NOT expand macros — this is a conservative *syntactic* ban that also catches macro
 //!   laundering: a decoder-local `#[macro_export] macro_rules!` emitting the mint, invoked elsewhere);
-//! - a `use ... from_transport_digest` re-export.
+//! - a `use ... <symbol>` re-export.
 //!
 //! Positive controls are synthetic snippets, so production `prro/src` stays GREEN.
 
@@ -22,8 +28,16 @@ use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;
 
-/// The gated symbol — the sole cross-crate digest mint constructor.
-const GATED_SYMBOL: &str = "from_transport_digest";
+/// The gated symbols — the cross-crate transport mint constructors. `from_transport_digest`
+/// (digest) and `from_transport` (provenance). NOTE the substring overlap is harmless: the
+/// exact-ident checks (`==`) never confuse them; only the conservative macro token-tree check uses
+/// `contains`, where double-flagging one macro line is benign (still a violation).
+const GATED_SYMBOLS: &[&str] = &["from_transport_digest", "from_transport"];
+
+/// The gated symbol matching `ident` exactly, if any (for method/path call sites).
+fn matched_exact(ident: &syn::Ident) -> Option<&'static str> {
+    GATED_SYMBOLS.iter().copied().find(|g| ident == g)
+}
 
 #[derive(Debug, Clone)]
 struct Violation {
@@ -95,59 +109,55 @@ impl<'ast, 'a> Visit<'ast> for MintScan<'a> {
         syn::visit::visit_item_fn(self, node);
     }
 
-    // `Type::from_transport_digest(...)` (associated-fn syntax → Expr::Call).
+    // `Type::<gated>(...)` (associated-fn syntax → Expr::Call).
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
-            if p.path
-                .segments
-                .last()
-                .map(|s| s.ident == GATED_SYMBOL)
-                .unwrap_or(false)
-            {
+            if let Some(sym) = p.path.segments.last().and_then(|s| matched_exact(&s.ident)) {
                 self.flag(format!(
-                    "`{GATED_SYMBOL}(...)` digest mint called outside the transport decoder"
+                    "`{sym}(...)` transport mint called outside the transport decoder"
                 ));
             }
         }
         syn::visit::visit_expr_call(self, node);
     }
 
-    // `x.from_transport_digest(...)` (method syntax).
+    // `x.<gated>(...)` (method syntax).
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if node.method == GATED_SYMBOL {
+        if let Some(sym) = matched_exact(&node.method) {
             self.flag(format!(
-                "`.{GATED_SYMBOL}(...)` digest mint called outside the transport decoder"
+                "`.{sym}(...)` transport mint called outside the transport decoder"
             ));
         }
         syn::visit::visit_expr_method_call(self, node);
     }
 
-    // A `use ... from_transport_digest ...` re-export.
+    // A `use ... <gated> ...` re-export.
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        if uses_symbol(&node.tree) {
+        if let Some(sym) = used_symbol(&node.tree) {
             self.flag(format!(
-                "re-export of `{GATED_SYMBOL}` (`use`) outside the transport decoder"
+                "re-export of `{sym}` (`use`) outside the transport decoder"
             ));
         }
         syn::visit::visit_item_use(self, node);
     }
 
-    // Any macro invocation whose token-tree MENTIONS the symbol (laundering vector).
+    // Any macro invocation whose token-tree MENTIONS a symbol (laundering vector).
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        if node.tokens.to_string().contains(GATED_SYMBOL) {
+        let toks = node.tokens.to_string();
+        if let Some(sym) = GATED_SYMBOLS.iter().find(|s| toks.contains(**s)) {
             self.flag(format!(
-                "macro token-tree mentions `{GATED_SYMBOL}` outside the transport decoder \
-                 (macro laundering)"
+                "macro token-tree mentions `{sym}` outside the transport decoder (macro laundering)"
             ));
         }
         syn::visit::visit_macro(self, node);
     }
 
-    // A `macro_rules!` / `#[macro_export] macro_rules!` DEFINITION mentioning the symbol.
+    // A `macro_rules!` / `#[macro_export] macro_rules!` DEFINITION mentioning a symbol.
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
-        if node.mac.tokens.to_string().contains(GATED_SYMBOL) {
+        let toks = node.mac.tokens.to_string();
+        if let Some(sym) = GATED_SYMBOLS.iter().find(|s| toks.contains(**s)) {
             self.flag(format!(
-                "macro_rules! definition emits `{GATED_SYMBOL}` outside the transport decoder \
+                "macro_rules! definition emits `{sym}` outside the transport decoder \
                  (macro-export laundering)"
             ));
         }
@@ -155,13 +165,14 @@ impl<'ast, 'a> Visit<'ast> for MintScan<'a> {
     }
 }
 
-fn uses_symbol(tree: &syn::UseTree) -> bool {
+/// The gated symbol a `use` tree names, if any.
+fn used_symbol(tree: &syn::UseTree) -> Option<&'static str> {
     match tree {
-        syn::UseTree::Path(p) => uses_symbol(&p.tree),
-        syn::UseTree::Name(n) => n.ident == GATED_SYMBOL,
-        syn::UseTree::Rename(r) => r.ident == GATED_SYMBOL,
-        syn::UseTree::Group(g) => g.items.iter().any(uses_symbol),
-        syn::UseTree::Glob(_) => false,
+        syn::UseTree::Path(p) => used_symbol(&p.tree),
+        syn::UseTree::Name(n) => matched_exact(&n.ident),
+        syn::UseTree::Rename(r) => matched_exact(&r.ident),
+        syn::UseTree::Group(g) => g.items.iter().find_map(used_symbol),
+        syn::UseTree::Glob(_) => None,
     }
 }
 
@@ -193,6 +204,8 @@ fn scan_source(text: &str, file_name: &str) -> Vec<Violation> {
 
 #[test]
 fn production_src_mints_digest_only_in_transport_decoder() {
+    // Despite the historical name this gate now covers BOTH the digest AND the provenance mints
+    // (all of `GATED_SYMBOLS`); the assertion is identical in shape — no mint outside the decoder.
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let dps_root = src_root.join("transports").join("dps");
     let mut files = Vec::new();
@@ -219,8 +232,9 @@ fn production_src_mints_digest_only_in_transport_decoder() {
     }
     assert!(
         all.is_empty(),
-        "digest mint `{GATED_SYMBOL}` may be called ONLY in prro/src/transports/dps/** — \
-         the engine must carry a transport-minted digest, never fabricate one. Violations: {all:#?}"
+        "cross-crate transport mints {GATED_SYMBOLS:?} may be called ONLY in \
+         prro/src/transports/dps/** — the engine must CARRY a transport-minted digest / provenance, \
+         never fabricate one. Violations: {all:#?}"
     );
 }
 
@@ -236,8 +250,27 @@ fn services_call_of_mint_is_caught() {
     "#;
     let v = scan_source(snippet, "<services_call>");
     assert!(
-        v.iter().any(|x| x.detail.contains(GATED_SYMBOL)),
+        v.iter().any(|x| x.detail.contains("from_transport_digest")),
         "a services-side from_transport_digest call must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn services_call_of_provenance_mint_is_caught() {
+    // PR2 pin4: the engine forging a fiscal-id provenance via the cross-crate `from_transport`
+    // ctor. Without this the D-4 argument (`Accepted` carries no digest because the non-empty id
+    // PROVES provenance) is defeatable. Both provenance types share the `from_transport` ident.
+    let snippet = r#"
+        fn map(reply: &Raw) -> SendResponse {
+            let id = NonEmptyFiscalNumber::from_transport("forged".to_string());
+            let code = NonOkStatusCode::from_transport(-1);
+            SendResponse::accepted(id, code)
+        }
+    "#;
+    let v = scan_source(snippet, "<services_provenance>");
+    assert!(
+        v.iter().filter(|x| x.detail.contains("from_transport")).count() >= 2,
+        "engine-side NonEmptyFiscalNumber/NonOkStatusCode::from_transport must both be caught: {v:#?}"
     );
 }
 
@@ -267,7 +300,7 @@ fn macro_invocation_laundering_is_caught() {
     "#;
     let v = scan_source(snippet, "<macro_invoke>");
     assert!(
-        v.iter().any(|x| x.detail.contains(GATED_SYMBOL)),
+        v.iter().any(|x| x.detail.contains("from_transport_digest")),
         "a macro invocation mentioning the mint must be caught: {v:#?}"
     );
 }
@@ -285,13 +318,28 @@ fn reexport_of_mint_is_caught() {
 }
 
 #[test]
+fn reexport_of_provenance_mint_is_caught() {
+    // PR2 pin4: a `use` re-export laundering the provenance ctor out of the decoder module.
+    let snippet = r#"
+        pub use prro_domain::delivery::NonEmptyFiscalNumber::from_transport;
+    "#;
+    let v = scan_source(snippet, "<reexport_provenance>");
+    assert!(
+        v.iter()
+            .any(|x| x.detail.contains("re-export") && x.detail.contains("from_transport")),
+        "a re-export of the provenance mint must be caught: {v:#?}"
+    );
+}
+
+#[test]
 fn cfg_test_double_is_exempt() {
-    // Test doubles (in #[cfg(test)] modules) legitimately call the mint — exempt.
+    // Test doubles (in #[cfg(test)] modules) legitimately call the mints — exempt.
     let snippet = r#"
         #[cfg(test)]
         mod tests {
             fn make() {
                 let _ = DecodedResponseDigest::from_transport_digest([0xAB; 32]);
+                let _ = NonEmptyFiscalNumber::from_transport("DPS-1".to_string());
             }
         }
     "#;
@@ -304,16 +352,16 @@ fn cfg_test_double_is_exempt() {
 
 #[test]
 fn ordinary_carry_of_a_digest_is_not_flagged() {
-    // The engine READING a digest out of an opaque reply (as_bytes / passing it on) is fine —
-    // only the MINT (from_transport_digest) is gated.
+    // The engine READING a digest / provenance out of an opaque reply (as_bytes / as_str / passing
+    // it on) is fine — only the MINT (from_transport* ctor) is gated.
     let snippet = r#"
-        fn carry(d: DecodedResponseDigest) -> [u8; 32] {
-            *d.as_bytes()
+        fn carry(d: DecodedResponseDigest, id: &NonEmptyFiscalNumber) -> ([u8; 32], String) {
+            (*d.as_bytes(), id.as_str().to_string())
         }
     "#;
     let v = scan_source(snippet, "<carry>");
     assert!(
         v.is_empty(),
-        "carrying a digest must not be flagged: {v:#?}"
+        "carrying a digest/id must not be flagged: {v:#?}"
     );
 }

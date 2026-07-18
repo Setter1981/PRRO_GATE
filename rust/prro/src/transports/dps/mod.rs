@@ -25,6 +25,7 @@ pub mod error;
 #[doc(hidden)]
 pub mod gen;
 pub mod grpc;
+pub mod raw_reply;
 pub mod t112;
 
 pub use channel::DpsChannel;
@@ -33,3 +34,8 @@ pub use dto::{
 };
 pub use error::{AuthorizationKind, DpsError};
 pub use grpc::GrpcDpsChannel;
+// CS-3 3.2 PR2 pin3: the shadow-path READ surface (spec §4.2). The construction
+// seal is the private `RawSendReplyInner` field + `pub(in crate::transports::dps)`
+// builders — making the module/read-types `pub` lets the engine (and tests) NAME and
+// MATCH the observation without gaining the ability to mint one.
+pub use raw_reply::{RawSendObservation, RawSendReply, RawSendReplyKind, WireDiagnostics};
