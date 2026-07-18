@@ -145,6 +145,14 @@ SendOutcomeInner::Accepted(SentAccepted)   // NO digest (D-4)
 
 ### 4.1c Total input sum-type + transport-minted provenance (B1, B2)
 
+> **AMENDMENT (2026-07-18, variant-3 adjudication — realized in PR4).** `ParsedReply` / `RepliedCode`
+> / `from_parsed` below were **RETIRED**: the engine mapper reads `RawSendReply::kind()` **directly**
+> (its 6-arm view is the strict superset — it also carries `RemoteAuthStatus`/`NoResponse`, which
+> `ParsedReply` cannot express), and the code×doc_type table lives in `SendOutcome::from_server_code`.
+> `from_dps_status` + `RawDpsStatus` are deleted. The provenance types (`NonEmptyFiscalNumber`,
+> `NonOkStatusCode`) and the digest-only-where-it-exists principle stand as written. See
+> `services/write_path/shadow_map.rs::map_send_reply` + PR4 pin A/B.
+
 Replace `from_dps_status(RawDpsStatus, doc_type, digest)` (digest-always) with a **total** input
 that carries a digest **only where one exists** (no `Option`/fictitious) and whose id/code carry
 **provenance**, not just form — the engine can fabricate neither:
