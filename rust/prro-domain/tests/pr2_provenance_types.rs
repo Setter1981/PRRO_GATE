@@ -38,7 +38,7 @@ fn binding() -> DpsProtocolBinding {
 #[test]
 fn call_failed_without_trusted_dps_envelope_classifies_submitted_unknown() {
     let ev = SubmissionEvidence::Started {
-        response: SendResponse::NoResponse(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+        response: SendResponse::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
         binding: binding(),
         envelope_hash: EnvelopeHash([0u8; 32]),
     };

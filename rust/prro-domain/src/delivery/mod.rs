@@ -399,11 +399,13 @@ pub enum NoResponseCause {
 }
 
 /// A peer response that is NOT a parseable DPS envelope (B8 fix).
+///
+/// CS-3 3.2 PR4: `AuthenticatedPeerGarbage` was REMOVED — tonic collapses a decode-failure to
+/// `Internal` (→ §4.3 row 9 `NoResponse{CallFailedWithoutTrustedDpsEnvelope}`), so the shipped
+/// transport can never mint it (it needs the future codec). The only remaining evidence is a
+/// TLS-proven auth status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteStatusEvidence {
-    /// TLS-authenticated peer, un-parseable body (e.g. WAF intercept).
-    /// CS-3 seam required to prove peer-auth (AM-2).
-    AuthenticatedPeerGarbage(GrpcStatusDigest),
     /// gRPC Unauthenticated / PermissionDenied over an established TLS session.
     /// CS-3 seam required to distinguish from `NoResponse` in the incumbent (AM-2).
     RemoteAuthStatus(GrpcStatusDigest),
@@ -414,8 +416,17 @@ pub enum RemoteStatusEvidence {
 /// Split from `SubmissionEvidence` because the port is always post-CAS
 /// (`CALL_STARTED` already fired), so `NotStarted` is structurally impossible
 /// at the port boundary.
+/// CS-3 3.2 PR4: **opaque + sealed** (was a public enum — §2 Class-A). Constructible ONLY via the
+/// authority ctors [`parsed`](Self::parsed)/[`no_response`](Self::no_response)/
+/// [`remote_status`](Self::remote_status), which are **source-gated to the ONE engine-mapper file**
+/// (`services/write_path/shadow_map.rs`, §4.4) — the engine mapper *constructs* a `SendResponse` but
+/// can only forward transport-minted evidence read out of the opaque `RawSendReply`; it can never
+/// inject a fabricated digest/id/code. Read via [`kind`](Self::kind).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SendResponse {
+pub struct SendResponse(SendResponseInner);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SendResponseInner {
     /// Genuine local absence — no bytes / no session reached the far side (B4).
     NoResponse(NoResponseCause),
     /// The far side responded, but NOT with a parseable DPS envelope (B8).
@@ -424,11 +435,42 @@ pub enum SendResponse {
     Parsed(SendOutcome),
 }
 
+/// Borrowed view of a sealed [`SendResponse`] — read (match) but never construct.
+#[derive(Debug)]
+pub enum SendResponseKind<'a> {
+    NoResponse(&'a NoResponseCause),
+    RemoteStatus(&'a RemoteStatusEvidence),
+    Parsed(&'a SendOutcome),
+}
+
 impl SendResponse {
+    // ── Authority ctors (§4.4) — source-gated to the engine-mapper file. ──
+    /// A DPS envelope was received and parsed into a [`SendOutcome`].
+    pub fn parsed(outcome: SendOutcome) -> Self {
+        Self(SendResponseInner::Parsed(outcome))
+    }
+    /// Genuine local absence — no trusted DPS reply reached the far side.
+    pub fn no_response(cause: NoResponseCause) -> Self {
+        Self(SendResponseInner::NoResponse(cause))
+    }
+    /// An authenticated peer replied, but NOT with a parseable DPS envelope.
+    pub fn remote_status(evidence: RemoteStatusEvidence) -> Self {
+        Self(SendResponseInner::RemoteStatus(evidence))
+    }
+
+    /// Read the sealed response for matching.
+    pub fn kind(&self) -> SendResponseKind<'_> {
+        match &self.0 {
+            SendResponseInner::NoResponse(c) => SendResponseKind::NoResponse(c),
+            SendResponseInner::RemoteStatus(e) => SendResponseKind::RemoteStatus(e),
+            SendResponseInner::Parsed(o) => SendResponseKind::Parsed(o),
+        }
+    }
+
     /// Per AM-1: `true` only when a real DPS envelope was parsed.
     /// `RemoteStatus` and `NoResponse` do NOT prove DPS forward-progress.
     pub fn proves_dps_forward_progress(&self) -> bool {
-        matches!(self, Self::Parsed(_))
+        matches!(self.0, SendResponseInner::Parsed(_))
     }
 }
 
@@ -444,7 +486,11 @@ pub struct SendOutcome(SendOutcomeInner);
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SendOutcomeInner {
     Accepted(SentAccepted),
-    Rejected(DpsReject),
+    /// §4.1b: the definitive verdict now carries its seam digest (the parsed reply's fingerprint).
+    Rejected {
+        verdict: DpsReject,
+        digest: DecodedResponseDigest,
+    },
     Indeterminate(SendIndeterminate),
 }
 
@@ -454,19 +500,12 @@ pub enum SendOutcomeKind<'a> {
     /// DPS accepted the document (non-empty `id`) — certainty = `Submitted`.
     Accepted(&'a SentAccepted),
     /// DPS issued a definitive verdict on THIS document — certainty = `Submitted`.
-    Rejected(DpsReject),
+    Rejected {
+        verdict: DpsReject,
+        digest: &'a DecodedResponseDigest,
+    },
     /// Parsed but does NOT establish processing certainty — `SubmittedUnknown`.
     Indeterminate(&'a SendIndeterminate),
-}
-
-/// A raw DPS reply status handed to [`SendOutcome::from_dps_status`] (Bridge-0.1).
-/// The engine builds this from the wire facts; the domain owns the total mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RawDpsStatus<'a> {
-    /// Status OK — carries the server fiscal id (empty ⇒ `OkButNoFiscalNumber`).
-    Ok { fiscal_id: &'a str },
-    /// A non-OK DPS status code (as emitted on the wire).
-    Error(i32),
 }
 
 impl SendOutcome {
@@ -474,64 +513,89 @@ impl SendOutcome {
     pub fn kind(&self) -> SendOutcomeKind<'_> {
         match &self.0 {
             SendOutcomeInner::Accepted(a) => SendOutcomeKind::Accepted(a),
-            SendOutcomeInner::Rejected(r) => SendOutcomeKind::Rejected(*r),
+            SendOutcomeInner::Rejected { verdict, digest } => SendOutcomeKind::Rejected {
+                verdict: *verdict,
+                digest,
+            },
             SendOutcomeInner::Indeterminate(i) => SendOutcomeKind::Indeterminate(i),
         }
     }
 
-    /// The SOLE honest, total constructor (Bridge-0.1). Maps a raw DPS status +
-    /// the STORE-OWNED `doc_type` to a sealed outcome:
-    /// - OK + non-empty id → `Accepted`; OK + empty id → `OkButNoFiscalNumber`.
-    /// - `-1..-16` named codes → the matching `DpsReject` verdict.
-    /// - `-2/-15` split STRICTLY by doc type: close/Z ⇒ `CloseAmbiguous`, else `Close`.
-    /// - `-3` → `SaveError`; `-4` and every other unrecognized code → `UnknownStatus`.
-    ///
-    /// Correction 1 (Bridge-0.1): `doc_type` is supplied by the engine from the durable
-    /// store, NEVER carried on the wire — a wire-carried doc type would just move forgery.
-    pub fn from_dps_status(
-        status: RawDpsStatus<'_>,
+    // ── CS-3 3.2 PR4 authority ctors (§4.4) — source-gated to the ONE engine-mapper file. ──
+    //
+    // They consume ONLY transport-minted provenance (`NonEmptyFiscalNumber` / `NonOkStatusCode` /
+    // `DecodedResponseDigest` read out of the opaque `RawSendReply`), so the engine mapper can
+    // forward evidence but never fabricate it. `from_dps_status` (the old digest-always,
+    // B1-dishonest form) is RETIRED (§4.1c / auditor directive #5) — no production or domain API
+    // path builds a `SendOutcome` from a raw wire status any more.
+
+    /// OK + non-empty id: wrap the ALREADY-VALIDATED transport-minted fiscal number directly
+    /// (NO [`SentAccepted::observe`] re-validation — validation belongs to the transport mint,
+    /// §4.4). No digest (D-4: the non-empty id IS the proof of acceptance).
+    pub fn accepted(fiscal_id: NonEmptyFiscalNumber) -> SendOutcome {
+        SendOutcome(SendOutcomeInner::Accepted(SentAccepted {
+            fiscal_number: fiscal_id.as_str().to_string(),
+        }))
+    }
+
+    /// OK + empty id — cannot prove acceptance (captures what a bare `Ok` erases).
+    pub fn ok_but_no_fiscal_number(digest: DecodedResponseDigest) -> SendOutcome {
+        SendOutcome(SendOutcomeInner::Indeterminate(SendIndeterminate(
+            SendIndeterminateInner::OkButNoFiscalNumber { digest },
+        )))
+    }
+
+    /// `status == 0` — a decode-indeterminate missing status (D-2, NEW).
+    pub fn missing_status(digest: DecodedResponseDigest) -> SendOutcome {
+        SendOutcome(SendOutcomeInner::Indeterminate(SendIndeterminate(
+            SendIndeterminateInner::MissingStatus { digest },
+        )))
+    }
+
+    /// A non-OK, non-UNKNOWN DPS status code (`NonOkStatusCode` ⇒ never `0`/`1`) + the STORE-owned
+    /// `doc_type` → the sealed outcome. The honest replacement for the old `from_dps_status` Error
+    /// branch: the `-2/-15` close/Z split lives HERE (the sole constructor) so `Close` vs
+    /// `CloseAmbiguous` can never be mismatched, and `-4`/unknown ⇒ `UnknownStatus` so it can never
+    /// hold a named verdict. Every verdict/indeterminate carries the parsed reply's digest (§4.1b).
+    pub fn from_server_code(
+        code: NonOkStatusCode,
         doc_type: DocType,
         digest: DecodedResponseDigest,
     ) -> SendOutcome {
         let is_close_shift = matches!(doc_type, DocType::ShiftClose | DocType::ZReport);
-        let inner = match status {
-            RawDpsStatus::Ok { fiscal_id } => match SentAccepted::observe(fiscal_id) {
-                Some(accepted) => SendOutcomeInner::Accepted(accepted),
-                None => SendOutcomeInner::Indeterminate(SendIndeterminate(
-                    SendIndeterminateInner::OkButNoFiscalNumber { digest },
-                )),
-            },
-            RawDpsStatus::Error(code) => match code {
-                -1 => SendOutcomeInner::Rejected(DpsReject::Verify),
-                -5 => SendOutcomeInner::Rejected(DpsReject::Type),
-                -6 => SendOutcomeInner::Rejected(DpsReject::NotPrevZReport),
-                -7 => SendOutcomeInner::Rejected(DpsReject::Xml),
-                -8 => SendOutcomeInner::Rejected(DpsReject::XmlDate),
-                -9 => SendOutcomeInner::Rejected(DpsReject::XmlChk),
-                -10 => SendOutcomeInner::Rejected(DpsReject::XmlZReport),
-                -11 => SendOutcomeInner::Rejected(DpsReject::Offline168),
-                -12 => SendOutcomeInner::Rejected(DpsReject::BadHashPrev),
-                -13 => SendOutcomeInner::Rejected(DpsReject::NotRegisteredRro),
-                -14 => SendOutcomeInner::Rejected(DpsReject::NotRegisteredSigner),
-                -16 => SendOutcomeInner::Rejected(DpsReject::OfflineId),
-                // §12 R1 — the -2/-15 split is doc-type dependent and lives HERE (the sole
-                // constructor), so `Close` vs `CloseAmbiguous` can never be mismatched.
-                -2 | -15 if is_close_shift => SendOutcomeInner::Indeterminate(SendIndeterminate(
-                    SendIndeterminateInner::CloseAmbiguous,
-                )),
-                -2 | -15 => SendOutcomeInner::Rejected(DpsReject::Close),
-                -3 => SendOutcomeInner::Indeterminate(SendIndeterminate(
-                    SendIndeterminateInner::SaveError,
-                )),
-                // -4 (canonical ERROR_UNKNOWN) + every other unrecognized code. Sealed
-                // `UnknownStatusCode` guarantees this can never hold a named DpsReject code.
-                other => SendOutcomeInner::Indeterminate(SendIndeterminate(
-                    SendIndeterminateInner::UnknownStatus {
+        // First resolve the verdict WITHOUT touching `digest` (Copy i32 only), so `digest` is
+        // moved exactly once into whichever arm actually builds the outcome.
+        let verdict = match code.get() {
+            -1 => Some(DpsReject::Verify),
+            -5 => Some(DpsReject::Type),
+            -6 => Some(DpsReject::NotPrevZReport),
+            -7 => Some(DpsReject::Xml),
+            -8 => Some(DpsReject::XmlDate),
+            -9 => Some(DpsReject::XmlChk),
+            -10 => Some(DpsReject::XmlZReport),
+            -11 => Some(DpsReject::Offline168),
+            -12 => Some(DpsReject::BadHashPrev),
+            -13 => Some(DpsReject::NotRegisteredRro),
+            -14 => Some(DpsReject::NotRegisteredSigner),
+            -16 => Some(DpsReject::OfflineId),
+            // §12 R1 — the -2/-15 split is doc-type dependent; NON-close ⇒ `Close`.
+            -2 | -15 if !is_close_shift => Some(DpsReject::Close),
+            _ => None,
+        };
+        let inner = match verdict {
+            Some(verdict) => SendOutcomeInner::Rejected { verdict, digest },
+            // Indeterminate residue: -2/-15 on a close/Z doc, -3, and -4/unknown.
+            None => {
+                let ind = match code.get() {
+                    -2 | -15 => SendIndeterminateInner::CloseAmbiguous { digest },
+                    -3 => SendIndeterminateInner::SaveError { digest },
+                    other => SendIndeterminateInner::UnknownStatus {
                         code: UnknownStatusCode(other),
                         digest,
                     },
-                )),
-            },
+                };
+                SendOutcomeInner::Indeterminate(SendIndeterminate(ind))
+            }
         };
         SendOutcome(inner)
     }
@@ -617,8 +681,18 @@ enum SendIndeterminateInner {
         code: UnknownStatusCode,
         digest: DecodedResponseDigest,
     },
-    SaveError,
-    CloseAmbiguous,
+    /// §4.1b: now carries the seam digest.
+    SaveError {
+        digest: DecodedResponseDigest,
+    },
+    /// §4.1b: now carries the seam digest.
+    CloseAmbiguous {
+        digest: DecodedResponseDigest,
+    },
+    /// D-2 (NEW): proto `status == 0` — a decode-indeterminate missing status.
+    MissingStatus {
+        digest: DecodedResponseDigest,
+    },
     OkButNoFiscalNumber {
         digest: DecodedResponseDigest,
     },
@@ -633,9 +707,11 @@ pub enum SendIndeterminateKind<'a> {
         digest: &'a DecodedResponseDigest,
     },
     /// -3 ERROR_SAVE — transient server error, retry is safe.
-    SaveError,
+    SaveError { digest: &'a DecodedResponseDigest },
     /// -2 ERROR_CHECK / -15 ERROR_NOT_OPEN_SHIFT on a close/Z-report doc type ONLY (§12 R1).
-    CloseAmbiguous,
+    CloseAmbiguous { digest: &'a DecodedResponseDigest },
+    /// proto `status == 0` — missing status on the wire (D-2).
+    MissingStatus { digest: &'a DecodedResponseDigest },
     /// DPS returned status OK but `id` was empty — cannot prove acceptance.
     OkButNoFiscalNumber { digest: &'a DecodedResponseDigest },
 }
@@ -650,8 +726,15 @@ impl SendIndeterminate {
                     digest,
                 }
             }
-            SendIndeterminateInner::SaveError => SendIndeterminateKind::SaveError,
-            SendIndeterminateInner::CloseAmbiguous => SendIndeterminateKind::CloseAmbiguous,
+            SendIndeterminateInner::SaveError { digest } => {
+                SendIndeterminateKind::SaveError { digest }
+            }
+            SendIndeterminateInner::CloseAmbiguous { digest } => {
+                SendIndeterminateKind::CloseAmbiguous { digest }
+            }
+            SendIndeterminateInner::MissingStatus { digest } => {
+                SendIndeterminateKind::MissingStatus { digest }
+            }
             SendIndeterminateInner::OkButNoFiscalNumber { digest } => {
                 SendIndeterminateKind::OkButNoFiscalNumber { digest }
             }
@@ -814,9 +897,9 @@ pub fn classify(evidence: &SubmissionEvidence) -> ClassifiedOutcome {
 }
 
 fn classify_started(response: &SendResponse) -> ClassifiedOutcome {
-    match response {
+    match response.kind() {
         // NoResponse: bytes may or may not have left — SubmittedUnknown (B4/RP4B-1).
-        SendResponse::NoResponse(cause) => {
+        SendResponseKind::NoResponse(cause) => {
             let routing = match cause {
                 NoResponseCause::LocalHandshakeFailure
                 | NoResponseCause::Timeout
@@ -834,14 +917,14 @@ fn classify_started(response: &SendResponse) -> ClassifiedOutcome {
             }
         }
         // RemoteStatus: authenticated peer replied but NOT with a DPS envelope (B8).
-        SendResponse::RemoteStatus(_) => ClassifiedOutcome {
+        SendResponseKind::RemoteStatus(_) => ClassifiedOutcome {
             certainty: SubmissionCertainty::SubmittedUnknown,
             provenance: ResponseProvenance::AuthenticatedPeer,
             routing: Some(ActiveRetryClass::ProbeRequired),
             node_effect: node_effect_for_active(ActiveRetryClass::ProbeRequired),
         },
         // Parsed: a real DPS envelope — apply the disjoint algebra (§5).
-        SendResponse::Parsed(outcome) => classify_parsed(outcome),
+        SendResponseKind::Parsed(outcome) => classify_parsed(outcome),
     }
 }
 
@@ -857,7 +940,7 @@ fn classify_parsed(outcome: &SendOutcome) -> ClassifiedOutcome {
         // Rejected: a definitive DPS verdict — certainty=Submitted, routing + effect per code.
         // The effect comes from `routing_for_reject` (NOT the class default) because
         // `-11 Offline168` diverges: (TerminalReject, NodeBlocked) vs `-1`'s NoNodeEffect.
-        SendOutcomeKind::Rejected(verdict) => {
+        SendOutcomeKind::Rejected { verdict, .. } => {
             let (routing, node_effect) = routing_for_reject(&verdict);
             ClassifiedOutcome {
                 certainty: SubmissionCertainty::Submitted,
@@ -912,8 +995,10 @@ fn routing_for_reject(verdict: &DpsReject) -> (ActiveRetryClass, NodeEffect) {
 fn routing_for_indeterminate(ind: &SendIndeterminate) -> ActiveRetryClass {
     match ind.kind() {
         SendIndeterminateKind::UnknownStatus { .. } => ActiveRetryClass::TransientRetry,
-        SendIndeterminateKind::SaveError => ActiveRetryClass::TransientRetry,
-        SendIndeterminateKind::CloseAmbiguous => ActiveRetryClass::ProbeRequired,
+        SendIndeterminateKind::SaveError { .. } => ActiveRetryClass::TransientRetry,
+        SendIndeterminateKind::CloseAmbiguous { .. } => ActiveRetryClass::ProbeRequired,
+        // D-2: proto status==0 is a decode-indeterminate — probe, don't blind-retry (§4.6).
+        SendIndeterminateKind::MissingStatus { .. } => ActiveRetryClass::ProbeRequired,
         SendIndeterminateKind::OkButNoFiscalNumber { .. } => ActiveRetryClass::ProbeRequired,
     }
 }

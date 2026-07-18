@@ -2,15 +2,19 @@
 //!
 //! The checkpoint audit found the outcome algebra could express illegal states
 //! (`UnknownStatus("-1")`, `CloseAmbiguous` on a `Sell` doc). The fix seals the algebra
-//! behind the SOLE constructor [`SendOutcome::from_dps_status`]. Per Bridge-0.1
-//! correction 2, the *bypass-impossibility* is proven by trybuild; THIS test proves the
-//! *matrix correctness* at runtime: every raw status × doc_type maps to the one honest
-//! outcome — named codes to their verdict, `-2/-15` split strictly by doc type, and
-//! `UnknownStatus` ONLY for codes with no dedicated verdict.
+//! behind the mapper-gated ctors that consume ONLY transport-minted provenance:
+//! [`SendOutcome::from_server_code`] (the `NonOkStatusCode` × doc_type matrix — the honest
+//! replacement for the retired `from_dps_status` Error branch), [`SendOutcome::accepted`]
+//! (OK + [`NonEmptyFiscalNumber`]), [`SendOutcome::ok_but_no_fiscal_number`] (OK + empty id),
+//! and [`SendOutcome::missing_status`] (proto `status == 0`). Per Bridge-0.1 correction 2,
+//! the *bypass-impossibility* is proven by trybuild; THIS test proves the *matrix
+//! correctness* at runtime: every server code × doc_type maps to the one honest outcome —
+//! named codes to their verdict, `-2/-15` split strictly by doc type, and `UnknownStatus`
+//! ONLY for codes with no dedicated verdict.
 
 use prro_domain::delivery::{
-    DecodedResponseDigest, DpsReject, RawDpsStatus, SendIndeterminateKind, SendOutcome,
-    SendOutcomeKind,
+    DecodedResponseDigest, DpsReject, NonEmptyFiscalNumber, NonOkStatusCode, SendIndeterminateKind,
+    SendOutcome, SendOutcomeKind,
 };
 use prro_domain::enums::DocType;
 
@@ -38,8 +42,14 @@ fn from_dps_status_maps_named_codes_to_verdicts() {
     ];
     for &(code, want) in named {
         for dt in [DocType::Sell, DocType::ZReport, DocType::ShiftClose] {
-            match SendOutcome::from_dps_status(RawDpsStatus::Error(code), dt, dg()).kind() {
-                SendOutcomeKind::Rejected(got) => assert_eq!(
+            match SendOutcome::from_server_code(
+                NonOkStatusCode::from_transport(code).unwrap(),
+                dt,
+                dg(),
+            )
+            .kind()
+            {
+                SendOutcomeKind::Rejected { verdict: got, .. } => assert_eq!(
                     got, want,
                     "code {code} on {dt:?} must map to {want:?}, got {got:?}"
                 ),
@@ -61,8 +71,17 @@ fn from_dps_status_splits_minus2_minus15_by_doc_type() {
             DocType::ServiceIn,
             DocType::ShiftOpen,
         ] {
-            match SendOutcome::from_dps_status(RawDpsStatus::Error(code), dt, dg()).kind() {
-                SendOutcomeKind::Rejected(DpsReject::Close) => {}
+            match SendOutcome::from_server_code(
+                NonOkStatusCode::from_transport(code).unwrap(),
+                dt,
+                dg(),
+            )
+            .kind()
+            {
+                SendOutcomeKind::Rejected {
+                    verdict: DpsReject::Close,
+                    ..
+                } => {}
                 other => {
                     panic!("{code} on non-close {dt:?} must be Rejected(Close), got {other:?}")
                 }
@@ -70,9 +89,15 @@ fn from_dps_status_splits_minus2_minus15_by_doc_type() {
         }
         // Close/Z doc types → Indeterminate(CloseAmbiguous).
         for dt in [DocType::ShiftClose, DocType::ZReport] {
-            match SendOutcome::from_dps_status(RawDpsStatus::Error(code), dt, dg()).kind() {
+            match SendOutcome::from_server_code(
+                NonOkStatusCode::from_transport(code).unwrap(),
+                dt,
+                dg(),
+            )
+            .kind()
+            {
                 SendOutcomeKind::Indeterminate(ind) => match ind.kind() {
-                    SendIndeterminateKind::CloseAmbiguous => {}
+                    SendIndeterminateKind::CloseAmbiguous { .. } => {}
                     other => panic!("{code} on close {dt:?} must be CloseAmbiguous, got {other:?}"),
                 },
                 other => panic!("{code} on close {dt:?} must be Indeterminate, got {other:?}"),
@@ -86,15 +111,30 @@ fn from_dps_status_splits_minus2_minus15_by_doc_type() {
 #[test]
 fn from_dps_status_unknown_only_for_non_named_codes() {
     // -3 is its own SaveError, not UnknownStatus.
-    match SendOutcome::from_dps_status(RawDpsStatus::Error(-3), DocType::Sell, dg()).kind() {
+    match SendOutcome::from_server_code(
+        NonOkStatusCode::from_transport(-3).unwrap(),
+        DocType::Sell,
+        dg(),
+    )
+    .kind()
+    {
         SendOutcomeKind::Indeterminate(ind) => {
-            assert!(matches!(ind.kind(), SendIndeterminateKind::SaveError));
+            assert!(matches!(
+                ind.kind(),
+                SendIndeterminateKind::SaveError { .. }
+            ));
         }
         other => panic!("-3 must be Indeterminate(SaveError), got {other:?}"),
     }
     // -4 (canonical ERROR_UNKNOWN) + truly-unknown codes → UnknownStatus with the raw code.
     for code in [-4, -99, -1234, -50] {
-        match SendOutcome::from_dps_status(RawDpsStatus::Error(code), DocType::Sell, dg()).kind() {
+        match SendOutcome::from_server_code(
+            NonOkStatusCode::from_transport(code).unwrap(),
+            DocType::Sell,
+            dg(),
+        )
+        .kind()
+        {
             SendOutcomeKind::Indeterminate(ind) => match ind.kind() {
                 SendIndeterminateKind::UnknownStatus { code: got, .. } => assert_eq!(got, code),
                 other => panic!("{code} must be UnknownStatus, got {other:?}"),
@@ -107,15 +147,13 @@ fn from_dps_status_unknown_only_for_non_named_codes() {
 /// OK + non-empty id → `Accepted`; OK + empty id → `OkButNoFiscalNumber` (AL-3).
 #[test]
 fn from_dps_status_ok_splits_accepted_vs_no_fiscal_number() {
-    match SendOutcome::from_dps_status(RawDpsStatus::Ok { fiscal_id: "DPS-1" }, DocType::Sell, dg())
+    match SendOutcome::accepted(NonEmptyFiscalNumber::from_transport("DPS-1".to_string()).unwrap())
         .kind()
     {
         SendOutcomeKind::Accepted(a) => assert_eq!(a.fiscal_number(), "DPS-1"),
         other => panic!("OK+id must be Accepted, got {other:?}"),
     }
-    match SendOutcome::from_dps_status(RawDpsStatus::Ok { fiscal_id: "" }, DocType::Sell, dg())
-        .kind()
-    {
+    match SendOutcome::ok_but_no_fiscal_number(dg()).kind() {
         SendOutcomeKind::Indeterminate(ind) => {
             assert!(matches!(
                 ind.kind(),

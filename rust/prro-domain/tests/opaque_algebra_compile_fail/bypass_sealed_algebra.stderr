@@ -1,7 +1,7 @@
 error[E0423]: cannot initialize a tuple struct which contains private fields
-  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:14:27
+  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:16:27
    |
-14 |     let _bypass_outcome = SendOutcome(unimplemented!());
+16 |     let _bypass_outcome = SendOutcome(unimplemented!());
    |                           ^^^^^^^^^^^
    |
 note: constructor is not visible here due to private fields
@@ -9,16 +9,25 @@ note: constructor is not visible here due to private fields
    |
    | pub struct SendOutcome(SendOutcomeInner);
    |                        ^^^^^^^^^^^^^^^^ private field
-help: you might have meant to use the `from_dps_status` associated function
+help: you might have meant to use an associated function to build this type
    |
-14 -     let _bypass_outcome = SendOutcome(unimplemented!());
-14 +     let _bypass_outcome = SendOutcome::from_dps_status(_, _, _);
+16 -     let _bypass_outcome = SendOutcome(unimplemented!());
+16 +     let _bypass_outcome = SendOutcome::accepted(_);
+   |
+16 -     let _bypass_outcome = SendOutcome(unimplemented!());
+16 +     let _bypass_outcome = SendOutcome::ok_but_no_fiscal_number(_);
+   |
+16 -     let _bypass_outcome = SendOutcome(unimplemented!());
+16 +     let _bypass_outcome = SendOutcome::missing_status(_);
+   |
+16 -     let _bypass_outcome = SendOutcome(unimplemented!());
+16 +     let _bypass_outcome = SendOutcome::from_server_code(_, _, _);
    |
 
 warning: unreachable call
-  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:14:27
+  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:16:27
    |
-14 |     let _bypass_outcome = SendOutcome(unimplemented!());
+16 |     let _bypass_outcome = SendOutcome(unimplemented!());
    |                           ^^^^^^^^^^^ ---------------- any code following this expression is unreachable
    |                           |
    |                           unreachable call
@@ -26,9 +35,9 @@ warning: unreachable call
    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
 
 error[E0423]: cannot initialize a tuple struct which contains private fields
-  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:17:33
+  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:19:33
    |
-17 |     let _bypass_indeterminate = SendIndeterminate(unimplemented!());
+19 |     let _bypass_indeterminate = SendIndeterminate(unimplemented!());
    |                                 ^^^^^^^^^^^^^^^^^
    |
 note: constructor is not visible here due to private fields
@@ -38,17 +47,17 @@ note: constructor is not visible here due to private fields
    |                              ^^^^^^^^^^^^^^^^^^^^^^ private field
 
 warning: unreachable call
-  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:17:33
+  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:19:33
    |
-17 |     let _bypass_indeterminate = SendIndeterminate(unimplemented!());
+19 |     let _bypass_indeterminate = SendIndeterminate(unimplemented!());
    |                                 ^^^^^^^^^^^^^^^^^ ---------------- any code following this expression is unreachable
    |                                 |
    |                                 unreachable call
 
 error[E0423]: cannot initialize a tuple struct which contains private fields
-  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:21:24
+  --> tests/opaque_algebra_compile_fail/bypass_sealed_algebra.rs:23:24
    |
-21 |     let _bypass_code = UnknownStatusCode(-1);
+23 |     let _bypass_code = UnknownStatusCode(-1);
    |                        ^^^^^^^^^^^^^^^^^
    |
 note: constructor is not visible here due to private fields

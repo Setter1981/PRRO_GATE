@@ -34,10 +34,17 @@ use prro::db::repositories::delivery_reservation::{self, NewReservation};
 use prro::db::tx::with_immediate;
 use prro_domain::delivery::{
     classify, AuthorizedGeneration, BoundedText, DecodedResponseDigest, DpsProtocolBinding,
-    DpsProtocolId, EnvelopeHash, GrpcStatusDigest, NoResponseCause, ObservedOutcomeV1,
-    PositiveGeneration, PreflightRefusal, ProtocolContractVersion, RawDpsStatus,
-    RemoteStatusEvidence, SendOutcome, SendResponse, SubmissionEvidence,
+    DpsProtocolId, EnvelopeHash, GrpcStatusDigest, NoResponseCause, NonEmptyFiscalNumber,
+    NonOkStatusCode, ObservedOutcomeV1, PositiveGeneration, PreflightRefusal,
+    ProtocolContractVersion, RemoteStatusEvidence, SendOutcome, SendResponse, SubmissionEvidence,
 };
+
+/// Local shim replacing the deleted domain `RawDpsStatus` — keeps the `parsed(...)` call sites
+/// terse while the domain no longer exposes a raw-status enum or `from_dps_status`.
+enum RawStatus<'a> {
+    Ok { fiscal_id: &'a str },
+    Error(i32),
+}
 use prro_domain::enums::DocType;
 use sqlx::SqlitePool;
 
@@ -267,15 +274,24 @@ fn started(response: SendResponse) -> SubmissionEvidence {
     }
 }
 
-/// Build a `Started{Parsed}` evidence from a raw DPS status via the SOLE sealed
-/// constructor. `dt` MUST equal the row's classify doc_type (the `-2/-15` close split
-/// happens inside `from_dps_status`).
-fn parsed(status: RawDpsStatus<'_>, dt: DocType) -> SubmissionEvidence {
-    started(SendResponse::Parsed(SendOutcome::from_dps_status(
-        status,
-        dt,
-        ev_digest(),
-    )))
+/// Build a `Started{Parsed}` evidence from a raw DPS status via the PR4 authority ctors.
+/// `dt` MUST equal the row's classify doc_type (the `-2/-15` close split happens inside
+/// [`SendOutcome::from_server_code`]).
+fn parsed(status: RawStatus<'_>, dt: DocType) -> SubmissionEvidence {
+    let outcome = match status {
+        RawStatus::Ok { fiscal_id } => {
+            match NonEmptyFiscalNumber::from_transport(fiscal_id.to_string()) {
+                Some(id) => SendOutcome::accepted(id),
+                None => SendOutcome::ok_but_no_fiscal_number(ev_digest()),
+            }
+        }
+        RawStatus::Error(code) => SendOutcome::from_server_code(
+            NonOkStatusCode::from_transport(code).unwrap(),
+            dt,
+            ev_digest(),
+        ),
+    };
+    started(SendResponse::parsed(outcome))
 }
 
 /// Mapped ClassifiedOutcome from the normative graph (§2 table).
@@ -333,7 +349,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // ── Started/NoResponse ──────────────────────────────────────────────────
         GraphRow {
             label: "Started/NoResponse(Timeout) → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry",
-            evidence: started(SendResponse::NoResponse(NoResponseCause::Timeout)),
+            evidence: started(SendResponse::no_response(NoResponseCause::Timeout)),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "NO_RESPONSE",
@@ -342,7 +358,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "Started/NoResponse(Cancelled) → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry",
-            evidence: started(SendResponse::NoResponse(NoResponseCause::Cancelled)),
+            evidence: started(SendResponse::no_response(NoResponseCause::Cancelled)),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "NO_RESPONSE",
@@ -351,7 +367,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "Started/NoResponse(LocalHandshake) → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry",
-            evidence: started(SendResponse::NoResponse(NoResponseCause::LocalHandshakeFailure)),
+            evidence: started(SendResponse::no_response(NoResponseCause::LocalHandshakeFailure)),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "NO_RESPONSE",
@@ -360,7 +376,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         },
         GraphRow {
             label: "Started/NoResponse(Crashed) → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry (RP4B-1)",
-            evidence: started(SendResponse::NoResponse(NoResponseCause::CrashedBeforeObservation)),
+            evidence: started(SendResponse::no_response(NoResponseCause::CrashedBeforeObservation)),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "NO_RESPONSE",
@@ -368,18 +384,12 @@ fn normative_graph_rows() -> Vec<GraphRow> {
             node_effect: "NoNodeEffect",
         },
         // ── Started/RemoteStatus ────────────────────────────────────────────────
-        GraphRow {
-            label: "Started/RemoteStatus(Garbage) → SUBMITTED_UNKNOWN/AUTHENTICATED_PEER/ProbeRequired",
-            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::AuthenticatedPeerGarbage(grpc_ev_digest()))),
-            doc_type: DocType::Sell,
-            certainty: "SUBMITTED_UNKNOWN",
-            provenance: "AUTHENTICATED_PEER",
-            routing: Some("ProbeRequired"),
-            node_effect: "ProbeRequired",
-        },
+        // NOTE: the former `RemoteStatus(Garbage)` row was DELETED — the
+        // `RemoteStatusEvidence::AuthenticatedPeerGarbage` variant no longer exists in the
+        // PR4 domain API (only `RemoteAuthStatus` remains).
         GraphRow {
             label: "Started/RemoteStatus(AuthStatus) → SUBMITTED_UNKNOWN/AUTHENTICATED_PEER/ProbeRequired",
-            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(grpc_ev_digest()))),
+            evidence: started(SendResponse::remote_status(RemoteStatusEvidence::RemoteAuthStatus(grpc_ev_digest()))),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "AUTHENTICATED_PEER",
@@ -389,18 +399,18 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // ── Started/Parsed(Accepted) ─────────────────────────────────────────────
         GraphRow {
             label: "Started/Parsed(Accepted) → SUBMITTED/PARSED_DPS_ENVELOPE/NULL",
-            evidence: parsed(RawDpsStatus::Ok { fiscal_id: "DPS-123" }, DocType::Sell),
+            evidence: parsed(RawStatus::Ok { fiscal_id: "DPS-123" }, DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
             routing: None,
             node_effect: "NoNodeEffect",
         },
-        // ── Started/Parsed(Rejected) — named codes via from_dps_status ─────────
+        // ── Started/Parsed(Rejected) — named codes via from_server_code ─────────
         // -1 Verify → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Verify/-1) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: parsed(RawDpsStatus::Error(-1), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-1), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -410,7 +420,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -5 Type → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Type/-5) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: parsed(RawDpsStatus::Error(-5), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-5), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -420,7 +430,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -6 NotPrevZReport → OperatorEscalation / OperatorEscalation
         GraphRow {
             label: "Rejected(NotPrevZReport/-6) → SUBMITTED/PARSED_DPS_ENVELOPE/OperatorEscalation/OperatorEscalation",
-            evidence: parsed(RawDpsStatus::Error(-6), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-6), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -430,7 +440,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -7 Xml → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Xml/-7) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: parsed(RawDpsStatus::Error(-7), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-7), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -440,7 +450,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -8 XmlDate → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlDate/-8) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: parsed(RawDpsStatus::Error(-8), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-8), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -450,7 +460,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -9 XmlChk → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlChk/-9) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: parsed(RawDpsStatus::Error(-9), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-9), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -460,7 +470,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -10 XmlZReport → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(XmlZReport/-10) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: parsed(RawDpsStatus::Error(-10), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-10), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -470,7 +480,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -11 Offline168 → TerminalReject / NodeBlocked
         GraphRow {
             label: "Rejected(Offline168/-11) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NodeBlocked",
-            evidence: parsed(RawDpsStatus::Error(-11), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-11), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -480,7 +490,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -12 BadHashPrev → MacRecovery / MacReseedPending
         GraphRow {
             label: "Rejected(BadHashPrev/-12) → SUBMITTED/PARSED_DPS_ENVELOPE/MacRecovery/MacReseedPending",
-            evidence: parsed(RawDpsStatus::Error(-12), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-12), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -490,7 +500,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -13 NotRegisteredRro → FnConfigError / FnConfigError
         GraphRow {
             label: "Rejected(NotRegisteredRro/-13) → SUBMITTED/PARSED_DPS_ENVELOPE/FnConfigError/FnConfigError",
-            evidence: parsed(RawDpsStatus::Error(-13), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-13), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -500,7 +510,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -14 NotRegisteredSigner → FnConfigError / FnConfigError
         GraphRow {
             label: "Rejected(NotRegisteredSigner/-14) → SUBMITTED/PARSED_DPS_ENVELOPE/FnConfigError/FnConfigError",
-            evidence: parsed(RawDpsStatus::Error(-14), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-14), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -510,7 +520,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -16 OfflineId → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(OfflineId/-16) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: parsed(RawDpsStatus::Error(-16), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-16), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -520,7 +530,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -2 on a non-close doc (§12 R1) → Rejected(Close) → TerminalReject / NoNodeEffect
         GraphRow {
             label: "Rejected(Close/Sell §12R1) → SUBMITTED/PARSED_DPS_ENVELOPE/TerminalReject/NoNodeEffect",
-            evidence: parsed(RawDpsStatus::Error(-2), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-2), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -531,7 +541,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -4 UnknownStatus → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
         GraphRow {
             label: "Indeterminate(Unknown/-4) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/TransientRetry",
-            evidence: parsed(RawDpsStatus::Error(-4), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-4), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -541,7 +551,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -3 SaveError → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
         GraphRow {
             label: "Indeterminate(SaveError/-3) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/TransientRetry",
-            evidence: parsed(RawDpsStatus::Error(-3), DocType::Sell),
+            evidence: parsed(RawStatus::Error(-3), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -551,7 +561,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -2 on Z_REPORT (§12 R1) → CloseAmbiguous → SUBMITTED_UNKNOWN / PARSED / ProbeRequired
         GraphRow {
             label: "Indeterminate(CloseAmbiguous/ZReport) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
-            evidence: parsed(RawDpsStatus::Error(-2), DocType::ZReport),
+            evidence: parsed(RawStatus::Error(-2), DocType::ZReport),
             doc_type: DocType::ZReport,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -561,7 +571,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // -2 on ShiftClose (§12 R1) → CloseAmbiguous → SUBMITTED_UNKNOWN / PARSED / ProbeRequired
         GraphRow {
             label: "Indeterminate(CloseAmbiguous/ShiftClose) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
-            evidence: parsed(RawDpsStatus::Error(-2), DocType::ShiftClose),
+            evidence: parsed(RawStatus::Error(-2), DocType::ShiftClose),
             doc_type: DocType::ShiftClose,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -571,7 +581,7 @@ fn normative_graph_rows() -> Vec<GraphRow> {
         // OK + empty id → OkButNoFiscalNumber → SUBMITTED_UNKNOWN / PARSED / ProbeRequired
         GraphRow {
             label: "Indeterminate(OkButNoFiscalNumber) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
-            evidence: parsed(RawDpsStatus::Ok { fiscal_id: "" }, DocType::Sell),
+            evidence: parsed(RawStatus::Ok { fiscal_id: "" }, DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
@@ -616,7 +626,7 @@ async fn st01_every_classifier_output_is_033_storable() {
 
         // ── Drive the REAL sealed classifier and read its output via the getters. ──
         // (Bridge-0.1 3.1b: `classify` takes no doc_type — the -2/-15 split is baked into
-        // the outcome at `from_dps_status`, so row.doc_type is used only at construction.)
+        // the outcome at `from_server_code`, so row.doc_type is used only at construction.)
         let classified = classify(&row.evidence);
         let got_cert = classified.certainty().as_str();
         let got_prov = classified.provenance().as_str();

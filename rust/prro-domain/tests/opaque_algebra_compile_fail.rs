@@ -5,7 +5,8 @@
 //! half — the sealed algebra cannot be BYPASSED. `SendOutcome` / `SendIndeterminate` wrap a
 //! PRIVATE inner enum and `UnknownStatusCode` has a PRIVATE field, so no external code can
 //! hand-construct an illegal outcome (the checkpoint's `UnknownStatus("-1")` /
-//! `CloseAmbiguous`+`Sell` states). The sole constructor is `SendOutcome::from_dps_status`.
+//! `CloseAmbiguous`+`Sell` states). The only constructors are the CS-3 3.2 PR4 mapper-gated
+//! `SendOutcome::{accepted, ok_but_no_fiscal_number, from_server_code, missing_status}`.
 //!
 //! TEETH (proven empirically during Bridge-0.1): make any of the three inner fields `pub`
 //! → the fixture compiles → this canary goes RED.
@@ -17,7 +18,7 @@ fn opaque_algebra_bypass_compile_fail() {
 }
 
 /// Bridge-0.1 (3.1b) — doc_type single-source canary. `classify` takes ONLY the sealed
-/// evidence; the `-2/-15` close split is consumed once, at `from_dps_status`. Passing a
+/// evidence; the `-2/-15` close split is consumed once, at `from_server_code`. Passing a
 /// second, independent `doc_type` to `classify` (the re-binding vector: a Sell-built
 /// outcome re-classified as ZReport) is an arity error, so it cannot be written.
 ///
