@@ -54,10 +54,17 @@ fn from_dps_status_maps_named_codes_to_verdicts() {
 fn from_dps_status_splits_minus2_minus15_by_doc_type() {
     for code in [-2, -15] {
         // Non-close doc types → Rejected(Close).
-        for dt in [DocType::Sell, DocType::Return, DocType::ServiceIn, DocType::ShiftOpen] {
+        for dt in [
+            DocType::Sell,
+            DocType::Return,
+            DocType::ServiceIn,
+            DocType::ShiftOpen,
+        ] {
             match SendOutcome::from_dps_status(RawDpsStatus::Error(code), dt, dg()).kind() {
                 SendOutcomeKind::Rejected(DpsReject::Close) => {}
-                other => panic!("{code} on non-close {dt:?} must be Rejected(Close), got {other:?}"),
+                other => {
+                    panic!("{code} on non-close {dt:?} must be Rejected(Close), got {other:?}")
+                }
             }
         }
         // Close/Z doc types → Indeterminate(CloseAmbiguous).
@@ -105,7 +112,8 @@ fn from_dps_status_ok_splits_accepted_vs_no_fiscal_number() {
         SendOutcomeKind::Accepted(a) => assert_eq!(a.fiscal_number(), "DPS-1"),
         other => panic!("OK+id must be Accepted, got {other:?}"),
     }
-    match SendOutcome::from_dps_status(RawDpsStatus::Ok { fiscal_id: "" }, DocType::Sell, dg()).kind()
+    match SendOutcome::from_dps_status(RawDpsStatus::Ok { fiscal_id: "" }, DocType::Sell, dg())
+        .kind()
     {
         SendOutcomeKind::Indeterminate(ind) => {
             assert!(matches!(

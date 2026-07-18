@@ -596,6 +596,9 @@ async fn h4_04_non_null_routing_class_accepts_node_blocked() {
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
     advance_to_cs_paired(&pool, 0x01).await;
 
+    // Offline168 (-11) is the real classifier output that yields this pairing:
+    // (SUBMITTED, PARSED_DPS_ENVELOPE, TerminalReject, NodeBlocked). Because routing_class
+    // is NON-NULL, the H4 clean-accept trigger does NOT fire, so NodeBlocked is valid here.
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', \
@@ -603,13 +606,13 @@ async fn h4_04_non_null_routing_class_accepts_node_blocked() {
              response_provenance = 'PARSED_DPS_ENVELOPE', \
              routing_class = 'TerminalReject', \
              apply_state = 'PENDING_APPLY', \
-             node_effect = 'NoNodeEffect' \
+             node_effect = 'NodeBlocked' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect("routing_class=TerminalReject + node_effect=NoNodeEffect must be accepted");
+    .expect("routing_class=TerminalReject (non-NULL) + node_effect=NodeBlocked must be accepted");
 }
 
 #[tokio::test]

@@ -420,9 +420,9 @@ impl SendOutcome {
                 -16 => SendOutcomeInner::Rejected(DpsReject::OfflineId),
                 // §12 R1 — the -2/-15 split is doc-type dependent and lives HERE (the sole
                 // constructor), so `Close` vs `CloseAmbiguous` can never be mismatched.
-                -2 | -15 if is_close_shift => SendOutcomeInner::Indeterminate(
-                    SendIndeterminate(SendIndeterminateInner::CloseAmbiguous),
-                ),
+                -2 | -15 if is_close_shift => SendOutcomeInner::Indeterminate(SendIndeterminate(
+                    SendIndeterminateInner::CloseAmbiguous,
+                )),
                 -2 | -15 => SendOutcomeInner::Rejected(DpsReject::Close),
                 -3 => SendOutcomeInner::Indeterminate(SendIndeterminate(
                     SendIndeterminateInner::SaveError,

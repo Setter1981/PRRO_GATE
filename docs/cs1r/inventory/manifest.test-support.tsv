@@ -2427,6 +2427,7 @@ test-support	prro-domain	prro-domain	ids::cashier_id_tests::from_str_roundtrip	f
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_accepts_typical_handle	false
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_empty	false
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_too_long	false
+test-support	prro-domain	prro-domain::opaque_algebra_compile_fail	opaque_algebra_bypass_compile_fail	false
 test-support	prro-domain	prro-domain::purity_gate	accepted_capability_nodes_are_annotated	false
 test-support	prro-domain	prro-domain::purity_gate	closure_edge_manifest_is_set_equal	false
 test-support	prro-domain	prro-domain::purity_gate	closure_manifest_root_and_schema_are_pinned	false
@@ -2449,10 +2450,15 @@ test-support	prro-domain	prro-domain::rp4b_2_classify_graph_pin	observed_outcome
 test-support	prro-domain	prro-domain::rp4b_2_classify_graph_pin	rp4b_2_classify_full_graph_matches_normative	false
 test-support	prro-domain	prro-domain::rp4b_2_classify_graph_pin	rp4b_3_parsed_rows_are_distinct_from_timeout	false
 test-support	prro-domain	prro-domain::rp4b_2_classify_graph_pin	sent_accepted_observe_rejects_empty_id	false
+test-support	prro-domain	prro-domain::rp4b_31_opaque_algebra	from_dps_status_maps_named_codes_to_verdicts	false
+test-support	prro-domain	prro-domain::rp4b_31_opaque_algebra	from_dps_status_ok_splits_accepted_vs_no_fiscal_number	false
+test-support	prro-domain	prro-domain::rp4b_31_opaque_algebra	from_dps_status_splits_minus2_minus15_by_doc_type	false
+test-support	prro-domain	prro-domain::rp4b_31_opaque_algebra	from_dps_status_unknown_only_for_non_named_codes	false
 test-support	prro-domain	prro-domain::rp4b_r2_sealed_and_node_effect	classify_surfaces_node_effect_offline168_vs_verify	false
 test-support	prro-domain	prro-domain::rp4b_r2_sealed_and_node_effect	classify_surfaces_node_effect_on_all_paths	false
 test-support	prro-domain	prro-domain::rp4b_r2_sealed_and_node_effect	kvt1_raw_enforces_min_length	false
 test-support	prro-domain	prro-domain::rp4b_r2_sealed_and_node_effect	record_copies_node_effect_from_classified	false
+test-support	prro-domain	prro-domain::rp4b_r2_sealed_and_node_effect	record_enforces_generation_certainty_invariant	false
 test-support	prro-domain	prro-domain::rp4b_r2_sealed_and_node_effect	record_rejects_non_positive_generation	false
 test-support	prro-domain	prro-domain::rp4b_r2_sealed_and_node_effect	sent_accepted_getter_reads_fiscal_number	false
 test-support	prro-domain	prro-domain::rp_cs1_4_contract_dag	contract_crates_are_io_free	false
