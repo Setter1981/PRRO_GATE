@@ -1,0 +1,23 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/opaque_algebra_compile_fail/fabricate_provenance.rs:9:15
+  |
+9 |     let _id = NonEmptyFiscalNumber("DPS-forged".to_string());
+  |               ^^^^^^^^^^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/delivery/mod.rs
+  |
+  | pub struct NonEmptyFiscalNumber(String);
+  |                                 ^^^^^^ private field
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/opaque_algebra_compile_fail/fabricate_provenance.rs:10:17
+   |
+10 |     let _code = NonOkStatusCode(-1);
+   |                 ^^^^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/delivery/mod.rs
+   |
+   | pub struct NonOkStatusCode(i32);
+   |                            ^^^ private field

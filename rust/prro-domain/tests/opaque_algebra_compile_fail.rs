@@ -40,3 +40,14 @@ fn digest_types_cannot_be_fabricated_by_literal_compile_fail() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/opaque_algebra_compile_fail/fabricate_digest.rs");
 }
+
+/// CS-3 3.2 (PR2) — provenance fabrication canary. `NonEmptyFiscalNumber` / `NonOkStatusCode` have a
+/// PRIVATE field; only the transport decoder mints them via `from_transport` (source-gated). An
+/// external literal (the engine fabricating a fiscal id / status code) is a privacy error.
+///
+/// TEETH: make either field `pub` → the fixture compiles → canary RED.
+#[test]
+fn provenance_types_cannot_be_fabricated_by_literal_compile_fail() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/opaque_algebra_compile_fail/fabricate_provenance.rs");
+}

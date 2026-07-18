@@ -146,6 +146,58 @@ impl GrpcStatusDigest {
     }
 }
 
+// ─── Transport-minted provenance types (CS-3 3.2 PR2, spec §4.1c) ─────────────
+
+/// A DPS-assigned fiscal number PROVEN to have come off a parsed reply (non-empty).
+///
+/// **Sealed:** private field; the sole ctor [`from_transport`](Self::from_transport) is `pub`
+/// (the transport decoder, another crate, must call it) but is restricted to the decoder by the
+/// workspace source-gate — so a non-empty id proves **provenance** (it was observed on the wire),
+/// not merely form. The engine can only CARRY it out of an opaque `RawSendReply`, never fabricate
+/// one; that is what lets `Accepted` carry no digest (D-4) — the id itself is the transport-proven
+/// evidence. `from_transport` also enforces the non-empty invariant (`OkButNoFiscalNumber` is the
+/// empty case, not this).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonEmptyFiscalNumber(String);
+
+impl NonEmptyFiscalNumber {
+    /// Transport-only mint. `None` if `id` is empty (that is `OkButNoFiscalNumber`, not this).
+    pub fn from_transport(id: String) -> Option<Self> {
+        if id.is_empty() {
+            None
+        } else {
+            Some(Self(id))
+        }
+    }
+    /// The fiscal number (guaranteed non-empty by construction).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A DPS status code PROVEN to be a real non-OK server code (`!= 0` and `!= 1`).
+///
+/// `0` = `UNKNOWN` (missing status → `MissingStatus`) and `1` = `OK` (→ `Accepted` / empty-id) are
+/// handled by dedicated branches, so a `ServerCode` can never hold them. Same sealing: private
+/// field + transport-only `from_transport` (source-gated).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NonOkStatusCode(i32);
+
+impl NonOkStatusCode {
+    /// Transport-only mint. `None` for `0` (UNKNOWN/MissingStatus) or `1` (OK/Accepted).
+    pub fn from_transport(code: i32) -> Option<Self> {
+        if code == 0 || code == 1 {
+            None
+        } else {
+            Some(Self(code))
+        }
+    }
+    /// The raw non-OK status code (guaranteed `!= 0 && != 1`).
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
 // ─── The three orthogonal delivery axes (§2) ─────────────────────────────────
 
 /// Axis 1 — did the submission definitely reach DPS? (D3: total over `SubmissionEvidence`)
@@ -338,6 +390,12 @@ pub enum NoResponseCause {
     /// Durable `CALL_STARTED` marker written, then reboot before any response observed.
     /// The document is `SubmittedUnknown` — fence held, no new wire (D4).
     CrashedBeforeObservation,
+    /// CS-3 3.2 (PR2, §4.3 branch 9): the call returned a reply/status that is NOT a trusted DPS
+    /// envelope and NOT the TLS-proven Unauth/PermDenied of `RemoteAuthStatus` — any other tonic
+    /// `Status` (Internal / Unavailable / Unknown / ResourceExhausted / DeadlineExceeded /
+    /// plaintext-auth …). It is **not** a genuine local absence, but classifies the same
+    /// (`SubmittedUnknown`); no blind resend.
+    CallFailedWithoutTrustedDpsEnvelope,
 }
 
 /// A peer response that is NOT a parseable DPS envelope (B8 fix).
@@ -763,7 +821,10 @@ fn classify_started(response: &SendResponse) -> ClassifiedOutcome {
                 NoResponseCause::LocalHandshakeFailure
                 | NoResponseCause::Timeout
                 | NoResponseCause::Cancelled
-                | NoResponseCause::CrashedBeforeObservation => ActiveRetryClass::TransientRetry,
+                | NoResponseCause::CrashedBeforeObservation
+                | NoResponseCause::CallFailedWithoutTrustedDpsEnvelope => {
+                    ActiveRetryClass::TransientRetry
+                }
             };
             ClassifiedOutcome {
                 certainty: SubmissionCertainty::SubmittedUnknown,
