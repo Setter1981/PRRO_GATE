@@ -25,6 +25,7 @@ pub mod error;
 #[doc(hidden)]
 pub mod gen;
 pub mod grpc;
+pub(crate) mod raw_reply;
 pub mod t112;
 
 pub use channel::DpsChannel;
