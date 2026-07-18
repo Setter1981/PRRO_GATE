@@ -2441,6 +2441,7 @@ live-dps	prro-domain	prro-domain	ids::cashier_id_tests::from_str_roundtrip	false
 live-dps	prro-domain	prro-domain	ids::cashier_id_tests::new_accepts_typical_handle	false
 live-dps	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_empty	false
 live-dps	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_too_long	false
+live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	doc_type_cannot_be_rebound_at_classify_compile_fail	false
 live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	opaque_algebra_bypass_compile_fail	false
 live-dps	prro-domain	prro-domain::purity_gate	accepted_capability_nodes_are_annotated	false
 live-dps	prro-domain	prro-domain::purity_gate	closure_edge_manifest_is_set_equal	false

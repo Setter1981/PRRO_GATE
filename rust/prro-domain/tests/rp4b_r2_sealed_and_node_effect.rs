@@ -95,8 +95,8 @@ fn parsed_reject(v: DpsReject) -> SubmissionEvidence {
 /// node effects — `classify` must surface that discriminant, not discard it.
 #[test]
 fn classify_surfaces_node_effect_offline168_vs_verify() {
-    let offline168 = classify(&parsed_reject(DpsReject::Offline168), DocType::Sell);
-    let verify = classify(&parsed_reject(DpsReject::Verify), DocType::Sell);
+    let offline168 = classify(&parsed_reject(DpsReject::Offline168));
+    let verify = classify(&parsed_reject(DpsReject::Verify));
 
     // Same routing triple...
     assert_eq!(offline168.routing(), Some(ARC::TerminalReject));
@@ -112,61 +112,43 @@ fn classify_surfaces_node_effect_offline168_vs_verify() {
 #[test]
 fn classify_surfaces_node_effect_on_all_paths() {
     // NotStarted / SigningFailed → WrapperBug routing → WrapperBug effect.
-    let signing = classify(
-        &not_started(PreflightRefusal::SigningFailed(
-            BoundedText::from_truncating("sign"),
-        )),
-        DocType::Sell,
-    );
+    let signing = classify(&not_started(PreflightRefusal::SigningFailed(
+        BoundedText::from_truncating("sign"),
+    )));
     assert_eq!(signing.routing(), Some(ARC::WrapperBug));
     assert_eq!(signing.node_effect(), NE::WrapperBug);
 
     // NotStarted / PreconditionFailed → TransientRetry → NoNodeEffect.
-    let precond = classify(
-        &not_started(PreflightRefusal::PreconditionFailed(
-            BoundedText::from_truncating("guard"),
-        )),
-        DocType::Sell,
-    );
+    let precond = classify(&not_started(PreflightRefusal::PreconditionFailed(
+        BoundedText::from_truncating("guard"),
+    )));
     assert_eq!(precond.node_effect(), NE::NoNodeEffect);
 
     // NoResponse(Timeout) → TransientRetry → NoNodeEffect.
-    let timeout = classify(
-        &started(SendResponse::NoResponse(NoResponseCause::Timeout)),
-        DocType::Sell,
-    );
+    let timeout = classify(&started(SendResponse::NoResponse(NoResponseCause::Timeout)));
     assert_eq!(timeout.node_effect(), NE::NoNodeEffect);
 
     // RemoteStatus → ProbeRequired routing → ProbeRequired effect.
-    let remote = classify(
-        &started(SendResponse::RemoteStatus(
-            RemoteStatusEvidence::RemoteAuthStatus(RawResponseDigest([0u8; 32])),
-        )),
-        DocType::Sell,
-    );
+    let remote = classify(&started(SendResponse::RemoteStatus(
+        RemoteStatusEvidence::RemoteAuthStatus(RawResponseDigest([0u8; 32])),
+    )));
     assert_eq!(remote.routing(), Some(ARC::ProbeRequired));
     assert_eq!(remote.node_effect(), NE::ProbeRequired);
 
     // Accepted → clean (routing None) → NoNodeEffect.
-    let accepted = classify(
-        &parsed(RawDpsStatus::Ok { fiscal_id: "DPS-1" }, DocType::Sell),
+    let accepted = classify(&parsed(
+        RawDpsStatus::Ok { fiscal_id: "DPS-1" },
         DocType::Sell,
-    );
+    ));
     assert_eq!(accepted.routing(), None);
     assert_eq!(accepted.node_effect(), NE::NoNodeEffect);
 
     // Indeterminate(CloseAmbiguous, -2 on a close doc) → ProbeRequired → ProbeRequired.
-    let close = classify(
-        &parsed(RawDpsStatus::Error(-2), DocType::ZReport),
-        DocType::ZReport,
-    );
+    let close = classify(&parsed(RawDpsStatus::Error(-2), DocType::ZReport));
     assert_eq!(close.node_effect(), NE::ProbeRequired);
 
     // Indeterminate(SaveError, -3) → TransientRetry → NoNodeEffect.
-    let save = classify(
-        &parsed(RawDpsStatus::Error(-3), DocType::Sell),
-        DocType::Sell,
-    );
+    let save = classify(&parsed(RawDpsStatus::Error(-3), DocType::Sell));
     assert_eq!(save.node_effect(), NE::NoNodeEffect);
 }
 
@@ -177,7 +159,7 @@ fn classify_surfaces_node_effect_on_all_paths() {
 /// what `classify` derived.
 #[test]
 fn record_copies_node_effect_from_classified() {
-    let classified = classify(&parsed_reject(DpsReject::Offline168), DocType::Sell);
+    let classified = classify(&parsed_reject(DpsReject::Offline168));
     // Offline168 → Submitted, so a Started generation is required (invariant).
     let gen = AuthorizedGeneration::Started(PositiveGeneration::new(5).unwrap());
     let rec =
@@ -213,17 +195,14 @@ fn record_enforces_generation_certainty_invariant() {
     let started = AuthorizedGeneration::Started(PositiveGeneration::new(1).unwrap());
 
     // Submitted (Verify reject) — Started ok, NotStarted rejected.
-    let submitted = classify(&parsed_reject(DpsReject::Verify), DocType::Sell);
+    let submitted = classify(&parsed_reject(DpsReject::Verify));
     assert!(ObservedOutcomeV1::record(&submitted, None, started).is_ok());
     assert!(ObservedOutcomeV1::record(&submitted, None, AuthorizedGeneration::NotStarted).is_err());
 
     // NotSubmitted (preflight NotStarted evidence) — NotStarted ok, Started rejected.
-    let not_submitted = classify(
-        &not_started(PreflightRefusal::PreconditionFailed(
-            BoundedText::from_truncating("guard"),
-        )),
-        DocType::Sell,
-    );
+    let not_submitted = classify(&not_started(PreflightRefusal::PreconditionFailed(
+        BoundedText::from_truncating("guard"),
+    )));
     assert_eq!(not_submitted.certainty(), SC::NotSubmitted);
     assert!(
         ObservedOutcomeV1::record(&not_submitted, None, AuthorizedGeneration::NotStarted).is_ok()

@@ -2427,6 +2427,7 @@ test-support	prro-domain	prro-domain	ids::cashier_id_tests::from_str_roundtrip	f
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_accepts_typical_handle	false
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_empty	false
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_too_long	false
+test-support	prro-domain	prro-domain::opaque_algebra_compile_fail	doc_type_cannot_be_rebound_at_classify_compile_fail	false
 test-support	prro-domain	prro-domain::opaque_algebra_compile_fail	opaque_algebra_bypass_compile_fail	false
 test-support	prro-domain	prro-domain::purity_gate	accepted_capability_nodes_are_annotated	false
 test-support	prro-domain	prro-domain::purity_gate	closure_edge_manifest_is_set_equal	false
