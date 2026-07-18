@@ -17,11 +17,11 @@
 //! and FAIL (type-not-found or classification mismatch) before the implementation lands.
 
 use prro_domain::delivery::{
-    classify, ActiveRetryClass, AuthorizedGeneration, BoundedText, DpsProtocolBinding,
-    DpsProtocolId, EnvelopeHash, NoResponseCause, NodeEffect, PositiveGeneration, PreflightRefusal,
-    ProtocolContractVersion, RawDpsStatus, RawResponseDigest, RemoteStatusEvidence,
-    ResponseProvenance, SendOutcome, SendResponse, SentAccepted, SubmissionCertainty,
-    SubmissionEvidence,
+    classify, ActiveRetryClass, AuthorizedGeneration, BoundedText, DecodedResponseDigest,
+    DpsProtocolBinding, DpsProtocolId, EnvelopeHash, GrpcStatusDigest, NoResponseCause, NodeEffect,
+    PositiveGeneration, PreflightRefusal, ProtocolContractVersion, RawDpsStatus,
+    RemoteStatusEvidence, ResponseProvenance, SendOutcome, SendResponse, SentAccepted,
+    SubmissionCertainty, SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
 
@@ -40,8 +40,12 @@ fn hash() -> EnvelopeHash {
     EnvelopeHash([0u8; 32])
 }
 
-fn digest() -> RawResponseDigest {
-    RawResponseDigest([0u8; 32])
+fn digest() -> DecodedResponseDigest {
+    DecodedResponseDigest::from_transport_digest([0xAB; 32])
+}
+
+fn grpc_digest() -> GrpcStatusDigest {
+    GrpcStatusDigest::from_transport_digest([0xAB; 32])
 }
 
 fn not_started_preflight() -> SubmissionEvidence {
@@ -188,13 +192,13 @@ fn normative_graph() -> Vec<GraphRow> {
         // ── Started{RemoteStatus} ───────────────────────────────────────────
         GraphRow {
             label: "Started/RemoteStatus(Garbage) → SubmittedUnknown/AuthenticatedPeer/ProbeRequired",
-            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::AuthenticatedPeerGarbage(digest()))),
+            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::AuthenticatedPeerGarbage(grpc_digest()))),
             doc_type: DocType::Sell,
             expected: expected(SC::SubmittedUnknown, RP::AuthenticatedPeer, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },
         GraphRow {
             label: "Started/RemoteStatus(AuthStatus) → SubmittedUnknown/AuthenticatedPeer/ProbeRequired",
-            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(digest()))),
+            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(grpc_digest()))),
             doc_type: DocType::Sell,
             expected: expected(SC::SubmittedUnknown, RP::AuthenticatedPeer, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },

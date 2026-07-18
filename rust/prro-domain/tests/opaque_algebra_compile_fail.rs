@@ -27,3 +27,16 @@ fn doc_type_cannot_be_rebound_at_classify_compile_fail() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/opaque_algebra_compile_fail/rebind_doc_type.rs");
 }
+
+/// CS-3 3.2 (PR1) — digest fabrication canary. `DecodedResponseDigest`/`GrpcStatusDigest` have a
+/// PRIVATE field; only the transport decoder mints them via `from_transport_digest`. An external
+/// literal (the engine fabricating a digest) is a privacy error, so it cannot be written. (The
+/// `from_transport_digest` ctor is `pub` for cross-crate use; a workspace source-gate — PR1 pin 5 —
+/// restricts CALLS to the decoder. This canary covers the literal-fabrication half.)
+///
+/// TEETH: make either digest field `pub` → the fixture compiles → canary RED.
+#[test]
+fn digest_types_cannot_be_fabricated_by_literal_compile_fail() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/opaque_algebra_compile_fail/fabricate_digest.rs");
+}

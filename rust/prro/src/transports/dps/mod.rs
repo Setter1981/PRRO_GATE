@@ -19,6 +19,7 @@
 //! tonic shapes do NOT belong in any production code path.
 
 pub mod channel;
+pub(crate) mod digest_framing;
 pub mod dto;
 pub mod error;
 #[doc(hidden)]

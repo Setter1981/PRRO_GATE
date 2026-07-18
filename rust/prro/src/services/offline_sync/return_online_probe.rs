@@ -561,7 +561,7 @@ mod ra_tests {
             dps_error_class(&DpsError::RemoteStatus {
                 code: "Unauthenticated".into(),
                 message: "x".into(),
-                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+                digest: prro_domain::delivery::GrpcStatusDigest::from_transport_digest([0xAB; 32]),
             }),
             "RemoteStatus"
         );
@@ -569,7 +569,9 @@ mod ra_tests {
             dps_error_class(&DpsError::Indeterminate {
                 code: -4,
                 message: "y".into(),
-                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+                digest: prro_domain::delivery::DecodedResponseDigest::from_transport_digest(
+                    [0xAB; 32]
+                ),
             }),
             "Indeterminate"
         );

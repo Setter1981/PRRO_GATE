@@ -9,12 +9,13 @@
 //! `UnknownStatus` ONLY for codes with no dedicated verdict.
 
 use prro_domain::delivery::{
-    DpsReject, RawDpsStatus, RawResponseDigest, SendIndeterminateKind, SendOutcome, SendOutcomeKind,
+    DecodedResponseDigest, DpsReject, RawDpsStatus, SendIndeterminateKind, SendOutcome,
+    SendOutcomeKind,
 };
 use prro_domain::enums::DocType;
 
-fn dg() -> RawResponseDigest {
-    RawResponseDigest([0u8; 32])
+fn dg() -> DecodedResponseDigest {
+    DecodedResponseDigest::from_transport_digest([0xAB; 32])
 }
 
 /// Every named DPS code maps to its dedicated `DpsReject` verdict — on ANY doc type

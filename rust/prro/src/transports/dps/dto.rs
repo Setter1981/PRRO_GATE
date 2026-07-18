@@ -132,8 +132,10 @@ pub struct RroInfo {
 
 // ─── Typed-DTO ↔ generated-prost conversions (crate-private) ───────────
 
+use super::digest_framing::{DigestFramer, MsgType};
 use super::error::{AuthorizationKind, DpsError};
 use super::gen;
+use prro_domain::delivery::DecodedResponseDigest;
 
 impl From<DpsCheckType> for gen::check::Type {
     fn from(t: DpsCheckType) -> Self {
@@ -167,18 +169,60 @@ impl From<&CheckSignBlob> for gen::CheckRequest {
     }
 }
 
-/// SHA-256 digest of a decoded DPS response envelope (re-encoded canonically via
-/// prost).  Captures the parsed reply as lossless raw-reply evidence for
-/// [`DpsError::Indeterminate`] (R3): deterministic, and distinct for distinct
-/// replies — so a later Bridge maps `Indeterminate` to
-/// `SendIndeterminate::UnknownStatus` carrying the SAME digest, never a fabricated
-/// one.  A re-encode (not the wire bytes) is used because tonic decodes the
-/// protobuf before this layer; prost's encoding is canonical/deterministic, so the
-/// digest is a stable fingerprint of the response content.
-fn response_digest<M: prost::Message>(m: &M) -> prro_domain::delivery::RawResponseDigest {
-    use prro_domain::delivery::RawResponseDigest;
-    use sha2::{Digest, Sha256};
-    RawResponseDigest(Sha256::digest(m.encode_to_vec()).into())
+// CS-3 3.2 (PR1): the decoded-content digest is the byte-exact, versioned framing of the KNOWN
+// decoded fields (spec §4.1), NOT a prost re-encode. It is a *collision-resistant fingerprint of
+// the decoded content* — NOT a raw-wire proof ([[project_digest_decoded_content_decision]]); a
+// re-encode would silently drop unknown fields / encoding quirks. The framing lives in
+// `digest_framing`; these functions are the SOLE mint of a `DecodedResponseDigest` (source-gated to
+// this decoder module — PR1 pin 5), so the engine can only carry a transport-minted digest.
+
+/// Framed digest of a decoded `CheckResponse` (fields in proto field-number order).
+fn decoded_digest_check(r: &gen::CheckResponse) -> DecodedResponseDigest {
+    let mut f = DigestFramer::new(MsgType::CheckResponse);
+    f.field_str(&r.id)
+        .field_int(r.status as i64)
+        .field_bytes(&r.id_sign)
+        .field_bytes(&r.data_sign)
+        .field_str(&r.error_message);
+    DecodedResponseDigest::from_transport_digest(f.finalize())
+}
+
+/// Framed digest of a decoded `StatusResponse`.
+fn decoded_digest_status(r: &gen::StatusResponse) -> DecodedResponseDigest {
+    let mut f = DigestFramer::new(MsgType::StatusResponse);
+    f.field_bool(r.open_shift)
+        .field_bool(r.online)
+        .field_str(&r.last_signer)
+        .field_int(r.status as i64)
+        .field_str(&r.error_message);
+    DecodedResponseDigest::from_transport_digest(f.finalize())
+}
+
+/// Framed digest of a decoded `RroInfoResponse` (16 fields incl. the recursive `operators`).
+fn decoded_digest_rro_info(r: &gen::RroInfoResponse) -> DecodedResponseDigest {
+    let mut f = DigestFramer::new(MsgType::RroInfoResponse);
+    f.field_int(r.status as i64)
+        .field_int(r.status_rro as i64)
+        .field_bool(r.open_shift)
+        .field_bool(r.online)
+        .field_str(&r.last_signer)
+        .field_str(&r.name)
+        .field_str(&r.name_to)
+        .field_str(&r.addr)
+        .field_bool(r.single_tax)
+        .field_bool(r.offline_allowed)
+        .field_int(r.add_num as i64)
+        .field_str(&r.pn)
+        .field_repeated(&r.operators, |b, o| {
+            b.field_str(&o.serial)
+                .field_int(o.status as i64)
+                .field_bool(o.senior)
+                .field_str(&o.isname);
+        })
+        .field_str(&r.tins)
+        .field_int(r.lnum as i64)
+        .field_str(&r.name_pay);
+    DecodedResponseDigest::from_transport_digest(f.finalize())
 }
 
 /// Dispatch a `gen::CheckResponse` onto either `Ok(CheckAck)` or a
@@ -230,7 +274,7 @@ pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAc
         Status::ErrorUnknown => {
             // R3: capture the parsed reply as lossless raw-reply evidence BEFORE
             // moving `error_message` out of `r`.
-            let digest = response_digest(&r);
+            let digest = decoded_digest_check(&r);
             Err(DpsError::Indeterminate {
                 code: -4,
                 message: r.error_message,
@@ -282,7 +326,7 @@ pub(crate) fn try_decode_status_response(
         Status::ErrorUnknown => {
             // R3: capture the parsed reply as lossless raw-reply evidence BEFORE
             // moving `error_message` out of `r`.
-            let digest = response_digest(&r);
+            let digest = decoded_digest_status(&r);
             Err(DpsError::Indeterminate {
                 code: -4,
                 message: r.error_message,
@@ -420,7 +464,7 @@ pub(crate) fn try_decode_rro_info_response(r: gen::RroInfoResponse) -> Result<Rr
         }
         Status::ErrorUnknown => {
             // R3: lossless raw-reply digest of the RroInfoResponse envelope.
-            let digest = response_digest(&r);
+            let digest = decoded_digest_rro_info(&r);
             Err(DpsError::Indeterminate {
                 code: -4,
                 message: "ERROR_UNKNOWN (-4) on RroInfoResponse".into(),
@@ -482,11 +526,10 @@ mod tests {
         );
     }
 
-    /// R3 (lossless raw-reply seam): `Indeterminate` carries a `RawResponseDigest`
-    /// derived from the ACTUAL parsed envelope, so the Bridge maps it losslessly
-    /// (no fabricated digest). Different replies → different digests; identical
-    /// replies → identical digest (deterministic). Teeth: a constant/fabricated
-    /// digest would fail the `assert_ne!`.
+    /// CS-3 3.2: `Indeterminate` carries a `DecodedResponseDigest` — the byte-exact framed
+    /// fingerprint of the ACTUAL decoded envelope (§4.1), so the Bridge carries the transport-minted
+    /// digest, never a fabricated one. Distinct DECODED CONTENT → distinct digest; identical content
+    /// → identical digest (deterministic). Teeth: a constant/fabricated digest fails the `assert_ne!`.
     #[test]
     fn r3_indeterminate_carries_reply_digest_not_fabricated() {
         use crate::transports::dps::gen::check_response::Status;

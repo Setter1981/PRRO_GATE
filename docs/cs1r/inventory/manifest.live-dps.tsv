@@ -646,6 +646,10 @@ live-dps	prro	prro	services::write_path::stage_send::tests::truncate_msg_caps_at
 live-dps	prro	prro	services::write_path::stage_send::tests::truncate_msg_passes_short_strings_unchanged	false
 live-dps	prro	prro	services::write_path::stage_send::tests::truncate_msg_respects_utf8_boundaries	false
 live-dps	prro	prro	services::write_path::stage_send::tests::wire_decision_to_outcome_kind_maps_per_w10_table	false
+live-dps	prro	prro	transports::dps::digest_framing::tests::check_response_shape_matches_independent_preimage	false
+live-dps	prro	prro	transports::dps::digest_framing::tests::distinct_content_yields_distinct_digest	false
+live-dps	prro	prro	transports::dps::digest_framing::tests::grpc_status_uses_numeric_code_not_debug	false
+live-dps	prro	prro	transports::dps::digest_framing::tests::repeated_nested_operators_are_recursive_and_counted	false
 live-dps	prro	prro	transports::dps::dto::tests::r3_indeterminate_carries_reply_digest_not_fabricated	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_is_not_transport	false
 live-dps	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_yields_indeterminate_not_transport	false
@@ -1089,6 +1093,13 @@ live-dps	prro	prro::derive_tax_summaries	items_in_same_group_sum_aggregated_into
 live-dps	prro	prro::derive_tax_summaries	items_without_tax_group_1_are_ignored	false
 live-dps	prro	prro::derive_tax_summaries	summaries_emit_in_input_order_emitter_handles_sort	false
 live-dps	prro	prro::derive_tax_summaries	unknown_tax_group_is_skipped_no_summary_emitted	false
+live-dps	prro	prro::digest_mint_source_gate	cfg_test_double_is_exempt	false
+live-dps	prro	prro::digest_mint_source_gate	macro_export_laundering_of_mint_is_caught	false
+live-dps	prro	prro::digest_mint_source_gate	macro_invocation_laundering_is_caught	false
+live-dps	prro	prro::digest_mint_source_gate	ordinary_carry_of_a_digest_is_not_flagged	false
+live-dps	prro	prro::digest_mint_source_gate	production_src_mints_digest_only_in_transport_decoder	false
+live-dps	prro	prro::digest_mint_source_gate	reexport_of_mint_is_caught	false
+live-dps	prro	prro::digest_mint_source_gate	services_call_of_mint_is_caught	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_expired_when_past_not_after	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_ok_when_more_than_30_days_remain	false
 live-dps	prro	prro::doctor_live_verdicts	cert_window_warn_when_less_than_30_days_remain	false
@@ -2441,6 +2452,7 @@ live-dps	prro-domain	prro-domain	ids::cashier_id_tests::from_str_roundtrip	false
 live-dps	prro-domain	prro-domain	ids::cashier_id_tests::new_accepts_typical_handle	false
 live-dps	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_empty	false
 live-dps	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_too_long	false
+live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	digest_types_cannot_be_fabricated_by_literal_compile_fail	false
 live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	doc_type_cannot_be_rebound_at_classify_compile_fail	false
 live-dps	prro-domain	prro-domain::opaque_algebra_compile_fail	opaque_algebra_bypass_compile_fail	false
 live-dps	prro-domain	prro-domain::purity_gate	accepted_capability_nodes_are_annotated	false

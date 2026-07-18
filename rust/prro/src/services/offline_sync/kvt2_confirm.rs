@@ -2357,12 +2357,14 @@ mod tests {
             DpsError::RemoteStatus {
                 code: "Unauthenticated".into(),
                 message: "creds rejected".into(),
-                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+                digest: prro_domain::delivery::GrpcStatusDigest::from_transport_digest([0xAB; 32]),
             },
             DpsError::Indeterminate {
                 code: -4,
                 message: "server unknown".into(),
-                digest: prro_domain::delivery::RawResponseDigest([0u8; 32]),
+                digest: prro_domain::delivery::DecodedResponseDigest::from_transport_digest(
+                    [0xAB; 32],
+                ),
             },
         ] {
             let out = classify_check_result(Err(err), Kvt2ConfirmSource::SentFresh, None, false);

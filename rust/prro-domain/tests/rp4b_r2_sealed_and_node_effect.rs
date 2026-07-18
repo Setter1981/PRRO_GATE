@@ -12,11 +12,11 @@
 //! `ObservedOutcomeV1::record` exist — must fail to compile, then pass.
 
 use prro_domain::delivery::{
-    classify, ActiveRetryClass as ARC, AuthorizedGeneration, BoundedText, DpsProtocolBinding,
-    DpsProtocolId, DpsReject, EnvelopeHash, Kvt1Raw, NoResponseCause, NodeEffect as NE,
-    ObservedOutcomeV1, PositiveGeneration, PreflightRefusal, ProtocolContractVersion, RawDpsStatus,
-    RawResponseDigest, RemoteStatusEvidence, ResponseProvenance as RP, SendOutcome, SendResponse,
-    SentAccepted, SubmissionCertainty as SC, SubmissionEvidence,
+    classify, ActiveRetryClass as ARC, AuthorizedGeneration, BoundedText, DecodedResponseDigest,
+    DpsProtocolBinding, DpsProtocolId, DpsReject, EnvelopeHash, GrpcStatusDigest, Kvt1Raw,
+    NoResponseCause, NodeEffect as NE, ObservedOutcomeV1, PositiveGeneration, PreflightRefusal,
+    ProtocolContractVersion, RawDpsStatus, RemoteStatusEvidence, ResponseProvenance as RP,
+    SendOutcome, SendResponse, SentAccepted, SubmissionCertainty as SC, SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
 
@@ -47,8 +47,8 @@ fn not_started(reason: PreflightRefusal) -> SubmissionEvidence {
     }
 }
 
-fn dg() -> RawResponseDigest {
-    RawResponseDigest([0u8; 32])
+fn dg() -> DecodedResponseDigest {
+    DecodedResponseDigest::from_transport_digest([0xAB; 32])
 }
 
 /// Build a `Started{Parsed}` evidence from a raw DPS status via the SOLE sealed
@@ -130,7 +130,7 @@ fn classify_surfaces_node_effect_on_all_paths() {
 
     // RemoteStatus → ProbeRequired routing → ProbeRequired effect.
     let remote = classify(&started(SendResponse::RemoteStatus(
-        RemoteStatusEvidence::RemoteAuthStatus(RawResponseDigest([0u8; 32])),
+        RemoteStatusEvidence::RemoteAuthStatus(GrpcStatusDigest::from_transport_digest([0xAB; 32])),
     )));
     assert_eq!(remote.routing(), Some(ARC::ProbeRequired));
     assert_eq!(remote.node_effect(), NE::ProbeRequired);

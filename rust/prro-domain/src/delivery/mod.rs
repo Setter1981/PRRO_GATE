@@ -11,7 +11,7 @@
 //!   [`RemoteStatusEvidence`], [`SendOutcome`], [`DpsReject`], [`SendIndeterminate`],
 //!   [`SentAccepted`], [`ReconcileOutcome`], [`Kvt1Raw`].
 //! - Supporting primitives: [`DpsProtocolBinding`], [`DpsProtocolId`], [`EnvelopeHash`],
-//!   [`BoundedText`], [`RawResponseDigest`], [`PreflightRefusal`].
+//!   [`BoundedText`], [`DecodedResponseDigest`], [`GrpcStatusDigest`], [`PreflightRefusal`].
 //! - [`ClassifiedOutcome`] + the total classifier [`classify`].
 //! - [`ObservedOutcomeV1`] — the self-contained durable record payload (A4-6 + amendment).
 //!
@@ -104,9 +104,47 @@ impl BoundedText {
     }
 }
 
-/// A fixed-size 32-byte digest of a raw DPS response body (prevents unbounded storage).
+/// Digest of a **decoded** DPS response envelope's KNOWN content (CS-3 3.2, spec §4.1).
+///
+/// **Sealed:** the field is private; the sole constructor
+/// [`from_transport_digest`](Self::from_transport_digest) takes an already-framed 32-byte hash.
+/// The versioned, length-prefixed framing + SHA-256 live in the transport decoder
+/// (`prro::transports::dps::digest_framing`) — the only place that can compute the bytes — and a
+/// workspace source-gate (PR1 pin 5) additionally restricts the constructor to that decoder, so the
+/// engine can only *carry* a transport-minted digest, never fabricate one. This is a
+/// *decoded-content* fingerprint, NOT a raw-wire proof ([[project_digest_decoded_content_decision]]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RawResponseDigest(pub [u8; 32]);
+pub struct DecodedResponseDigest([u8; 32]);
+
+impl DecodedResponseDigest {
+    /// The SOLE constructor: the framed 32-byte hash computed by the transport decoder.
+    pub fn from_transport_digest(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    /// The 32-byte digest (read-only).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Digest of a gRPC transport-status reply (`{code, message, details}`, spec §4.1).
+///
+/// A DISTINCT type from [`DecodedResponseDigest`] because it fingerprints a different kind of reply
+/// (a non-DPS gRPC status), with its own message-type tag in the framing. Same sealing: private
+/// field + transport-only `from_transport_digest`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrpcStatusDigest([u8; 32]);
+
+impl GrpcStatusDigest {
+    /// The SOLE constructor: the framed 32-byte hash computed by the transport decoder.
+    pub fn from_transport_digest(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    /// The 32-byte digest (read-only).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 // ─── The three orthogonal delivery axes (§2) ─────────────────────────────────
 
@@ -307,10 +345,10 @@ pub enum NoResponseCause {
 pub enum RemoteStatusEvidence {
     /// TLS-authenticated peer, un-parseable body (e.g. WAF intercept).
     /// CS-3 seam required to prove peer-auth (AM-2).
-    AuthenticatedPeerGarbage(RawResponseDigest),
+    AuthenticatedPeerGarbage(GrpcStatusDigest),
     /// gRPC Unauthenticated / PermissionDenied over an established TLS session.
     /// CS-3 seam required to distinguish from `NoResponse` in the incumbent (AM-2).
-    RemoteAuthStatus(RawResponseDigest),
+    RemoteAuthStatus(GrpcStatusDigest),
 }
 
 /// The raw send result (from `DpsSubmissionPort::submit_raw` — CS-6/Bridge).
@@ -395,7 +433,7 @@ impl SendOutcome {
     pub fn from_dps_status(
         status: RawDpsStatus<'_>,
         doc_type: DocType,
-        digest: RawResponseDigest,
+        digest: DecodedResponseDigest,
     ) -> SendOutcome {
         let is_close_shift = matches!(doc_type, DocType::ShiftClose | DocType::ZReport);
         let inner = match status {
@@ -519,12 +557,12 @@ pub struct SendIndeterminate(SendIndeterminateInner);
 enum SendIndeterminateInner {
     UnknownStatus {
         code: UnknownStatusCode,
-        digest: RawResponseDigest,
+        digest: DecodedResponseDigest,
     },
     SaveError,
     CloseAmbiguous,
     OkButNoFiscalNumber {
-        digest: RawResponseDigest,
+        digest: DecodedResponseDigest,
     },
 }
 
@@ -534,14 +572,14 @@ pub enum SendIndeterminateKind<'a> {
     /// Any code NOT in `DpsReject` (incl. `-4 ERROR_UNKNOWN`). `code` is the raw status.
     UnknownStatus {
         code: i32,
-        digest: &'a RawResponseDigest,
+        digest: &'a DecodedResponseDigest,
     },
     /// -3 ERROR_SAVE — transient server error, retry is safe.
     SaveError,
     /// -2 ERROR_CHECK / -15 ERROR_NOT_OPEN_SHIFT on a close/Z-report doc type ONLY (§12 R1).
     CloseAmbiguous,
     /// DPS returned status OK but `id` was empty — cannot prove acceptance.
-    OkButNoFiscalNumber { digest: &'a RawResponseDigest },
+    OkButNoFiscalNumber { digest: &'a DecodedResponseDigest },
 }
 
 impl SendIndeterminate {
