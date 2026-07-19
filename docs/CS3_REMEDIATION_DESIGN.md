@@ -1,4 +1,4 @@
-# CS-3 Oracle Remediation — rev 3
+# CS-3 Oracle Remediation — rev 3.1
 
 **Status:** DESIGN ONLY. No production code or migration 035 exists yet.
 
@@ -22,7 +22,10 @@ Migration 035 adds only columns, indexes, and triggers to the existing reservati
 ## 0. Independent re-audit corrections
 
 The rev-2 verdict `SIMPLIFY_THEN_SOUND` was too optimistic. The independent re-audit found four
-blocking defects. Rev 3 makes each one normative rather than leaving it as a residual.
+blocking defects. Rev 3 made each one normative rather than leaving it as a residual. The rev-3
+spot-check then found two further composition defects: origin-blind release of an offline reject and
+an unverified `STOP/BLOCKED -> GOING_ONLINE` handoff. Rev 3.1 closes both without adding an entity,
+mode, reservation state, or submit affordance.
 
 ### C1 — `seed_advanced` is removed
 
@@ -60,17 +63,24 @@ operator release that does not exist. Live code has no exit from document/shift 
 `reset_stop_mode` currently does not touch reservations
 (`admin.rs:281-390`; `fiscal_documents.rs:174-260`; `shifts.rs:74-94`).
 
-Rev 3 does not add an invented release token or FSM state. An unresolved outcome remains in the
-existing `PENDING_APPLY` state and the FN is put in the existing `STOP_MODE`. The existing
-`reset_stop_mode` operation is strengthened:
+Rev 3.1 does not add an invented release token or FSM state. An unresolved outcome remains in the
+existing `PENDING_APPLY` state and the FN is put in existing `STOP_MODE` (`Offline168` uses existing
+`BLOCKED`). The existing `reset_stop_mode` operation is strengthened:
 
 1. ordinary STOP reset is refused while a CS-3 reservation is `PENDING_APPLY`;
-2. an operator resolution completes that same reservation to `APPLIED` and resets
-   `STOP_MODE -> GOING_ONLINE` in one `BEGIN IMMEDIATE`;
-3. the decision and supplied reason are appended to the existing `audit_log`;
-4. no outcome evidence is rewritten and the document is never wired again.
+2. while the production CLI holds its existing singleton process lock, the command first runs the
+   existing read-only `status_rro` probe outside a write transaction and requires a trusted snapshot
+   with `online=true` whose `open_shift` agrees with the requested post-resolution shift projection;
+3. after a successful probe, one `BEGIN IMMEDIATE` full-tuple/generation CAS completes that same
+   reservation to `APPLIED`, clears its active pointer, applies the resolution, and moves the mode to
+   `GOING_ONLINE` when an active offline session must drain or directly to `ONLINE` when none exists;
+4. the decision, supplied reason, probe snapshot, and mode target are appended to the existing
+   `audit_log` in the same transaction;
+5. no outcome evidence is rewritten and the document is never submitted again.
 
 This is an extension of an existing operation over existing rows, not a new authority entity.
+`status_rro` is an FN-level reconciliation read, not a document `send_chk`/`submit_raw` call, and
+therefore does not weaken lifetime call-once.
 
 ### C4 — `Sent + NotFound` halts the FN atomically
 
@@ -88,6 +98,38 @@ returns before its cohort scan when mode is not `GoingOnline`
 (`offline_sync/backlog_drain.rs:687-704`). The existing reset surface therefore provides a real,
 audited exit after operator review.
 
+### C5/P3 — offline reject is origin-sensitive
+
+A parsed reject is seed-unchanged only for an online-origin document. An offline-origin document
+already advanced the local chain at `OfflineLocalAck`, before its later DPS transmission
+(`stage_offline_ack.rs:451-499`). It may also have locally issued successors. Therefore an
+offline-origin reject can never take the automatic `APPLIED/RELEASE` branch:
+
+1. its evidence is recorded without rewriting the existing classifier axes;
+2. the reservation remains `PENDING_APPLY`;
+3. the FN enters existing `STOP_MODE` (`Offline168` uses existing `BLOCKED`);
+4. operator completion must either validate the retained offline chain or atomically cancel every
+   dependent `OfflineLocalAck` successor and install the confirmed predecessor seed.
+
+Only after that existing-row repair may the reservation become `APPLIED` and clear its pointer.
+Online-origin definitive rejects retain the automatic seed-unchanged release.
+
+### C6/BRICK — return-online is proved, not assumed
+
+Live `return_online_probe` skips its DPS call when mode is already `GOING_ONLINE`, and live
+`backlog_drain` returns without changing the mode when no active offline session exists. Consequently,
+moving STOP/BLOCKED directly to `GOING_ONLINE` does not itself prove connectivity and can leave a
+non-offline FN permanently refusing ingress.
+
+The existing reset command therefore owns a pre-transaction `status_rro` call while
+`run_reset_stop_mode` holds the existing singleton lock that already refuses to race `prro serve`
+(`admin.rs:1368-1375`). Probe failure, `online=false`, or disagreement between `snapshot.open_shift`
+and the requested post-resolution shift projection changes no fiscal state. Probe success is consumed
+by the resolution transaction: an active OPEN/DRAINING offline session selects `GOING_ONLINE` for the
+existing drain, while no active session selects `ONLINE` directly. The transaction re-reads the
+session and mode before its CAS; the singleton lock excludes a production writer between probe and
+commit.
+
 ---
 
 ## 1. Safety properties and defending mechanisms
@@ -95,9 +137,9 @@ audited exit after operator review.
 | Property | Defending mechanism |
 |---|---|
 | **P2: at most one DPS wire call per document lifetime** | Partial unique index on `document_id WHERE call_started_at IS NOT NULL`; the same `NOT EXISTS` condition in `authorize_submission`; marker committed before wire; all production send sites pass through the consumed non-Clone authorization. |
-| **P3: the FN chain never forks** | Per-FN reservation fence holds RN, CS, and every PENDING apply; clean accept advances the seed before APPLIED in one transaction; unresolved outcomes enter STOP_MODE; `Sent+NotFound` enters STOP_MODE atomically. |
+| **P3: the FN chain never forks** | Per-FN reservation fence holds RN, CS, and every PENDING apply; clean accept advances the online seed before APPLIED in one transaction; an offline-origin reject remains PENDING until its locally advanced chain is validated or repaired; unresolved outcomes enter STOP_MODE/BLOCKED; `Sent+NotFound` enters STOP_MODE atomically. |
 | **P4: no silent loss/double-apply across crash** | Exact durable evidence union; record and apply are separate commits; apply is full-tuple/generation guarded and idempotent; PENDING is boot-hydrated without wire I/O. |
-| **BRICK: a legitimate next document is not refused forever** | No permanent outcome class remains in the SQL fence. Operator resolution finishes PENDING and resets STOP in one transaction. Definitive seed-unchanged rejects release automatically after APPLIED. |
+| **BRICK: a legitimate next document is not refused forever** | No permanent outcome class remains in the SQL fence. After a successful read-only DPS status probe, operator resolution finishes PENDING, clears the active pointer, and selects ONLINE directly or GOING_ONLINE for a real offline drain in one transaction. Only online-origin definitive seed-unchanged rejects release automatically after APPLIED. |
 
 The above is conditional on the named implementation gates in §7. Until they exist and bite,
 the design is not an implementation GO.
@@ -177,18 +219,21 @@ fences. Safety is instead obtained by the atomic apply/STOP rules below.
 |---|---|---|---|---|
 | 1 | `RESERVED_NOT_STARTED` | no wire yet | HOLD | protects the single active FN plan |
 | 2 | `CALL_STARTED` | wire outcome absent | HOLD | crash cannot authorize a new call |
-| 3 | Accepted, `PENDING_APPLY` | stamp F, apply ledger, advance online seed, mark APPLIED in one tx | RELEASE | seed and ledger are visible with release |
-| 4 | definitive seed-unchanged reject | apply target/audit, mark APPLIED | RELEASE | DPS did not accept; seed did not advance |
-| 5 | `-11 Offline168` | apply reject + node `BLOCKED`, mark APPLIED in one tx | RELEASE reservation; node HOLD | existing admin reset gains a guarded BLOCKED-resolution branch after the 168h condition is cleared |
-| 6 | SubmittedUnknown / ProbeRequired | keep PENDING; set node STOP in the record tx | HOLD | no new reservation and no same-doc wire |
-| 7 | `-12 MacRecovery` | keep PENDING; set node STOP in the record tx | HOLD | chain repair must precede operator completion |
-| 8 | `-6 OperatorEscalation` | keep PENDING; set node STOP in the record tx | HOLD | shift/order review must precede completion |
-| 9 | safe NotSubmitted preflight failure | apply local outcome, mark APPLIED | RELEASE | no call occurred |
-| 10 | previously Sent + reconciliation NotFound | doc RMR + node STOP + trace/audit in one tx | no active reservation; node HOLD | seed was already advanced; STOP prevents successor until review |
+| 3 | Accepted, `PENDING_APPLY` | stamp F, apply ledger; online-origin advances seed, offline-origin proves the existing local-chain ownership and performs zero seed writes; mark APPLIED in one tx | RELEASE | seed/ownership and ledger are visible with release |
+| 4 | **online-origin** definitive seed-unchanged reject | apply target/audit, mark APPLIED | RELEASE | DPS did not accept and this online attempt never advanced the seed |
+| 5 | **offline-origin** parsed reject (all verdict classes) | keep PENDING; set node STOP, or BLOCKED for `-11`, in the record tx | HOLD | local fiscalisation already advanced the chain; successor cleanup/validation and any seed correction must precede release |
+| 6 | **online-origin** `-11 Offline168` | apply reject + node `BLOCKED`, mark APPLIED in one tx | RELEASE reservation; node HOLD | guarded operator resolution requires the cause-cleared record and a successful DPS status probe |
+| 7 | SubmittedUnknown / ProbeRequired | keep PENDING; set node STOP in the record tx | HOLD | no new reservation and no same-doc submit |
+| 8 | **online-origin** `-12 MacRecovery` | keep PENDING; set node STOP in the record tx | HOLD | chain repair must precede operator completion |
+| 9 | **online-origin** `-6 OperatorEscalation` | keep PENDING; set node STOP in the record tx | HOLD | shift/order review must precede completion |
+| 10 | safe NotSubmitted preflight failure | apply local outcome, mark APPLIED | RELEASE | no call occurred |
+| 11 | previously Sent + reconciliation NotFound | doc RMR + node STOP + trace/audit in one tx | no active reservation; node HOLD | seed was already advanced; STOP prevents successor until review |
 
-For rows 6–8, the record transaction stores evidence and flips node mode to STOP atomically while
-leaving `apply_state=PENDING_APPLY`. SQLite `BEGIN IMMEDIATE` serializes the FN writer, and the
-PENDING fence remains authoritative even if a future path forgets the mode gate.
+For rows 5 and 7–9, the record transaction stores evidence and flips node mode to STOP atomically
+(`-11` flips it to BLOCKED) while leaving `apply_state=PENDING_APPLY`. SQLite `BEGIN IMMEDIATE`
+serializes the FN writer, and the PENDING fence remains authoritative even if a future path forgets
+the mode gate. The origin split is an apply decision over the immutable fiscal-document row; it does
+not change the classifier axes or add an evidence variant.
 
 ### 3.3 Whole-fence enforcement
 
@@ -207,32 +252,58 @@ operator-facing halt; it is not used as a substitute for the reservation check.
 
 ### 3.4 Existing `reset_stop_mode` extension
 
-The current `reset_stop_mode(pool, fiscal_number, reason)` is the only release surface. Its contract
-is strengthened, not duplicated:
+The current `reset_stop_mode(pool, fiscal_number, reason)` remains the only release surface. Its
+implementation/signature may receive the already existing DPS channel and FN signing material, but
+the command and authority stay the same. The contract is strengthened, not duplicated:
 
-- if no CS-3 PENDING reservation and no CS-3 NotFound-RMR marker exists, retain current behavior;
-- if a CS-3 PENDING row exists, a plain reset fails closed;
+- the production `run_reset_stop_mode` path holds its existing singleton process lock from before DB
+  open through the probe and resolution commit; an in-process caller must hold the existing
+  reconciliation guard for the same interval;
+- if a CS-3 PENDING row or CS-3 NotFound-RMR marker exists, a plain reset fails closed and a typed
+  operator resolution is mandatory;
 - the operator supplies one of the existing semantic resolutions through this command:
   accepted with the observed non-empty fiscal number; not accepted; or corrected chain seed for
   `MacReseedPending`;
-- the transaction re-reads the reservation, document, node mode, and current generation;
+- while still holding that existing guard, the command calls existing `status_rro` **outside**
+  `BEGIN IMMEDIATE`; any DPS error, `snapshot.online != true`, or mismatch between
+  `snapshot.open_shift` and the requested post-resolution shift projection leaves the reservation,
+  pointer, document, seed, shift, and node mode unchanged and appends only the existing failure audit;
+- after a successful probe, the transaction re-reads the reservation, document, node mode, current
+  generation, active pointer, and active OPEN/DRAINING offline session;
+- a PENDING completion uses the full authority predicate
+  `{reservation_id, stored authorized_generation == current node generation, binding, envelope_hash,
+  active_delivery_reservation_id == reservation_id}`;
 - accepted resolution stamps the supplied fiscal number and marks APPLIED; it advances the seed from
   the document's immutable `unsigned_xml_sha256` only for online-origin, while offline-origin proves
   the already locally advanced chain and never rewrites the seed backwards;
 - not-accepted resolution moves the document to its existing manual/terminal state without advancing
-  the seed and marks APPLIED;
+  an online seed; for offline-origin it performs the mandatory cohort cleanup and predecessor-seed
+  repair below before marking APPLIED;
 - MAC resolution writes the operator-confirmed seed through the existing
   `node_state::update_last_known_xml_sha_tx`, marks the document manual, and marks APPLIED;
-- the same transaction performs `STOP_MODE -> GOING_ONLINE` and appends a Critical audit row;
-- any stale generation, wrong effect, missing document, invalid seed length, CAS miss, or forbidden
-  document transition rolls back the entire operation.
+- the same transaction that changes `PENDING_APPLY -> APPLIED` clears
+  `active_delivery_reservation_id`, and no other operator branch may clear that pointer;
+- the mode target is `GOING_ONLINE` only when the in-transaction read proves an active OPEN/DRAINING
+  offline session that the existing backlog drain must finish; otherwise it is `ONLINE`;
+- the same transaction appends a Critical audit containing the semantic resolution, supplied reason,
+  successful DPS snapshot, previous/target mode, reservation id/generation when present, and cleanup
+  result;
+- any stale generation, wrong effect, missing document, invalid seed length, changed session, CAS miss,
+  forbidden document/shift transition, or pointer mismatch rolls back the entire operation.
 
-The same existing admin operation also gains a distinct guarded branch for
-`BLOCKED -> GOING_ONLINE`. It is accepted only when the latest cause is the applied `Offline168`
-effect, no active reservation exists, the operator records why the 168-hour condition is now cleared,
-and the return-online path will revalidate before ONLINE. A plain STOP reset cannot clear BLOCKED, and
-a plain BLOCKED reset cannot bypass these checks. This closes the pre-existing `-11` terminal-mode
-brick without adding a mode or a command.
+A successful probe followed by a transaction failure is harmless: it was read-only, and the node
+remains STOP/BLOCKED for a retry. No network or crypto operation occurs inside the SQLite transaction.
+The existing `return_online_probe` is not relied on after the mode change: it deliberately skips
+`GOING_ONLINE`, while the admin command has already obtained and transactionally consumed the
+required successful snapshot.
+
+The same existing admin operation also gains a guarded `BLOCKED` branch. For an online-origin
+`Offline168` already APPLIED, it requires no active reservation/pointer, the latest applied
+`Offline168` cause, the operator's cause-cleared reason, and the successful pre-probe above. For an
+offline-origin `Offline168`, the reservation is still PENDING, so the full operator completion,
+cohort/seed repair, pointer clear, and mode transition occur together. A plain STOP reset cannot clear
+BLOCKED, and a plain BLOCKED reset cannot bypass these checks. This closes the pre-existing `-11`
+terminal-mode brick without adding a mode or a command.
 
 The one missing live document edge is added to the existing whitelist:
 
@@ -243,7 +314,9 @@ Sending -> RequiresManualReconciliation
 It is callable only from the operator completion branch for a document that has a matching
 CALL_STARTED/PENDING reservation. It is not a resend or a new state.
 
-The complete origin × document-family shift/seed matrix is:
+The complete origin × document-family shift/seed matrix below applies to PENDING operator completion.
+An online-origin definitive reject that already took row 4's automatic APPLIED/RELEASE path does not
+enter it:
 
 | Origin / document | Accepted resolution | Not-accepted resolution |
 |---|---|---|
@@ -253,6 +326,13 @@ The complete origin × document-family shift/seed matrix is:
 | offline regular | stamp F; **no seed write**; validate existing offline chain ownership | doc `Sending -> RMR`; cancel later OLA successors or refuse; install operator-confirmed predecessor seed |
 | offline SHIFT_OPEN | stamp F; no seed write; existing `OLPD -> Opened` when cohort permits | doc `Sending -> RMR`; cancel dependent OLA cohort; narrow `OLPD -> Closed` rollback; install confirmed predecessor seed |
 | offline close/Z | stamp F; no seed write; existing `CLPD -> Closed` when cohort permits | doc `Sending -> RMR`; cancel dependent OLA cohort; narrow `CLPD -> OLPD` rollback; install confirmed predecessor seed |
+
+The successful `StatusSnapshot.open_shift` must agree with the selected matrix result before the
+transaction starts: accepted SHIFT_OPEN expects `true`, rejected SHIFT_OPEN expects `false`, accepted
+close/Z expects `false`, and rejected close/Z expects `true`. A regular document must preserve the
+server-visible predecessor shift posture (`Opened`/pending-close is open; `Closed` is closed). A
+mismatch is evidence that the requested resolution or local projection is stale; it is audited and
+changes no row.
 
 `OLPD` and `CLPD` mean the existing `OpenedLocalPendingDrain` and
 `ClosingLocalPendingDrain` states. The three rollback additions
@@ -395,11 +475,21 @@ The post-wire flow is:
 1. wire I/O completes outside a SQLite write transaction;
 2. record transaction writes evidence union, axes, authorized generation, node effect,
    `PENDING_APPLY`, transport trace, and audit;
-3. if the row is unresolved (rows 6–8), the same transaction also sets existing STOP_MODE and ends;
-4. otherwise a separate repeatable apply transaction re-reads the reservation and document, checks
-   `{reservation_id, authorized_generation, binding, envelope_hash}`, performs the ledger/seed/node
-   effect, marks APPLIED, and clears the active pointer;
+3. if the row is unresolved (row 5 or rows 7–9), the same transaction also sets existing STOP_MODE
+   (`BLOCKED` for `Offline168`) and ends;
+4. otherwise a separate repeatable apply transaction re-reads the reservation and immutable document
+   origin, checks
+   `{reservation_id, stored authorized_generation == current node generation, binding, envelope_hash,
+   active_delivery_reservation_id == reservation_id}`, performs the ledger/seed/node effect, marks
+   APPLIED, and clears the active pointer;
 5. a crash at any boundary leaves either CALL_STARTED or PENDING evidence; boot performs no wire call.
+
+The apply planner consumes only the recorded evidence plus the existing immutable document row.
+Origin is not re-derived from diagnostics: `offline_fiscal_no IS NULL` selects the online automatic
+rules, while a non-NULL offline stamp selects the offline ownership/hold rules. A parsed reject whose
+document is offline-origin is therefore a deliberate manual PENDING result even though its existing
+classifier routing remains `TerminalReject`, `FnConfigError`, `NodeBlocked`, `MacRecovery`, or
+`OperatorEscalation`.
 
 On boot, a durable CALL_STARTED row with no outcome is converted once to the existing
 `NoResponse { CrashedBeforeObservation }` leaf, `PENDING_APPLY`, and STOP_MODE. This is a local recovery
@@ -462,11 +552,11 @@ compares all four copies structurally; comments are not parsed.
 
 | Existing document | Required correction |
 |---|---|
-| Spec #2 delivery reservation FSM | Add lifetime call-once; replace active predicate with §3.1; make PENDING the only observed hold; describe STOP/operator completion. |
+| Spec #2 delivery reservation FSM | Add lifetime call-once; replace active predicate with §3.1; make PENDING the only observed hold; split automatic reject apply by immutable document origin; describe STOP/operator completion and pointer release. |
 | Spec #1 transition contract | Replace both `Sent + NotFound -> ErrorRetryable` rows with the atomic doc-RMR + node-STOP transaction; delete issued-doc redrive language. |
 | Spec #4A / CS-3 keystone | Make the existing discriminant payload-carrying and durable; assign record, hydration, and operator completion; retire live `-12 Resigned => continue`. |
 | Spec #4B DPS contract | Add authorize NOT-EXISTS; state that a started ambiguous attempt is never rewired; retain the current single CloseAmbiguous leaf. |
-| Bridge D/E dossier | Replace permanent routing fences with PENDING+STOP; add exact storage matrix, boot hydration, reset-stop guard, and call-once index. |
+| Bridge D/E dossier | Replace permanent routing fences with PENDING+STOP; add exact storage matrix, boot hydration, offline-reject hold, verified reset-stop handoff, pointer lifecycle, and call-once index. |
 
 No locked spec may continue to claim automatic resend for a document that crossed CALL_STARTED.
 
@@ -486,10 +576,13 @@ Each guard must be broken locally and shown to make its named test fail.
 | Full evidence round-trip | Every eleven leaf rows records, cold-reopens, hydrates, and derives the expected axes/effect. The test calls production `classify`/`record`, not a copied classifier. |
 | SQL matrix tightness | For every leaf, delete one required payload, add one forbidden payload, or swap routing/effect; each mutation is rejected by SQLite. Include NULL-bypass cases. |
 | Apply replay | Crash after record and after each apply write; cold replay produces one ledger/effect result, zero RPC, and APPLIED. Stale generation drops without ledger/seed/fence mutation. |
-| SubmittedUnknown liveness | Timeout after marker -> evidence PENDING + STOP. Plain reset fails. Operator completion + reset commits atomically; next legitimate document can authorize; original document never rewires. |
-| `-12/-6` liveness | Both enter PENDING+STOP. Plain reset fails. Correct operator completion releases PENDING; -12 seed correction uses existing tx-bound seed update; next doc extends the corrected/current seed. |
-| `-11` liveness | APPLIED `Offline168` releases the reservation but remains BLOCKED. Plain reset fails; guarded operator resolution CASes BLOCKED→GOING_ONLINE only after the cause is recorded as cleared. |
+| SubmittedUnknown liveness | Timeout after marker -> evidence PENDING + STOP. Plain reset fails. Failed `status_rro` changes no fiscal row. Successful probe + operator completion atomically marks APPLIED, clears the matching pointer, and selects ONLINE when no session exists or GOING_ONLINE for an active drain; next legitimate document can authorize and the original never rewires. |
+| `-12/-6` liveness | Both enter PENDING+STOP. Plain reset fails. Correct operator completion releases PENDING and its pointer; -12 seed correction uses the existing tx-bound seed update; next doc extends the corrected/current seed. Probe failure leaves the entire hold intact. |
+| `-11` liveness | Online-origin APPLIED `Offline168` releases the reservation but remains BLOCKED; offline-origin `Offline168` remains PENDING+BLOCKED. Plain reset fails. After a recorded cause-clear and successful probe, the guarded online branch requires no active pointer; the offline branch additionally repairs/validates its cohort and clears the matching PENDING pointer. |
+| Offline-reject origin split | Create offline doc A at OLA (seed advanced), then offline successor B, then return a terminal reject for A. A stays PENDING and node STOP, B produces zero DPS RPC, and a plain reset fails. Mutating the planner to the online APPLIED/RELEASE branch must make the pin RED. Operator completion either atomically cancels/reconciles B and installs the confirmed predecessor seed or refuses without partial writes. |
 | Operator matrix | Accepted/rejected regular, shift-open, shift-close/Z, and online/offline origins each exercise the real document + shift whitelists. Offline Accepted performs zero seed writes. Rejected shift documents exercise `Opening->Closed`, `OLPD->Closed`, or `CLPD->OLPD`; a mutation to `Created` must remain refused. An offline rejection with a live successor refuses reset unless successors are atomically cancelled/reconciled. |
+| Verified mode handoff | With STOP and no active offline session, successful probe + completion ends ONLINE (never stranded GOING_ONLINE). With an OPEN/DRAINING session it ends GOING_ONLINE and the existing drain owns promotion. Replacing the target selection with unconditional GOING_ONLINE must fail. A probe error, `online=false`, or `open_shift` mismatch must leave mode/evidence/pointer/ledger/seed/shift unchanged. Flip every matrix case's expected `open_shift`; each mutation must RED. |
+| Operator pointer lifecycle | For a PENDING row, completion requires `active_delivery_reservation_id == reservation_id`; APPLIED and pointer NULL commit together. Inject failure between every planned write and reopen: either both remain old or both are released, and a next-document authorization succeeds only in the released case. |
 | Sent+NotFound atomicity | Boot and offline variants produce doc RMR + STOP + trace/audit. Inject failure after each write; reopen sees either all old or all new state. Success followed by drain/ingress produces zero RPC until reset. |
 | Clean-accept atomic release | Inject a failure before seed/SFN/APPLIED commit; row remains PENDING and next doc is refused. Successful apply exposes all effects and releases. |
 | Legacy cutover | Reservation-less Sending/ErrorRetryable at activation fails closed before any wire; the pre-deploy empty-in-flight gate is the preferred production condition. |
@@ -506,15 +599,15 @@ Minimal implementation sequence:
 1. spec corrections and migration-035 tests;
 2. evidence field + record/hydration using the existing algebra;
 3. lifetime authorization and sole-caller wire gate;
-4. repeatable apply and PENDING boot resume;
-5. STOP/operator completion extension;
+4. origin-sensitive repeatable apply and PENDING boot resume;
+5. STOP/BLOCKED operator completion, pre-transaction DPS probe, pointer release, and verified mode target;
 6. atomic `Sent+NotFound`;
 7. whole-fence cutover and retirement of every blind-resend edge.
 
 D and E still land in one production release. No network or crypto operation occurs inside
 `BEGIN IMMEDIATE`.
 
-**Design verdict after rev-3 correction:** `DESIGN_SOUND, IMPLEMENTATION NOT YET GATED`.
+**Design verdict after rev-3.1 correction:** `DESIGN_SOUND, IMPLEMENTATION NOT YET GATED`.
 
 The design now gives an explicit defender for P2, P3, P4, and BRICK without a new table or domain
 entity. Implementation is `NO-GO` until the §7 teeth are observed RED on guard removal and green on

@@ -26,8 +26,11 @@ full token/fence contract; it does not re-state it** (an earlier rev drifted and
 > - **Fence** — reduced to `state IN ('RESERVED_NOT_STARTED','CALL_STARTED') OR (state='OUTCOME_OBSERVED'
 >   AND apply_state='PENDING_APPLY')` (no routing/certainty disjunct, no `seed_advanced` — proven dead).
 >   **Unresolved** outcomes (SubmittedUnknown / `-12` / `-6`) stay `PENDING_APPLY` + flip the existing
->   **`STOP_MODE`**; **release** = the strengthened existing **`reset_stop_mode`** (operator completes
->   PENDING → APPLIED + `STOP_MODE → GOING_ONLINE`). Definitive seed-unchanged rejects RELEASE at APPLIED.
+>   **`STOP_MODE`**; **release** = the strengthened existing **`reset_stop_mode`**, gated on a **verified
+>   read-only `status_rro`** (rev3.1: `online=true`, `open_shift` agrees — not bare operator trust), which
+>   completes PENDING → APPLIED, clears the active pointer atomically, and selects `ONLINE` or `GOING_ONLINE`
+>   by offline-session presence. Definitive **online-origin** seed-unchanged rejects RELEASE at APPLIED; an
+>   **offline-origin** reject HOLDS the fence until its chain is repaired.
 > - **P4** — `EvidenceDiscriminant` is **payload-carrying + durable** in four union columns on
 >   `delivery_reservation` (`evidence_kind/text/code/digest`) with fail-closed matrix triggers + boot hydration.
 > - **`Sent + NotFound`** → atomic doc-RMR + node-`STOP_MODE` + trace/audit (not a redrive).

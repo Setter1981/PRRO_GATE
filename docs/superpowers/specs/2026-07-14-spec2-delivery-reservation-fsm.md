@@ -104,6 +104,11 @@ op). Rev3 fixes it by **reusing existing machinery, no new table/state/token**:
   it completes the PENDING reservation to `APPLIED` and CASes `STOP_MODE → GOING_ONLINE` in one
   `BEGIN IMMEDIATE`. A plain STOP reset **fails closed** while a CS-3 PENDING row exists. No new release
   token / FSM state (design §3.4). This is the SubmittedUnknown fence-release the rev2 fence lacked.
+  **(rev3.1)** the release is gated on a **verified read-only `status_rro`** (probe OUTSIDE the tx,
+  `online=true`, `snapshot.open_shift` agrees) — not bare operator trust; it then selects `ONLINE` (no
+  offline session) or `GOING_ONLINE` (an active OPEN/DRAINING session must drain), and **clears the active
+  pointer atomically with `PENDING → APPLIED`**. An **offline-origin reject / `Offline168` HOLDS the fence**
+  (stays PENDING+BLOCKED) until its local chain is repaired (origin-sensitive — design §C5/§3.4).
 - **Definitive seed-unchanged rejects** (`TerminalReject` / `FnConfigError`, and `-11` with an atomic node
   `BLOCKED` + a guarded `BLOCKED → GOING_ONLINE` operator branch) **RELEASE** at `APPLIED` — no permanent
   brick (design §3.2 rows 4/5, §3.4).
