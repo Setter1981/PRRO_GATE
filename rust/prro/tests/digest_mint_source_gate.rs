@@ -1086,3 +1086,104 @@ fn unrelated_ctor_name_not_flagged() {
         "unrelated parsed/accepted idents (incl. StageSendOutcome) must not be flagged: {v:#?}"
     );
 }
+
+// ─── (M3) live-seam tripwire — the mapper stays wired into the production send path ──────────────
+//
+// Consolidated-audit M3: the §4.6 drift-pin proves `map_send_reply` AGREES with the live
+// `route_send_result` FOR ONE decode, but it constructs both sides itself — so DELETING the live
+// `map_send_reply` call from `stage_send.rs` (the shadow drives nothing in 3.2) left every test
+// GREEN. That call is the D/E TRIPWIRE: in Bridge + D/E the shadow becomes load-bearing (the
+// authoritative record), so the seam MUST survive intact until it is deliberately promoted. This AST
+// scan fails CLOSED if the live call disappears or its evidence source changes shape.
+//
+// The pin is intentionally tight (it asserts the exact live shape `map_send_reply(
+// wire_observation.evidence(), ..)`), so removing OR silently rewiring the seam is a RED that forces
+// a conscious update here — which is the whole point of a tripwire. Test code is exempt (the
+// drift-pin's own `map_send_reply` calls live in `grpc.rs`, a different file, and are `#[test]`).
+
+struct SeamScan {
+    /// non-test call-sites to `map_send_reply` in this file, any argument shape.
+    any_calls: usize,
+    /// of those, the ones whose first argument is exactly `wire_observation.evidence()` (the live
+    /// transport-minted observation) — the production seam we pin.
+    live_calls: usize,
+}
+
+/// `true` iff `arg` is the method call `wire_observation.evidence()` (structural, quote-free).
+fn arg_is_live_observation_evidence(arg: &syn::Expr) -> bool {
+    if let syn::Expr::MethodCall(mc) = arg {
+        if mc.method == "evidence" && mc.args.is_empty() {
+            if let syn::Expr::Path(p) = &*mc.receiver {
+                return p.path.is_ident("wire_observation");
+            }
+        }
+    }
+    false
+}
+
+impl<'ast> Visit<'ast> for SeamScan {
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        if is_test_exempt(&f.attrs) {
+            return;
+        }
+        syn::visit::visit_item_fn(self, f);
+    }
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        if is_test_exempt(&m.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, m);
+    }
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        if is_test_exempt(&f.attrs) {
+            return;
+        }
+        syn::visit::visit_impl_item_fn(self, f);
+    }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(p) = &*call.func {
+            let is_mapper = p
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident == "map_send_reply")
+                .unwrap_or(false);
+            if is_mapper {
+                self.any_calls += 1;
+                if call.args.first().is_some_and(arg_is_live_observation_evidence) {
+                    self.live_calls += 1;
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+#[test]
+fn m3_map_send_reply_stays_wired_into_stage_send() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let stage_send = manifest.join("src/services/write_path/stage_send.rs");
+    let text = fs::read_to_string(&stage_send).expect("read stage_send.rs");
+    let parsed = syn::parse_file(&text).expect("stage_send.rs parses");
+
+    let mut scan = SeamScan {
+        any_calls: 0,
+        live_calls: 0,
+    };
+    scan.visit_file(&parsed);
+
+    assert!(
+        scan.any_calls >= 1,
+        "the live `map_send_reply` call was REMOVED from stage_send.rs — the CS-3 3.2 read-only \
+         shadow seam is the D/E tripwire and must stay wired until deliberately promoted. If this \
+         removal is intentional (the shadow is being promoted / retired), update this tripwire."
+    );
+    assert_eq!(
+        scan.live_calls, 1,
+        "expected exactly ONE live `map_send_reply(wire_observation.evidence(), ..)` seam in \
+         stage_send.rs, found {} (any-shape count {}). The seam was rewired to a different \
+         evidence source — confirm it still forwards the single-RPC transport observation and \
+         update this pin.",
+        scan.live_calls, scan.any_calls
+    );
+}

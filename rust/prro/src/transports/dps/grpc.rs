@@ -588,6 +588,12 @@ mod tests {
     /// compare against; it is validated by the domain's own `routing_for_reject`/`node_effect_for_active`
     /// tests, and exercised for real when D/E consumes the shadow. This is NOT a full-outcome
     /// (target_state-level) equivalence claim.
+    ///
+    /// **Scope, part 2 (consolidated-audit M3):** this pin proves the mapper AGREES with the live
+    /// path, but it constructs both sides itself — it does NOT prove the mapper is WIRED into the
+    /// production send path. That wiring (the D/E tripwire) is pinned separately by
+    /// `digest_mint_source_gate::m3_map_send_reply_stays_wired_into_stage_send`, which REDs if the
+    /// live `map_send_reply(wire_observation.evidence(), ..)` call is removed from `stage_send.rs`.
     #[test]
     fn pin_d_section_4_6_drift_pin() {
         use crate::db::models::enums::NodeMode;
