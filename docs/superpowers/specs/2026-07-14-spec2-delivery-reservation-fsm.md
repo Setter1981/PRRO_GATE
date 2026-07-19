@@ -56,6 +56,14 @@ fiscal_number`. **`CallStarted` is committed DURABLE *before* `send_chk`** (`sta
 | `OutcomeRecordedPendingApply` | **boot-idempotent apply** of the recorded plan (see §4) |
 | applied | already resolved |
 
+**⟶ 3.2 realized-status (CS-3 recon; write-back).** The FSM is realized as an **INACTIVE schema shell**, not a
+live driver: migrations 032/033 create the exact 3 states as a strict `CHECK` + the `delivery_reservation` repo,
+but the repo has **zero production caller** (`delivery_reservation.rs` — tests only), and 033's `apply_state`
+(`NULL → PENDING_APPLY → APPLIED`) scaffolding is INACTIVE. `CrashedBeforeObservation` is **un-mintable by any
+live path**; today's live boot resolver runs off the `fiscal_documents` FSM → `ErrorRetryable`/`RMR`, **not**
+`SubmittedUnknown`. Activating the FSM (the durable `CallStarted` marker, the crash-window resolution above, and
+the atomic apply of §4) is **CS-3 Bridge/D/E** — this section is the design-locked target, not a description of 3.2.
+
 ## 4 · Atomic OutcomeObserved → ledger apply (S2-V3)
 **Verified real order:** the wire call runs first, then a **separate 4b tx** does
 `Sending→Sent + server_fiscal_no + seed + trace + audit` (`stage_send.rs:1539/1685/1865`). The
@@ -63,6 +71,9 @@ ambiguous timeout happens **before** that CAS, so `server_fiscal_no` is **not ye
 was wrong). Fix: the `OutcomeObserved` evidence **and** its ledger effect (`TransitionPlan`) commit
 in **ONE transaction**; where that is impossible, record `OutcomeRecordedPendingApply` durably and
 apply **boot-idempotently** — **"resolved" is forbidden before apply.**
+**⟶ 3.2 realized-status:** the `OutcomeRecordedPendingApply` two-commit apply is 033 scaffolding **INACTIVE** (no
+production caller); CS-3 Slice D wires the two commit boundaries (record `ObservedOutcomeV1` first, repeatable
+apply CAS second — keystone §2 slice D).
 
 ## 5 · SubmittedUnknown → chain-generation FENCE + honest reconciliation (S2-V4)
 A `SubmittedUnknown` sets a **durable per-FN chain-generation fence** — NOT just "no second call
@@ -70,6 +81,30 @@ during this call." While fenced, the FN may do **only** read-only reconciliation
 operator resolution; **no new issuance, no new offline-session, no seed advance.** *Why:* the seed
 advances only after a **known** `Accepted` (`stage_send.rs:1725`); starting doc B on the old seed
 while doc A was actually accepted **forks the chain** and B can evict A from `lastChk`.
+
+**Fence predicate (NORMATIVE — CS-3 Slice D authors migration 035).** The fence HOLDS through
+`OUTCOME_OBSERVED + PENDING_APPLY` and releases **only after `APPLIED`** for a clean accept / safe `NotSubmitted`;
+`SubmittedUnknown` and a routed-`Submitted` STAY fenced. 3.2's 033 fence index `ux_reservation_active` does **not**
+account for `apply_state`, so a clean accept (`OUTCOME_OBSERVED`, `routing_class NULL`, `apply_state=PENDING_APPLY`)
+falls OUT of the index and the FN-fence would drop **before** the ledger apply (033 itself flags "CS-3 rebuilds this
+with PENDING_APPLY/APPLIED"). **Slice D authors migration 035** rebuilding the two DB objects — the index
+`ux_reservation_active` and the trigger `delivery_reservation_no_replace` — plus the Rust helper `get_active_for_fn`
+(same predicate, updated in the same slice; SQLite has no stored fns), all sharing this predicate **verbatim**:
+```sql
+state IN ('RESERVED_NOT_STARTED','CALL_STARTED')
+OR ( state = 'OUTCOME_OBSERVED'
+     AND ( apply_state = 'PENDING_APPLY'
+        OR submission_certainty = 'SUBMITTED_UNKNOWN'
+        OR (submission_certainty = 'SUBMITTED' AND routing_class IS NOT NULL) ) )
+```
+RED-pin: revert migration 035 → a second same-FN reservation inserts while the first is `PENDING_APPLY` → RED (the
+auditor's reproduced canary).
+
+**The fence is FN-WIDE, not doc-local (NORMATIVE — CS-3 Slice E enforcement surface).** Under fence, for the WHOLE
+FN, E must: **gate all 7 `stage_send::run` callers** by reservation certainty; **remove/guard the
+`(ErrorRetryable → Sending)` edge**; **stop the 4 seed-writers** (`offline_code_replenish` / `boot_phase` /
+`stage_offline_ack` / the online seed-UPDATE); and **block** offline-ack / offline-session / offline-code-replenish
+— not merely the redrive path. (See keystone §2 slice E.)
 
 **Reconciliation is per-protocol, capability-gated.** `envelope_hash` is **not** a query key — the
 current DPS offers **no query-by-local-identity**, only `lastChk` + comparison of an **already-known
@@ -96,6 +131,12 @@ re-invokes the engine; same-key/different-hash → `Conflict`; `NoSafeReplayIden
 Keep `DpsError + RetryClass + evidence` intact **up to** the collapse at
 `inline_map.rs:394` (`StageSendOutcome`/`SendDisposition`); the collapse to `target_state` must
 happen **after** the three fields are recorded, not before.
+
+**⟶ 3.2 realized-status (CS-3 3.2 PR4; write-back).** `map_send_reply` derives `RawSendReply → SendResponse` and
+binds it as `_shadow_response` (`stage_send.rs:1573`, `shadow_map.rs:15`), but it is a **READ-ONLY shadow — the
+three fields are computed and NOT recorded before the `target_state` collapse**; the live decision is still the
+legacy `route_send_result` collapse (`stage_send.rs:1587`). So this cut-point is a **design-locked target, not
+already-realized** — **D/E wires the shadow load-bearing** (records the three fields, drives routing off them).
 
 ## 9 · RED-pins (rev 2)
 - **RP-1 (started-call ⇒ SubmittedUnknown):** a `Transport`/timeout after `CallStarted` yields

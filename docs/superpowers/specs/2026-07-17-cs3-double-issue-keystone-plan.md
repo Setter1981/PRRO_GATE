@@ -12,6 +12,12 @@ Spec #2 (delivery FSM) · migration 032 (`delivery_reservation`, INACTIVE).
 > The working branch `fuzzer-tier1-dossier` is **stale** (pre-CS-2). Ground every line number against `origin/main`
 > (worktree isolation). **This plan is TO BE committed to `origin/main` as the oracle** (currently untracked on
 > the stale branch — a `origin/main` worktree would not otherwise see it; committing is the §5 operational step).
+>
+> **⟶ STATUS 2026-07-19 (write-back):** DONE — this plan + the spec family are now **TRACKED on `origin/main`**
+> (#285 `f2c17b1` spec1/spec2 · #311 `7ff0cf2` spec4b · #312 `b5c85e0` keystone); §5's "commit the oracle" + "#4B header → GO" + "#4A A4-6 amendment"
+> operational steps are **executed**. THIS PR is the follow-up **drift write-back** (the 9 reconciliation-delta
+> CONFIRMED drifts + the dossier-rev9 §2A refinements). The BASE-BRANCH / ground-on-`origin/main` guidance above
+> still holds for implementers of the D/E slices.
 
 ## 0 · What CS-3 is + the north-star pins
 CS-3 **activates** the INACTIVE `delivery_reservation` model so a **`SubmittedUnknown`** doc is **never
@@ -41,8 +47,13 @@ blind-resent** — killing double-issue. #4A locks the contract; #4B types the m
 - **The live `-12` double-wire:** `stage_send.rs:1068-1069`
   `match mac_recovery::run_mac_recovery(...).await? { MacRecoveryOutcome::Resigned => continue, ...}` — the
   `continue` re-loops the send with **re-signed bytes** = a real second wire-call. NS-3 kills this.
-- **`-4` collapse:** `dto.rs:215` `Status::ErrorUnknown => Err(DpsError::Transport(...))` — a parsed DPS `-4`
-  becomes indistinguishable from a bare timeout → `TransientRetry` → blind re-send.
+- **`-4` collapse (CS-3 recon — TYPE-baseline REFRESHED; behavioral hazard remains):** Slice A **shipped** —
+  `Status::ErrorUnknown => Err(DpsError::Indeterminate{ code: -4, .. })` (`dto.rs:277`), so `-4` is now a **typed
+  `Indeterminate`, distinct from a bare timeout** (the old `dto.rs:215` `Transport` collapse is superseded). BUT
+  `error_routing.rs:331` still projects `Indeterminate → ErrorRetryable / TransientRetry` (a documented
+  "compatibility projection", audit-identical to `Transport`), so the **blind-resend hazard persists** until the
+  fence / differentiation lands in **slice E**. The residual hazard is re-anchored to the routing layer, not the
+  decode.
 - **Chain-seed writers (must all respect the fence):** the seed-UPDATE fn `node_state::update_last_known_xml_sha_tx`
   (`node_state.rs:170`; sibling `seed_prevhash` `:137`) has **four** real callers (grounded, corrected):
   `offline_code_replenish.rs:267`, `boot_phase.rs:1814`, `stage_offline_ack.rs:495`, `stage_send.rs:1785`
@@ -77,6 +88,105 @@ blind-resent** — killing double-issue. #4A locks the contract; #4B types the m
 **Order:** `C-pure ‖ B → C-DB → A → A′ → Bridge → D → E`. **D and E MUST ship in the same production release**
 (fix 5): D creates reservations, E enforces the fence — D without E creates unenforced reservations; E without D
 has nothing to enforce. Value (double-issue kill) lands at E.
+
+## 2A · Normative D/E refinements (from dossier rev9 — write into the oracle)
+These lift the two dossier-rev9 normative locks that belong in the spine: the durable-record **discriminant**
+(C-pure) and the total **`ObservedOutcomeV1 → ApplyPlan`** matrix + its full-tuple pin (D). The token/fence
+contract stays in §2's D/E slice rows (slices D, E); these are the pieces not yet in a spec.
+
+### 2A.1 · `EvidenceDiscriminant` — the durable record must be LOSSLESS (C-pure; audit Bl1)
+`ObservedOutcomeV1` (`mod.rs:1114`) stores `{certainty, provenance, routing, remote_correlation_id, node_effect,
+authorized_generation}` — NOT the evidence leaf / `DpsReject` code / `ProbeReason`. Distinct outcomes
+(`MissingStatus` / `CloseAmbiguous`−2 / `CloseAmbiguous`−15 / `OkButNoFiscalNumber` / TLS `RemoteStatus`) collapse
+to the SAME tuple yet need different probe/audit, so `record → ApplyPlan` would be **undefined**. **LOCK:** add a
+closed `evidence_discriminant` to `ObservedOutcomeV1` (the current `ProbeReason`, `error_routing.rs:242`, has only
+3 variants and is NOT sufficient). Verbatim:
+```rust
+enum EvidenceDiscriminant {
+    PreconditionFailed,
+    SigningFailed,
+    NoResponse(NoResponseCause),
+    RemoteAuthStatus,
+    Accepted,
+    Rejected(DpsReject),
+    UnknownStatus(i32),
+    SaveError,
+    CloseAmbiguous(CloseAmbiguousCode),
+    MissingStatus,
+    OkButNoFiscalNumber,
+}
+enum CloseAmbiguousCode { Code2, Code15 }
+```
+With it, `record → ApplyPlan` is a **total function** (boot-after-record reconstructs losslessly). This is the
+concrete realization of the C-pure "durable semantic/effect discriminant" (§2 C-pure row).
+
+### 2A.2 · `ObservedOutcomeV1 → ApplyPlan` — the total matrix (D; audit Bl3)
+`ObservedOutcomeV1` carries no `target_state` / audit-plan / trace-completion / probe-semantics; the live
+`RoutingDecision` has 7 effect fields (`error_routing.rs:53`). Before D, build the NORMATIVE total matrix over the
+durable record — two grounded halves + a projection:
+
+**(A) classifier leaf table — VERBATIM from `classify` (`mod.rs:893`); rows TOTAL over the graph:**
+
+| evidence leaf | certainty | provenance | routing (`ActiveRetryClass`) | `node_effect` |
+|---|---|---|---|---|
+| NotStarted / `PreconditionFailed` | NotSubmitted | NoResponse | TransientRetry | NoNodeEffect |
+| NotStarted / `SigningFailed` | NotSubmitted | NoResponse | **WrapperBug** | **WrapperBug** |
+| Started / NoResponse (any cause) | SubmittedUnknown | NoResponse | TransientRetry | NoNodeEffect |
+| Started / RemoteStatus | SubmittedUnknown | AuthenticatedPeer | ProbeRequired | ProbeRequired |
+| Started / Parsed / **Accepted** | Submitted | ParsedDpsEnvelope | (none) | NoNodeEffect |
+| Started / Parsed / Rejected(code) | Submitted | ParsedDpsEnvelope | `routing_for_reject(code)` ↓ | per code ↓ |
+| Started / Parsed / Indeterminate(`UnknownStatus`/`SaveError`) | SubmittedUnknown | ParsedDpsEnvelope | TransientRetry | NoNodeEffect |
+| Started / Parsed / Indeterminate(`CloseAmbiguous`/`MissingStatus`/`OkButNoFiscalNumber`) | SubmittedUnknown | ParsedDpsEnvelope | ProbeRequired | ProbeRequired |
+
+`routing_for_reject` per `DpsReject` — VERBATIM (`mod.rs:983`): `Verify / Type / Xml / XmlDate / XmlChk /
+XmlZReport / OfflineId / Close` → `(TerminalReject, NoNodeEffect)`; `NotPrevZReport` → `(OperatorEscalation,
+OperatorEscalation)`; `Offline168`(−11) → `(TerminalReject, NodeBlocked)`; `BadHashPrev`(−12) → `(MacRecovery,
+MacReseedPending)`; `NotRegisteredRro` / `NotRegisteredSigner` → `(FnConfigError, FnConfigError)`.
+
+**(B) ApplyPlan projection `(certainty, routing, node_effect) → 6 output dims`:**
+- **`node_effect`** = the classifier's, verbatim (table A).
+- **issuance effects (SPLIT — snapshot-aware, Bl3):** only for clean Accepted (`Submitted ∧ routing=None`), and
+  per origin: **`SFN stamp`** fires **always** (on Accepted); **`seed advance`** only for **online-origin**
+  (`offline_fiscal_no.is_none()`, `stage_send.rs:1771`); **`shift-confirm`** only for online-origin ∧ the shift
+  doc/edge (`stage_send.rs:1829`). An offline-origin clean accept stamps SFN only (seed/shift stay owned by the
+  offline path, not re-fired). NONE of these for any non-Accepted leaf.
+- **`target_state` · `audit_event/severity` · `probe`** = **`route_send_result(DpsError, doc_type)` VERBATIM**
+  (the behaviour-preserving oracle, `error_routing.rs:53`), with the **D2 rule**: a reject/indeterminate resolved
+  **pre-SENT** takes its `route_send_result.target_state`; **post-SENT** (issued-but-unconfirmed) → **RMR** (seed
+  already advanced, not rolled back). **Accepted → `DocState::Sent`** (`stage_send.rs:1720` — NOT terminal `Ack`).
+- **`audit/trace`** — conditional completion: complete an EXISTING `transport_trace`; for a pre-wire refusal
+  (`NotStarted`) where none exists, do NOT create one.
+- **`fence`** (per the migration-035 predicate — Spec #2 §5): **RELEASE** (at `APPLIED`) iff `certainty ∈
+  {clean-Accepted, NotSubmitted}`; **HELD** iff `certainty=SubmittedUnknown` OR `(Submitted ∧ routing≠None)`.
+
+### 2A.3 · The ApplyPlan pair-graph pin (7D — Bl2; NEW work)
+The 3.2 drift-pin is **coarse** — it compares only `{retry_class, node-Blocked}` (`grpc.rs:584`). The ApplyPlan pin
+extends comparison to the **full 7 dimensions** `(target_state, retry_class, seed/SFN/shift, node_effect, audit,
+probe, fence)` — `retry_class` (routing) an **explicit** dimension — and **ESTABLISHES the complete delta set**
+(NOT assumed a-priori). Rule: **unchanged rows → exact-7-tuple-equal**; **declared cutover rows → their exact
+`(incumbent, target)` 7-tuple**; **any other divergence the pin surfaces → adjudicate** (declare if intentional,
+else RED) — so "no 4th delta" is a pin RESULT, not a claim. The target-side ProbeRequired **audit is LOCKED** to the
+incumbent's `AuditEvent::StageSendProbeRequired / Warning` (`error_routing.rs:449`); each ProbeRequired leaf has a
+**named `ProbeReason`** (keyed by `EvidenceDiscriminant`), added alongside the existing `DecodeUnknown` /
+`Code2CloseShift` / `Code15CloseShift`. The **3 KNOWN deltas**:
+1. **empty-id** — incumbent is a **`GuardAbort` / `NoApply` sentinel**: `EmptyServerFiscalNo` (`stage_send.rs:1589`)
+   aborts BEFORE 4-b (doc stays `Sending` for W9, **no in-line ApplyPlan**). target = `OkButNoFiscalNumber`
+   `(ErrorRetryable, ProbeRequired, none, ProbeRequired, StageSendProbeRequired/Warning,
+   ProbeRequired[ProbeReason::OkButNoFiscalNumber], HELD)`.
+2. **unknown non-zero** — incumbent `Decode` `(ErrorRetryable, ProbeRequired, none, None, StageSendDecodeUnknown/
+   Warning, ProbeRequired[DecodeUnknown], HELD)` (`error_routing.rs:360`); target `UnknownStatus` `(ErrorRetryable,
+   TransientRetry, none, None, StageSendTransientRetry/Warning, no-probe, HELD)` — **diverges on {retry_class,
+   audit, probe}** (routing reverses).
+3. **TLS `RemoteStatus`** — incumbent `(ErrorRetryable, TransientRetry, none, None, StageSendTransientRetry/Warning,
+   no-probe, HELD)` (`error_routing.rs:314`); target `RemoteAuthStatus` `(ErrorRetryable, ProbeRequired, none,
+   ProbeRequired, StageSendProbeRequired/Warning, ProbeRequired[ProbeReason::AuthenticatedPeerReply], HELD)` —
+   **diverges on {retry_class, node_effect, audit, probe}**.
+
+Declaring only #3 (as an earlier rev did) would RED on rows 1–2. **Replay/drop (separate):** a stale-generation
+apply is a TOTAL no-op on ledger/seed/audit/fence (no release); a replay of an `APPLIED` row is idempotent.
+**Boot-mint** of `SendResponse::no_response(CrashedBeforeObservation)` needs a **second allowed mapper** on the
+digest-mint allowlist (`digest_mint_source_gate.rs:179`) — the authority gate today allows minting only inside
+`shadow_map::map_send_reply`.
 
 ## 3 · Invariant & risk guards (every slice)
 - **INV-1** no net/crypto in a write tx — reservation write (D, 4-pre) + record-then-apply (D, 4-b, two commits)
@@ -115,8 +225,8 @@ has nothing to enforce. Value (double-issue kill) lands at E.
 - `ingress_inbox.idempotency_strategy` → Spec #3. Concrete adapters + full crate-DAG → CS-6.
 
 ## 5 · Operational (do before/with the first slice)
-- **Commit this plan to `origin/main`** as the CS-3 oracle (else a `origin/main` worktree can't see it). Pair it
-  in **one docs PR** with:
+- **Commit this plan to `origin/main`** as the CS-3 oracle (else a `origin/main` worktree can't see it) — **✅ DONE
+  (#312 `b5c85e0`; see the header STATUS note).** Paired in **one docs PR** with:
   - the **#4B header fix**: the merged #4B still reads `DRAFT / CONDITIONAL-GO` though the body carries the final
     GO'd fix — correct the header to GO;
   - a **#4A A4-6 mini-amendment** (point-fix): the effect-discriminant formally extends A4-6's `ObservedOutcomeV1`
