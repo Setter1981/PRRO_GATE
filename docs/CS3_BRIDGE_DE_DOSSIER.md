@@ -14,6 +14,30 @@ full token/fence contract; it does not re-state it** (an earlier rev drifted and
 - `docs/CS3_BRIDGE_DE_TERRAIN_MAP.md` — grounded seam map (recon-grade file:line).
 - `docs/CS3_SPEC_RECONCILIATION_DELTA.md` — the spec↔realized-3.2 delta (adversarially verified).
 
+> **⟶ SUPERSEDED for the D/E fence + evidence + operator-recovery by `docs/CS3_REMEDIATION_DESIGN.md`
+> (rev3, `DESIGN_SOUND / IMPLEMENTATION-NOT-YET-GATED`).** A model-decorrelated external re-audit rated this
+> dossier's D/E design **SYSTEMIC** — it admitted **P2** (a doc can be wired twice) and **P4** (the durable
+> record loses the accepted fiscal number on a crash) — and its `§3-D` permanent routing-fence **unsound**
+> (a first transport blip bricks the FN with no operator exit). Rev3 corrects it with **NO new
+> table/state/token**; the `§3-D`/`§3-E` fence-predicate + token detail below is **superseded**:
+> - **P2** — a per-document lifetime **call-once** guard: `ux_delivery_document_ever_started ON
+>   delivery_reservation(document_id) WHERE call_started_at IS NOT NULL` + a `NOT EXISTS` clause in
+>   `authorize_submission`; a started-then-ambiguous attempt is **never re-wired**.
+> - **Fence** — reduced to `state IN ('RESERVED_NOT_STARTED','CALL_STARTED') OR (state='OUTCOME_OBSERVED'
+>   AND apply_state='PENDING_APPLY')` (no routing/certainty disjunct, no `seed_advanced` — proven dead).
+>   **Unresolved** outcomes (SubmittedUnknown / `-12` / `-6`) stay `PENDING_APPLY` + flip the existing
+>   **`STOP_MODE`**; **release** = the strengthened existing **`reset_stop_mode`**, gated on a **verified
+>   read-only `status_rro`** (rev3.1: `online=true`, `open_shift` agrees — not bare operator trust), which
+>   completes PENDING → APPLIED, clears the active pointer atomically, and selects `ONLINE` or `GOING_ONLINE`
+>   by offline-session presence. Definitive **online-origin** seed-unchanged rejects RELEASE at APPLIED; an
+>   **offline-origin** reject HOLDS the fence until its chain is repaired.
+> - **P4** — `EvidenceDiscriminant` is **payload-carrying + durable** in four union columns on
+>   `delivery_reservation` (`evidence_kind/text/code/digest`) with fail-closed matrix triggers + boot hydration.
+> - **`Sent + NotFound`** → atomic doc-RMR + node-`STOP_MODE` + trace/audit (not a redrive).
+>
+> Full storage matrix, migration 035 DDL, the operator resolution matrix, and RED-pins are in
+> `CS3_REMEDIATION_DESIGN.md` §2–§7. The `§3-D`/`§3-E` detail below is retained for history, NOT current design.
+
 ---
 
 ## §0 Where we are

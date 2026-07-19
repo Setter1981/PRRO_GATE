@@ -100,25 +100,40 @@ authorized_generation}` — NOT the evidence leaf / `DpsReject` code / `ProbeRea
 (`MissingStatus` / `CloseAmbiguous`−2 / `CloseAmbiguous`−15 / `OkButNoFiscalNumber` / TLS `RemoteStatus`) collapse
 to the SAME tuple yet need different probe/audit, so `record → ApplyPlan` would be **undefined**. **LOCK:** add a
 closed `evidence_discriminant` to `ObservedOutcomeV1` (the current `ProbeReason`, `error_routing.rs:242`, has only
-3 variants and is NOT sufficient). Verbatim:
+3 variants and is NOT sufficient).
+
+**⟶ CORRECTED by `CS3_REMEDIATION_DESIGN.md` (rev3) — the discriminant is PAYLOAD-CARRYING and DURABLE.** An
+earlier draft made it a payload-FREE Rust field, which the re-audit proved NOT lossless (`Accepted` with no
+`fiscal_number` loses `F` on a crash between record and apply → P4). Rev3: each variant carries the exact
+payload apply needs, stored DURABLY in **four nullable union columns** on `delivery_reservation`
+(`evidence_kind / evidence_text / evidence_code / evidence_digest`) with a **fail-closed matrix trigger** per
+leaf (NULL-bypass closed via `COALESCE(CASE … ELSE 0 END) <> 1`), frozen after `OUTCOME_OBSERVED`; boot
+hydrates the same `ObservedOutcomeV1` and fails loud on an unknown tag / illegal payload:
 ```rust
 enum EvidenceDiscriminant {
     PreconditionFailed,
     SigningFailed,
-    NoResponse(NoResponseCause),
-    RemoteAuthStatus,
-    Accepted,
-    Rejected(DpsReject),
-    UnknownStatus(i32),
-    SaveError,
-    CloseAmbiguous(CloseAmbiguousCode),
-    MissingStatus,
-    OkButNoFiscalNumber,
+    NoResponse { cause: NoResponseCause },
+    RemoteAuthStatus { digest: DecodedResponseDigest },
+    Accepted { fiscal_number: NonEmptyFiscalNumber },              // ← F preserved durably (P4 fix)
+    Rejected { verdict: DpsReject, digest: DecodedResponseDigest },
+    UnknownStatus { raw_code: i32, digest: DecodedResponseDigest },
+    SaveError { digest: DecodedResponseDigest },
+    CloseAmbiguous { digest: DecodedResponseDigest },              // SINGLE arm — from_server_code collapses -2/-15 (mod.rs:594)
+    MissingStatus { digest: DecodedResponseDigest },
+    OkButNoFiscalNumber { digest: DecodedResponseDigest },
 }
-enum CloseAmbiguousCode { Code2, Code15 }
 ```
-With it, `record → ApplyPlan` is a **total function** (boot-after-record reconstructs losslessly). This is the
-concrete realization of the C-pure "durable semantic/effect discriminant" (§2 C-pure row).
+`ObservedOutcomeV1::record` receives the sealed classified outcome + this discriminant and rejects a leaf
+whose axes/generation/routing/node-effect disagree. `remote_correlation_id` is NOT the lossless authority for
+`Accepted` (must be byte-equal to `evidence_text`, else fail-closed). The `CloseAmbiguousCode{Code2,Code15}`
+split is **dropped** (unsourceable from the sealed `from_server_code`; both → ProbeRequired).
+
+With it, `record → ApplyPlan` is a **total function over {reservation evidence + immutable doc row}** (origin /
+`doc_type` / shift / chain-hashes from the doc row; `F` / verdict / digest from the reservation evidence) — boot
+reconstructs losslessly with NO wire access. **Full storage matrix, boot hydration, and the per-leaf
+axis/routing/node-effect rules: `CS3_REMEDIATION_DESIGN.md` (rev3) §4.** This realizes the C-pure "durable
+semantic/effect discriminant" (§2 C-pure row).
 
 ### 2A.2 · `ObservedOutcomeV1 → ApplyPlan` — the total matrix (D; audit Bl3)
 `ObservedOutcomeV1` carries no `target_state` / audit-plan / trace-completion / probe-semantics; the live
@@ -187,6 +202,23 @@ apply is a TOTAL no-op on ledger/seed/audit/fence (no release); a replay of an `
 **Boot-mint** of `SendResponse::no_response(CrashedBeforeObservation)` needs a **second allowed mapper** on the
 digest-mint allowlist (`digest_mint_source_gate.rs:179`) — the authority gate today allows minting only inside
 `shadow_map::map_send_reply`.
+
+### 2A.4 · Record / hydration / operator-completion + `-12` (CORRECTED — rev3)
+- **Record-then-apply (design §4.3):** wire I/O outside any write-tx; the record tx writes the evidence union
+  + axes + generation + node-effect + `PENDING_APPLY` + trace + audit; an **unresolved** outcome
+  (`SubmittedUnknown` / `-12` / `-6`) ALSO flips `STOP_MODE` in that same tx; a separate repeatable apply tx
+  re-reads + full-tuple/generation-guards + applies + `APPLIED` + clears the pointer. Boot performs **no wire
+  call**; a durable `CALL_STARTED` with no outcome → once → `NoResponse{CrashedBeforeObservation}` +
+  `PENDING_APPLY` + `STOP_MODE` (local recovery write, not a synthetic DPS response).
+- **Operator completion (design §3.4):** the strengthened existing `reset_stop_mode` completes a PENDING
+  reservation (accepted-with-`F` / not-accepted / MAC-seed) + CASes `STOP_MODE → GOING_ONLINE`, with the full
+  origin × document-family shift/seed rollback matrix (narrow `Opening→Closed` / `OLPD→Closed` / `CLPD→OLPD`,
+  offline-successor cancellation). No new entity/token/state.
+- **`-12` (NS-3 sharpened — design §3.2 row 7, §3.4):** the MacRecovery-class short-circuit gates **BEFORE**
+  `run_mac_recovery` (which already re-signs + overwrites `previous_hash`/XML/CMS — merely removing the
+  `Resigned => continue` at `stage_send.rs:1082` is too late); a `-12` → `PENDING` + `STOP_MODE`; operator
+  MAC-seed resolution via `reset_stop_mode` writes the confirmed seed through the existing tx-bound
+  `node_state::update_last_known_xml_sha_tx`. One wire, bytes unchanged, **no corrective resend in Bridge/D/E**.
 
 ## 3 · Invariant & risk guards (every slice)
 - **INV-1** no net/crypto in a write tx — reservation write (D, 4-pre) + record-then-apply (D, 4-b, two commits)
