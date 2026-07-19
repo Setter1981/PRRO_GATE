@@ -162,15 +162,19 @@ struct ReservationRowRaw {
 }
 
 /// Return the single ACTIVE (fenced) reservation for `fiscal_number`, if
-/// any.  "Active" is exactly the `ux_reservation_active` partial-unique
-/// predicate (Spec #4 §3 fence): in-flight (`RESERVED_NOT_STARTED` /
-/// `CALL_STARTED`), an observed `SUBMITTED_UNKNOWN`, or an observed
-/// `SUBMITTED` with a non-NULL `routing_class` (reject / degraded).  A
-/// clean accept (`SUBMITTED` + `routing_class` NULL) or a safe pre-call
-/// cancel (`NOT_SUBMITTED`) is NOT active and releases the fence.
+/// any.  "Active" is exactly the narrowed §3.1 `ux_reservation_active`
+/// partial-unique predicate (migration 035, design §3.1): the in-flight
+/// states (`RESERVED_NOT_STARTED` / `CALL_STARTED`) OR the record-then-apply
+/// window (`OUTCOME_OBSERVED` with `apply_state = 'PENDING_APPLY'`).  Once
+/// the outcome is applied (`apply_state = 'APPLIED'`) the row is NOT active
+/// and releases the fence.  Unresolved outcomes (SubmittedUnknown / -12 / -6)
+/// are held by `node_state.mode = STOP_MODE` (Slice 5), NOT this SQL fence,
+/// so they do NOT keep a reservation active here.
 ///
-/// The partial-unique index guarantees at most one such row per FN, so
-/// this returns `Option`.  Read-only, pool-bound.
+/// This predicate is byte-identical to the `ux_reservation_active` index and
+/// the `delivery_reservation_no_replace` trigger clause (migration 035).  The
+/// partial-unique index guarantees at most one such row per FN, so this
+/// returns `Option`.  Read-only, pool-bound.
 ///
 /// **INACTIVE:** invoked only from persistence tests in CS-2.
 pub async fn get_active_for_fn(
@@ -186,9 +190,7 @@ pub async fn get_active_for_fn(
          FROM delivery_reservation \
          WHERE fiscal_number = ? \
            AND (state IN ('RESERVED_NOT_STARTED','CALL_STARTED') \
-             OR (state = 'OUTCOME_OBSERVED' AND submission_certainty = 'SUBMITTED_UNKNOWN') \
-             OR (state = 'OUTCOME_OBSERVED' AND submission_certainty = 'SUBMITTED' \
-                 AND routing_class IS NOT NULL))",
+             OR (state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY'))",
     )
     .bind(fiscal_number)
     .fetch_optional(pool)

@@ -719,14 +719,19 @@ async fn t01_rn_cs_oo_happy_path_ok() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
-    // RN→CS→OO clean accept. After clean accept the fence is RELEASED (routing NULL).
+    // RN→CS→OO clean accept. §3.1: holds at PENDING_APPLY, releases at APPLIED.
     drive_clean_accept(&pool, 0x01).await;
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
     let active = delivery_reservation::get_active_for_fn(&pool, FN_A)
         .await
         .unwrap();
     assert!(
         active.is_none(),
-        "clean accept (SUBMITTED + routing NULL) releases the fence"
+        "clean accept (SUBMITTED + routing NULL) at APPLIED releases the fence"
     );
 }
 
@@ -750,11 +755,20 @@ async fn t02_rn_oo_not_submitted_clears_marker_ok() {
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect("RN→OO(NOT_SUBMITTED) is a legal edge and releases the fence");
+    .expect("RN→OO(NOT_SUBMITTED) is a legal edge");
+    // §3.1: releases only at APPLIED (PENDING_APPLY holds).
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
     let active = delivery_reservation::get_active_for_fn(&pool, FN_A)
         .await
         .unwrap();
-    assert!(active.is_none(), "NOT_SUBMITTED cancel releases the fence");
+    assert!(
+        active.is_none(),
+        "NOT_SUBMITTED cancel at APPLIED releases the fence"
+    );
 }
 
 #[tokio::test]
@@ -919,11 +933,17 @@ async fn f04_second_reservation_accepted_after_clean_accept() {
     let doc1 = seed_doc(&pool, FN_A, 0x11, 1).await;
     let doc2 = seed_doc(&pool, FN_A, 0x22, 2).await;
     insert_res(&pool, new_res(0x01, doc1, FN_A)).await.unwrap();
-    drive_clean_accept(&pool, 0x01).await; // SUBMITTED + routing NULL → fence released
-                                           // Fence released → a NEW reservation on the FN is ACCEPTED.
+    drive_clean_accept(&pool, 0x01).await; // SUBMITTED + routing NULL, PENDING_APPLY → STILL fenced (§3.1)
+                                           // §3.1: a clean accept RELEASES the fence only once APPLIED (PENDING_APPLY holds until then).
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Fence released at APPLIED → a NEW reservation on the FN is ACCEPTED.
     insert_res(&pool, new_res(0x02, doc2, FN_A))
         .await
-        .expect("2nd reservation after clean accept must be accepted (fence released)");
+        .expect("2nd reservation after clean accept APPLIED must be accepted (fence released)");
     let active = delivery_reservation::get_active_for_fn(&pool, FN_A)
         .await
         .unwrap()
@@ -948,9 +968,15 @@ async fn f05_second_reservation_accepted_after_not_submitted() {
     .execute(&pool)
     .await
     .unwrap();
+    // §3.1: PENDING_APPLY still holds the fence; NOT_SUBMITTED releases only at APPLIED.
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
     insert_res(&pool, new_res(0x02, doc2, FN_A))
         .await
-        .expect("2nd reservation after NOT_SUBMITTED cancel must be accepted");
+        .expect("2nd reservation after NOT_SUBMITTED cancel (APPLIED) must be accepted");
 }
 
 // ═══════════════════════════ immutability ═══════════════════════════
@@ -1347,6 +1373,12 @@ async fn n01_sequential_attempts_increment_after_cancel() {
     .execute(&pool)
     .await
     .unwrap();
+    // §3.1: release the fence at APPLIED (attempt 1 never started, so call-once allows a 2nd).
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
     // attempt 2 for the SAME document — repo computes MAX(attempt_no)+1 = 2.
     let a2 = insert_res(&pool, new_res(0x02, doc, FN_A)).await.unwrap();
     assert_eq!(
@@ -1390,6 +1422,10 @@ async fn p01_upgrade_on_nonempty_db_sqlite_master_diff() {
         "delivery_reservation",
         "ux_fd_docid_fn",
         "ux_reservation_active",
+        // 035 adds the per-document lifetime call-once index (P2); like the other
+        // reservation objects, the control DB drops the table (auto-dropping this
+        // partial index), so it belongs in the filtered-out reservation-object set.
+        "ux_delivery_document_ever_started",
         "ix_reservation_call_started",
         "delivery_reservation_insert_state",
         "delivery_reservation_no_replace",
