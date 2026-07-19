@@ -440,4 +440,83 @@ mod tests {
             other => panic!("row10: {other:?}"),
         }
     }
+
+    /// CS-3 3.2 PR4 (consolidated-audit B2) — DIGEST FIDELITY per parsed arm. The §4.3 coverage test
+    /// above only checks WHICH arm is produced (it feeds every row the same `dg()` and never reads the
+    /// `DecodedResponseDigest` back), so a constant/fabricated digest — the auditor's `[0xEE;32]` at
+    /// `from_server_code` — stayed all-green. This feeds EACH digest-carrying arm an INDEPENDENT input
+    /// digest, reads the carried digest back out of the sealed outcome, and asserts it equals the
+    /// input BYTE-FOR-BYTE. Because every row's input byte is unique, a per-arm constant OR a
+    /// cross-row swap flips at least one assertion → RED. (The grpc-digest arm 8 is already covered
+    /// with an independent digest above.)
+    #[test]
+    fn pr4_b2_map_send_reply_forwards_exact_digest_per_arm() {
+        use crate::services::write_path::shadow_map::map_send_reply;
+        use prro_domain::delivery::{
+            DecodedResponseDigest, SendIndeterminateKind, SendOutcomeKind, SendResponse,
+            SendResponseKind,
+        };
+        use prro_domain::enums::DocType;
+
+        let sell = DocType::Sell;
+        let zrep = DocType::ZReport;
+        let code = |c: i32| NonOkStatusCode::from_transport(c).unwrap();
+        let dgst = |b: u8| DecodedResponseDigest::from_transport_digest([b; 32]);
+
+        // Pull the carried DecodedResponseDigest bytes out of a parsed outcome. Panics for an
+        // arm that carries none (Accepted) or a non-parsed response.
+        let parsed_digest = |resp: &SendResponse| -> [u8; 32] {
+            match resp.kind() {
+                SendResponseKind::Parsed(o) => match o.kind() {
+                    SendOutcomeKind::Rejected { digest, .. } => *digest.as_bytes(),
+                    SendOutcomeKind::Indeterminate(i) => match i.kind() {
+                        SendIndeterminateKind::UnknownStatus { digest, .. }
+                        | SendIndeterminateKind::SaveError { digest }
+                        | SendIndeterminateKind::CloseAmbiguous { digest }
+                        | SendIndeterminateKind::MissingStatus { digest }
+                        | SendIndeterminateKind::OkButNoFiscalNumber { digest } => {
+                            *digest.as_bytes()
+                        }
+                    },
+                    SendOutcomeKind::Accepted(_) => panic!("Accepted carries no digest"),
+                },
+                other => panic!("not a parsed outcome: {other:?}"),
+            }
+        };
+
+        // One case per digest-carrying arm — each with a UNIQUE input byte (single source of truth).
+        let cases = [
+            {
+                let b = 0x11u8;
+                (RawSendReply::ok_no_fiscal_id(dgst(b)), sell, b) // OkButNoFiscalNumber
+            },
+            {
+                let b = 0x22u8;
+                (RawSendReply::server_code(code(-1), dgst(b)), sell, b) // Rejected(Verify)
+            },
+            {
+                let b = 0x33u8;
+                (RawSendReply::server_code(code(-3), dgst(b)), sell, b) // SaveError
+            },
+            {
+                let b = 0x44u8;
+                (RawSendReply::server_code(code(-2), dgst(b)), zrep, b) // CloseAmbiguous (close doc)
+            },
+            {
+                let b = 0x55u8;
+                (RawSendReply::server_code(code(-4), dgst(b)), sell, b) // UnknownStatus
+            },
+            {
+                let b = 0x66u8;
+                (RawSendReply::missing_status(dgst(b)), sell, b) // MissingStatus
+            },
+        ];
+        for (reply, dt, b) in cases {
+            let out = parsed_digest(&map_send_reply(&reply, dt));
+            assert_eq!(
+                out, [b; 32],
+                "arm fed digest [{b:#x};32] must forward it EXACTLY (no constant/swap)"
+            );
+        }
+    }
 }
