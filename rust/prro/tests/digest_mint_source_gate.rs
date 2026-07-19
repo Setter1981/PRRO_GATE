@@ -15,7 +15,27 @@
 //!   * DELIVERY authority ctors — `SendResponse::{parsed,no_response,remote_status}` /
 //!     `SendOutcome::{accepted,ok_but_no_fiscal_number,missing_status,from_server_code}` — `pub` in
 //!     prro-domain, so "the engine can only FORWARD transport-minted evidence, never fabricate a
-//!     `SendResponse`/`SendOutcome`" rests on THIS gate.
+//!     `SendResponse`/`SendOutcome`" is enforced (best-effort) by THIS gate.
+//!
+//! ## WHAT THIS GATE IS — and is NOT (consolidated-audit round-2, honest framing)
+//!
+//! This is a **best-effort CI source-policy lint**, **NOT a type-level seal**. A syn scan cannot
+//! perform macro expansion, type/alias resolution, cfg evaluation over all feature combinations, or
+//! resolution of `include!`d / generated / proc-macro-expanded source. It catches the REALISTIC
+//! threat (accidental / careless misplacement — a stray direct call, capture, wrapper, alias,
+//! `cfg(not(test))`, or `include!`), which is what the canaries below pin. A DETERMINED adversary
+//! retains residual vectors that are heuristic-only or beyond syn:
+//!   - split-token / arbitrarily-computed macros (only a conservative heuristic here);
+//!   - type-alias / associated-type projection indirection (`type A = SendResponse; <A>::parsed`);
+//!   - proc-macro expansion (invisible to syn entirely);
+//!   - feature-combination subtleties beyond "cfg logically requires test".
+//!
+//! **In 3.2 this is safe because the mapped `SendResponse` is a READ-ONLY shadow that drives nothing**
+//! (bound as `_shadow_response`, never consumed) — a fabricated value is inert. The STRONG guarantee
+//! (a real type-seal) requires co-locating the private mint with its sole consumer in one
+//! crate/module so Rust privacy enforces it; that is a **deferred D/E entry-condition** (before the
+//! shadow is wired live, either land that co-location OR record an accepted "lint + review" decision).
+//! Do NOT describe this gate as "type-sealed authority" — it is a source policy backed by CI + review.
 //!
 //! ## The model (auditor's required fix — the old two-visitor gate was porous)
 //!
@@ -205,7 +225,7 @@ fn is_test_exempt(attrs: &[syn::Attribute]) -> bool {
             let Ok(inner) = syn::parse2::<syn::Meta>(ml.tokens.clone()) else {
                 continue;
             };
-            if cfg_positive_test(&inner) {
+            if cfg_requires_test(&inner) {
                 return true;
             }
         }
@@ -213,32 +233,32 @@ fn is_test_exempt(attrs: &[syn::Attribute]) -> bool {
     false
 }
 
-/// `true` if the cfg predicate `m` has `test` in a POSITIVE (non-negated) position, i.e. entering
-/// this predicate implies a build where `test` may hold. `not(...)` FLIPS polarity: `test` under an
-/// odd number of `not` does NOT exempt (so `cfg(not(test))` is production-only ⇒ NOT exempt).
-fn cfg_positive_test(m: &syn::Meta) -> bool {
-    cfg_test_polarity(m, /*negated=*/ false)
-}
-
-fn cfg_test_polarity(m: &syn::Meta, negated: bool) -> bool {
+/// `true` iff the cfg predicate `m` LOGICALLY REQUIRES `test` — i.e. every build that satisfies `m`
+/// has `test` enabled (so the item is genuinely test-only and safe to exempt). This is proper
+/// boolean implication, NOT "mentions test anywhere" (consolidated-audit round-2 B1: the old
+/// `.any()` on `any(...)` wrongly exempted `any(test, feature="x")`, which compiles in production
+/// when `x` is on, and `any(test, not(test))`, which is always true):
+/// - `test`         → requires test;
+/// - `all(A,B,…)`   → requires test if ANY conjunct requires it (all needs every conjunct);
+/// - `any(A,B,…)`   → requires test ONLY if EVERY disjunct requires it (any needs just one branch);
+/// - `not(…)` / unknown wrappers → conservatively does NOT require test (no full boolean analysis;
+///   worst case a pathological `not(not(test))` is scanned, which is safe — the author uses plain
+///   `cfg(test)`).
+fn cfg_requires_test(m: &syn::Meta) -> bool {
     match m {
-        // `cfg(test)` — bare ident.
-        syn::Meta::Path(p) => !negated && p.is_ident("test"),
+        syn::Meta::Path(p) => p.is_ident("test"),
         syn::Meta::List(ml) => {
             let parsed = ml.parse_args_with(
                 syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
             );
             let Ok(items) = parsed else { return false };
-            if ml.path.is_ident("not") {
-                // `not(X)` flips polarity of everything inside.
-                items.iter().any(|i| cfg_test_polarity(i, !negated))
-            } else if ml.path.is_ident("all") || ml.path.is_ident("any") {
-                // Per spec: `test` appearing POSITIVELY anywhere inside `all(...)`/`any(...)`
-                // exempts (positive, non-negated position). Polarity is inherited.
-                items.iter().any(|i| cfg_test_polarity(i, negated))
+            if ml.path.is_ident("all") {
+                items.iter().any(cfg_requires_test)
+            } else if ml.path.is_ident("any") {
+                !items.is_empty() && items.iter().all(cfg_requires_test)
             } else {
-                // Unknown predicate wrapper — recurse conservatively (still respects polarity).
-                items.iter().any(|i| cfg_test_polarity(i, negated))
+                // `not(...)` and any unknown predicate: conservatively NOT test-required.
+                false
             }
         }
         syn::Meta::NameValue(_) => false,
@@ -335,13 +355,38 @@ fn delivery_from_path(path: &syn::Path) -> Option<GatedSymbol> {
 /// leaving a single-segment `path == [ctor]`.
 fn delivery_from_qself(p: &syn::ExprPath) -> Option<GatedSymbol> {
     let qself = p.qself.as_ref()?;
-    let ty = type_last_seg(&qself.ty)?;
+    // Round-2 B3: recurse into generic args so `<Identity<SendResponse>>::parsed` (identity alias
+    // hiding the real type in a type-parameter) is caught, not just `<SendResponse>::parsed`.
+    let ty = first_delivery_type_in(&qself.ty)?;
     let ctor = p.path.segments.last()?.ident.to_string();
     DELIVERY_CTORS
         .iter()
         .copied()
         .find(|(t, c)| **t == ty && **c == ctor)
         .map(|(t, c)| GatedSymbol::Delivery(t, c))
+}
+
+/// Recursively find a delivery authority TYPE named in `ty` — the type itself OR any of its generic
+/// arguments. HEURISTIC (round-2 B3): syn cannot resolve type aliases / associated-type projections,
+/// so deeper indirection (`type A = SendResponse; <A>::parsed`, `<T as Tr>::Assoc`) still evades.
+/// See the module-level limits.
+fn first_delivery_type_in(ty: &syn::Type) -> Option<String> {
+    let syn::Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    let id = seg.ident.to_string();
+    if DELIVERY_TYPES.contains(&id.as_str()) {
+        return Some(id);
+    }
+    if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
+        for arg in &ab.args {
+            if let syn::GenericArgument::Type(inner) = arg {
+                if let Some(found) = first_delivery_type_in(inner) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The last path-segment ident of a `Type` path, if it is a plain path type.
@@ -442,17 +487,10 @@ impl<'ast, 'a> Visit<'ast> for AuthorityScan<'a> {
         syn::visit::visit_expr_path(self, node);
     }
 
-    // ── method-call syntax (`x.from_transport(..)`) — defensive; the mints are assoc fns, but a
-    //    method-call form of a gated ident is still a mint attempt. ──
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if let Some(sym) = mint_from_ident(&node.method) {
-            self.flag(format!(
-                "`.{}(...)` mint called via method syntax outside the transport decoder",
-                sym.label()
-            ));
-        }
-        syn::visit::visit_expr_method_call(self, node);
-    }
+    // NB: method syntax (`x.from_transport(..)`) is deliberately NOT flagged — the mints are
+    // associated fns with no `self`, so a `.from_transport()` method call is always an UNRELATED
+    // method on some other type (round-2 false-positive fix). The default traversal still recurses
+    // into the receiver + args so a gated call nested inside is caught by `visit_expr_call`.
 
     // ── re-export gate: `use ... <mint>` or `use ... SendResponse as X` ──
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
@@ -482,6 +520,16 @@ impl<'ast, 'a> Visit<'ast> for AuthorityScan<'a> {
 
     // ── macro laundering: token-tree mentions a mint ident OR a `Type::ctor` delivery pattern ──
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        // Round-2 B5: `include!("x.inc")` pulls source the .rs walker never sees → a mint/ctor in the
+        // included file is invisible. Forbid production `include!` in the guarded area (there is none
+        // today). Same class: `#[path]` mod (see visit_item_mod). syn cannot resolve either target.
+        if node.path.is_ident("include") {
+            self.flag(
+                "`include!(...)` in guarded production code — the included source is not scanned; \
+                 inline it or move the file under the normal module tree"
+                    .to_string(),
+            );
+        }
         if let Some(what) = macro_tokens_mention_gated(&node.tokens.to_string()) {
             self.flag(format!(
                 "macro invocation token-tree mentions gated symbol `{what}` (macro laundering)"
@@ -543,6 +591,16 @@ fn macro_tokens_mention_gated(raw: &str) -> Option<String> {
             return Some(format!("{t}::{c}"));
         }
     }
+    // Round-2 B2: split-token laundering — a macro that reassembles `<$ty>::$ctor(...)` receives the
+    // type and ctor as SEPARATE tokens (e.g. `invoke!(SendResponse, no_response, arg)`), so the
+    // `Type::ctor` adjacency check above misses it. Conservatively flag any macro token-tree that
+    // mentions BOTH a delivery authority TYPE and a delivery CTOR ident. This is a HEURISTIC (may
+    // over-flag; syn cannot expand the macro to know the real reassembly) — see the module limits.
+    let mentions_type = DELIVERY_TYPES.iter().find(|t| compact.contains(**t));
+    let mentions_ctor = DELIVERY_CTORS.iter().find(|(_, c)| compact.contains(c));
+    if let (Some(t), Some((_, c))) = (mentions_type, mentions_ctor) {
+        return Some(format!("split-token {t} + {c}"));
+    }
     None
 }
 
@@ -583,25 +641,37 @@ fn scan_source(text: &str, file_name: &str) -> Vec<Violation> {
 
 #[test]
 fn production_src_authority_flow_gate_holds() {
-    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    collect_rs_files(&src_root, &mut files);
-    assert!(
-        !files.is_empty(),
-        "expected .rs files under {}",
-        src_root.display()
-    );
+    // Round-2 B4: scan the OWNING crate too — `prro-domain/src` DEFINES the authority ctors + mints
+    // (pub cross-crate), so a forwarding wrapper THERE (invisible to a prro-only scan) could
+    // fabricate. The workspace root is the manifest dir's parent (`rust/`).
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .expect("crate dir has a parent (workspace root)");
+    let roots = [
+        manifest.join("src"),
+        workspace.join("prro-domain").join("src"),
+    ];
 
     let mut all = Vec::new();
-    for path in &files {
-        let text = fs::read_to_string(path).expect("read .rs");
-        // Relative path (forward-slash normalized) so the file-suffix allowlist match works.
-        let rel = path
-            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        all.extend(scan_source(&text, &rel));
+    for root in &roots {
+        let mut files = Vec::new();
+        collect_rs_files(root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "expected .rs files under {}",
+            root.display()
+        );
+        for path in &files {
+            let text = fs::read_to_string(path).expect("read .rs");
+            // Relative path (forward-slash normalized) so the file-suffix allowlist match works.
+            let rel = path
+                .strip_prefix(workspace)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            all.extend(scan_source(&text, &rel));
+        }
     }
 
     assert!(
@@ -806,6 +876,54 @@ fn parse_error_fails_gate() {
     );
 }
 
+// ── Round-2 auditor canaries (5 NEW bypasses on real production code) ──
+
+#[test]
+fn split_token_macro_ctor_is_caught() {
+    // `invoke!(SendResponse, no_response, arg)` reassembles `<$ty>::$ctor(arg)` — the type and ctor
+    // reach the invocation as SEPARATE tokens, so the `Type::ctor` adjacency check misses. The
+    // split-token heuristic (mentions a delivery TYPE and a delivery CTOR) must catch it.
+    let snippet = r#"
+        fn forge() -> SendResponse {
+            invoke!(SendResponse, no_response, NoResponseCause::Timeout)
+        }
+    "#;
+    let v = scan_source(snippet, "services/write_path/other.rs");
+    assert!(
+        v.iter().any(|x| x.detail.contains("split-token")),
+        "split-token macro must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn generic_identity_alias_delivery_ctor_is_caught() {
+    // `<Identity<SendResponse>>::parsed(o)` hides the real type in a generic arg — the recursive
+    // generic-arg walk must find SendResponse.
+    let snippet = r#"
+        fn forge(o: SendOutcome) -> SendResponse {
+            <Identity<SendResponse>>::parsed(o)
+        }
+    "#;
+    let v = scan_source(snippet, "services/write_path/other.rs");
+    assert!(
+        v.iter().any(|x| x.detail.contains("SendResponse::parsed")),
+        "generic-identity-alias qself ctor must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn production_include_macro_is_caught() {
+    // `include!("x.inc")` pulls source the .rs walker never scans → forbidden in the guarded area.
+    let snippet = r#"
+        include!("audit_authority.inc");
+    "#;
+    let v = scan_source(snippet, "services/write_path/other.rs");
+    assert!(
+        v.iter().any(|x| x.detail.contains("include!")),
+        "production include! must be caught: {v:#?}"
+    );
+}
+
 // ─── (3) negative controls — must NOT be flagged ────────────────────────────────
 
 #[test]
@@ -829,8 +947,9 @@ fn genuine_cfg_test_mint_is_exempt() {
 }
 
 #[test]
-fn cfg_any_positive_test_is_exempt() {
-    // `#[cfg(any(test, feature = "x"))]` — `test` in a POSITIVE position → exempt per spec.
+fn cfg_any_test_or_feature_is_not_exempt() {
+    // Round-2 B1: `#[cfg(any(test, feature = "x"))]` is production-reachable (compiles when `x` is
+    // on WITHOUT test), so it does NOT logically require test → the mint inside is a VIOLATION.
     let snippet = r#"
         #[cfg(any(test, feature = "x"))]
         fn helper() {
@@ -839,8 +958,24 @@ fn cfg_any_positive_test_is_exempt() {
     "#;
     let v = scan_source(snippet, ATTACK_FILE);
     assert!(
+        !v.is_empty(),
+        "cfg(any(test, feature)) is production-reachable and must NOT be exempt"
+    );
+}
+
+#[test]
+fn cfg_all_test_and_feature_is_exempt() {
+    // `all(test, feature)` compiles ONLY when test is on → genuinely test-only → exempt.
+    let snippet = r#"
+        #[cfg(all(test, feature = "x"))]
+        fn helper() {
+            let _ = DecodedResponseDigest::from_transport_digest([0u8; 32]);
+        }
+    "#;
+    let v = scan_source(snippet, ATTACK_FILE);
+    assert!(
         v.is_empty(),
-        "cfg(any(test, ...)) with positive test must be exempt: {v:#?}"
+        "all(test, ...) requires test → must be exempt: {v:#?}"
     );
 }
 

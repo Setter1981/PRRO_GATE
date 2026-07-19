@@ -106,13 +106,17 @@ impl BoundedText {
 
 /// Digest of a **decoded** DPS response envelope's KNOWN content (CS-3 3.2, spec §4.1).
 ///
-/// **Sealed:** the field is private; the sole constructor
-/// [`from_transport_digest`](Self::from_transport_digest) takes an already-framed 32-byte hash.
-/// The versioned, length-prefixed framing + SHA-256 live in the transport decoder
-/// (`prro::transports::dps::digest_framing`) — the only place that can compute the bytes — and a
-/// workspace source-gate (PR1 pin 5) additionally restricts the constructor to that decoder, so the
-/// engine can only *carry* a transport-minted digest, never fabricate one. This is a
-/// *decoded-content* fingerprint, NOT a raw-wire proof ([[project_digest_decoded_content_decision]]).
+/// **Private field:** the sole constructor [`from_transport_digest`](Self::from_transport_digest)
+/// takes an already-framed 32-byte hash. The versioned, length-prefixed framing + SHA-256 live in
+/// the transport decoder (`prro::transports::dps::digest_framing`) — the only place that computes
+/// the bytes. The ctor is `pub` (cross-crate), so placement is enforced by a **best-effort CI
+/// source-policy lint** (`digest_mint_source_gate.rs`), **NOT a type-level seal**: a syn scan cannot
+/// see macro expansion / cfg-feature combinations / type-alias resolution / `include!`d or generated
+/// source, so a determined bypass is possible. It catches accidental/careless misplacement (the
+/// realistic threat) and is defence-in-depth; the true type-seal (co-locating the mint with its sole
+/// consumer so Rust privacy enforces it) is a **deferred D/E entry-condition** — in 3.2 the shadow is
+/// read-only so a fabricated digest drives nothing. This is a *decoded-content* fingerprint, NOT a
+/// raw-wire proof ([[project_digest_decoded_content_decision]]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodedResponseDigest([u8; 32]);
 
@@ -130,8 +134,9 @@ impl DecodedResponseDigest {
 /// Digest of a gRPC transport-status reply (`{code, message, details}`, spec §4.1).
 ///
 /// A DISTINCT type from [`DecodedResponseDigest`] because it fingerprints a different kind of reply
-/// (a non-DPS gRPC status), with its own message-type tag in the framing. Same sealing: private
-/// field + transport-only `from_transport_digest`.
+/// (a non-DPS gRPC status), with its own message-type tag in the framing. Same private field +
+/// transport-only `from_transport_digest`, with the same best-effort source-policy lint (not a
+/// type-seal) as [`DecodedResponseDigest`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrpcStatusDigest([u8; 32]);
 
@@ -150,13 +155,16 @@ impl GrpcStatusDigest {
 
 /// A DPS-assigned fiscal number PROVEN to have come off a parsed reply (non-empty).
 ///
-/// **Sealed:** private field; the sole ctor [`from_transport`](Self::from_transport) is `pub`
-/// (the transport decoder, another crate, must call it) but is restricted to the decoder by the
-/// workspace source-gate — so a non-empty id proves **provenance** (it was observed on the wire),
-/// not merely form. The engine can only CARRY it out of an opaque `RawSendReply`, never fabricate
-/// one; that is what lets `Accepted` carry no digest (D-4) — the id itself is the transport-proven
-/// evidence. `from_transport` also enforces the non-empty invariant (`OkButNoFiscalNumber` is the
-/// empty case, not this).
+/// **Private field:** the sole ctor [`from_transport`](Self::from_transport) is `pub` (the transport
+/// decoder, another crate, must call it). Placement is enforced by a **best-effort CI source-policy
+/// lint** (`digest_mint_source_gate.rs`), **NOT a type-level seal** — a syn scan cannot cover macro
+/// expansion / cfg-feature combinations / type-alias resolution / `include!`d source, so a
+/// determined bypass is possible; it catches the realistic accidental-misplacement threat. Under
+/// that discipline a non-empty id proves **provenance** (observed on the wire), which is what lets
+/// `Accepted` carry no digest (D-4). In 3.2 the shadow is read-only, so a fabricated id drives
+/// nothing; the true type-seal (mint co-located with its sole consumer) is a **deferred D/E
+/// entry-condition**. `from_transport` also enforces the non-empty invariant (`OkButNoFiscalNumber`
+/// is the empty case, not this).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NonEmptyFiscalNumber(String);
 
