@@ -82,29 +82,46 @@ operator resolution; **no new issuance, no new offline-session, no seed advance.
 advances only after a **known** `Accepted` (`stage_send.rs:1725`); starting doc B on the old seed
 while doc A was actually accepted **forks the chain** and B can evict A from `lastChk`.
 
-**Fence predicate (NORMATIVE — CS-3 Slice D authors migration 035).** The fence HOLDS through
-`OUTCOME_OBSERVED + PENDING_APPLY` and releases **only after `APPLIED`** for a clean accept / safe `NotSubmitted`;
-`SubmittedUnknown` and a routed-`Submitted` STAY fenced. 3.2's 033 fence index `ux_reservation_active` does **not**
-account for `apply_state`, so a clean accept (`OUTCOME_OBSERVED`, `routing_class NULL`, `apply_state=PENDING_APPLY`)
-falls OUT of the index and the FN-fence would drop **before** the ledger apply (033 itself flags "CS-3 rebuilds this
-with PENDING_APPLY/APPLIED"). **Slice D authors migration 035** rebuilding the two DB objects — the index
-`ux_reservation_active` and the trigger `delivery_reservation_no_replace` — plus the Rust helper `get_active_for_fn`
-(same predicate, updated in the same slice; SQLite has no stored fns), all sharing this predicate **verbatim**:
-```sql
-state IN ('RESERVED_NOT_STARTED','CALL_STARTED')
-OR ( state = 'OUTCOME_OBSERVED'
-     AND ( apply_state = 'PENDING_APPLY'
-        OR submission_certainty = 'SUBMITTED_UNKNOWN'
-        OR (submission_certainty = 'SUBMITTED' AND routing_class IS NOT NULL) ) )
-```
-RED-pin: revert migration 035 → a second same-FN reservation inserts while the first is `PENDING_APPLY` → RED (the
-auditor's reproduced canary).
+**⟶ CORRECTED by `CS3_REMEDIATION_DESIGN.md` (rev3) — the fence is NOT a permanent SQL fence.** An earlier
+draft (rev2) held `SubmittedUnknown` / routed-`Submitted` in the SQL fence **forever**; a model-decorrelated
+re-audit proved this **unsound**: a first-attempt transport blip → `SubmittedUnknown` → an un-releasable SQL
+fence → the whole FN **bricks** with no operator exit (the spec family had zero SubmittedUnknown fence-release
+op). Rev3 fixes it by **reusing existing machinery, no new table/state/token**:
 
-**The fence is FN-WIDE, not doc-local (NORMATIVE — CS-3 Slice E enforcement surface).** Under fence, for the WHOLE
-FN, E must: **gate all 7 `stage_send::run` callers** by reservation certainty; **remove/guard the
-`(ErrorRetryable → Sending)` edge**; **stop the 4 seed-writers** (`offline_code_replenish` / `boot_phase` /
-`stage_offline_ack` / the online seed-UPDATE); and **block** offline-ack / offline-session / offline-code-replenish
-— not merely the redrive path. (See keystone §2 slice E.)
+- **Active-fence predicate (NORMATIVE, verbatim — design §3.1)** — reduced to the record-then-apply window only:
+  ```sql
+  state IN ('RESERVED_NOT_STARTED','CALL_STARTED')
+  OR ( state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY' )
+  ```
+  No routing-class or certainty disjunct. Byte-identical across `ux_reservation_active`,
+  `delivery_reservation_no_replace`, `get_active_for_fn`, and the D/E authorization query.
+- **Unresolved outcomes** (`SubmittedUnknown` / `-12 MacRecovery` / `-6 OperatorEscalation`) stay
+  `PENDING_APPLY` **and** flip `node_state.mode = STOP_MODE` in the SAME record tx (design §3.2). `STOP_MODE`
+  already refuses ingress (`stage_acquire.rs:301`) → no new issuance → no fork; the PENDING fence stays
+  authoritative even if a future mode gate is forgotten.
+- **Release = the strengthened existing `reset_stop_mode`** (`admin.rs:300`, today CASes `STOP_MODE →
+  GOING_ONLINE`): the operator supplies the resolution (accepted-with-observed-`F` / not-accepted / MAC-seed);
+  it completes the PENDING reservation to `APPLIED` and CASes `STOP_MODE → GOING_ONLINE` in one
+  `BEGIN IMMEDIATE`. A plain STOP reset **fails closed** while a CS-3 PENDING row exists. No new release
+  token / FSM state (design §3.4). This is the SubmittedUnknown fence-release the rev2 fence lacked.
+- **Definitive seed-unchanged rejects** (`TerminalReject` / `FnConfigError`, and `-11` with an atomic node
+  `BLOCKED` + a guarded `BLOCKED → GOING_ONLINE` operator branch) **RELEASE** at `APPLIED` — no permanent
+  brick (design §3.2 rows 4/5, §3.4).
+- **P2 lifetime call-once (NORMATIVE — design §2):** a UNIQUE partial index
+  `ux_delivery_document_ever_started ON delivery_reservation(document_id) WHERE call_started_at IS NOT NULL`
+  + a `NOT EXISTS(… call_started_at IS NOT NULL)` clause in `authorize_submission` + the same historical
+  clause in `delivery_reservation_no_replace` — **at most one wire per `document_id` over its whole life**; a
+  started-then-ambiguous attempt is **never re-wired** (a connect-refused/timeout after the durable marker
+  consumes the document's one lifetime call → reconcile/operator, never resend).
+- **Whole-fence cutover (E):** every `stage_send::run` caller + the `(ErrorRetryable, Sending)` edge + the
+  4 seed-writers (`offline_code_replenish` / `boot_phase` / `stage_offline_ack` / the online seed-UPDATE) +
+  offline issuance/session/code prove no conflicting active reservation via §3.1 (design §3.3). `STOP_MODE`
+  is the durable operator-facing halt, **not** a substitute for the reservation check.
+
+> The `seed_advanced` column proposed in an earlier draft is **dropped** (proven a dead disjunct: a routed
+> reject never reaches `WireDecision::Sent`, so it is never issued). **Full normative detail — the exact
+> predicates, the durable evidence-union storage, the operator resolution matrix, migration 035, and the
+> RED-pins — lives in `CS3_REMEDIATION_DESIGN.md` (rev3) §2–§7, the design-of-record.**
 
 **Reconciliation is per-protocol, capability-gated.** `envelope_hash` is **not** a query key — the
 current DPS offers **no query-by-local-identity**, only `lastChk` + comparison of an **already-known

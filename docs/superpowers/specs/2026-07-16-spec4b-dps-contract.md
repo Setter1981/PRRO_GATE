@@ -242,9 +242,16 @@ struct AuthorizedSubmission {                     // no pub ctor; built only by 
 }
 fn authorize_submission(store: &Store, id: ReservationId, envelope: BoundSignedEnvelope) -> Option<AuthorizedSubmission>;
 //   ONE atomic tx: verify durable RESERVED_NOT_STARTED ∧ unfenced ∧ reservation.binding == envelope.binding
-//   (FULL tuple, PB-2) ∧ hash == SHA256(bytes); flip RN→CALL_STARTED (set call_started_at, 032:162); mint.
+//   (FULL tuple, PB-2) ∧ hash == SHA256(bytes) ∧ **P2 LIFETIME CALL-ONCE** (rev3 §2) — `NOT EXISTS (SELECT 1
+//   FROM delivery_reservation WHERE document_id = :document_id AND call_started_at IS NOT NULL)`; flip
+//   RN→CALL_STARTED (set call_started_at, 032:162); mint AFTER commit.
 //   After the CAS the row is CALL_STARTED ⇒ a second call returns None (no double mint). A fenced /
-//   OUTCOME_OBSERVED reservation NEVER yields a token — blind-resend is untypable (D4). NO corrective path (B1).
+//   OUTCOME_OBSERVED reservation NEVER yields a token, AND **a document that EVER started a wire never gets a
+//   second one**: a started-then-ambiguous attempt (timeout / connect-refused after the durable marker →
+//   SubmittedUnknown) is **NEVER re-wired** — it is reconciled / operator-resolved via `reset_stop_mode`
+//   (rev3 §3.4), never resent. Blind-resend is untypable (D4). NO corrective path (B1). The
+//   `ux_delivery_document_ever_started` partial index is the DB backstop; this NOT-EXISTS is the zero-wire
+//   early refusal (rev3 §2).
 async fn submit_authorized(port: &dyn DpsSubmissionPort, auth: AuthorizedSubmission)
     -> Result<AttemptObservation, PortBindingMismatch>;
 //   the SOLE production caller of submit_raw. Consumes the token by value; forwards its bound bytes as a
