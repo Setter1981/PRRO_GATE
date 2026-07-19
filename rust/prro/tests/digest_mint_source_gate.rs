@@ -1150,7 +1150,11 @@ impl<'ast> Visit<'ast> for SeamScan {
                 .unwrap_or(false);
             if is_mapper {
                 self.any_calls += 1;
-                if call.args.first().is_some_and(arg_is_live_observation_evidence) {
+                if call
+                    .args
+                    .first()
+                    .is_some_and(arg_is_live_observation_evidence)
+                {
                     self.live_calls += 1;
                 }
             }

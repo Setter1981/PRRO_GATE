@@ -212,7 +212,9 @@ pub(in crate::transports::dps) fn observe_from_legacy(
     let evidence = match legacy {
         Ok(ack) => match NonEmptyFiscalNumber::from_transport(ack.id.clone()) {
             Some(id) => RawSendReply::accepted(id),
-            None => RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
+            None => {
+                RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope)
+            }
         },
         Err(_) => RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
     };
