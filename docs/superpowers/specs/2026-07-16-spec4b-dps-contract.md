@@ -44,7 +44,7 @@ record-then-apply are already locked (#4A / Spec #2).
 | B2 | **corrective transition undefined; no `generation` column** | Not a #4B type (B1). `generation` clarified = `node_state.delivery_generation` (CS-3 token, not a reservation column); AO-1's generation-check is CS-3 apply-time | §4; `minilock:28,35`, `032:17` |
 | B3 | **algebra not a disjoint partition** (`Reject::Unknown`≡`Indeterminate::UnknownStatus`; `DpsCode` unconstrained; `ParsedOutcome` undeclared) | `SendOutcome` declared; `DpsReject` = **closed named verdicts only** (no free-form); every unrecognized code ⇒ `SendIndeterminate::UnknownStatus` (the sole free-form arm). Disjoint by construction | §5 |
 | B3b/B5 | **send vs quittance phase confusion** — a matched `last_chk` with short `data_sign` loses already-proven `Submitted` | **Send-evidence and reconcile-evidence are different types.** `SubmissionEvidence` carries `SendOutcome` (establishes certainty); `ReconciliationObservation` carries `ReconcileOutcome` (monotone refine, **never regresses** certainty) | §3, §5, §6 |
-| B4/B8 | **`NoResponse(ProtocolDecode)` false**; gRPC `Unauthenticated` over live TLS is a *peer response*, not absence | `SendResponse` = `NoResponse(cause)` **only** for genuine local absence; a `RemoteStatus` arm carries authenticated-peer garbage **and** remote auth-status | §3 |
+| B4/B8 | **`NoResponse(ProtocolDecode)` false**; gRPC `Unauthenticated` over live TLS is a *peer response*, not absence | `SendResponse` = `NoResponse(cause)` **only** for genuine local absence; a `RemoteStatus` arm carries the TLS-proven remote auth-status **(CS-3 3.2:** the un-parseable authenticated-peer *garbage body* is NOT `RemoteStatus` — it collapses to `NoResponse{CallFailedWithoutTrustedDpsEnvelope}`, §3 SE-2**)** | §3 |
 | B5 | **F7 correlation nominal** (proves FN, not the doc; `ProvenCorrelation` undefined) | Contract-owned `validate_reconcile(ticket, raw)`; the **only** ctor of `ReconciliationObservation`; `ProvenCorrelation` is a private witness built solely on an exact doc-level match; FN-level `last_chk` ⇒ `UnattributedProbeObservation` | §6 |
 | B6 | **RP4B-2 still green-but-unsound** (image equality misses an Accepted/Rejected swap) | pin compares the **full graph** `{(evidence-discriminant, classify(evidence))} == normative-graph`, not just the image | §10 RP4B-2 |
 | B7 | **binding not held at the port boundary** — a wrong port can wire-call before mismatch | `submit_raw(envelope) -> Result<SendResponse, PortBindingMismatch>` (never `SubmissionEvidence` — port is post-CAS, `NotStarted` impossible); MUST check `envelope.binding == self.binding()` **before any wire I/O** | §6 DP-3; RP4B-5 |
@@ -78,12 +78,16 @@ record-then-apply are already locked (#4A / Spec #2).
 enum SubmissionCertainty { NotSubmitted, SubmittedUnknown, Submitted }              // prro-domain
 enum ResponseProvenance  { NoResponse, AuthenticatedPeer, ParsedDpsEnvelope }       // prro-domain
 // (c) B/F8 — classifier + fresh-write input is ActiveRetryClass (7). HydratedRetryClass (8) is the read/decode
-//     type (adds DrainChainSettleRetry). RetryClass stays the storage authority (relocated to prro-domain,
-//     compat re-export). set_routing (the fresh-write store API) accepts ActiveRetryClass ONLY.
-enum ActiveRetryClass   { TerminalReject, TransientRetry, FnConfigError, WrapperBug, ProbeRequired, MacRecovery, OperatorEscalation }
-enum HydratedRetryClass { Active(ActiveRetryClass), DrainChainSettleRetry }         // decode-only; DrainChain unreachable fresh
-impl From<ActiveRetryClass> for RetryClass { /* widening */ }
-// fresh-write API (store): fn set_routing(&self, id: ReservationId, r: ActiveRetryClass);   // cannot take DrainChain
+//     type (adds DrainChainSettleRetry).
+//   ⚠️ R4 RELOCATION IS UNBUILT (CS-3 3.2 recon, §12 R4): `ActiveRetryClass` IS realized in prro-domain
+//     (mod.rs:270), but `RetryClass` was NOT relocated — it stays the storage authority in prro
+//     (error_routing.rs:69) with NO compat re-export, NO `From<ActiveRetryClass>` widening, and NO `set_routing`
+//     store API. The relocation triple + a routing-store home is a Bridge/D work item (keystone), NOT a shipped
+//     state. The three lines below are the DESIGN TARGET, not current code.
+enum ActiveRetryClass   { TerminalReject, TransientRetry, FnConfigError, WrapperBug, ProbeRequired, MacRecovery, OperatorEscalation }  // REALIZED (prro-domain mod.rs:270)
+enum HydratedRetryClass { Active(ActiveRetryClass), DrainChainSettleRetry }         // decode-only; DrainChain unreachable fresh (REALIZED)
+impl From<ActiveRetryClass> for RetryClass { /* widening */ }                       // UNBUILT (D/E) — RetryClass not yet relocated
+// fresh-write API (store): fn set_routing(&self, id: ReservationId, r: ActiveRetryClass);   // UNBUILT (D/E) — no routing-store home yet
 ```
 **Total SEND-derivation** — a total function of `SubmissionEvidence` (§3). Reconciliation is a **separate**
 monotone refinement (§5), never in this table:
@@ -92,7 +96,7 @@ monotone refinement (§5), never in this table:
 |---|---|---|---|---|
 | `NotStarted{reason}` | `NotSubmitted` | `NoResponse` | `TransientRetry` / `WrapperBug` | `:107`,`:110` |
 | `Started{NoResponse(cause)}` (incl. `CrashedBeforeObservation`) | `SubmittedUnknown` | `NoResponse` | `TransientRetry` / `WrapperBug` | `:108` |
-| `Started{RemoteStatus(_)}` (auth-peer garbage / remote auth-status) | `SubmittedUnknown` | `AuthenticatedPeer` | `ProbeRequired` | `:114` |
+| `Started{RemoteStatus(RemoteAuthStatus)}` (TLS-proven Unauth/PermDenied; CS-3 3.2 — garbage body is NOT here → `NoResponse`) | `SubmittedUnknown` | `AuthenticatedPeer` | `ProbeRequired` | `:114` |
 | `Started{Parsed(Indeterminate)}` (`-4`,`-3`,close-ambig, unknown-code, OK-no-id) | `SubmittedUnknown` | `ParsedDpsEnvelope` | `TransientRetry` / `ProbeRequired` | `:110`,`:114` |
 | `Started{Parsed(Accepted(SentAccepted))}` | `Submitted` | `ParsedDpsEnvelope` | *(NULL clean-accept)* | `:109`,`:110` |
 | `Started{Parsed(Rejected(closed verdict))}` (`-1`,`-12`,`-13`,`-14`,close-verdict) | `Submitted` | `ParsedDpsEnvelope` | one of `:113`'s four | `:109`,`:113` |
@@ -106,27 +110,41 @@ enum SubmissionEvidence {                         // prro-dps-contract; no publi
     NotStarted { reason: PreflightRefusal, binding: DpsProtocolBinding, envelope_hash: EnvelopeHash },
     Started    { response: SendResponse,   binding: DpsProtocolBinding, envelope_hash: EnvelopeHash },
 }
-enum SendResponse {
+// CS-3 3.2 (realized, prro-domain mod.rs:435): `SendResponse` ships as an OPAQUE struct over a PRIVATE inner
+// enum, read via `kind() -> SendResponseKind<'_>` and built ONLY by source-gated ctors
+// (`no_response` / `remote_status` / `parsed`) — Class-A sealing, NOT a public 3-arm enum. Same three arms.
+struct SendResponse(SendResponseInner);           // opaque; view: kind(); ctors: no_response/remote_status/parsed
+enum SendResponseInner {                          // PRIVATE — the three arms are the pre-3.2 public enum, now sealed
     NoResponse(NoResponseCause),                  // GENUINE local absence — no bytes / no session reached the far side
     RemoteStatus(RemoteStatusEvidence),           // the far side responded, but NOT with a parseable DPS envelope
     Parsed(SendOutcome),                          // a DPS envelope was received + parsed (§5)
 }
+enum SendResponseKind<'a> { NoResponse(&'a NoResponseCause), RemoteStatus(&'a RemoteStatusEvidence), Parsed(&'a SendOutcome) }
 enum NoResponseCause {                            // B4 — no ProtocolDecode, no auth-status here
     LocalHandshakeFailure,                        // TCP/TLS/DNS never established a session
     Timeout, Cancelled,                           // per-call deadline / future dropped / shutdown
     CrashedBeforeObservation,                     // durable CALL_STARTED, then reboot before any response
+    CallFailedWithoutTrustedDpsEnvelope,          // CS-3 3.2 (mod.rs:406): incumbent tonic `Internal` — a received body
+                                                  //   decode-collapsed with NO TLS-proven status (honest genuine-absence)
 }
 enum RemoteStatusEvidence {                       // B8 — a peer response, NOT a transport-level absence
-    AuthenticatedPeerGarbage(RawResponseDigest),  // TLS-authenticated peer, un-parseable body (WAF)
-    RemoteAuthStatus(RawResponseDigest),          // gRPC Unauthenticated/PermissionDenied over an established session
+    // CS-3 3.2 (realized, mod.rs:416): `AuthenticatedPeerGarbage` was REMOVED — the incumbent tonic seam collapses a
+    // decode-failure of a received body to `Internal` → `NoResponse{CallFailedWithoutTrustedDpsEnvelope}`, so the
+    // un-parseable-WAF-body case never reaches this axis; only the TLS-proven Unauth/PermDenied arm survives.
+    RemoteAuthStatus(GrpcStatusDigest),           // gRPC Unauthenticated/PermissionDenied over an established session
 }
 struct EnvelopeHash([u8; 32]);                    // == 032:85 length=32
+struct DecodedResponseDigest([u8; 32]);           // CS-3 3.2 (mod.rs:121): honest fingerprint of DECODED DPS envelope content
+struct GrpcStatusDigest([u8; 32]);                // CS-3 3.2 (mod.rs:141): DISTINCT type — fingerprints a transport-status reply
 ```
 - **SE-1 (fail-safe):** absence of a `NotStarted` witness ⇒ `Started` (Spec #2 §3). `NotStarted` only before the
   durable `CALL_STARTED` marker (`032:80`) or a `PreflightRefusal`.
-- **SE-2:** a decode failure of *received* bytes is never `NoResponse` — it is `RemoteStatus::AuthenticatedPeerGarbage`
-  (once CS-3 proves peer auth), else it collapses honestly to `NoResponse(LocalHandshakeFailure|Timeout)` under the
-  incumbent (AM-2). A `RemoteStatus` never sets `proves_dps_forward_progress()` (§8).
+- **SE-2 (CS-3 3.2 realized — INVERTED from the rev-6 prose):** a decode failure of *received* bytes ships as
+  `NoResponse(CallFailedWithoutTrustedDpsEnvelope)` (honest genuine-absence, `mod.rs:406`), **not** a `RemoteStatus`
+  garbage arm — the incumbent tonic seam collapses the un-parseable authenticated-peer body to `Internal`. Only a
+  TLS-proven `Unauthenticated`/`PermissionDenied` surfaces as `RemoteStatus::RemoteAuthStatus` (A′ seam, `grpc.rs`).
+  A parsed-garbage evidence arm would need a custom codec (a 3.2 non-goal). A `RemoteStatus` never sets
+  `proves_dps_forward_progress()` (§8).
 
 ## 4 · `AttemptObservation` — bind to reservation + node generation
 ```rust
@@ -141,6 +159,8 @@ struct AttemptObservation { reservation_id: ReservationId, node_generation: Deli
 ## 5 · Algebra — disjoint partition; send vs reconcile as different types (B3, B3b/B5)
 **Send-outcome** (from `send_chk`; establishes certainty for the first time):
 ```rust
+// CS-3 3.2 (realized): like `SendResponse` (§3), `SendOutcome` and `SendIndeterminate` ship SEALED — opaque
+// structs over private inner enums, read via `kind()` (mod.rs:524, mod.rs:732). Same arms; Class-A sealing.
 enum SendOutcome {                                // B3 — declared; the three arms are disjoint by construction
     Accepted(SentAccepted),                       // ⇒ Submitted
     Rejected(DpsReject),                          // a closed DPS verdict on THIS doc ⇒ Submitted
@@ -163,10 +183,10 @@ enum DpsReject {                                  // CLOSED — every named defi
     Close,                                        // -2 ERROR_CHECK / -15 ERROR_NOT_OPEN_SHIFT for NON-close doc types (§12 R1)
 }
 enum SendIndeterminate {                          // the ONLY free-form arm is UnknownStatus
-    UnknownStatus { raw_code: BoundedText, digest: RawResponseDigest }, // -4 ERROR_UNKNOWN + any code NOT in DpsReject
+    UnknownStatus { raw_code: BoundedText, digest: DecodedResponseDigest }, // -4 ERROR_UNKNOWN + any code NOT in DpsReject
     SaveError,                                    // -3 ERROR_SAVE (transient)
     CloseAmbiguous,                               // -2 ERROR_CHECK / -15 ERROR_NOT_OPEN_SHIFT on close / Z-report ONLY (§12 R1)
-    OkButNoFiscalNumber { digest: RawResponseDigest }, // status OK but empty id
+    OkButNoFiscalNumber { digest: DecodedResponseDigest }, // status OK but empty id
 }
 // Partition completeness: every send status in proto:41-56 has exactly one home — a definitive verdict in the
 // CLOSED DpsReject, or -3/-4/OK-no-id in SendIndeterminate; -2/-15 split by doc_type (verdict vs CloseAmbiguous).
@@ -270,7 +290,7 @@ struct ProvenCorrelation(());                     // private witness; built ONLY
 struct UnattributedProbeObservation { fn_liveness: FnLiveness }  // FN liveness only; attributes to NO reservation
 enum FnLiveness {                                 // where NotFound now lives (moved out of ReconcileOutcome)
     NotFound,                                     // last_chk empty id — the FN has no matching last check (inconclusive for THIS doc)
-    OtherDocLast(RawResponseDigest),              // the FN's last check is a DIFFERENT doc — live, but not ours
+    OtherDocLast(DecodedResponseDigest),              // the FN's last check is a DIFFERENT doc — live, but not ours
 }
 enum ReconciliationCapability { None /* ⇒ immediate RMR behind the fence */, ByServerFiscalNo, ByLocalIdentity }
 ```
@@ -321,11 +341,13 @@ trait DpsPortRegistry { fn resolve(&self, b: &DpsProtocolBinding) -> Option<Arc<
 - **AM-1 (narrow liveness):** `proves_dps_forward_progress()` is `true` **only** for `SendResponse::Parsed(_)`
   (Accepted / Rejected / Indeterminate — a real DPS envelope). `RemoteStatus(_)` / `NoResponse(_)` ⇒ `false`
   (degrade; never reset the anti-mask; never permit issuance).
-- **AM-2 (`AUTHENTICATED_PEER` is a CS-3-seam value, honest):** the incumbent `map_tonic_status`
-  (`grpc.rs:127-128`) collapses **every** tonic `Status` into `Transport(...)`; so today a WAF/garbage body or a
-  remote auth-status is indistinguishable from a reset and surfaces as `NoResponse`. Populating
-  `RemoteStatus`/`AuthenticatedPeer` requires the CS-3 seam (`tls_authenticated ∧ dps-parse-failed`). #4B pins the
-  type + law; it does not claim incumbent derivability.
+- **AM-2 (CS-3 3.2 — A′ seam realized for TLS-proven status; garbage body stays genuine-absence):** the incumbent
+  `map_tonic_status` (`grpc.rs:127-128`) collapsed **every** tonic `Status` into `Transport(...)`. **A′ (shipped)**
+  now live-converts a **TLS-proven** `Unauthenticated`/`PermissionDenied` into `RemoteStatus::RemoteAuthStatus`
+  (`grpc.rs`), and the shadow yields it read-only. An un-parseable **WAF/garbage body is NOT proven** — it surfaces
+  honestly as `NoResponse(CallFailedWithoutTrustedDpsEnvelope)` (tonic `Internal`, `mod.rs:406`); a parsed-garbage
+  evidence arm would need a custom codec (a 3.2 non-goal). #4B pins the type + law; the `AuthenticatedPeer`
+  provenance is populated only for the TLS-proven `RemoteAuthStatus` arm.
 
 ## 9 · Normative invariants
 - **D1** three axes independent; no authoritative single `DeliveryOutcome`.
@@ -356,8 +378,10 @@ trait DpsPortRegistry { fn resolve(&self, b: &DpsProtocolBinding) -> Option<Arc<
   `SubmittedUnknown` (incl. `CrashedBeforeObservation`).
 - **RP4B-3** `-4` ⇒ `{SubmittedUnknown, Parsed, TransientRetry}`; `-3` same row; bare timeout ⇒ `{SubmittedUnknown,
   NoResponse, TransientRetry}`; `-1` ⇒ `{Submitted, Parsed, TerminalReject}` — all distinct.
-- **RP4B-4** WAF/garbage / remote-auth-status ⇒ `{SubmittedUnknown, AuthenticatedPeer, ProbeRequired}`,
-  `proves_..()==false`; + an AM-2 pin that the incumbent yields `NoResponse` for the same wire until CS-3.
+- **RP4B-4** a **TLS-proven** `RemoteAuthStatus` (Unauth/PermDenied) ⇒ `{SubmittedUnknown, AuthenticatedPeer,
+  ProbeRequired}`, `proves_..()==false`; a WAF/garbage body ⇒ `NoResponse(CallFailedWithoutTrustedDpsEnvelope)`
+  (CS-3 3.2 A′ realized — **not** a `RemoteStatus` arm); + the AM-2 pin that the pre-A′ incumbent yielded
+  `NoResponse` for the TLS-proven wire too.
 - **RP4B-5 (F6/B7)** binding: immutable Rust type; DB mutation reject (`032:170-187`); PB-2 **full-tuple** equality
   (same `protocol_id`, different `contract_version` ⇒ rejected at creation); **wrong-port `submit_raw` ⇒
   `PortBindingMismatch` with ZERO wire calls** (mock asserts no send); global profile-flip does not affect a bound doc.
@@ -388,13 +412,15 @@ trait DpsPortRegistry { fn resolve(&self, b: &DpsProtocolBinding) -> Option<Arc<
 ## 12 · Resolved rulings (auditor) + status
 - **R1** `-2/-15` → `SendIndeterminate::CloseAmbiguous` for close / Z-report; `DpsReject::Close` for other doc
   types (§5). **R2** PB-2 invariant + negative pin = #4B; atomic tx = CS-3; **full tuple**. **R3** homes
-  (auditor instruction #2): `prro-domain` = IDs / binding / semantic axes / `RetryClass`+`ActiveRetryClass`+
+  (auditor instruction #2): `prro-domain` = IDs / binding / semantic axes / `RetryClass` (relocation UNBUILT — R4) +`ActiveRetryClass`+
   `HydratedRetryClass`; `prro-dps-contract` = wire-observation types + the **raw** `DpsPort` traits
   (`submit_raw`, `probe`, status/codes) + `validate_reconcile`; **the `AuthorizedSubmission` token +
   `authorize_submission` mint + the `submit_authorized` wrapper live in the engine delivery module** (private
-  ctor). Honest split: token-mint = Rust-privacy-proven engine-only; no-direct-`submit_raw` = DAG/review. **R4**
-  `RetryClass`→`prro-domain` w/ compat re-export; `ActiveRetryClass` (fresh-write) and `HydratedRetryClass`
-  (decode) are distinct types.
+  ctor). Honest split: token-mint = Rust-privacy-proven engine-only; no-direct-`submit_raw` = DAG/review. **R4 (CS-3 3.2 recon — PARTIAL):**
+  `ActiveRetryClass` (fresh-write) and `HydratedRetryClass` (decode) are distinct types and **realized**
+  (prro-domain `mod.rs:270`); but the `RetryClass`→`prro-domain` relocation + compat re-export +
+  `From<ActiveRetryClass>` + `set_routing` are **UNBUILT** — `RetryClass` stays in prro `error_routing.rs:69`.
+  Carried as a Bridge/D routing-store work item (§2(c)).
 - **Corrective-resend / `-12`:** **deferred out of #4B** (D4, §11) — a CS-3 new-attempt edge + a locked-spec
   amendment. This is the one place #4B says "not here, and here is exactly what CS-3 must additionally lock."
 
