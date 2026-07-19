@@ -661,6 +661,7 @@ test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_check_response_y
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_rro_info_response_yields_indeterminate	false
 test-support	prro	prro	transports::dps::dto::tests::rp4b_3_neg4_status_response_yields_indeterminate	false
 test-support	prro	prro	transports::dps::grpc::tests::pin3_observe_tonic_status_mirrors_r1_tls_gate	false
+test-support	prro	prro	transports::dps::grpc::tests::pin_b3_observe_tonic_status_returned_status_is_never_genuine_absence	false
 test-support	prro	prro	transports::dps::grpc::tests::pin_d_section_4_6_drift_pin	false
 test-support	prro	prro	transports::dps::grpc::tests::r1_tls_proven_channel_yields_remote_status_for_both_codes	false
 test-support	prro	prro	transports::dps::grpc::tests::r1_unproven_channel_cannot_forge_authenticated_peer	false
@@ -671,8 +672,10 @@ test-support	prro	prro	transports::dps::grpc::tests::rp4b4_remote_status_retry_c
 test-support	prro	prro	transports::dps::grpc::tests::rp4b4_unauthenticated_yields_remote_status	false
 test-support	prro	prro	transports::dps::grpc::tests::rp4b4_unavailable_yields_transport	false
 test-support	prro	prro	transports::dps::raw_reply::tests::every_variant_round_trips_through_kind	false
+test-support	prro	prro	transports::dps::raw_reply::tests::m2_transport_absence_never_widens_to_crash_before_observation	false
 test-support	prro	prro	transports::dps::raw_reply::tests::observation_carries_evidence_and_diagnostics	false
 test-support	prro	prro	transports::dps::raw_reply::tests::observe_from_legacy_is_honestly_degraded	false
+test-support	prro	prro	transports::dps::raw_reply::tests::pr4_b2_map_send_reply_forwards_exact_digest_per_arm	false
 test-support	prro	prro	transports::dps::raw_reply::tests::pr4_map_send_reply_covers_section_4_3	false
 test-support	prro	prro	transports::dps::t112::tests::byte_pin_full_equality	false
 test-support	prro	prro	transports::dps::t112::tests::byte_pin_length_206	false
@@ -1119,6 +1122,7 @@ test-support	prro	prro::digest_mint_source_gate	forwarding_wrapper_in_allowed_fi
 test-support	prro	prro::digest_mint_source_gate	full_forge_chain_via_captures_is_caught	false
 test-support	prro	prro::digest_mint_source_gate	generic_identity_alias_delivery_ctor_is_caught	false
 test-support	prro	prro::digest_mint_source_gate	genuine_cfg_test_mint_is_exempt	false
+test-support	prro	prro::digest_mint_source_gate	m3_map_send_reply_stays_wired_into_stage_send	false
 test-support	prro	prro::digest_mint_source_gate	macro_invocation_delivery_ctor_is_caught	false
 test-support	prro	prro::digest_mint_source_gate	parse_error_fails_gate	false
 test-support	prro	prro::digest_mint_source_gate	plain_type_import_not_flagged	false
