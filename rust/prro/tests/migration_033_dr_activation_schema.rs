@@ -898,10 +898,25 @@ async fn rg01_column_count_is_now_20() {
             "033 new column {col} must exist; have {names:?}"
         );
     }
+    // 036 adds four evidence-union columns (Slice 2a). open_pool applies ALL
+    // migrations, so the head total is 24 (17 from 032 + 3 from 033 + 4 from 036).
+    // The 033-specific guarantee is the loop above; the total tracks the current
+    // head. (Test id kept — the additions-only inventory gate forbids renaming it.)
+    for col in [
+        "evidence_kind",
+        "evidence_text",
+        "evidence_code",
+        "evidence_digest",
+    ] {
+        assert!(
+            names.contains(col),
+            "036 evidence column {col} must exist at head; have {names:?}"
+        );
+    }
     assert_eq!(
         names.len(),
-        20,
-        "total column count must be 20 (17 from 032 + 3 from 033); have {names:?}"
+        24,
+        "total column count must be 24 (17 from 032 + 3 from 033 + 4 from 036); have {names:?}"
     );
 }
 

@@ -1447,6 +1447,15 @@ async fn p01_upgrade_on_nonempty_db_sqlite_master_diff() {
         "delivery_reservation_cs_pairing_update",
         "delivery_reservation_oo_completeness",
         "delivery_reservation_clean_accept_node_effect",
+        // 036 adds three more triggers ON delivery_reservation (Slice 2a evidence
+        // union: pre-OO/insert null-guard, fail-closed matrix, evidence immutability).
+        // The control DB's DROP TABLE auto-drops them, so they belong in the
+        // filtered-out reservation-object set. (036's four evidence COLUMNS are part
+        // of the delivery_reservation table DDL, which is already filtered out via the
+        // table itself — only the triggers are separate sqlite_master rows.)
+        "delivery_reservation_evidence_insert",
+        "delivery_reservation_evidence_matrix_update",
+        "delivery_reservation_evidence_immutable",
     ]
     .into_iter()
     .collect();
