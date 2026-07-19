@@ -1191,3 +1191,99 @@ fn m3_map_send_reply_stays_wired_into_stage_send() {
         scan.live_calls, scan.any_calls
     );
 }
+
+// ─── (4) legacy test identities — round-3 inventory (additions-only) ─────────────────────────────
+//
+// The B1 round-2 rewrite (two-visitor gate → authority-flow gate) RENAMED the old canaries. The
+// additions-only inventory gate (`inventory_gate.sh`) forbids ANY removed test identity vs the merge
+// base, and — per the round-3 auditor — a prose "architecture decision" cannot make CI green (the gate
+// can't read it), while a formal exception mechanism would add a new bypass surface. The sanctioned fix
+// is to RESTORE the nine old identities as THIN WRAPPERS delegating to the superseding checks (or
+// re-exercising the exact original concern via the real gate `scan_source`). No coverage is lost and
+// the additions-only gate stays intact (9 identities restored ⇒ 0 removals).
+
+#[test]
+fn cfg_test_double_is_exempt() {
+    // → superseded by `genuine_cfg_test_mint_is_exempt` (a genuine #[cfg(test)] mint is exempt).
+    genuine_cfg_test_mint_is_exempt();
+}
+
+#[test]
+fn macro_export_laundering_of_mint_is_caught() {
+    // → superseded by `decoder_macro_export_mint_is_caught`.
+    decoder_macro_export_mint_is_caught();
+}
+
+#[test]
+fn macro_invocation_laundering_is_caught() {
+    // → superseded by `macro_invocation_delivery_ctor_is_caught`.
+    macro_invocation_delivery_ctor_is_caught();
+}
+
+#[test]
+fn ordinary_carry_of_a_digest_is_not_flagged() {
+    // → superseded by `carrying_a_digest_not_flagged` (negative control).
+    carrying_a_digest_not_flagged();
+}
+
+#[test]
+fn production_src_mints_digest_only_in_transport_decoder() {
+    // → superseded by the whole-tree production scan `production_src_authority_flow_gate_holds`.
+    production_src_authority_flow_gate_holds();
+}
+
+#[test]
+fn reexport_of_provenance_mint_is_caught() {
+    // → superseded by `aliased_use_of_mint_is_caught` (which re-exports the provenance mint
+    // `from_transport`).
+    aliased_use_of_mint_is_caught();
+}
+
+#[test]
+fn reexport_of_mint_is_caught() {
+    // Thin wrapper re-exercising the DIGEST-mint re-export concern directly via the gate (the new
+    // `aliased_use_of_mint_is_caught` covers the provenance mint; this covers `from_transport_digest`).
+    let snippet = r#"
+        use prro_domain::delivery::DecodedResponseDigest::from_transport_digest;
+    "#;
+    let v = scan_source(snippet, ATTACK_FILE);
+    assert!(
+        v.iter().any(|x| x.detail.contains("from_transport_digest")
+            && x.detail.contains("re-export / alias")),
+        "a `use` re-export of the digest mint must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn services_call_of_mint_is_caught() {
+    // Thin wrapper re-exercising the original concern: a DIGEST mint called from a non-allowlisted
+    // services site is a violation (direct call outside its allowlisted (file, fn)).
+    let snippet = r#"
+        fn helper() {
+            let _ = DecodedResponseDigest::from_transport_digest([0u8; 32]);
+        }
+    "#;
+    let v = scan_source(snippet, "services/write_path/other.rs");
+    assert!(
+        v.iter()
+            .any(|x| x.detail.contains("from_transport_digest")
+                && x.detail.contains("NON-allowlisted")),
+        "a services-side digest-mint call must be caught: {v:#?}"
+    );
+}
+
+#[test]
+fn services_call_of_provenance_mint_is_caught() {
+    // Thin wrapper re-exercising the original concern for the PROVENANCE mint.
+    let snippet = r#"
+        fn helper() {
+            let _ = NonEmptyFiscalNumber::from_transport("FORGED".to_string());
+        }
+    "#;
+    let v = scan_source(snippet, "services/write_path/other.rs");
+    assert!(
+        v.iter()
+            .any(|x| x.detail.contains("from_transport") && x.detail.contains("NON-allowlisted")),
+        "a services-side provenance-mint call must be caught: {v:#?}"
+    );
+}

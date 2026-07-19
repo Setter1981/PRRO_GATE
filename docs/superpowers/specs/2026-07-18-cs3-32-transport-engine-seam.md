@@ -237,7 +237,7 @@ grpc; 1,9,10 none (type-level).
 | `RawSendReply` + inner mint | `prro::transports::dps` | private inner | decoder | **module privacy** (compile-time) |
 | authority ctors: `SendResponse::{parsed,no_response,remote_status}`, `SendOutcome::{accepted,ok_but_no_fiscal_number,missing_status,from_server_code}` (`SentAccepted::observe` is **not** an engine-mapper ctor — the id arrives pre-validated as `NonEmptyFiscalNumber`) | `prro-domain` | pub | ONE engine mapper file (`shadow_map.rs::map_send_reply`) | `digest_mint_source_gate.rs` authority-flow lint (best-effort source-policy) |
 
-**Symbol source-gate (wrapper-proof, B3).** A syn-scan (sibling of `with_immediate_no_foreign_io`,
+**Symbol source-gate (wrapper-aware, B3).** A syn-scan (sibling of `with_immediate_no_foreign_io`,
 realized as the `digest_mint_source_gate.rs` authority-flow lint) with **per-symbol allowlists**.
 This is a **best-effort source-policy, NOT a type-seal** — do not claim a type-seal.
 **Decoder-only** (`transports::dps`): `from_transport_digest`, `NonEmptyFiscalNumber::from_transport`,
@@ -249,10 +249,21 @@ remote_status}` and `SendOutcome::{accepted, ok_but_no_fiscal_number, missing_st
 `NonEmptyFiscalNumber`, so `observe` stays wherever it is today, never in the mapper allowlist. The
 gate **also forbids** re-export (`pub use`), forwarding wrappers, and function-pointer capture of any
 gated symbol — so a `mint_for_engine` wrapper in the allowed module cannot launder the mint.
-**`prro-testkit` is an explicit test-only allowlist entry.** Precise guarantee: the engine mapper
-*constructs* `SendResponse` but can only forward evidence (digest/id/code) read out of the opaque,
-transport-minted `RawSendReply` (via its `kind()` view) — it never obtains a constructible digest,
-id, or code to inject. Nothing rests on external trybuild proving sibling sealing.
+**`prro-testkit` is an explicit test-only allowlist entry.** **Intended source policy (enforced
+best-effort for recognized source forms; NOT a type-level guarantee):** the engine mapper
+*constructs* `SendResponse` but is intended only to forward evidence (digest/id/code) read out of the
+opaque, transport-minted `RawSendReply` (via its `kind()` view), rather than obtaining a constructible
+digest, id, or code to inject. The lint enforces this for the recognized source forms it can see; a
+determined author can still defeat a purely syntactic lint (novel code generation, proc-macro
+expansion, or editing the lint/tripwire itself). Nothing rests on external trybuild proving sibling
+sealing.
+
+**D/E entry decision (round-3, recorded here).** Under the current **trusted-contributor threat model**
+(two cofounder-developers with commit rights; the concern is accidental regression / careless change,
+NOT a malicious author), **authority lint + mandatory review by the second cofounder** for any change
+to the authority constructors, the engine mapper, the transport mints, or the gate itself **is the
+accepted control**. A Rust type-seal via mint/consumer co-location is **NOT required** at D/E under
+this model; if the trust model changes, revisit co-location before wiring the shadow live.
 
 ### 4.5 Single doc_type source
 
@@ -316,16 +327,18 @@ crash/drop (boot edge). Three declared deltas: **empty-id, unknown-non-zero, TLS
 2. **trybuild: cross-crate literal** — digest / `SendResponse` literal from another crate → won't
    compile.
 3. **symbol source-gate: transport-only mint (+ macro/re-export laundering)** —
-   `from_transport_digest`/`from_transport`/framing/`RawSendReply` ctor appear ONLY in the decoder.
+   `from_transport_digest`/`from_transport`/framing/`RawSendReply` ctor are source-gated (best-effort)
+   to the decoder: the lint flags any recognized appearance elsewhere (it is not a type-level guarantee).
    The gate is **syntactic** (syn does not expand macros): it **forbids any `macro_rules!` /
    `#[macro_export]` / token-tree that mentions a gated symbol**, plus `pub use` / forwarding
    wrapper / fn-pointer capture, anywhere outside the decoder → RED. Canary: a `#[macro_export]
    macro_rules!` in the decoder that emits the mint, invoked from `services/*`, must be caught by
    the syntactic ban (proven, not assumed).
 4. **symbol source-gate: one engine mapper** — `SendResponse::{parsed, no_response, remote_status}`
-   and `SendOutcome::{accepted, ok_but_no_fiscal_number, missing_status, from_server_code}` appear
-   ONLY in the mapper file (`shadow_map.rs::map_send_reply`); `RawSendReply`/digest/`from_transport`
-   construction ONLY in the decoder; **`SentAccepted::observe` is NOT in the mapper allowlist**.
+   and `SendOutcome::{accepted, ok_but_no_fiscal_number, missing_status, from_server_code}` are
+   source-gated (best-effort) to the mapper file (`shadow_map.rs::map_send_reply`);
+   `RawSendReply`/digest/`from_transport` construction to the decoder; **`SentAccepted::observe` is NOT
+   in the mapper allowlist**.
    Direct `RawSendReply` / `SendResponse::*` / `Accepted` construction from any other `services/*` →
    RED. Realized coverage: `raw_reply.rs::pr4_map_send_reply_covers_section_4_3` (the §4.3 mapping is
    total) + `grpc.rs::pin_d_section_4_6_drift_pin` (the §4.6 drift-pin).

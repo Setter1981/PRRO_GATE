@@ -424,12 +424,13 @@ pub enum RemoteStatusEvidence {
 /// Split from `SubmissionEvidence` because the port is always post-CAS
 /// (`CALL_STARTED` already fired), so `NotStarted` is structurally impossible
 /// at the port boundary.
-/// CS-3 3.2 PR4: **opaque + sealed** (was a public enum — §2 Class-A). Constructible ONLY via the
-/// authority ctors [`parsed`](Self::parsed)/[`no_response`](Self::no_response)/
-/// [`remote_status`](Self::remote_status), which are **source-gated to the ONE engine-mapper file**
-/// (`services/write_path/shadow_map.rs`, §4.4) — the engine mapper *constructs* a `SendResponse` but
-/// can only forward transport-minted evidence read out of the opaque `RawSendReply`; it can never
-/// inject a fabricated digest/id/code. Read via [`kind`](Self::kind).
+/// CS-3 3.2 PR4: **opaque** (was a public enum — §2 Class-A). The authority ctors
+/// [`parsed`](Self::parsed)/[`no_response`](Self::no_response)/[`remote_status`](Self::remote_status)
+/// are `pub` (cross-crate), **source-gated best-effort to the ONE engine-mapper file**
+/// (`services/write_path/shadow_map.rs`, §4.4) — the intended policy is that the engine mapper only
+/// *forwards* transport-minted evidence read out of the opaque `RawSendReply`, rather than injecting a
+/// fabricated digest/id/code. This is a best-effort source-policy lint, NOT a type-level guarantee
+/// (see the gate module doc + §4.4 D/E decision). Read via [`kind`](Self::kind).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SendResponse(SendResponseInner);
 
