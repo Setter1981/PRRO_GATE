@@ -82,7 +82,8 @@ network-outside-tx (stage_send.rs:1562, tx.rs:65 + syn-scan); transport identity
 
 1. **contract/digest types + ownership** — opaque `DecodedResponseDigest`/`GrpcStatusDigest` in
    domain (§4.1, `pub from_transport_digest`, framing+SHA in transport); **opaque** `SendResponse`;
-   digest carrier fields (§4.1b); **total `ParsedReply` input** + `from_parsed` (§4.1c); delete
+   digest carrier fields (§4.1b); the engine mapper reads `RawSendReply::kind()` **directly** and
+   the code×doc_type table lives in `SendOutcome::from_server_code` (§4.1c); delete
    `RawResponseDigest` (D-3, not byte-neutral — Debug strings, pinned).
 2. **single-RPC total transport evidence** — `send_chk_observed` (§4.2): one call + one decode →
    `(legacy, RawSendObservation)`; opaque `RawSendReply`.
@@ -153,32 +154,34 @@ SendOutcomeInner::Accepted(SentAccepted)   // NO digest (D-4)
 > `NonOkStatusCode`) and the digest-only-where-it-exists principle stand as written. See
 > `services/write_path/shadow_map.rs::map_send_reply` + PR4 pin A/B.
 
-Replace `from_dps_status(RawDpsStatus, doc_type, digest)` (digest-always) with a **total** input
-that carries a digest **only where one exists** (no `Option`/fictitious) and whose id/code carry
-**provenance**, not just form — the engine can fabricate neither:
+Replace `from_dps_status(RawDpsStatus, doc_type, digest)` (digest-always, now **deleted**) with a
+**total** input that carries a digest **only where one exists** (no `Option`/fictitious) and whose
+id/code carry **provenance**, not just form — the engine can fabricate neither. The realized input
+is the opaque `RawSendReply` (§4.2), whose 6-arm `kind()` view the engine mapper reads **directly**;
+its provenance wrappers are:
 
 ```text
 // prro-domain, opaque + private field; the SOLE `from_transport(...)` ctor is source-gated to the decoder
-struct NonEmptyFiscalNumber(String /*private, non-empty*/);  // proves the id came OFF a parsed reply
+struct NonEmptyFiscalNumber(String /*private, non-empty*/);  // proves the id came OFF a decoded reply
 struct NonOkStatusCode(i32 /*private, != 0 && != 1*/);       // a real non-OK / non-UNKNOWN DPS code
-
-struct ParsedReply(ParsedReplyInner);           // OPAQUE; minted ONLY by the transport decoder (§4.4 gate)
-enum ParsedReplyInner {                          // private inner — engine cannot construct a variant
-  Accepted { fiscal_id: NonEmptyFiscalNumber },                // NO digest
-  Replied  { code: RepliedCode, digest: DecodedResponseDigest },
-}
-enum RepliedCode { OkEmptyId | ServerCode(NonOkStatusCode) | MissingStatus }  // 0⇒MissingStatus, 1⇒Accepted/OkEmptyId — never ServerCode
-fn SendOutcome::from_parsed(reply: ParsedReply, doc_type: DocType) -> SendOutcome   // the engine mapper
 ```
 
+> **Retired (variant-3 adjudication).** The intermediate `struct ParsedReply(ParsedReplyInner)` /
+> `enum RepliedCode` / `fn SendOutcome::from_parsed` are **not** built. Their job is done directly by
+> `RawSendReply::kind()` (§4.2 — a strict superset that also carries `RemoteAuthStatus`/`NoResponse`,
+> which `ParsedReply` could not express) plus the code×doc_type table owned by
+> `SendOutcome::from_server_code`. See `services/write_path/shadow_map.rs::map_send_reply`.
+
 `NonEmptyFiscalNumber`/`NonOkStatusCode` are **transport-minted** (their `from_transport` ctors are
-source-gated to the decoder, §4.4) — so a non-empty id proves *provenance* (it came off the parsed
-reply), not merely form, and `ServerCode` can never hold `0`/`1`. `from_parsed` maps
-`Accepted→SendOutcome::Accepted` by **wrapping the already-validated `NonEmptyFiscalNumber`** — the
-engine mapper does **not** call `SentAccepted::observe` (validation belongs to the transport mint) —
-`OkEmptyId→OkButNoFiscalNumber{digest}`, `ServerCode→Rejected/CloseAmbiguous/SaveError/UnknownStatus`
-by code×doc_type, `MissingStatus→MissingStatus{digest}`. No path builds `Accepted` with a bogus
-digest or a fabricated id.
+source-gated to the decoder, §4.4) — so a non-empty id proves *provenance* (it came off the decoded
+reply), not merely form, and `ServerCode` can never hold `0`/`1`. The engine mapper
+`map_send_reply` maps `RawSendReply::Accepted→SendOutcome::accepted` by **wrapping the
+already-validated `NonEmptyFiscalNumber`** — it does **not** call `SentAccepted::observe`
+(validation belongs to the transport mint) — `OkNoFiscalId→ok_but_no_fiscal_number{digest}`,
+`ServerCode→from_server_code(code, doc_type)→Rejected/CloseAmbiguous/SaveError/UnknownStatus`,
+`MissingStatus→missing_status{digest}`, and the `RemoteAuthStatus`/`NoResponse` arms map into
+`SendResponse::{remote_status,no_response}`. No path builds `Accepted` with a bogus digest or a
+fabricated id.
 
 ### 4.2 Single-RPC fan-out seam (B4) — total over tonic outcomes (B3-partition)
 
@@ -231,29 +234,31 @@ grpc; 1,9,10 none (type-level).
 | `DecodedResponseDigest`/`GrpcStatusDigest` | `prro-domain::delivery` | private field; `from_transport_digest` **pub** | transport decoder | cross-crate privacy (other crates) **+ symbol source-gate** |
 | `NonEmptyFiscalNumber`/`NonOkStatusCode` | `prro-domain::delivery` | private field; `from_transport` **pub** | transport decoder | cross-crate privacy **+ symbol source-gate** (provenance, not just form) |
 | framing/SHA helpers | `prro::transports::dps` (decoder) | **`fn`-private, not re-exported** | decoder only | symbol source-gate |
-| `RawSendReply` + inner + `ParsedReply` mint | `prro::transports::dps` | private inner | decoder | **module privacy** (compile-time) |
-| authority ctors: `from_parsed`, `SendResponse::{parsed,no_response,remote_status}` (`SentAccepted::observe` is **not** an engine-mapper ctor — the id arrives pre-validated as `NonEmptyFiscalNumber`) | `prro-domain` | pub | ONE engine mapper file | symbol source-gate |
+| `RawSendReply` + inner mint | `prro::transports::dps` | private inner | decoder | **module privacy** (compile-time) |
+| authority ctors: `SendResponse::{parsed,no_response,remote_status}`, `SendOutcome::{accepted,ok_but_no_fiscal_number,missing_status,from_server_code}` (`SentAccepted::observe` is **not** an engine-mapper ctor — the id arrives pre-validated as `NonEmptyFiscalNumber`) | `prro-domain` | pub | ONE engine mapper file (`shadow_map.rs::map_send_reply`) | `digest_mint_source_gate.rs` authority-flow lint (best-effort source-policy) |
 
-**Symbol source-gate (wrapper-proof, B3).** A syn-scan (sibling of `with_immediate_no_foreign_io`)
-with **per-symbol allowlists**. **Decoder-only** (`transports::dps`): `from_transport_digest`,
-`NonEmptyFiscalNumber::from_transport`, `NonOkStatusCode::from_transport`, framing, **and both
-`RawSendReply` and `ParsedReply` construction** (`ParsedReply` is an **opaque struct with a private
-inner enum**, minted only here — §4.1c). **Engine-mapper-only** (one file, e.g.
-`services/write_path/shadow_map.rs`): `SendOutcome::from_parsed`, `SendResponse::{parsed,
-no_response, remote_status}`. **`SentAccepted::observe` is NOT a mapper ctor** — the id arrives
-pre-validated as `NonEmptyFiscalNumber`, so `observe` stays wherever it is today, never in the
-mapper allowlist. The gate **also forbids** re-export (`pub use`), forwarding wrappers, and
-function-pointer capture of any gated symbol — so a `mint_for_engine` wrapper in the allowed module
-cannot launder the mint. **`prro-testkit` is an explicit test-only allowlist entry.** Precise
-guarantee: the engine mapper *constructs* `SendResponse` but can only forward evidence
-(digest/id/code) read out of the opaque, transport-minted `RawSendReply`/`ParsedReply` — it never
-obtains a constructible digest, id, code, or `ParsedReply` to inject. Nothing rests on external
-trybuild proving sibling sealing.
+**Symbol source-gate (wrapper-proof, B3).** A syn-scan (sibling of `with_immediate_no_foreign_io`,
+realized as the `digest_mint_source_gate.rs` authority-flow lint) with **per-symbol allowlists**.
+This is a **best-effort source-policy, NOT a type-seal** — do not claim a type-seal.
+**Decoder-only** (`transports::dps`): `from_transport_digest`, `NonEmptyFiscalNumber::from_transport`,
+`NonOkStatusCode::from_transport`, framing, **and `RawSendReply` construction** (`RawSendReply` is an
+**opaque struct with a private inner enum**, minted only here — §4.2). **Engine-mapper-only** (one
+file, e.g. `services/write_path/shadow_map.rs::map_send_reply`): `SendResponse::{parsed, no_response,
+remote_status}` and `SendOutcome::{accepted, ok_but_no_fiscal_number, missing_status, from_server_code}`.
+**`SentAccepted::observe` is NOT a mapper ctor** — the id arrives pre-validated as
+`NonEmptyFiscalNumber`, so `observe` stays wherever it is today, never in the mapper allowlist. The
+gate **also forbids** re-export (`pub use`), forwarding wrappers, and function-pointer capture of any
+gated symbol — so a `mint_for_engine` wrapper in the allowed module cannot launder the mint.
+**`prro-testkit` is an explicit test-only allowlist entry.** Precise guarantee: the engine mapper
+*constructs* `SendResponse` but can only forward evidence (digest/id/code) read out of the opaque,
+transport-minted `RawSendReply` (via its `kind()` view) — it never obtains a constructible digest,
+id, or code to inject. Nothing rests on external trybuild proving sibling sealing.
 
 ### 4.5 Single doc_type source
 
 `fiscal_documents.doc_type` → `fetch_send_inputs_tx` (fiscal_documents.rs:1909 / stage_send.rs:1248)
-→ engine → `from_parsed(reply, store_doc_type)`. `RawSendReply` carries no doc_type.
+→ engine → `map_send_reply(reply, store_doc_type)` (which feeds the code×doc_type join to
+`SendOutcome::from_server_code`). `RawSendReply` carries no doc_type.
 
 ### 4.6 Total normalized old→target pair graph (B4 — the drift-pin oracle)
 
@@ -311,25 +316,28 @@ crash/drop (boot edge). Three declared deltas: **empty-id, unknown-non-zero, TLS
 2. **trybuild: cross-crate literal** — digest / `SendResponse` literal from another crate → won't
    compile.
 3. **symbol source-gate: transport-only mint (+ macro/re-export laundering)** —
-   `from_transport_digest`/`from_transport`/framing/`RawSendReply`/`ParsedReply` ctor appear ONLY in
-   the decoder. The gate is **syntactic** (syn does not expand macros): it **forbids any
-   `macro_rules!` / `#[macro_export]` / token-tree that mentions a gated symbol**, plus `pub use` /
-   forwarding wrapper / fn-pointer capture, anywhere outside the decoder → RED. Canary: a
-   `#[macro_export] macro_rules!` in the decoder that emits the mint, invoked from `services/*`,
-   must be caught by the syntactic ban (proven, not assumed).
-4. **symbol source-gate: one engine mapper** — `from_parsed` / `SendResponse::{parsed, no_response,
-   remote_status}` appear ONLY in the mapper file; `ParsedReply`/digest/`from_transport` construction
-   ONLY in the decoder; **`SentAccepted::observe` is NOT in the mapper allowlist**. Direct
-   `ParsedReply` / `SendResponse::*` / `Accepted` construction from any other `services/*` → RED.
+   `from_transport_digest`/`from_transport`/framing/`RawSendReply` ctor appear ONLY in the decoder.
+   The gate is **syntactic** (syn does not expand macros): it **forbids any `macro_rules!` /
+   `#[macro_export]` / token-tree that mentions a gated symbol**, plus `pub use` / forwarding
+   wrapper / fn-pointer capture, anywhere outside the decoder → RED. Canary: a `#[macro_export]
+   macro_rules!` in the decoder that emits the mint, invoked from `services/*`, must be caught by
+   the syntactic ban (proven, not assumed).
+4. **symbol source-gate: one engine mapper** — `SendResponse::{parsed, no_response, remote_status}`
+   and `SendOutcome::{accepted, ok_but_no_fiscal_number, missing_status, from_server_code}` appear
+   ONLY in the mapper file (`shadow_map.rs::map_send_reply`); `RawSendReply`/digest/`from_transport`
+   construction ONLY in the decoder; **`SentAccepted::observe` is NOT in the mapper allowlist**.
+   Direct `RawSendReply` / `SendResponse::*` / `Accepted` construction from any other `services/*` →
+   RED. Realized coverage: `raw_reply.rs::pr4_map_send_reply_covers_section_4_3` (the §4.3 mapping is
+   total) + `grpc.rs::pin_d_section_4_6_drift_pin` (the §4.6 drift-pin).
 5. **same-digest + independent golden preimage (B2/B5)** — carrier digest == seam value; PLUS the
    test recomputes `SHA-256(framing(fields))` from raw fields **for all four messages
    (CheckResponse/StatusResponse/RroInfoResponse + GrpcStatus, the latter using the canonical
    numeric code)** and asserts `==`; a constant / re-framed / wrong-version / Debug-coded digest →
    RED. Proves `digest == H(framing(fields))`.
 6. **rejected/save/close/missing carry digest (B3)** — each round-trips the seam digest.
-7. **Accepted has no digest, honestly built (B1)** — `ParsedReply::Accepted` has no digest field;
-   `from_parsed(Accepted,dt)` builds `Accepted`; adding an `Option<digest>` or a fabricated digest
-   → won't compile / RED.
+7. **Accepted has no digest, honestly built (B1)** — `RawSendReply::Accepted` has no digest field;
+   `map_send_reply(Accepted,dt)` builds `SendOutcome::accepted`; adding an `Option<digest>` or a
+   fabricated digest → won't compile / RED.
 8. **empty-id + digest** — OK+empty → `OkButNoFiscalNumber{real digest}`.
 9. **no-response-has-no-digest** — branches 1/9/10 have no digest field (type-level).
 10. **drift-pin over the §4.6 pair graph (B4)** — normalized `LiveOutcome` vs `ShadowNormal`:
@@ -360,8 +368,9 @@ crash/drop (boot edge). Three declared deltas: **empty-id, unknown-non-zero, TLS
 ## D-1…D-4 (adopted)
 
 `DecodedResponseDigest` · dedicated `MissingStatus`→ProbeRequired · delete `RawResponseDigest` in
-PR1 (not byte-neutral) · `Accepted` no digest — GO (opaque `RawSendReply`, transport-minted
-`NonEmptyFiscalNumber`, total `ParsedReply`).
+PR1 (not byte-neutral) · `Accepted` no digest — GO (opaque `RawSendReply` read directly via
+`kind()`, transport-minted `NonEmptyFiscalNumber`, code×doc_type table in
+`SendOutcome::from_server_code`).
 
 ## B6 note (closed)
 

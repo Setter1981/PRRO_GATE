@@ -204,16 +204,20 @@ fn status_digest(s: &Status) -> GrpcStatusDigest {
 /// without a proven TLS peer. `WireDiagnostics` preserves the gRPC code/message for trace/audit
 /// (non-authority). Borrows `&s` so the caller can move the `Status` into `map_tonic_status` after.
 fn observe_tonic_status(s: &Status, peer_auth: PeerAuth) -> (RawSendReply, WireDiagnostics) {
+    // §4.3 (consolidated-audit B3): `observe_tonic_status` ALWAYS receives a RETURNED tonic `Status`
+    // (the `Err` arm of `send_chk_v2().await`), i.e. §4.3 ROW 9. A returned status does NOT prove a
+    // genuine absence of reply, so it can NEVER mint the ROW-10 causes
+    // (`Timeout`/`Cancelled`/`LocalHandshakeFailure`) — those are for a future that timed out / was
+    // cancelled / a pre-`Status` local handshake failure (NO `Status` object at all), which do not
+    // arise at this layer (tonic surfaces even deadline/unavailable AS a returned `Status`). Only a
+    // TLS-proven `Unauthenticated`/`PermissionDenied` is special (an authenticated non-DPS peer, row
+    // 8); EVERY other returned status → `CallFailedWithoutTrustedDpsEnvelope` (the honest "no trusted
+    // DPS envelope" cause), matching `map_tonic_status`'s live routing (all → `Transport`).
     let evidence = match s.code() {
         tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
             if peer_auth == PeerAuth::TlsProven =>
         {
             RawSendReply::remote_auth_status(status_digest(s))
-        }
-        tonic::Code::DeadlineExceeded => RawSendReply::no_response(NoResponseCause::Timeout),
-        tonic::Code::Cancelled => RawSendReply::no_response(NoResponseCause::Cancelled),
-        tonic::Code::Unavailable => {
-            RawSendReply::no_response(NoResponseCause::LocalHandshakeFailure)
         }
         _ => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
     };
@@ -448,7 +452,7 @@ mod tests {
     /// `map_tonic_status`'s EXACT TLS gate (R1). A `TlsProven` Unauthenticated/PermissionDenied →
     /// `RemoteAuthStatus`; the SAME codes over an `Unproven` channel → `NoResponse{CallFailed…}`
     /// (a plaintext MITM cannot forge AuthenticatedPeer provenance). Flip the `peer_auth` gate →
-    /// RED. Genuine transport absences map to their typed `NoResponse` causes.
+    /// RED.
     #[test]
     fn pin3_observe_tonic_status_mirrors_r1_tls_gate() {
         use crate::transports::dps::raw_reply::RawSendReplyKind;
@@ -469,25 +473,67 @@ mod tests {
             let code = s.code();
             let (raw, _diag) = observe_tonic_status(&s, PeerAuth::Unproven);
             assert!(
-                matches!(raw.kind(), RawSendReplyKind::NoResponse { .. }),
-                "Unproven {code:?} must NOT yield RemoteAuthStatus (provenance forgery)"
+                matches!(
+                    raw.kind(),
+                    RawSendReplyKind::NoResponse {
+                        cause: NoResponseCause::CallFailedWithoutTrustedDpsEnvelope
+                    }
+                ),
+                "Unproven {code:?} must NOT yield RemoteAuthStatus (provenance forgery) — \
+                 it is a returned Status with no trusted DPS envelope"
             );
         }
-        let expectations = [
-            (Status::deadline_exceeded("t"), NoResponseCause::Timeout),
-            (Status::cancelled("c"), NoResponseCause::Cancelled),
-            (
-                Status::unavailable("u"),
-                NoResponseCause::LocalHandshakeFailure,
-            ),
+    }
+
+    /// CS-3 3.2 PR4 (consolidated-audit B3) — §4.3 ROW-9 vs ROW-10 partition tooth.
+    /// `observe_tonic_status` ALWAYS receives a **returned** tonic `Status` (the `Err` arm of an
+    /// awaited RPC), which is §4.3 ROW 9. A returned status can NEVER mint a ROW-10 genuine-absence
+    /// cause (`Timeout`/`Cancelled`/`LocalHandshakeFailure`) — those require NO `Status` object at
+    /// all. So every non-TLS-auth returned status (deadline/cancelled/unavailable/internal/…) MUST
+    /// collapse to `CallFailedWithoutTrustedDpsEnvelope`, matching `map_tonic_status`'s live routing
+    /// (all → `Transport`). This was a PR2 bug (deadline→Timeout etc.); the fix removed those arms.
+    /// Re-introduce any row-10 arm → a code below flips → RED. It also asserts none of the row-10
+    /// causes are EVER produced here (the honest-absence causes belong to a future that never yielded
+    /// a `Status`, minted elsewhere — not this observer).
+    #[test]
+    fn pin_b3_observe_tonic_status_returned_status_is_never_genuine_absence() {
+        use crate::transports::dps::raw_reply::RawSendReplyKind;
+        use prro_domain::delivery::NoResponseCause;
+
+        // Every returned status that is NOT a TLS-proven auth denial is row-9 → CallFailed…,
+        // regardless of the specific gRPC code (deadline/cancelled/unavailable are all *returned*
+        // statuses here, not genuine absences).
+        let returned = [
+            Status::deadline_exceeded("t"),
+            Status::cancelled("c"),
+            Status::unavailable("u"),
+            Status::internal("boom"),
+            Status::unknown("?"),
+            Status::resource_exhausted("full"),
+            // auth codes without TLS proof also collapse here (provenance cannot be forged)
+            Status::unauthenticated("forged"),
+            Status::permission_denied("forged"),
         ];
-        for (s, want) in expectations {
+        for s in returned {
             let code = s.code();
-            let (raw, _diag) = observe_tonic_status(&s, PeerAuth::TlsProven);
-            assert!(
-                matches!(raw.kind(), RawSendReplyKind::NoResponse { cause } if cause == want),
-                "{code:?} → expected NoResponse({want:?})"
-            );
+            let unproven = if matches!(
+                code,
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+            ) {
+                PeerAuth::Unproven
+            } else {
+                PeerAuth::TlsProven
+            };
+            let (raw, _diag) = observe_tonic_status(&s, unproven);
+            match raw.kind() {
+                RawSendReplyKind::NoResponse {
+                    cause: NoResponseCause::CallFailedWithoutTrustedDpsEnvelope,
+                } => {}
+                other => panic!(
+                    "returned Status {code:?} is §4.3 row-9 → must be \
+                     CallFailedWithoutTrustedDpsEnvelope, got {other:?}"
+                ),
+            }
         }
     }
 
