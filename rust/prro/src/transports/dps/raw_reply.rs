@@ -50,6 +50,44 @@ enum RawSendReplyInner {
     NoResponse { cause: NoResponseCause },
 }
 
+/// The closed subset of [`NoResponseCause`] a **live wire observation** may legitimately mint
+/// (consolidated-audit M2). `CrashedBeforeObservation` is deliberately EXCLUDED: it is a
+/// boot-resume/reaper cause (a durable `CALL_STARTED` marker found with no observed response after a
+/// reboot), minted by the recovery path — NEVER by a returned transport observation, which by
+/// definition *did* observe a returned result. Because the transport `no_response` builder takes
+/// `TransportAbsence` (not the full domain `NoResponseCause`), a transport decoder **cannot name**
+/// the crash cause: this is a genuine WITHIN-CRATE structural type-seal (the domain `SendResponse`
+/// still accepts the full enum for the D/E boot-resume path). Contrast the cross-crate
+/// digest/provenance mint, which Rust cannot sibling-seal — there a source-policy lint is the only
+/// fence; here co-location makes the seal real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::transports::dps) enum TransportAbsence {
+    /// TCP/TLS/DNS never established a session with the far side.
+    LocalHandshakeFailure,
+    /// Per-call deadline expired / future dropped / clean shutdown.
+    Timeout,
+    /// Future cancelled (e.g. shutdown signal).
+    Cancelled,
+    /// A returned reply/status that is not a trusted DPS envelope (§4.3 branch 9).
+    CallFailedWithoutTrustedDpsEnvelope,
+}
+
+impl TransportAbsence {
+    /// Widen into the domain cause. The match is exhaustive, so a future `TransportAbsence` variant
+    /// forces an arm here — and there is intentionally NO arm producing
+    /// `NoResponseCause::CrashedBeforeObservation` (M2 seal).
+    fn into_cause(self) -> NoResponseCause {
+        match self {
+            TransportAbsence::LocalHandshakeFailure => NoResponseCause::LocalHandshakeFailure,
+            TransportAbsence::Timeout => NoResponseCause::Timeout,
+            TransportAbsence::Cancelled => NoResponseCause::Cancelled,
+            TransportAbsence::CallFailedWithoutTrustedDpsEnvelope => {
+                NoResponseCause::CallFailedWithoutTrustedDpsEnvelope
+            }
+        }
+    }
+}
+
 impl RawSendReply {
     // ── Transport-only builders: `pub(in crate::transports::dps)` so the DPS decoder submodules
     //    (grpc.rs/dto.rs) mint them, but the engine (crate::services) cannot. ──
@@ -72,8 +110,10 @@ impl RawSendReply {
     pub(in crate::transports::dps) fn remote_auth_status(grpc: GrpcStatusDigest) -> Self {
         Self(RawSendReplyInner::RemoteAuthStatus { grpc })
     }
-    pub(in crate::transports::dps) fn no_response(cause: NoResponseCause) -> Self {
-        Self(RawSendReplyInner::NoResponse { cause })
+    pub(in crate::transports::dps) fn no_response(cause: TransportAbsence) -> Self {
+        Self(RawSendReplyInner::NoResponse {
+            cause: cause.into_cause(),
+        })
     }
 
     /// Borrowed view for the engine mapper — read (match) but never construct.
@@ -172,9 +212,9 @@ pub(in crate::transports::dps) fn observe_from_legacy(
     let evidence = match legacy {
         Ok(ack) => match NonEmptyFiscalNumber::from_transport(ack.id.clone()) {
             Some(id) => RawSendReply::accepted(id),
-            None => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+            None => RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
         },
-        Err(_) => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+        Err(_) => RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
     };
     RawSendObservation::new(evidence, WireDiagnostics::default())
 }
@@ -218,16 +258,45 @@ mod tests {
             matches!(remote.kind(), RawSendReplyKind::RemoteAuthStatus { grpc: g } if g == &grpc())
         );
 
-        let none = RawSendReply::no_response(NoResponseCause::Timeout);
+        let none = RawSendReply::no_response(TransportAbsence::Timeout);
         assert!(
             matches!(none.kind(), RawSendReplyKind::NoResponse { cause } if cause == NoResponseCause::Timeout)
         );
     }
 
+    /// CS-3 3.2 PR4 (consolidated-audit M2) — the transport `no_response` builder takes the closed
+    /// [`TransportAbsence`] subset, so a live wire observation can NEVER mint the boot-resume cause
+    /// `CrashedBeforeObservation`. This is a genuine WITHIN-CRATE structural type-seal:
+    /// `RawSendReply::no_response(NoResponseCause::CrashedBeforeObservation)` does not compile (wrong
+    /// argument type) and `TransportAbsence` has no crash variant. The compile-time seal is the
+    /// primary guarantee; this enumerates the whole subset as a belt-and-suspenders runtime witness —
+    /// RED if a future edit adds a crash arm to `TransportAbsence`/`into_cause` and lists it here.
+    #[test]
+    fn m2_transport_absence_never_widens_to_crash_before_observation() {
+        for a in [
+            TransportAbsence::LocalHandshakeFailure,
+            TransportAbsence::Timeout,
+            TransportAbsence::Cancelled,
+            TransportAbsence::CallFailedWithoutTrustedDpsEnvelope,
+        ] {
+            assert_ne!(
+                a.into_cause(),
+                NoResponseCause::CrashedBeforeObservation,
+                "{a:?} must not widen to the boot-resume crash cause"
+            );
+            let reply = RawSendReply::no_response(a);
+            assert!(matches!(
+                reply.kind(),
+                RawSendReplyKind::NoResponse { cause }
+                    if cause != NoResponseCause::CrashedBeforeObservation
+            ));
+        }
+    }
+
     #[test]
     fn observation_carries_evidence_and_diagnostics() {
         let obs = RawSendObservation::new(
-            RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+            RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
             WireDiagnostics {
                 status_code: None,
                 grpc_code: Some("Unavailable".into()),
@@ -366,7 +435,7 @@ mod tests {
             other => panic!("row8: {other:?}"),
         }
         // Rows 9/10 — NoResponse → NoResponse (DIRECT), forwarding the SAME cause.
-        match map_send_reply(&RawSendReply::no_response(NoResponseCause::Timeout), sell).kind() {
+        match map_send_reply(&RawSendReply::no_response(TransportAbsence::Timeout), sell).kind() {
             SendResponseKind::NoResponse(c) => assert_eq!(*c, NoResponseCause::Timeout),
             other => panic!("row10: {other:?}"),
         }

@@ -27,8 +27,8 @@ use super::dto::{
 };
 use super::error::DpsError;
 use super::gen::chk_income_service_client::ChkIncomeServiceClient;
-use super::raw_reply::{RawSendObservation, RawSendReply, WireDiagnostics};
-use prro_domain::delivery::{BoundedText, GrpcStatusDigest, NoResponseCause};
+use super::raw_reply::{RawSendObservation, RawSendReply, TransportAbsence, WireDiagnostics};
+use prro_domain::delivery::{BoundedText, GrpcStatusDigest};
 
 /// Whether this channel proved TLS peer-authentication at connect time (R1).
 ///
@@ -219,7 +219,7 @@ fn observe_tonic_status(s: &Status, peer_auth: PeerAuth) -> (RawSendReply, WireD
         {
             RawSendReply::remote_auth_status(status_digest(s))
         }
-        _ => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+        _ => RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
     };
     let diag = WireDiagnostics {
         status_code: None,
