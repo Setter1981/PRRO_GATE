@@ -19,11 +19,26 @@
 use prro_domain::delivery::{
     classify, ActiveRetryClass, AuthorizedGeneration, BoundedText, DecodedResponseDigest,
     DpsProtocolBinding, DpsProtocolId, EnvelopeHash, GrpcStatusDigest, NoResponseCause, NodeEffect,
-    PositiveGeneration, PreflightRefusal, ProtocolContractVersion, RawDpsStatus,
-    RemoteStatusEvidence, ResponseProvenance, SendOutcome, SendResponse, SentAccepted,
-    SubmissionCertainty, SubmissionEvidence,
+    NonEmptyFiscalNumber, NonOkStatusCode, PositiveGeneration, PreflightRefusal,
+    ProtocolContractVersion, RemoteStatusEvidence, ResponseProvenance, SendOutcome, SendResponse,
+    SentAccepted, SubmissionCertainty, SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
+
+// ─── Test-local raw-status shim ──────────────────────────────────────────────
+//
+// The domain `RawDpsStatus` enum + `SendOutcome::from_dps_status` were RETIRED
+// (PR4: honest transport-minted provenance; no `SendOutcome` is built from a raw
+// wire status any more). This test's graph is keyed on the SAME raw (code / fiscal_id,
+// doc_type) inputs, so we keep a byte-identical local shim of the deleted shape and
+// translate it to the new sealed ctors in the SOLE `parsed()` helper below. Every
+// graph row therefore still reads with the exact same `RawDpsStatus::Error(-N)` /
+// `RawDpsStatus::Ok { fiscal_id }` input, preserving the normative-table intent verbatim.
+#[derive(Clone, Copy, Debug)]
+enum RawDpsStatus<'a> {
+    Ok { fiscal_id: &'a str },
+    Error(i32),
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -72,15 +87,24 @@ fn started(response: SendResponse) -> SubmissionEvidence {
     }
 }
 
-/// Build a `Started{Parsed}` evidence from a raw DPS status via the SOLE sealed
-/// constructor. `dt` MUST equal the row's classify doc_type: the `-2/-15` close/non-close
-/// split happens INSIDE `from_dps_status`, so a mismatched `dt` would build the wrong outcome.
+/// Build a `Started{Parsed}` evidence from a raw DPS status via the new sealed ctors.
+/// `dt` MUST equal the row's classify doc_type: the `-2/-15` close/non-close split happens
+/// INSIDE `SendOutcome::from_server_code`, so a mismatched `dt` would build the wrong outcome.
+/// This is the SOLE translation point from the retired `from_dps_status` shape to the
+/// transport-minted ctors (`from_server_code` / `accepted` / `ok_but_no_fiscal_number`).
 fn parsed(status: RawDpsStatus<'_>, dt: DocType) -> SubmissionEvidence {
-    started(SendResponse::Parsed(SendOutcome::from_dps_status(
-        status,
-        dt,
-        digest(),
-    )))
+    let outcome = match status {
+        RawDpsStatus::Error(code) => SendOutcome::from_server_code(
+            NonOkStatusCode::from_transport(code).unwrap(),
+            dt,
+            digest(),
+        ),
+        RawDpsStatus::Ok { fiscal_id: "" } => SendOutcome::ok_but_no_fiscal_number(digest()),
+        RawDpsStatus::Ok { fiscal_id } => SendOutcome::accepted(
+            NonEmptyFiscalNumber::from_transport(fiscal_id.to_string()).unwrap(),
+        ),
+    };
+    started(SendResponse::parsed(outcome))
 }
 
 struct ExpectedAxes {
@@ -119,8 +143,8 @@ use SubmissionCertainty as SC;
 //   Started{NoResponse(Crashed)} → SubmittedUnknown / NoResponse / TransientRetry
 //   Started{NoResponse(Handshake)} → SubmittedUnknown / NoResponse / TransientRetry
 //   Started{NoResponse(Cancelled)} → SubmittedUnknown / NoResponse / TransientRetry
-//   Started{RemoteStatus(Garbage)} → SubmittedUnknown / AuthenticatedPeer / ProbeRequired
 //   Started{RemoteStatus(AuthStatus)} → SubmittedUnknown / AuthenticatedPeer / ProbeRequired
+//     (the RemoteStatus(Garbage) row was deleted — variant removed in PR4)
 //   Started{Parsed(Accepted)}   → Submitted / ParsedDpsEnvelope / None
 //   Started{Parsed(Rejected(-1 Verify))}   → Submitted / ParsedDpsEnvelope / TerminalReject
 //   Started{Parsed(Rejected(-5 Type))}     → Submitted / ParsedDpsEnvelope / TerminalReject
@@ -166,39 +190,37 @@ fn normative_graph() -> Vec<GraphRow> {
         // ── Started{NoResponse} ─────────────────────────────────────────────
         GraphRow {
             label: "Started/NoResponse(Timeout) → SubmittedUnknown/NoResponse/TransientRetry",
-            evidence: started(SendResponse::NoResponse(NoResponseCause::Timeout)),
+            evidence: started(SendResponse::no_response(NoResponseCause::Timeout)),
             doc_type: DocType::Sell,
             expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/NoResponse(Cancelled) → SubmittedUnknown/NoResponse/TransientRetry",
-            evidence: started(SendResponse::NoResponse(NoResponseCause::Cancelled)),
+            evidence: started(SendResponse::no_response(NoResponseCause::Cancelled)),
             doc_type: DocType::Sell,
             expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/NoResponse(LocalHandshake) → SubmittedUnknown/NoResponse/TransientRetry",
-            evidence: started(SendResponse::NoResponse(NoResponseCause::LocalHandshakeFailure)),
+            evidence: started(SendResponse::no_response(NoResponseCause::LocalHandshakeFailure)),
             doc_type: DocType::Sell,
             expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
         GraphRow {
             label: "Started/NoResponse(Crashed) → SubmittedUnknown/NoResponse/TransientRetry (RP4B-1)",
-            evidence: started(SendResponse::NoResponse(NoResponseCause::CrashedBeforeObservation)),
+            evidence: started(SendResponse::no_response(NoResponseCause::CrashedBeforeObservation)),
             doc_type: DocType::Sell,
             expected: expected(SC::SubmittedUnknown, RP::NoResponse, Some(ARC::TransientRetry), NE::NoNodeEffect),
         },
 
         // ── Started{RemoteStatus} ───────────────────────────────────────────
-        GraphRow {
-            label: "Started/RemoteStatus(Garbage) → SubmittedUnknown/AuthenticatedPeer/ProbeRequired",
-            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::AuthenticatedPeerGarbage(grpc_digest()))),
-            doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::AuthenticatedPeer, Some(ARC::ProbeRequired), NE::ProbeRequired),
-        },
+        // NOTE: the `AuthenticatedPeerGarbage` row was DELETED — that
+        // `RemoteStatusEvidence` variant was removed in PR4. The surviving
+        // `RemoteAuthStatus` row keeps the SubmittedUnknown/AuthenticatedPeer/
+        // ProbeRequired graph edge for the RemoteStatus provenance class.
         GraphRow {
             label: "Started/RemoteStatus(AuthStatus) → SubmittedUnknown/AuthenticatedPeer/ProbeRequired",
-            evidence: started(SendResponse::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(grpc_digest()))),
+            evidence: started(SendResponse::remote_status(RemoteStatusEvidence::RemoteAuthStatus(grpc_digest()))),
             doc_type: DocType::Sell,
             expected: expected(SC::SubmittedUnknown, RP::AuthenticatedPeer, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },
@@ -211,7 +233,7 @@ fn normative_graph() -> Vec<GraphRow> {
             expected: expected(SC::Submitted, RP::ParsedDpsEnvelope, None, NE::NoNodeEffect),
         },
 
-        // ── Started{Parsed(Rejected)} — named DpsReject codes via from_dps_status ──
+        // ── Started{Parsed(Rejected)} — named DpsReject codes via from_server_code ──
         GraphRow {
             label: "Started/Parsed(Rejected(Verify/-1)) → Submitted/Parsed/TerminalReject (RP4B-3)",
             evidence: parsed(RawDpsStatus::Error(-1), DocType::Sell),
@@ -371,7 +393,9 @@ fn rp4b_3_parsed_rows_are_distinct_from_timeout() {
     // -4 → Parsed (SubmittedUnknown + ParsedDpsEnvelope)
     let minus4 = classify(&parsed(RawDpsStatus::Error(-4), DocType::Sell));
     // Bare timeout → NoResponse (SubmittedUnknown + NoResponse)
-    let timeout = classify(&started(SendResponse::NoResponse(NoResponseCause::Timeout)));
+    let timeout = classify(&started(SendResponse::no_response(
+        NoResponseCause::Timeout,
+    )));
     // -1 Verify → Submitted + ParsedDpsEnvelope + TerminalReject
     let minus1 = classify(&parsed(RawDpsStatus::Error(-1), DocType::Sell));
 

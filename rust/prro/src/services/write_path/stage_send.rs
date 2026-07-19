@@ -1566,7 +1566,11 @@ async fn run_one_attempt(
     // transport-minted shadow; in 3.2 it is bound READ-ONLY and drives NOTHING (no record, no
     // second wire, no `-12` change) — it is wired live in PR4/Bridge.
     let (wire_result, wire_observation) = dps_channel.send_chk_observed(envelope.clone()).await;
-    let _ = &wire_observation;
+    // CS-3 3.2 PR4 pin B: project the transport-minted shadow into the typed delivery contract
+    // (`RawSendReply` + store `doc_type` → `SendResponse`, spec §4.3). READ-ONLY in 3.2 — the mapped
+    // response drives NOTHING (no classify-record, no state, no second wire); the §4.6 drift-pin
+    // proves it agrees with the live `route_send_result` outcome below, and D/E wires it live.
+    let _shadow_response = super::shadow_map::map_send_reply(wire_observation.evidence(), doc_type);
     let wire_call_finished_at = now_db_format();
 
     // W10.2: dispatch on the typed routing surface.  `is_live_send=true`

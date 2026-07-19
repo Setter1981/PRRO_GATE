@@ -27,8 +27,8 @@ use super::dto::{
 };
 use super::error::DpsError;
 use super::gen::chk_income_service_client::ChkIncomeServiceClient;
-use super::raw_reply::{RawSendObservation, RawSendReply, WireDiagnostics};
-use prro_domain::delivery::{BoundedText, GrpcStatusDigest, NoResponseCause};
+use super::raw_reply::{RawSendObservation, RawSendReply, TransportAbsence, WireDiagnostics};
+use prro_domain::delivery::{BoundedText, GrpcStatusDigest};
 
 /// Whether this channel proved TLS peer-authentication at connect time (R1).
 ///
@@ -204,18 +204,22 @@ fn status_digest(s: &Status) -> GrpcStatusDigest {
 /// without a proven TLS peer. `WireDiagnostics` preserves the gRPC code/message for trace/audit
 /// (non-authority). Borrows `&s` so the caller can move the `Status` into `map_tonic_status` after.
 fn observe_tonic_status(s: &Status, peer_auth: PeerAuth) -> (RawSendReply, WireDiagnostics) {
+    // §4.3 (consolidated-audit B3): `observe_tonic_status` ALWAYS receives a RETURNED tonic `Status`
+    // (the `Err` arm of `send_chk_v2().await`), i.e. §4.3 ROW 9. A returned status does NOT prove a
+    // genuine absence of reply, so it can NEVER mint the ROW-10 causes
+    // (`Timeout`/`Cancelled`/`LocalHandshakeFailure`) — those are for a future that timed out / was
+    // cancelled / a pre-`Status` local handshake failure (NO `Status` object at all), which do not
+    // arise at this layer (tonic surfaces even deadline/unavailable AS a returned `Status`). Only a
+    // TLS-proven `Unauthenticated`/`PermissionDenied` is special (an authenticated non-DPS peer, row
+    // 8); EVERY other returned status → `CallFailedWithoutTrustedDpsEnvelope` (the honest "no trusted
+    // DPS envelope" cause), matching `map_tonic_status`'s live routing (all → `Transport`).
     let evidence = match s.code() {
         tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
             if peer_auth == PeerAuth::TlsProven =>
         {
             RawSendReply::remote_auth_status(status_digest(s))
         }
-        tonic::Code::DeadlineExceeded => RawSendReply::no_response(NoResponseCause::Timeout),
-        tonic::Code::Cancelled => RawSendReply::no_response(NoResponseCause::Cancelled),
-        tonic::Code::Unavailable => {
-            RawSendReply::no_response(NoResponseCause::LocalHandshakeFailure)
-        }
-        _ => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+        _ => RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
     };
     let diag = WireDiagnostics {
         status_code: None,
@@ -448,7 +452,7 @@ mod tests {
     /// `map_tonic_status`'s EXACT TLS gate (R1). A `TlsProven` Unauthenticated/PermissionDenied →
     /// `RemoteAuthStatus`; the SAME codes over an `Unproven` channel → `NoResponse{CallFailed…}`
     /// (a plaintext MITM cannot forge AuthenticatedPeer provenance). Flip the `peer_auth` gate →
-    /// RED. Genuine transport absences map to their typed `NoResponse` causes.
+    /// RED.
     #[test]
     fn pin3_observe_tonic_status_mirrors_r1_tls_gate() {
         use crate::transports::dps::raw_reply::RawSendReplyKind;
@@ -469,25 +473,67 @@ mod tests {
             let code = s.code();
             let (raw, _diag) = observe_tonic_status(&s, PeerAuth::Unproven);
             assert!(
-                matches!(raw.kind(), RawSendReplyKind::NoResponse { .. }),
-                "Unproven {code:?} must NOT yield RemoteAuthStatus (provenance forgery)"
+                matches!(
+                    raw.kind(),
+                    RawSendReplyKind::NoResponse {
+                        cause: NoResponseCause::CallFailedWithoutTrustedDpsEnvelope
+                    }
+                ),
+                "Unproven {code:?} must NOT yield RemoteAuthStatus (provenance forgery) — \
+                 it is a returned Status with no trusted DPS envelope"
             );
         }
-        let expectations = [
-            (Status::deadline_exceeded("t"), NoResponseCause::Timeout),
-            (Status::cancelled("c"), NoResponseCause::Cancelled),
-            (
-                Status::unavailable("u"),
-                NoResponseCause::LocalHandshakeFailure,
-            ),
+    }
+
+    /// CS-3 3.2 PR4 (consolidated-audit B3) — §4.3 ROW-9 vs ROW-10 partition tooth.
+    /// `observe_tonic_status` ALWAYS receives a **returned** tonic `Status` (the `Err` arm of an
+    /// awaited RPC), which is §4.3 ROW 9. A returned status can NEVER mint a ROW-10 genuine-absence
+    /// cause (`Timeout`/`Cancelled`/`LocalHandshakeFailure`) — those require NO `Status` object at
+    /// all. So every non-TLS-auth returned status (deadline/cancelled/unavailable/internal/…) MUST
+    /// collapse to `CallFailedWithoutTrustedDpsEnvelope`, matching `map_tonic_status`'s live routing
+    /// (all → `Transport`). This was a PR2 bug (deadline→Timeout etc.); the fix removed those arms.
+    /// Re-introduce any row-10 arm → a code below flips → RED. It also asserts none of the row-10
+    /// causes are EVER produced here (the honest-absence causes belong to a future that never yielded
+    /// a `Status`, minted elsewhere — not this observer).
+    #[test]
+    fn pin_b3_observe_tonic_status_returned_status_is_never_genuine_absence() {
+        use crate::transports::dps::raw_reply::RawSendReplyKind;
+        use prro_domain::delivery::NoResponseCause;
+
+        // Every returned status that is NOT a TLS-proven auth denial is row-9 → CallFailed…,
+        // regardless of the specific gRPC code (deadline/cancelled/unavailable are all *returned*
+        // statuses here, not genuine absences).
+        let returned = [
+            Status::deadline_exceeded("t"),
+            Status::cancelled("c"),
+            Status::unavailable("u"),
+            Status::internal("boom"),
+            Status::unknown("?"),
+            Status::resource_exhausted("full"),
+            // auth codes without TLS proof also collapse here (provenance cannot be forged)
+            Status::unauthenticated("forged"),
+            Status::permission_denied("forged"),
         ];
-        for (s, want) in expectations {
+        for s in returned {
             let code = s.code();
-            let (raw, _diag) = observe_tonic_status(&s, PeerAuth::TlsProven);
-            assert!(
-                matches!(raw.kind(), RawSendReplyKind::NoResponse { cause } if cause == want),
-                "{code:?} → expected NoResponse({want:?})"
-            );
+            let unproven = if matches!(
+                code,
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+            ) {
+                PeerAuth::Unproven
+            } else {
+                PeerAuth::TlsProven
+            };
+            let (raw, _diag) = observe_tonic_status(&s, unproven);
+            match raw.kind() {
+                RawSendReplyKind::NoResponse {
+                    cause: NoResponseCause::CallFailedWithoutTrustedDpsEnvelope,
+                } => {}
+                other => panic!(
+                    "returned Status {code:?} is §4.3 row-9 → must be \
+                     CallFailedWithoutTrustedDpsEnvelope, got {other:?}"
+                ),
+            }
         }
     }
 
@@ -522,6 +568,241 @@ mod tests {
         assert_eq!(
             transport_decision.audit_event,
             remote_status_decision.audit_event,
+        );
+    }
+
+    /// CS-3 3.2 PR4 pin D — the §4.6 drift-pin (the keystone proof). For ONE wire input, co-derive
+    /// BOTH the LIVE outcome (`route_send_result`, the incumbent) AND the SHADOW outcome
+    /// (`map_send_reply` → `classify`, the new path) from the SAME single decode — the sound
+    /// co-derivation point is `observe_check_reply` / (`observe_tonic_status` + `map_tonic_status`),
+    /// NOT a StubDpsChannel (whose degraded default would give a false-green). Both are NORMALIZED to
+    /// a common `Norm`; unchanged rows must be EQUAL (two independent computations agree), the three
+    /// declared §4.6 deltas (empty-id, unknown-non-zero, TLS-RemoteStatus) an EXACT pair. Break the
+    /// mapper or the domain routing → a row flips → RED. This lives here because only `grpc`'s test
+    /// module can reach the private `map_tonic_status`/`observe_tonic_status`/`PeerAuth`.
+    ///
+    /// **Scope (honest, consolidated-audit minor):** equivalence is proven at the
+    /// `{retry_class, node-Blocked}` granularity — the two comparable axes. The live `RoutingDecision`
+    /// carries only `node_mode_flip: Option<NodeMode>` (Blocked or nothing), so the shadow's FINER
+    /// `node_effect` axis (`MacReseedPending`/`OperatorEscalation`/…) has NO live counterpart to
+    /// compare against; it is validated by the domain's own `routing_for_reject`/`node_effect_for_active`
+    /// tests, and exercised for real when D/E consumes the shadow. This is NOT a full-outcome
+    /// (target_state-level) equivalence claim.
+    ///
+    /// **Scope, part 2 (consolidated-audit M3):** this pin proves the mapper AGREES with the live
+    /// path, but it constructs both sides itself — it does NOT prove the mapper is WIRED into the
+    /// production send path. That wiring (the D/E tripwire) is pinned separately by
+    /// `digest_mint_source_gate::m3_map_send_reply_stays_wired_into_stage_send`, which REDs if the
+    /// live `map_send_reply(wire_observation.evidence(), ..)` call is removed from `stage_send.rs`.
+    #[test]
+    fn pin_d_section_4_6_drift_pin() {
+        use crate::db::models::enums::NodeMode;
+        use crate::services::write_path::error_routing::{
+            route_send_result, RetryClass, WireDecision,
+        };
+        use crate::services::write_path::shadow_map::map_send_reply;
+        use prro_domain::delivery::{
+            classify, ActiveRetryClass, ClassifiedOutcome, DpsProtocolBinding, DpsProtocolId,
+            EnvelopeHash, NodeEffect, ProtocolContractVersion, SendResponse, SubmissionEvidence,
+        };
+        use prro_domain::enums::DocType;
+
+        // ── the common normalized outcome (§4.6) ──
+        #[derive(Debug, PartialEq, Eq)]
+        enum Nc {
+            TerminalReject,
+            TransientRetry,
+            FnConfigError,
+            WrapperBug,
+            ProbeRequired,
+            MacRecovery,
+            OperatorEscalation,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        enum Norm {
+            Sent,
+            GuardEmptyId,
+            Retry { class: Nc, blocked: bool },
+        }
+        fn nc_live(c: RetryClass) -> Nc {
+            match c {
+                RetryClass::TerminalReject => Nc::TerminalReject,
+                RetryClass::TransientRetry => Nc::TransientRetry,
+                RetryClass::FnConfigError => Nc::FnConfigError,
+                RetryClass::WrapperBug => Nc::WrapperBug,
+                RetryClass::ProbeRequired => Nc::ProbeRequired,
+                RetryClass::MacRecovery => Nc::MacRecovery,
+                RetryClass::OperatorEscalation => Nc::OperatorEscalation,
+                RetryClass::DrainChainSettleRetry => {
+                    panic!("drain class is not an online-send outcome")
+                }
+            }
+        }
+        fn nc_shadow(c: ActiveRetryClass) -> Nc {
+            match c {
+                ActiveRetryClass::TerminalReject => Nc::TerminalReject,
+                ActiveRetryClass::TransientRetry => Nc::TransientRetry,
+                ActiveRetryClass::FnConfigError => Nc::FnConfigError,
+                ActiveRetryClass::WrapperBug => Nc::WrapperBug,
+                ActiveRetryClass::ProbeRequired => Nc::ProbeRequired,
+                ActiveRetryClass::MacRecovery => Nc::MacRecovery,
+                ActiveRetryClass::OperatorEscalation => Nc::OperatorEscalation,
+            }
+        }
+        fn normalize_live(wd: WireDecision) -> Norm {
+            match wd {
+                WireDecision::Sent { server_fiscal_no } => {
+                    // The stage_send EmptyServerFiscalNo guard turns an empty id into a refusal.
+                    if server_fiscal_no.is_empty() {
+                        Norm::GuardEmptyId
+                    } else {
+                        Norm::Sent
+                    }
+                }
+                WireDecision::Routed(rd) => Norm::Retry {
+                    class: nc_live(rd.retry_class),
+                    blocked: rd.node_mode_flip == Some(NodeMode::Blocked),
+                },
+            }
+        }
+        fn normalize_shadow(co: ClassifiedOutcome) -> Norm {
+            match co.routing() {
+                None => Norm::Sent, // clean Accepted — the only routing-cleared outcome
+                Some(c) => Norm::Retry {
+                    class: nc_shadow(c),
+                    blocked: co.node_effect() == NodeEffect::NodeBlocked,
+                },
+            }
+        }
+        fn started(response: SendResponse) -> SubmissionEvidence {
+            SubmissionEvidence::Started {
+                response,
+                binding: DpsProtocolBinding {
+                    protocol_id: DpsProtocolId::FscoZzd,
+                    contract_version: ProtocolContractVersion(1),
+                    capability_profile_version: None,
+                    endpoint_config_revision: None,
+                },
+                envelope_hash: EnvelopeHash([0u8; 32]),
+            }
+        }
+        fn chk(status: i32, id: &str) -> crate::transports::dps::gen::CheckResponse {
+            crate::transports::dps::gen::CheckResponse {
+                id: id.to_string(),
+                status,
+                id_sign: Vec::new(),
+                data_sign: Vec::new(),
+                error_message: String::new(),
+            }
+        }
+
+        // Co-derive Live + Shadow from ONE CheckResponse (the OK / DPS-status rows).
+        let drift_check = |status: i32, id: &str, dt: DocType| -> (Norm, Norm) {
+            let (legacy, raw, _diag) = observe_check_reply(chk(status, id));
+            let live = normalize_live(route_send_result(legacy, dt, true));
+            let shadow = normalize_shadow(classify(&started(map_send_reply(&raw, dt))));
+            (live, shadow)
+        };
+        // Co-derive Live + Shadow from ONE tonic Status (the transport-error rows).
+        let drift_status = |s: Status, pa: PeerAuth, dt: DocType| -> (Norm, Norm) {
+            let (raw, _diag) = observe_tonic_status(&s, pa); // borrow first…
+            let legacy: Result<CheckAck, DpsError> = Err(map_tonic_status(s, pa)); // …then move
+            let live = normalize_live(route_send_result(legacy, dt, true));
+            let shadow = normalize_shadow(classify(&started(map_send_reply(&raw, dt))));
+            (live, shadow)
+        };
+
+        let sell = DocType::Sell;
+        let z = DocType::ZReport;
+
+        // ── EQUAL rows: two INDEPENDENT computations must agree (no hardcoded expectation) ──
+        let equal_rows: &[(i32, &str, DocType)] = &[
+            (1, "DPS-1", sell), // OK + id → Sent
+            (-1, "", sell),
+            (-5, "", sell),
+            (-6, "", sell),
+            (-7, "", sell),
+            (-8, "", sell),
+            (-9, "", sell),
+            (-10, "", sell),
+            (-11, "", sell), // + NodeBlocked, both sides
+            (-12, "", sell),
+            (-13, "", sell),
+            (-14, "", sell),
+            (-16, "", sell),
+            (-2, "", sell), // non-close → TerminalReject
+            (-15, "", sell),
+            (-2, "", z), // close/Z → ProbeRequired
+            (-15, "", z),
+            (-3, "", sell),
+            (-4, "", sell),
+            (0, "", sell), // status==0 → both ProbeRequired (Live Decode, Shadow MissingStatus)
+        ];
+        for &(status, id, dt) in equal_rows {
+            let (live, shadow) = drift_check(status, id, dt);
+            assert_eq!(
+                live, shadow,
+                "§4.6 EQUAL row status={status} id={id:?} dt={dt:?}: live {live:?} != shadow {shadow:?}"
+            );
+        }
+        // Other tonic Status + genuine absence → both TransientRetry (equal).
+        for s in [
+            Status::internal("x"),
+            Status::deadline_exceeded("t"),
+            Status::unavailable("u"),
+        ] {
+            let code = s.code();
+            let (live, shadow) = drift_status(s, PeerAuth::Unproven, sell);
+            assert_eq!(live, shadow, "§4.6 EQUAL tonic row {code:?}");
+        }
+
+        // ── The THREE declared §4.6 deltas: EXACT pair (they legitimately differ) ──
+        // Delta 1 — empty-id: Live guards (EmptyServerFiscalNo), Shadow probes (OkButNoFiscalNumber).
+        let (live, shadow) = drift_check(1, "", sell);
+        assert_eq!(live, Norm::GuardEmptyId, "delta empty-id live");
+        assert_eq!(
+            shadow,
+            Norm::Retry {
+                class: Nc::ProbeRequired,
+                blocked: false
+            },
+            "delta empty-id shadow"
+        );
+        // Delta 2 — unknown non-zero: Live Decode→ProbeRequired, Shadow UnknownStatus→TransientRetry.
+        let (live, shadow) = drift_check(-17, "", sell);
+        assert_eq!(
+            live,
+            Norm::Retry {
+                class: Nc::ProbeRequired,
+                blocked: false
+            },
+            "delta unknown-non-zero live"
+        );
+        assert_eq!(
+            shadow,
+            Norm::Retry {
+                class: Nc::TransientRetry,
+                blocked: false
+            },
+            "delta unknown-non-zero shadow"
+        );
+        // Delta 3 — TLS RemoteStatus: Live TransientRetry (compat projection), Shadow ProbeRequired.
+        let (live, shadow) = drift_status(Status::unauthenticated("x"), PeerAuth::TlsProven, sell);
+        assert_eq!(
+            live,
+            Norm::Retry {
+                class: Nc::TransientRetry,
+                blocked: false
+            },
+            "delta TLS-RemoteStatus live"
+        );
+        assert_eq!(
+            shadow,
+            Norm::Retry {
+                class: Nc::ProbeRequired,
+                blocked: false
+            },
+            "delta TLS-RemoteStatus shadow"
         );
     }
 }

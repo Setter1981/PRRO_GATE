@@ -14,9 +14,10 @@
 use prro_domain::delivery::{
     classify, ActiveRetryClass as ARC, AuthorizedGeneration, BoundedText, DecodedResponseDigest,
     DpsProtocolBinding, DpsProtocolId, DpsReject, EnvelopeHash, GrpcStatusDigest, Kvt1Raw,
-    NoResponseCause, NodeEffect as NE, ObservedOutcomeV1, PositiveGeneration, PreflightRefusal,
-    ProtocolContractVersion, RawDpsStatus, RemoteStatusEvidence, ResponseProvenance as RP,
-    SendOutcome, SendResponse, SentAccepted, SubmissionCertainty as SC, SubmissionEvidence,
+    NoResponseCause, NodeEffect as NE, NonEmptyFiscalNumber, NonOkStatusCode, ObservedOutcomeV1,
+    PositiveGeneration, PreflightRefusal, ProtocolContractVersion, RemoteStatusEvidence,
+    ResponseProvenance as RP, SendOutcome, SendResponse, SentAccepted, SubmissionCertainty as SC,
+    SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
 
@@ -51,14 +52,23 @@ fn dg() -> DecodedResponseDigest {
     DecodedResponseDigest::from_transport_digest([0xAB; 32])
 }
 
-/// Build a `Started{Parsed}` evidence from a raw DPS status via the SOLE sealed
-/// constructor (the `-2/-15` close split happens inside `from_dps_status`, so `dt`
-/// must match the classify doc_type).
-fn parsed(status: RawDpsStatus<'_>, dt: DocType) -> SubmissionEvidence {
-    started(SendResponse::Parsed(SendOutcome::from_dps_status(
-        status,
+/// Build a `Started{Parsed}` evidence from a raw non-OK DPS status **code** via the
+/// SOLE sealed constructor (the `-2/-15` close split happens inside `from_server_code`,
+/// so `dt` must match the classify doc_type). `code` must be a real non-OK code
+/// (`!= 0 && != 1`) — `from_transport` returns `None` otherwise.
+fn parsed_err(code: i32, dt: DocType) -> SubmissionEvidence {
+    started(SendResponse::parsed(SendOutcome::from_server_code(
+        NonOkStatusCode::from_transport(code).unwrap(),
         dt,
         dg(),
+    )))
+}
+
+/// Build a `Started{Parsed}` evidence from an OK + non-empty fiscal id (the accepted
+/// path). `fiscal_id` must be non-empty (empty ⇒ `ok_but_no_fiscal_number`, not used here).
+fn parsed_ok(fiscal_id: &str, _dt: DocType) -> SubmissionEvidence {
+    started(SendResponse::parsed(SendOutcome::accepted(
+        NonEmptyFiscalNumber::from_transport(fiscal_id.to_string()).unwrap(),
     )))
 }
 
@@ -85,7 +95,7 @@ fn code_for(v: DpsReject) -> i32 {
 
 fn parsed_reject(v: DpsReject) -> SubmissionEvidence {
     // Non-close doc so -2 maps to Rejected(Close); named codes are doc-type-independent.
-    parsed(RawDpsStatus::Error(code_for(v)), DocType::Sell)
+    parsed_err(code_for(v), DocType::Sell)
 }
 
 // ─── R2-A: classify RETURNS node_effect on EVERY path (the keystone) ─────────
@@ -125,30 +135,29 @@ fn classify_surfaces_node_effect_on_all_paths() {
     assert_eq!(precond.node_effect(), NE::NoNodeEffect);
 
     // NoResponse(Timeout) → TransientRetry → NoNodeEffect.
-    let timeout = classify(&started(SendResponse::NoResponse(NoResponseCause::Timeout)));
+    let timeout = classify(&started(SendResponse::no_response(
+        NoResponseCause::Timeout,
+    )));
     assert_eq!(timeout.node_effect(), NE::NoNodeEffect);
 
     // RemoteStatus → ProbeRequired routing → ProbeRequired effect.
-    let remote = classify(&started(SendResponse::RemoteStatus(
+    let remote = classify(&started(SendResponse::remote_status(
         RemoteStatusEvidence::RemoteAuthStatus(GrpcStatusDigest::from_transport_digest([0xAB; 32])),
     )));
     assert_eq!(remote.routing(), Some(ARC::ProbeRequired));
     assert_eq!(remote.node_effect(), NE::ProbeRequired);
 
     // Accepted → clean (routing None) → NoNodeEffect.
-    let accepted = classify(&parsed(
-        RawDpsStatus::Ok { fiscal_id: "DPS-1" },
-        DocType::Sell,
-    ));
+    let accepted = classify(&parsed_ok("DPS-1", DocType::Sell));
     assert_eq!(accepted.routing(), None);
     assert_eq!(accepted.node_effect(), NE::NoNodeEffect);
 
     // Indeterminate(CloseAmbiguous, -2 on a close doc) → ProbeRequired → ProbeRequired.
-    let close = classify(&parsed(RawDpsStatus::Error(-2), DocType::ZReport));
+    let close = classify(&parsed_err(-2, DocType::ZReport));
     assert_eq!(close.node_effect(), NE::ProbeRequired);
 
     // Indeterminate(SaveError, -3) → TransientRetry → NoNodeEffect.
-    let save = classify(&parsed(RawDpsStatus::Error(-3), DocType::Sell));
+    let save = classify(&parsed_err(-3, DocType::Sell));
     assert_eq!(save.node_effect(), NE::NoNodeEffect);
 }
 

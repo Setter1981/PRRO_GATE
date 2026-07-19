@@ -1,6 +1,6 @@
 //! Must NOT compile: `classify` takes ONLY the sealed evidence.
 //!
-//! The `-2/-15` close/non-close split is consumed exactly ONCE, at `from_dps_status`
+//! The `-2/-15` close/non-close split is consumed exactly ONCE, at `SendOutcome::from_server_code`
 //! construction (the single source of doc_type). A sealed outcome therefore already
 //! encodes its doc-type-relevant distinction in its variant (`Rejected(Close)` vs
 //! `Indeterminate(CloseAmbiguous)`), and `classify` has no doc_type-dependent logic left.

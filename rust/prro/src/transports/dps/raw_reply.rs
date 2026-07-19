@@ -50,6 +50,44 @@ enum RawSendReplyInner {
     NoResponse { cause: NoResponseCause },
 }
 
+/// The closed subset of [`NoResponseCause`] a **live wire observation** may legitimately mint
+/// (consolidated-audit M2). `CrashedBeforeObservation` is deliberately EXCLUDED: it is a
+/// boot-resume/reaper cause (a durable `CALL_STARTED` marker found with no observed response after a
+/// reboot), minted by the recovery path — NEVER by a returned transport observation, which by
+/// definition *did* observe a returned result. Because the transport `no_response` builder takes
+/// `TransportAbsence` (not the full domain `NoResponseCause`), a transport decoder **cannot name**
+/// the crash cause: this is a genuine WITHIN-CRATE structural type-seal (the domain `SendResponse`
+/// still accepts the full enum for the D/E boot-resume path). Contrast the cross-crate
+/// digest/provenance mint, which Rust cannot sibling-seal — there a source-policy lint is the only
+/// fence; here co-location makes the seal real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::transports::dps) enum TransportAbsence {
+    /// TCP/TLS/DNS never established a session with the far side.
+    LocalHandshakeFailure,
+    /// Per-call deadline expired / future dropped / clean shutdown.
+    Timeout,
+    /// Future cancelled (e.g. shutdown signal).
+    Cancelled,
+    /// A returned reply/status that is not a trusted DPS envelope (§4.3 branch 9).
+    CallFailedWithoutTrustedDpsEnvelope,
+}
+
+impl TransportAbsence {
+    /// Widen into the domain cause. The match is exhaustive, so a future `TransportAbsence` variant
+    /// forces an arm here — and there is intentionally NO arm producing
+    /// `NoResponseCause::CrashedBeforeObservation` (M2 seal).
+    fn into_cause(self) -> NoResponseCause {
+        match self {
+            TransportAbsence::LocalHandshakeFailure => NoResponseCause::LocalHandshakeFailure,
+            TransportAbsence::Timeout => NoResponseCause::Timeout,
+            TransportAbsence::Cancelled => NoResponseCause::Cancelled,
+            TransportAbsence::CallFailedWithoutTrustedDpsEnvelope => {
+                NoResponseCause::CallFailedWithoutTrustedDpsEnvelope
+            }
+        }
+    }
+}
+
 impl RawSendReply {
     // ── Transport-only builders: `pub(in crate::transports::dps)` so the DPS decoder submodules
     //    (grpc.rs/dto.rs) mint them, but the engine (crate::services) cannot. ──
@@ -72,8 +110,10 @@ impl RawSendReply {
     pub(in crate::transports::dps) fn remote_auth_status(grpc: GrpcStatusDigest) -> Self {
         Self(RawSendReplyInner::RemoteAuthStatus { grpc })
     }
-    pub(in crate::transports::dps) fn no_response(cause: NoResponseCause) -> Self {
-        Self(RawSendReplyInner::NoResponse { cause })
+    pub(in crate::transports::dps) fn no_response(cause: TransportAbsence) -> Self {
+        Self(RawSendReplyInner::NoResponse {
+            cause: cause.into_cause(),
+        })
     }
 
     /// Borrowed view for the engine mapper — read (match) but never construct.
@@ -172,9 +212,11 @@ pub(in crate::transports::dps) fn observe_from_legacy(
     let evidence = match legacy {
         Ok(ack) => match NonEmptyFiscalNumber::from_transport(ack.id.clone()) {
             Some(id) => RawSendReply::accepted(id),
-            None => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+            None => {
+                RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope)
+            }
         },
-        Err(_) => RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+        Err(_) => RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
     };
     RawSendObservation::new(evidence, WireDiagnostics::default())
 }
@@ -218,16 +260,45 @@ mod tests {
             matches!(remote.kind(), RawSendReplyKind::RemoteAuthStatus { grpc: g } if g == &grpc())
         );
 
-        let none = RawSendReply::no_response(NoResponseCause::Timeout);
+        let none = RawSendReply::no_response(TransportAbsence::Timeout);
         assert!(
             matches!(none.kind(), RawSendReplyKind::NoResponse { cause } if cause == NoResponseCause::Timeout)
         );
     }
 
+    /// CS-3 3.2 PR4 (consolidated-audit M2) — the transport `no_response` builder takes the closed
+    /// [`TransportAbsence`] subset, so a live wire observation can NEVER mint the boot-resume cause
+    /// `CrashedBeforeObservation`. This is a genuine WITHIN-CRATE structural type-seal:
+    /// `RawSendReply::no_response(NoResponseCause::CrashedBeforeObservation)` does not compile (wrong
+    /// argument type) and `TransportAbsence` has no crash variant. The compile-time seal is the
+    /// primary guarantee; this enumerates the whole subset as a belt-and-suspenders runtime witness —
+    /// RED if a future edit adds a crash arm to `TransportAbsence`/`into_cause` and lists it here.
+    #[test]
+    fn m2_transport_absence_never_widens_to_crash_before_observation() {
+        for a in [
+            TransportAbsence::LocalHandshakeFailure,
+            TransportAbsence::Timeout,
+            TransportAbsence::Cancelled,
+            TransportAbsence::CallFailedWithoutTrustedDpsEnvelope,
+        ] {
+            assert_ne!(
+                a.into_cause(),
+                NoResponseCause::CrashedBeforeObservation,
+                "{a:?} must not widen to the boot-resume crash cause"
+            );
+            let reply = RawSendReply::no_response(a);
+            assert!(matches!(
+                reply.kind(),
+                RawSendReplyKind::NoResponse { cause }
+                    if cause != NoResponseCause::CrashedBeforeObservation
+            ));
+        }
+    }
+
     #[test]
     fn observation_carries_evidence_and_diagnostics() {
         let obs = RawSendObservation::new(
-            RawSendReply::no_response(NoResponseCause::CallFailedWithoutTrustedDpsEnvelope),
+            RawSendReply::no_response(TransportAbsence::CallFailedWithoutTrustedDpsEnvelope),
             WireDiagnostics {
                 status_code: None,
                 grpc_code: Some("Unavailable".into()),
@@ -277,5 +348,177 @@ mod tests {
             observe_from_legacy(&err).evidence().kind(),
             RawSendReplyKind::NoResponse { .. }
         ));
+    }
+
+    /// PR4 §4.3 — the engine mapper `map_send_reply` maps every `RawSendReply` arm to the correct
+    /// `SendResponse`. Total over the 6 arms; the code×doc_type `-2/-15` split checked both ways.
+    /// (Lives here because only `transports::dps` can mint a `RawSendReply`; the mapper output is
+    /// read via the domain's opaque `kind()` views.) Break any mapper arm → RED.
+    #[test]
+    fn pr4_map_send_reply_covers_section_4_3() {
+        use crate::services::write_path::shadow_map::map_send_reply;
+        use prro_domain::delivery::{
+            DpsReject, RemoteStatusEvidence, SendIndeterminateKind, SendOutcomeKind,
+            SendResponseKind,
+        };
+        use prro_domain::enums::DocType;
+
+        let sell = DocType::Sell;
+        let id = |s: &str| NonEmptyFiscalNumber::from_transport(s.to_string()).unwrap();
+        let code = |c: i32| NonOkStatusCode::from_transport(c).unwrap();
+
+        // Row 1 — Accepted → Parsed(Accepted{that id}).
+        match map_send_reply(&RawSendReply::accepted(id("DPS-9")), sell).kind() {
+            SendResponseKind::Parsed(o) => assert!(
+                matches!(o.kind(), SendOutcomeKind::Accepted(a) if a.fiscal_number() == "DPS-9")
+            ),
+            other => panic!("row1: {other:?}"),
+        }
+        // Row 2 — OkNoFiscalId → Parsed(OkButNoFiscalNumber).
+        assert!(matches!(
+            map_send_reply(&RawSendReply::ok_no_fiscal_id(dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                    if matches!(i.kind(), SendIndeterminateKind::OkButNoFiscalNumber { .. }))
+        ));
+        // Row 3 — named -1 → Parsed(Rejected{Verify}).
+        assert!(matches!(
+            map_send_reply(&RawSendReply::server_code(code(-1), dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Rejected { verdict: DpsReject::Verify, .. })
+        ));
+        // Row 4 — -2 non-close → Rejected(Close); -2 close/Z → CloseAmbiguous (doc_type split).
+        assert!(matches!(
+            map_send_reply(&RawSendReply::server_code(code(-2), dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Rejected { verdict: DpsReject::Close, .. })
+        ));
+        assert!(matches!(
+            map_send_reply(&RawSendReply::server_code(code(-2), dg()), DocType::ZReport).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                    if matches!(i.kind(), SendIndeterminateKind::CloseAmbiguous { .. }))
+        ));
+        // Row 5 — -3 → SaveError.
+        assert!(matches!(
+            map_send_reply(&RawSendReply::server_code(code(-3), dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                    if matches!(i.kind(), SendIndeterminateKind::SaveError { .. }))
+        ));
+        // Row 6 — -4 and every unknown non-zero → UnknownStatus.
+        for c in [-4i32, -17, 2, 12_345] {
+            assert!(
+                matches!(
+                    map_send_reply(&RawSendReply::server_code(code(c), dg()), sell).kind(),
+                    SendResponseKind::Parsed(o)
+                        if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                            if matches!(i.kind(), SendIndeterminateKind::UnknownStatus { .. }))
+                ),
+                "row6 code {c}"
+            );
+        }
+        // Row 7 — MissingStatus → Parsed(MissingStatus).
+        assert!(matches!(
+            map_send_reply(&RawSendReply::missing_status(dg()), sell).kind(),
+            SendResponseKind::Parsed(o)
+                if matches!(o.kind(), SendOutcomeKind::Indeterminate(i)
+                    if matches!(i.kind(), SendIndeterminateKind::MissingStatus { .. }))
+        ));
+        // Row 8 — RemoteAuthStatus → RemoteStatus (DIRECT), forwarding the SAME grpc digest.
+        match map_send_reply(&RawSendReply::remote_auth_status(grpc()), sell).kind() {
+            SendResponseKind::RemoteStatus(RemoteStatusEvidence::RemoteAuthStatus(g)) => {
+                assert_eq!(
+                    g,
+                    &grpc(),
+                    "row8 must forward the transport-minted grpc digest"
+                )
+            }
+            other => panic!("row8: {other:?}"),
+        }
+        // Rows 9/10 — NoResponse → NoResponse (DIRECT), forwarding the SAME cause.
+        match map_send_reply(&RawSendReply::no_response(TransportAbsence::Timeout), sell).kind() {
+            SendResponseKind::NoResponse(c) => assert_eq!(*c, NoResponseCause::Timeout),
+            other => panic!("row10: {other:?}"),
+        }
+    }
+
+    /// CS-3 3.2 PR4 (consolidated-audit B2) — DIGEST FIDELITY per parsed arm. The §4.3 coverage test
+    /// above only checks WHICH arm is produced (it feeds every row the same `dg()` and never reads the
+    /// `DecodedResponseDigest` back), so a constant/fabricated digest — the auditor's `[0xEE;32]` at
+    /// `from_server_code` — stayed all-green. This feeds EACH digest-carrying arm an INDEPENDENT input
+    /// digest, reads the carried digest back out of the sealed outcome, and asserts it equals the
+    /// input BYTE-FOR-BYTE. Because every row's input byte is unique, a per-arm constant OR a
+    /// cross-row swap flips at least one assertion → RED. (The grpc-digest arm 8 is already covered
+    /// with an independent digest above.)
+    #[test]
+    fn pr4_b2_map_send_reply_forwards_exact_digest_per_arm() {
+        use crate::services::write_path::shadow_map::map_send_reply;
+        use prro_domain::delivery::{
+            DecodedResponseDigest, SendIndeterminateKind, SendOutcomeKind, SendResponse,
+            SendResponseKind,
+        };
+        use prro_domain::enums::DocType;
+
+        let sell = DocType::Sell;
+        let zrep = DocType::ZReport;
+        let code = |c: i32| NonOkStatusCode::from_transport(c).unwrap();
+        let dgst = |b: u8| DecodedResponseDigest::from_transport_digest([b; 32]);
+
+        // Pull the carried DecodedResponseDigest bytes out of a parsed outcome. Panics for an
+        // arm that carries none (Accepted) or a non-parsed response.
+        let parsed_digest = |resp: &SendResponse| -> [u8; 32] {
+            match resp.kind() {
+                SendResponseKind::Parsed(o) => match o.kind() {
+                    SendOutcomeKind::Rejected { digest, .. } => *digest.as_bytes(),
+                    SendOutcomeKind::Indeterminate(i) => match i.kind() {
+                        SendIndeterminateKind::UnknownStatus { digest, .. }
+                        | SendIndeterminateKind::SaveError { digest }
+                        | SendIndeterminateKind::CloseAmbiguous { digest }
+                        | SendIndeterminateKind::MissingStatus { digest }
+                        | SendIndeterminateKind::OkButNoFiscalNumber { digest } => {
+                            *digest.as_bytes()
+                        }
+                    },
+                    SendOutcomeKind::Accepted(_) => panic!("Accepted carries no digest"),
+                },
+                other => panic!("not a parsed outcome: {other:?}"),
+            }
+        };
+
+        // One case per digest-carrying arm — each with a UNIQUE input byte (single source of truth).
+        let cases = [
+            {
+                let b = 0x11u8;
+                (RawSendReply::ok_no_fiscal_id(dgst(b)), sell, b) // OkButNoFiscalNumber
+            },
+            {
+                let b = 0x22u8;
+                (RawSendReply::server_code(code(-1), dgst(b)), sell, b) // Rejected(Verify)
+            },
+            {
+                let b = 0x33u8;
+                (RawSendReply::server_code(code(-3), dgst(b)), sell, b) // SaveError
+            },
+            {
+                let b = 0x44u8;
+                (RawSendReply::server_code(code(-2), dgst(b)), zrep, b) // CloseAmbiguous (close doc)
+            },
+            {
+                let b = 0x55u8;
+                (RawSendReply::server_code(code(-4), dgst(b)), sell, b) // UnknownStatus
+            },
+            {
+                let b = 0x66u8;
+                (RawSendReply::missing_status(dgst(b)), sell, b) // MissingStatus
+            },
+        ];
+        for (reply, dt, b) in cases {
+            let out = parsed_digest(&map_send_reply(&reply, dt));
+            assert_eq!(
+                out, [b; 32],
+                "arm fed digest [{b:#x};32] must forward it EXACTLY (no constant/swap)"
+            );
+        }
     }
 }

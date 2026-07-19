@@ -303,14 +303,23 @@ pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAc
 
 /// Total transport-minted evidence for one decoded `CheckResponse` — dispatches on the RAW status
 /// so the digest is framed from live fields. `Status::try_from` fails only for a code outside the
-/// declared `-16..=1` enum (proto-unrecognized) → the indeterminate `MissingStatus` posture, NOT a
-/// confident `ServerCode` (an unknown code is not a known server verdict).
+/// declared `-16..=1` enum (proto-unrecognized). §4.3 row-6 (auditor-adjudicated 2026-07-18): an
+/// unrecognized NON-ZERO code is still a server verdict code → `ServerCode` (the engine maps it to
+/// `UnknownStatus → TransientRetry`); ONLY proto `status == 0` (`Ok(Unknown)`) is `MissingStatus →
+/// ProbeRequired`. This preserves the §4.6 "unknown-non-zero" drift-delta (Live `Decode →
+/// ProbeRequired` vs Shadow `UnknownStatus → TransientRetry`).
 pub(in crate::transports::dps) fn raw_reply_from_check_response(
     r: &gen::CheckResponse,
 ) -> RawSendReply {
     use gen::check_response::Status;
     match Status::try_from(r.status) {
-        Err(_) => RawSendReply::missing_status(decoded_digest_check(r)),
+        // Unrecognized non-zero code (e.g. -17, 2): `NonOkStatusCode` rejects only 0/1, and a
+        // `try_from` Err ⇒ the code is outside -16..=1 ⇒ ∉ {0,1}, so the mint always succeeds.
+        Err(_) => RawSendReply::server_code(
+            NonOkStatusCode::from_transport(r.status)
+                .expect("Status::try_from Err ⇒ code ∉ declared -16..=1 enum ⇒ ∉ {0,1}"),
+            decoded_digest_check(r),
+        ),
         Ok(Status::Ok) => match NonEmptyFiscalNumber::from_transport(r.id.clone()) {
             // Non-empty id IS the transport-proven acceptance evidence (D-4) — no digest.
             Some(id) => RawSendReply::accepted(id),
@@ -654,16 +663,14 @@ mod tests {
                 other => panic!("status {code} → expected ServerCode, got {other:?}"),
             }
         }
-        // unknown non-zero (outside the declared enum) → MissingStatus (indeterminate posture, NOT
-        // a confident ServerCode — an unrecognized code is not a known server verdict).
+        // §4.3 row-6 (auditor-adjudicated): unknown non-zero (outside the declared enum) →
+        // ServerCode carrying that raw code (the engine maps it to UnknownStatus). Only proto
+        // status==0 (Status::Unknown, asserted above) is MissingStatus.
         for code in [-17i32, -99, 2, 7, 12_345] {
-            assert!(
-                matches!(
-                    raw_reply_from_check_response(&chk(code, "", "?")).kind(),
-                    RawSendReplyKind::MissingStatus { .. }
-                ),
-                "unknown non-zero {code} must map to MissingStatus"
-            );
+            match raw_reply_from_check_response(&chk(code, "", "?")).kind() {
+                RawSendReplyKind::ServerCode { code: c, .. } => assert_eq!(c.get(), code),
+                other => panic!("unknown non-zero {code} must map to ServerCode, got {other:?}"),
+            }
         }
     }
 
