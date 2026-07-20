@@ -354,10 +354,13 @@ async fn oc06_offline_not_accepted_refused_nothing_mutated() {
 // ───────────────────── oc07 shift-family refused ─────────────────────────────
 
 #[tokio::test]
-async fn oc07_shift_family_refused() {
+async fn oc07_offline_shift_family_refused() {
     let (_d, pool) = fresh_pool().await;
     let fscl = "5000000007";
-    let doc = seed_doc(&pool, fscl, 0x11, "SHIFT_OPEN", None).await;
+    // OFFLINE shift-family (offline_fiscal_no set) still needs the OLPD/CLPD rollback + OLA
+    // cohort cleanup + predecessor-seed repair — refused fail-closed (gap 4b). ONLINE
+    // shift-family is now supported via the operator-completion service (gap 4a, oc10-oc13).
+    let doc = seed_doc(&pool, fscl, 0x11, "SHIFT_OPEN", Some(0x11)).await;
     held_pending(&pool, 0x01, doc, fscl).await;
     let err = complete(
         &pool,
@@ -367,7 +370,7 @@ async fn oc07_shift_family_refused() {
         },
     )
     .await
-    .expect_err("shift-family completion is Slice 5b");
+    .expect_err("offline shift-family completion is gap 4b");
     assert!(is_err(&err, |e| matches!(
         e,
         CompletionError::ShiftFamilyNotSupported

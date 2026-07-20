@@ -993,13 +993,23 @@ pub enum CompletionError {
     DocTransitionFailed(crate::db::repositories::fiscal_documents::TransitionOutcome),
     /// Slice-5b boundary: a SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT document needs the shift-family
     /// rollback matrix (design §3.4). Refused fail-closed here, never half-applied.
-    #[error("shift-family operator completion (SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT) is Slice 5b")]
+    /// Gap-4b boundary: an OFFLINE-origin shift-family document (SHIFT_OPEN / SHIFT_CLOSE /
+    /// Z_REPORT) needs the OLPD/CLPD rollback + OLA cohort cleanup + predecessor-seed repair.
+    /// Online shift-family IS supported (gap 4a). Refused fail-closed, never half-applied.
+    #[error(
+        "offline shift-family operator completion (SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT) is gap 4b"
+    )]
     ShiftFamilyNotSupported,
-    /// Slice-5b boundary: an offline-origin not-accepted needs the mandatory OLA-successor cohort
+    /// Gap-4b boundary: an offline-origin not-accepted needs the mandatory OLA-successor cohort
     /// cleanup + predecessor-seed repair (design §3.4). Refused fail-closed (a fork hazard
     /// otherwise), never half-applied.
-    #[error("offline not-accepted needs OLA-successor cohort cleanup (Slice 5b)")]
+    #[error("offline not-accepted needs OLA-successor cohort cleanup (gap 4b)")]
     OfflineCohortCleanupRequired,
+    /// The `STOP_MODE -> target` mode CAS matched no row: the node left STOP_MODE concurrently
+    /// (a BLOCKED `-11` node, or a racing reset). The operator resolution is stale — the whole tx
+    /// rolls back rather than APPLYING under an unexpected mode.
+    #[error("node is not in STOP_MODE (mode CAS matched no row — stale resolution)")]
+    NodeNotStopMode,
     #[error(transparent)]
     Db(sqlx::Error),
 }
@@ -1080,10 +1090,18 @@ pub async fn complete_operator_pending(
     .map_err(CompletionError::Db)?;
     let (doc_type, offline_fiscal_no, unsigned_sha) =
         doc.ok_or(CompletionError::DocumentMissing)?;
-    if matches!(doc_type.as_str(), "SHIFT_OPEN" | "SHIFT_CLOSE" | "Z_REPORT") {
+    let online = offline_fiscal_no.is_none();
+    let shift_family = matches!(doc_type.as_str(), "SHIFT_OPEN" | "SHIFT_CLOSE" | "Z_REPORT");
+    // CS-3 gap 4a: an ONLINE shift-family completion is now supported here — this core handles
+    // the document / SFN / seed uniformly (accepted issues `Sending -> Sent`, not-accepted moves
+    // `Sending -> RMR`), and the operator-completion SERVICE applies the shift-state projection
+    // (`Opening -> Opened` / `Opening -> Closed`, etc.) via `apply_shift_transition` in the same
+    // tx (the sole `node_state.shift_state` writer — a repository must not invert into it). An
+    // OFFLINE-origin shift-family document still needs the OLA cohort cleanup + predecessor-seed
+    // repair, which is Slice-5b / gap 4b — refused fail-closed here, never half-applied.
+    if !online && shift_family {
         return Err(CompletionError::ShiftFamilyNotSupported);
     }
-    let online = offline_fiscal_no.is_none();
 
     let mut seed_advanced = false;
     let mut stamped_sfn: Option<String> = None;
@@ -1107,6 +1125,13 @@ pub async fn complete_operator_pending(
                     .map_err(completion_from_apply)?;
                 seed_advanced = true;
             }
+            // Accepted = issued: the document leaves `Sending` for the terminal issued state
+            // `Sent` (core fix — completion previously stamped SFN/seed + cleared the pointer but
+            // left the document resting in `Sending`, violating the no-non-terminal-at-quiescence
+            // pin). Atomic with the SFN/seed above.
+            doc_from_sending(tx, doc_id, DocState::Sent)
+                .await
+                .map_err(completion_from_apply)?;
             stamped_sfn = Some(f.clone());
         }
         OperatorResolution::NotAccepted => {
@@ -1159,12 +1184,22 @@ pub async fn complete_operator_pending(
     } else {
         ModeTarget::Online
     };
-    sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ? AND mode = 'STOP_MODE'")
-        .bind(mode_target.as_str())
-        .bind(&fiscal_number)
-        .execute(&mut **tx)
-        .await
-        .map_err(CompletionError::Db)?;
+    let mode_rows = sqlx::query(
+        "UPDATE node_state SET mode = ? WHERE fiscal_number = ? AND mode = 'STOP_MODE'",
+    )
+    .bind(mode_target.as_str())
+    .bind(&fiscal_number)
+    .execute(&mut **tx)
+    .await
+    .map_err(CompletionError::Db)?
+    .rows_affected();
+    // Core fix: the STOP_MODE → target CAS must move exactly one row. A PENDING reservation is
+    // held under STOP_MODE, so a 0-row CAS means the node left STOP_MODE concurrently (a BLOCKED
+    // `-11` node or a racing reset) — the operator resolution is stale; roll the whole tx back
+    // rather than silently APPLYING under an unexpected mode.
+    if mode_rows != 1 {
+        return Err(CompletionError::NodeNotStopMode);
+    }
 
     Ok(CompletionResult {
         applied: true,
@@ -1199,8 +1234,9 @@ fn completion_from_apply(e: ApplyError) -> CompletionError {
     match e {
         ApplyError::DocumentMissing => CompletionError::DocumentMissing,
         ApplyError::NodeStateMissing => CompletionError::NodeStateMissing,
+        ApplyError::DocTransitionFailed(o) => CompletionError::DocTransitionFailed(o),
         ApplyError::Db(db) => CompletionError::Db(db),
-        // The adapters only ever produce the three above.
+        // The adapters + `doc_from_sending` only ever produce the four above.
         other => CompletionError::Db(sqlx::Error::Decode(format!("unexpected: {other}").into())),
     }
 }

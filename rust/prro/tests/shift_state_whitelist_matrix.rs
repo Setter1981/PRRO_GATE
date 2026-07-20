@@ -8,11 +8,11 @@
 //!
 //! Test enumerates EVERY (from, to) pair across all 9 ShiftState
 //! variants:
-//! - 15 cells → expect `TransitionOutcome::Applied` (state actually changed).
-//! - 66 cells → expect `TransitionOutcome::Forbidden` (state UNCHANGED;
+//! - 16 cells → expect `TransitionOutcome::Applied` (state actually changed).
+//! - 65 cells → expect `TransitionOutcome::Forbidden` (state UNCHANGED;
 //!   no DB write attempted before the typed return).
 //!
-//! Spec §11 acceptance #1: locked-count test (`ALLOWED_EDGES.len() == 15`).
+//! Spec §11 acceptance #1: locked-count test (`ALLOWED_EDGES.len() == 16`).
 
 use prro::db::models::enums::{FiscalMode, ShiftState};
 use prro::db::models::ids::ShiftId;
@@ -35,7 +35,7 @@ const ALL_STATES: [ShiftState; 9] = [
 ];
 
 /// Spec §4.1 — 15 allowed (from, to) edges.  Numbered per spec.
-const ALLOWED_EDGES: [(ShiftState, ShiftState); 15] = [
+const ALLOWED_EDGES: [(ShiftState, ShiftState); 16] = [
     (ShiftState::Created, ShiftState::Opening), // 1
     (ShiftState::Created, ShiftState::OpenedLocalPendingDrain), // 2
     (ShiftState::Opening, ShiftState::Opened),  // 3
@@ -66,18 +66,20 @@ const ALLOWED_EDGES: [(ShiftState, ShiftState); 15] = [
         ShiftState::RequiresManualReconciliation,
     ), // 14
     (ShiftState::Opened, ShiftState::RequiresManualReconciliation), // 15 (M2-N2a: strict-sequential drain-reject on a plain Opened shift)
+    (ShiftState::Opening, ShiftState::Closed), // 16 (CS-3 gap 4a: operator-completion rollback of a not-accepted online SHIFT_OPEN)
 ];
 
 /// Drift-guard: spec §11 acceptance #1 locks the edge count.  Any
 /// addition / removal of a whitelist edge MUST update spec §4.1, this
 /// constant, AND `allowed_transition` body simultaneously.  (Was 14;
-/// M2-N2a added edge 15 `Opened → RequiresManualReconciliation`.)
+/// M2-N2a added edge 15 `Opened → RequiresManualReconciliation`; CS-3 gap 4a
+/// added edge 16 `Opening → Closed` for online-SHIFT_OPEN operator rollback.)
 #[test]
-fn locked_edge_count_is_15() {
+fn locked_edge_count_is_16() {
     assert_eq!(
         ALLOWED_EDGES.len(),
-        15,
-        "spec §11 acceptance #1: whitelist edge count is drift-guarded (M2-N2a → 15)"
+        16,
+        "spec §11 acceptance #1: whitelist edge count is drift-guarded (CS-3 gap 4a → 16)"
     );
 }
 
@@ -128,7 +130,7 @@ async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftS
 }
 
 #[tokio::test]
-async fn whitelist_matrix_15_allowed_66_forbidden_via_transition_state() {
+async fn whitelist_matrix_16_allowed_65_forbidden_via_transition_state() {
     let (pool, fn_id) = fresh_with_fn().await;
 
     let mut applied_count = 0usize;
@@ -188,10 +190,10 @@ async fn whitelist_matrix_15_allowed_66_forbidden_via_transition_state() {
     }
 
     assert_eq!(
-        applied_count, 15,
-        "spec §4.1: 15 whitelist edges (M2-N2a added 15)"
+        applied_count, 16,
+        "spec §4.1: 16 whitelist edges (CS-3 gap 4a added edge 16 Opening→Closed)"
     );
-    assert_eq!(forbidden_count, 9 * 9 - 15, "9*9 - 15 = 66 forbidden pairs");
+    assert_eq!(forbidden_count, 9 * 9 - 16, "9*9 - 16 = 65 forbidden pairs");
 }
 
 /// PR #66 R2 LOW-6: regression test for `TransitionOutcome::NotFound`

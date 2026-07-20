@@ -36,10 +36,10 @@ pub struct ShiftRow {
 /// M3b W14a-2a — whitelist of allowed shift state transitions per spec
 /// `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` §4.1.
 ///
-/// Drift-guard: edge count is locked at **14**.  Any addition / removal
+/// Drift-guard: edge count is locked at **16**.  Any addition / removal
 /// MUST update both this function body AND the matching scanner test
 /// `tests/shift_state_whitelist_matrix.rs` (9×9 = 81 (from, to) pairs:
-/// 14 Applied + 67 Forbidden).
+/// 16 Applied + 65 Forbidden).
 ///
 /// Per spec §4.4 forbidden patterns:
 /// - **`Error` is reachable via `force_to_error_with_audit` seam (operator-driven)
@@ -71,6 +71,12 @@ pub struct ShiftRow {
 ///       reject of an offline-origin predecessor on an online-opened shift that
 ///       went OFFLINE mid-shift — a normal state-machine branch, NOT an operator
 ///       override.  Same drain-reject class as 6 / 14, from a plain `Opened` shift.)
+///   16. Opening → Closed  (CS-3 gap 4a: operator-completion rollback of an
+///       online SHIFT_OPEN whose ambiguous send the operator resolves as NOT
+///       accepted — the shift never opened at DPS, so it rolls straight to
+///       Closed.  Authorized ONLY by the operator-completion service
+///       (`services::reconciliation::operator_completion`); NOT a normal ingress
+///       edge.  Pinned as such by the sole-caller test.)
 pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
     use ShiftState::*;
     matches!(
@@ -90,6 +96,7 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
             | (ClosingLocalPendingDrain, Closed)            // 13
             | (ClosingLocalPendingDrain, RequiresManualReconciliation) // 14
             | (Opened, RequiresManualReconciliation) // 15 (M2-N2a)
+            | (Opening, Closed) // 16 (CS-3 gap 4a)
     )
 }
 
