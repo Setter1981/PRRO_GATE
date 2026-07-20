@@ -9,10 +9,14 @@ note: constructor is not visible here due to private fields
   |
   | pub struct DecodedResponseDigest([u8; 32]);
   |                                  ^^^^^^^^ private field
-help: you might have meant to use the `from_transport_digest` associated function
+help: you might have meant to use an associated function to build this type
   |
-9 |     let _decoded = DecodedResponseDigest::from_transport_digest([0u8; 32]);
-  |                                         +++++++++++++++++++++++
+9 -     let _decoded = DecodedResponseDigest([0u8; 32]);
+9 +     let _decoded = DecodedResponseDigest::from_transport_digest(_);
+  |
+9 -     let _decoded = DecodedResponseDigest([0u8; 32]);
+9 +     let _decoded = DecodedResponseDigest::from_durable_evidence(_);
+  |
 
 error[E0423]: cannot initialize a tuple struct which contains private fields
   --> tests/opaque_algebra_compile_fail/fabricate_digest.rs:10:17
@@ -25,7 +29,11 @@ note: constructor is not visible here due to private fields
    |
    | pub struct GrpcStatusDigest([u8; 32]);
    |                             ^^^^^^^^ private field
-help: you might have meant to use the `from_transport_digest` associated function
+help: you might have meant to use an associated function to build this type
    |
-10 |     let _grpc = GrpcStatusDigest::from_transport_digest([0u8; 32]);
-   |                                 +++++++++++++++++++++++
+10 -     let _grpc = GrpcStatusDigest([0u8; 32]);
+10 +     let _grpc = GrpcStatusDigest::from_transport_digest(_);
+   |
+10 -     let _grpc = GrpcStatusDigest([0u8; 32]);
+10 +     let _grpc = GrpcStatusDigest::from_durable_evidence(_);
+   |

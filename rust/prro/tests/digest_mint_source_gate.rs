@@ -97,7 +97,7 @@ use syn::visit::Visit;
 /// substring overlap `from_transport_digest` ⊃ `from_transport` is harmless: all matching is on
 /// exact idents (`from_transport_digest != from_transport`), and the macro token-tree check is a
 /// deliberately conservative superset where double-flagging one line is still just a violation.
-const MINT_SYMBOLS: &[&str] = &["from_transport_digest", "from_transport"];
+const MINT_SYMBOLS: &[&str] = &["from_transport_digest", "from_transport", "from_durable_evidence"];
 
 /// The gated `(Type, ctor)` delivery authority pairs (two-segment `Type::ctor` tail match).
 const DELIVERY_CTORS: &[(&str, &str)] = &[
@@ -144,6 +144,14 @@ struct AllowEntry {
 }
 
 const ALLOWLIST: &[AllowEntry] = &[
+    // CS-3 Slice 2b — boot hydration re-materialises an already-recorded digest from its
+    // durable evidence_digest column. A SEPARATE narrow mint (design §4.4, kept distinct from
+    // the transport mint), gated to the single hydration site.
+    AllowEntry {
+        file_suffix: "delivery/evidence.rs",
+        fn_name: "from_columns",
+        symbol: GatedSymbol::Mint("from_durable_evidence"),
+    },
     // digest mints
     AllowEntry {
         file_suffix: "transports/dps/dto.rs",

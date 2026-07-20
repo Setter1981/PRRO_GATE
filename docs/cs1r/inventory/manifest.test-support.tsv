@@ -1099,6 +1099,7 @@ test-support	prro	prro::cs3_c_db_classifier_storage_roundtrip	tg02_submitted_unk
 test-support	prro	prro::cs3_c_db_classifier_storage_roundtrip	tg03_terminal_reject_with_submitted_unknown_rejected	false
 test-support	prro	prro::cs3_c_db_classifier_storage_roundtrip	tg04_probe_required_with_no_response_rejected	false
 test-support	prro	prro::cs3_c_db_classifier_storage_roundtrip	tg05_mac_recovery_with_submitted_unknown_rejected	false
+test-support	prro	prro::cs3_evidence_matrix_conformance	every_leaf_conforms_to_migration_036_matrix	false
 test-support	prro	prro::derive_tax_summaries	calc_tax_error_propagates_as_typed_result	false
 test-support	prro	prro::derive_tax_summaries	calc_tax_unsupported_txal_propagates	false
 test-support	prro	prro::derive_tax_summaries	empty_items_yields_empty_summaries	false
@@ -2502,6 +2503,9 @@ test-support	prro	prro::z_quiescence	offline_z_close_quiesces_clear_over_own_shi
 test-support	prro	prro::z_quiescence	pending_for_every_non_kvt2_blocking_state	false
 test-support	prro	prro::z_quiescence	post_sent_online_rmr_blocks_quiescence	false
 test-support	prro	prro::z_quiescence	rejected_and_cancelled_do_not_block	false
+test-support	prro-domain	prro-domain	delivery::evidence::tests::accepted_carries_exact_fiscal_number	false
+test-support	prro-domain	prro-domain	delivery::evidence::tests::hydration_fails_loud_on_garbage	false
+test-support	prro-domain	prro-domain	delivery::evidence::tests::roundtrip_all_eleven_leaves	false
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::from_str_roundtrip	false
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_accepts_typical_handle	false
 test-support	prro-domain	prro-domain	ids::cashier_id_tests::new_rejects_empty	false
