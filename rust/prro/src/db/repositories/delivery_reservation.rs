@@ -179,22 +179,54 @@ struct ReservationRowRaw {
 /// partial-unique index guarantees at most one such row per FN, so this
 /// returns `Option`.  Read-only, pool-bound.
 ///
+/// The active-reservation fence predicate body — the `state` disjunction shared,
+/// byte-identical, by [`get_active_for_fn`], [`fn_fence_active_tx`], the
+/// `ux_reservation_active` partial index and the `delivery_reservation_no_replace`
+/// trigger clause (migration 035).  The conformance test `fence_predicate_byte_identity`
+/// pins it against the migration SQL, so any drift fails CI.  Only ever interpolated
+/// with this compile-time constant (never user input) → no SQL-injection surface.
+pub const ACTIVE_FENCE_STATE_PREDICATE: &str = "state IN ('RESERVED_NOT_STARTED','CALL_STARTED') \
+       OR (state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY')";
+
+/// CS-3 S7-2 — the **tx-bound** FN active-reservation fence.  Returns `true` when the
+/// FN has an in-flight delivery reservation (the record-then-apply window, per the
+/// §3.1 predicate).  A foreign FN-chain / offline writer MUST call this INSIDE its own
+/// `BEGIN IMMEDIATE`, BEFORE its mutation, and fail-closed (refuse) when `true`: a
+/// pool-bound read ([`get_active_for_fn`]) races the fence across connections (TOCTOU).
+///
+/// `apply_outcome` is the active reservation itself and MUST NOT self-fence.
+///
+/// **INACTIVE until S7-1 cutover:** no reservation is ever active in production while
+/// the delivery FSM is dormant, so this returns `false` for every live call today; the
+/// wiring + teeth exist so the fence already guards each writer when the FSM activates.
+pub async fn fn_fence_active_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+) -> sqlx::Result<bool> {
+    let active: i64 = sqlx::query_scalar(&format!(
+        "SELECT EXISTS(SELECT 1 FROM delivery_reservation \
+         WHERE fiscal_number = ? AND ({ACTIVE_FENCE_STATE_PREDICATE}))"
+    ))
+    .bind(fiscal_number)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(active == 1)
+}
+
 /// **INACTIVE:** invoked only from persistence tests in CS-2.
 pub async fn get_active_for_fn(
     pool: &sqlx::SqlitePool,
     fiscal_number: &str,
 ) -> sqlx::Result<Option<ReservationRow>> {
-    let row: Option<ReservationRowRaw> = sqlx::query_as(
+    let row: Option<ReservationRowRaw> = sqlx::query_as(&format!(
         "SELECT reservation_id, document_id, fiscal_number, attempt_no, state, \
                 call_started_at, dps_protocol_id, protocol_contract_version, \
                 capability_profile_version, endpoint_config_revision, envelope_hash, \
                 remote_correlation_id, submission_certainty, response_provenance, \
                 routing_class, created_at, updated_at \
          FROM delivery_reservation \
-         WHERE fiscal_number = ? \
-           AND (state IN ('RESERVED_NOT_STARTED','CALL_STARTED') \
-             OR (state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY'))",
-    )
+         WHERE fiscal_number = ? AND ({ACTIVE_FENCE_STATE_PREDICATE})"
+    ))
     .bind(fiscal_number)
     .fetch_optional(pool)
     .await?;

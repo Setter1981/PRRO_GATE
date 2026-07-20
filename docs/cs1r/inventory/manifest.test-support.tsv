@@ -1252,6 +1252,9 @@ test-support	prro	prro::fiscal_documents_send_helpers	mark_submission_attempted_
 test-support	prro	prro::fiscal_documents_send_helpers	mark_submission_attempted_updates_existing_row	false
 test-support	prro	prro::fiscal_documents_send_helpers	set_server_fiscal_no_returns_false_for_missing_row	false
 test-support	prro	prro::fiscal_documents_send_helpers	set_server_fiscal_no_updates_existing_row	false
+test-support	prro	prro::fn_fence_active	fence_active_tx_detects_active_reservation	false
+test-support	prro	prro::fn_fence_active	fence_predicate_byte_identity	false
+test-support	prro	prro::fn_fence_active	fence_wired_into_writers_static_pin	false
 test-support	prro	prro::goldens_byte_equiv	cms_deterministic_prefix_equals_sell_xml	false
 test-support	prro	prro::goldens_byte_equiv	missing_golden_panics_with_remediation_message	false
 test-support	prro	prro::goldens_byte_equiv	prevhash_seed_is_32_zero_bytes	false

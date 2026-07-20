@@ -47,7 +47,7 @@ use sha2::{Digest, Sha256};
 use crate::app::App;
 use crate::crypto::errors::CryptoError;
 use crate::crypto::provider::SignCmsRequest;
-use crate::db::repositories::{node_state, offline_sessions};
+use crate::db::repositories::{delivery_reservation, node_state, offline_sessions};
 use crate::db::tx::with_immediate;
 use crate::services::write_path::stage_sign::SigningContext;
 use crate::transports::dps::channel::DpsChannel;
@@ -258,6 +258,17 @@ impl OfflineCodeReplenishService {
         let fn_id = fiscal_number.to_string();
         let inserted_summary = with_immediate(pool, move |tx| {
             Box::pin(async move {
+                // CS-3 S7-2 — fail-closed FN fence: refuse the chain-seed advance while a
+                // delivery reservation is in-flight (INACTIVE today; guards the tip against
+                // a fork at cutover). This surface has NO equality gate → highest fork risk.
+                if delivery_reservation::fn_fence_active_tx(tx, &fn_id)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                {
+                    return Err(anyhow::anyhow!(
+                        "replenish refused: FN {fn_id} has an active delivery reservation (S7-2 fence)"
+                    ));
+                }
                 // insert_dps_codes_tx: INSERT OR IGNORE (dedupe-safe / INV-4).
                 let ins = offline_sessions::insert_dps_codes_tx(tx, &fn_id, &codes)
                     .await

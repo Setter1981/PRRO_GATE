@@ -107,7 +107,9 @@ use crate::app::BootError;
 use crate::db::models::enums::{DocState, NodeMode, OfflineSessionState, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
-use crate::db::repositories::{audit_log, fiscal_documents, node_state, offline_sessions, shifts};
+use crate::db::repositories::{
+    audit_log, delivery_reservation, fiscal_documents, node_state, offline_sessions, shifts,
+};
 use crate::db::tx::with_immediate;
 use crate::db::types::DbDocumentId;
 use crate::services::offline_sync::kvt2_confirm;
@@ -2742,6 +2744,15 @@ async fn mint_session_end_prepared(
                 .is_some()
             {
                 return Ok::<(), anyhow::Error>(());
+            }
+            // CS-3 S7-2 — fail-closed FN fence: refuse minting the END (lnd advance +
+            // PREPARED insert = doc N+1) while a delivery reservation is in-flight
+            // (INACTIVE today). This direct mint bypasses stage_acquire, so it must
+            // carry the fence itself.
+            if delivery_reservation::fn_fence_active_tx(tx, &fiscal_number_owned).await? {
+                return Err(anyhow::anyhow!(
+                    "END-mint refused: FN {fiscal_number_owned} has an active delivery reservation (S7-2 fence)"
+                ));
             }
             let lnd = node_state::allocate_next_lnd(tx, &fiscal_number_owned).await?;
             let new_doc = NewDocument {
