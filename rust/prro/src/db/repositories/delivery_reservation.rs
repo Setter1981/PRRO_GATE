@@ -387,3 +387,320 @@ pub async fn authorize_submission(
         authorized_generation,
     })
 }
+
+/// The result of an [`apply_outcome`] call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyResult {
+    /// `true` = the effects were applied and the reservation marked `APPLIED` this call;
+    /// `false` = an idempotent no-op (already `APPLIED`, or the generation CAS found the row
+    /// stale / superseded — no ledger / seed / fence mutation happened).
+    pub applied: bool,
+    /// Whether the online MAC-chain seed (`last_known_unsigned_xml_sha256`) was advanced.
+    pub seed_advanced: bool,
+    /// The server fiscal number stamped on the document (Accepted only).
+    pub server_fiscal_no: Option<String>,
+}
+
+/// Why [`apply_outcome`] could not proceed (nothing is mutated on any of these).
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyError {
+    /// No reservation exists for the id.
+    #[error("reservation not found")]
+    ReservationNotFound,
+    /// The reservation is not at `OUTCOME_OBSERVED` + `PENDING_APPLY` (nothing to apply).
+    #[error("reservation is not OUTCOME_OBSERVED / PENDING_APPLY")]
+    NotPendingApply,
+    /// No `node_state` row for the fiscal number.
+    #[error("node_state row missing")]
+    NodeStateMissing,
+    /// The immutable document row is gone.
+    #[error("document row missing")]
+    DocumentMissing,
+    /// The recorded outcome is a HOLD (a `SubmittedUnknown` leaf, or an offline-origin reject):
+    /// it must remain `PENDING_APPLY` under STOP_MODE and be resolved by the operator (Slice 5),
+    /// never auto-released here (design §3.2 rows 5 / 7–9).
+    #[error("outcome is a HOLD (offline reject / submitted-unknown) — operator completion only")]
+    HeldNotAutoRelease,
+    /// An online `Accepted` whose document carries no `unsigned_xml_sha256` to seed from.
+    #[error("online Accepted has no unsigned_xml_sha256 to advance the seed")]
+    MissingSeedHash,
+    /// An `Accepted` row with no `evidence_text` (the accepted fiscal number).
+    #[error("Accepted has no fiscal number (evidence_text)")]
+    MissingFiscalNumber,
+    /// A lower-level SQLite error.
+    #[error(transparent)]
+    Db(sqlx::Error),
+}
+
+/// Origin-sensitive repeatable apply of a recorded outcome (CS-3 Slice 4, design §3.2 + §4.3).
+///
+/// In the caller's single `BEGIN IMMEDIATE`, this re-reads the reservation + the immutable
+/// document origin, runs the generation CAS
+/// `{authorized_generation == node_state.delivery_generation AND active_delivery_reservation_id
+/// == reservation_id}`, and — only for an **auto-release** outcome — performs the origin-split
+/// effect and marks the reservation `APPLIED`, clearing the active pointer.  It is **repeatable
+/// and idempotent**: a second call (or a stale-generation / already-APPLIED row) is a benign
+/// no-op that mutates nothing.
+///
+/// Auto-release outcomes (design §3.2):
+/// - `Accepted` (any origin): stamp the server fiscal number; **online** origin also advances the
+///   seed (`offline_fiscal_no IS NULL`), **offline** origin performs **zero seed writes** (row 3);
+/// - online-origin `Rejected` (definitive): no seed / no SFN; `NodeBlocked` flips node BLOCKED
+///   (row 4 / row 6 online `-11`);
+/// - `PreconditionFailed` / `SigningFailed` (safe NotSubmitted): local outcome only (row 10).
+///
+/// Everything else — a `SubmittedUnknown` leaf, or an **offline-origin** `Rejected` — is a HOLD:
+/// [`ApplyError::HeldNotAutoRelease`] (it stays `PENDING_APPLY` under STOP_MODE for the operator,
+/// Slice 5).
+///
+/// **INACTIVE (CS-3 Slice 4):** shadows the live `stage_send::run` 4-b; no production caller wires
+/// it until the whole-fence cutover (Slice 7).
+pub async fn apply_outcome(
+    tx: &mut WriteTxConn<'_>,
+    reservation_id: ReservationId,
+) -> Result<ApplyResult, ApplyError> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,         // state
+        Option<String>, // apply_state
+        Option<i64>,    // authorized_generation
+        String,         // fiscal_number
+        Vec<u8>,        // document_id
+        Option<String>, // evidence_kind
+        Option<String>, // evidence_text
+        Option<String>, // node_effect
+    )> = sqlx::query_as(
+        "SELECT state, apply_state, authorized_generation, fiscal_number, document_id, \
+                evidence_kind, evidence_text, node_effect \
+         FROM delivery_reservation WHERE reservation_id = ?",
+    )
+    .bind(&reservation_id[..])
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApplyError::Db)?;
+    let (
+        state,
+        apply_state,
+        authed_gen,
+        fiscal_number,
+        doc_id_blob,
+        evidence_kind,
+        evidence_text,
+        node_effect,
+    ) = row.ok_or(ApplyError::ReservationNotFound)?;
+
+    // Idempotent no-op if already applied; refuse if not yet observed.
+    match apply_state.as_deref() {
+        Some("APPLIED") => {
+            return Ok(ApplyResult {
+                applied: false,
+                seed_advanced: false,
+                server_fiscal_no: None,
+            })
+        }
+        Some("PENDING_APPLY") if state == "OUTCOME_OBSERVED" => {}
+        _ => return Err(ApplyError::NotPendingApply),
+    }
+
+    // Generation CAS: the reservation must still be the node's active, current-generation one.
+    let ns: Option<(i64, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT delivery_generation, active_delivery_reservation_id FROM node_state \
+         WHERE fiscal_number = ?",
+    )
+    .bind(&fiscal_number)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApplyError::Db)?;
+    let (cur_gen, active_ptr) = ns.ok_or(ApplyError::NodeStateMissing)?;
+    let is_current =
+        authed_gen == Some(cur_gen) && active_ptr.as_deref() == Some(&reservation_id[..]);
+    if !is_current {
+        // Stale / superseded — drop WITHOUT any mutation (design §7 apply-replay).
+        return Ok(ApplyResult {
+            applied: false,
+            seed_advanced: false,
+            server_fiscal_no: None,
+        });
+    }
+
+    // Immutable document origin.
+    let doc_id_arr: [u8; 16] = doc_id_blob
+        .as_slice()
+        .try_into()
+        .map_err(|_| ApplyError::Db(sqlx::Error::Decode("document_id != 16 bytes".into())))?;
+    let doc_id = DocumentId::from_bytes(doc_id_arr);
+    let doc: Option<(Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT offline_fiscal_no, unsigned_xml_sha256 FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(DbDocumentId(doc_id))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApplyError::Db)?;
+    let (offline_fiscal_no, unsigned_sha) = doc.ok_or(ApplyError::DocumentMissing)?;
+    let online = offline_fiscal_no.is_none();
+
+    // Classify the recorded outcome into auto-release vs HOLD, and compute effects.
+    let mut seed_advanced = false;
+    let mut stamped_sfn: Option<String> = None;
+    match evidence_kind.as_deref() {
+        Some("Accepted") => {
+            let sfn = evidence_text.ok_or(ApplyError::MissingFiscalNumber)?;
+            fd_set_server_fiscal_no(tx, doc_id, &sfn).await?;
+            if online {
+                let sha = unsigned_sha.ok_or(ApplyError::MissingSeedHash)?;
+                let arr: [u8; 32] = sha.as_slice().try_into().map_err(|_| {
+                    ApplyError::Db(sqlx::Error::Decode(
+                        "unsigned_xml_sha256 != 32 bytes".into(),
+                    ))
+                })?;
+                node_advance_seed(tx, &fiscal_number, &arr).await?;
+                seed_advanced = true;
+            }
+            stamped_sfn = Some(sfn);
+        }
+        Some("Rejected") => {
+            // Online-origin definitive reject releases; offline-origin reject is a HOLD.
+            if !online {
+                return Err(ApplyError::HeldNotAutoRelease);
+            }
+            if node_effect.as_deref() == Some("NodeBlocked") {
+                node_set_blocked(tx, &fiscal_number).await?;
+            }
+        }
+        Some("PreconditionFailed") | Some("SigningFailed") => {
+            // Safe NotSubmitted preflight failure — local outcome only, no wire effect.
+        }
+        // SubmittedUnknown leaves (NoResponse / RemoteAuthStatus / UnknownStatus / SaveError /
+        // CloseAmbiguous / MissingStatus / OkButNoFiscalNumber) and NULL evidence are HOLDs.
+        _ => return Err(ApplyError::HeldNotAutoRelease),
+    }
+
+    // Mark APPLIED + clear the active pointer, atomically with the effects above.
+    let applied_rows = sqlx::query(
+        "UPDATE delivery_reservation SET apply_state = 'APPLIED' \
+         WHERE reservation_id = ? AND apply_state = 'PENDING_APPLY'",
+    )
+    .bind(&reservation_id[..])
+    .execute(&mut **tx)
+    .await
+    .map_err(ApplyError::Db)?
+    .rows_affected();
+    if applied_rows != 1 {
+        return Err(ApplyError::NotPendingApply);
+    }
+    sqlx::query(
+        "UPDATE node_state SET active_delivery_reservation_id = NULL WHERE fiscal_number = ?",
+    )
+    .bind(&fiscal_number)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApplyError::Db)?;
+
+    Ok(ApplyResult {
+        applied: true,
+        seed_advanced,
+        server_fiscal_no: stamped_sfn,
+    })
+}
+
+// Thin adapters to the sibling repositories, mapping their sqlx errors into ApplyError and
+// treating a missing-row (`false`) as a structural breach.
+async fn fd_set_server_fiscal_no(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    sfn: &str,
+) -> Result<(), ApplyError> {
+    let ok = crate::db::repositories::fiscal_documents::set_server_fiscal_no_tx(tx, doc_id, sfn)
+        .await
+        .map_err(ApplyError::Db)?;
+    if ok {
+        Ok(())
+    } else {
+        Err(ApplyError::DocumentMissing)
+    }
+}
+
+async fn node_advance_seed(
+    tx: &mut WriteTxConn<'_>,
+    fn_id: &str,
+    hash: &[u8; 32],
+) -> Result<(), ApplyError> {
+    let ok = crate::db::repositories::node_state::update_last_known_xml_sha_tx(tx, fn_id, hash)
+        .await
+        .map_err(ApplyError::Db)?;
+    if ok {
+        Ok(())
+    } else {
+        Err(ApplyError::NodeStateMissing)
+    }
+}
+
+async fn node_set_blocked(tx: &mut WriteTxConn<'_>, fn_id: &str) -> Result<(), ApplyError> {
+    crate::db::repositories::node_state::set_mode_blocked_tx(tx, fn_id)
+        .await
+        .map_err(ApplyError::Db)?;
+    Ok(())
+}
+
+/// List the reservations resting at `CALL_STARTED` (the crash-mid-send set) for boot resume.
+///
+/// A reservation only ever rests at `CALL_STARTED` if the node crashed after committing the
+/// wire marker but before the outcome was recorded — a completed wire moves it to
+/// `OUTCOME_OBSERVED`.  Returns `(reservation_id, fiscal_number)` for each; the caller resumes
+/// each via [`resume_crashed_reservation`] in its own transaction (design §4.3 step 5).
+/// Read-only, pool-bound.
+pub async fn list_call_started_without_outcome(
+    pool: &sqlx::SqlitePool,
+) -> sqlx::Result<Vec<(ReservationId, String)>> {
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+        "SELECT reservation_id, fiscal_number FROM delivery_reservation WHERE state = 'CALL_STARTED'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, fscl) in rows {
+        let arr: [u8; 16] = id.as_slice().try_into().map_err(|_| {
+            sqlx::Error::Decode("delivery_reservation.reservation_id != 16 bytes".into())
+        })?;
+        out.push((arr, fscl));
+    }
+    Ok(out)
+}
+
+/// Boot-resume a crashed `CALL_STARTED` reservation (CS-3 Slice 4, design §4.3 step 5).
+///
+/// Converts, in the caller's single `BEGIN IMMEDIATE`, a `CALL_STARTED` reservation with no
+/// recorded outcome to the durable `NoResponse { CrashedBeforeObservation }` leaf
+/// (`SUBMITTED_UNKNOWN` / `NO_RESPONSE`) at `OUTCOME_OBSERVED` + `PENDING_APPLY`, and sets node
+/// `STOP_MODE`.  This is a **local recovery write, NOT a synthetic DPS response and NOT a
+/// resend** — boot performs no wire I/O.  The row then holds the FN fence (the §3.1
+/// `OUTCOME_OBSERVED` + `PENDING_APPLY` slot) until operator completion (Slice 5).
+///
+/// Returns `true` if a `CALL_STARTED` row was converted, `false` if it was not in that state
+/// (idempotent — a re-run after conversion is a no-op).
+pub async fn resume_crashed_reservation(
+    tx: &mut WriteTxConn<'_>,
+    reservation_id: ReservationId,
+    fiscal_number: &str,
+) -> Result<bool, ApplyError> {
+    let converted = sqlx::query(
+        "UPDATE delivery_reservation \
+         SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
+             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'NoResponse', evidence_text = 'CrashedBeforeObservation' \
+         WHERE reservation_id = ? AND state = 'CALL_STARTED'",
+    )
+    .bind(&reservation_id[..])
+    .execute(&mut **tx)
+    .await
+    .map_err(ApplyError::Db)?
+    .rows_affected()
+        == 1;
+    if converted {
+        crate::db::repositories::node_state::set_mode_stop_mode_tx(tx, fiscal_number)
+            .await
+            .map_err(ApplyError::Db)?;
+    }
+    Ok(converted)
+}
