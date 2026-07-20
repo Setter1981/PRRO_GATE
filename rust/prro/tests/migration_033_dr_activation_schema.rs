@@ -22,6 +22,10 @@ use prro::db::tx::with_immediate;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
+#[path = "support/inactive_lifecycle_scan.rs"]
+mod inactive_lifecycle_scan;
+use inactive_lifecycle_scan::scan_src_tree;
+
 // ─────────────────────────── fixtures ───────────────────────────
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -1152,51 +1156,18 @@ async fn rg07_node_state_now_has_delivery_generation_and_pointer_columns() {
     );
 }
 
-#[tokio::test]
-async fn rg08_no_production_caller_static_pin() {
-    // Static call-graph pin: delivery_reservation must still have NO production
-    // caller in src/ (mirrors migration_032 p03 — identical predicate).
-    use std::process::Command;
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let src = format!("{manifest}/src");
-    let out = Command::new("grep")
-        .args(["-rn", "delivery_reservation", &src])
-        .output()
-        .expect("grep runs");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut offenders = Vec::new();
-    for line in text.lines() {
-        let path = line.split(':').next().unwrap_or("");
-        let is_repo_file = path.ends_with("repositories/delivery_reservation.rs");
-        let is_mod_decl = path.ends_with("repositories/mod.rs");
-        if is_repo_file || is_mod_decl {
-            continue;
-        }
-        // CS-3 gap 4a (mirrors migration_032 p03): the operator-completion orchestrator is the ONE
-        // sanctioned production caller — allowed ONLY to reference `complete_operator_pending`. The
-        // still-INACTIVE S7-1 functions must remain uncalled anywhere in src (wired at cutover).
-        let is_orchestrator = path.ends_with("services/reconciliation/operator_completion.rs");
-        let inactive_s7_fns = [
-            "record_outcome",
-            "apply_outcome",
-            "authorize_submission",
-            "resume_crashed_reservation",
-            "list_call_started_without_outcome",
-            "get_active_for_fn",
-            "delivery_reservation::insert",
-        ];
-        if is_orchestrator {
-            if inactive_s7_fns.iter().any(|f| line.contains(f)) {
-                offenders.push(line.to_string());
-            }
-            continue;
-        }
-        offenders.push(line.to_string());
-    }
+/// rg08 (retargeted, mirrors `migration_032::p03`): the INACTIVE S7-1 delivery lifecycle has NO
+/// production caller after 033. Uses the shared structural scanner
+/// (`support/inactive_lifecycle_scan.rs`); its teeth are proven by the `p03_bite_*` synthetic
+/// controls in `migration_032`.
+#[test]
+fn rg08_no_production_caller_static_pin() {
+    let hits = scan_src_tree(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        offenders.is_empty(),
-        "delivery_reservation must have NO production caller in src/ after 033 (except the \
-         operator-completion orchestrator calling complete_operator_pending); found: {offenders:#?}"
+        hits.is_empty(),
+        "delivery_reservation INACTIVE S7-1 lifecycle must have NO production caller after 033 \
+         (fn_fence_active_tx / complete_operator_pending are the sanctioned ACTIVE exceptions); \
+         found: {hits:#?}"
     );
 }
 

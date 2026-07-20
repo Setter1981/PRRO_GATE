@@ -30,6 +30,10 @@ use prro::db::tx::with_immediate;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
+#[path = "support/inactive_lifecycle_scan.rs"]
+mod inactive_lifecycle_scan;
+use inactive_lifecycle_scan::{scan_inactive_lifecycle_refs, scan_src_tree};
+
 // ─────────────────────────── fixtures ───────────────────────────
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -1584,61 +1588,136 @@ async fn p02_normal_fiscalisation_leaves_reservation_empty() {
     );
 }
 
-/// Static call-graph pin (merge pin §6.4): the `delivery_reservation` repo is
-/// referenced ONLY by the migration / persistence tests, NEVER by a production
-/// caller.  Grep-based over `src/` — the sole allowed reference is the module
-/// declaration in `repositories/mod.rs` and the repo's own file.
-#[tokio::test]
-async fn p03_no_production_caller_static_pin() {
-    use std::process::Command;
-    // Find the crate src root relative to this test binary via CARGO_MANIFEST_DIR.
-    let manifest = env!("CARGO_MANIFEST_DIR"); // .../rust/prro
-    let src = format!("{manifest}/src");
-    let out = Command::new("grep")
-        .args(["-rn", "delivery_reservation", &src])
-        .output()
-        .expect("grep runs");
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Allowed references in src/: the module declaration in repositories/mod.rs
-    // and everything inside the repo's own source file.  Anything ELSE is a
-    // production caller and fails this pin.
-    let mut offenders = Vec::new();
-    for line in text.lines() {
-        // line format: <path>:<lineno>:<content>
-        let path = line.split(':').next().unwrap_or("");
-        let is_repo_file = path.ends_with("repositories/delivery_reservation.rs");
-        let is_mod_decl = path.ends_with("repositories/mod.rs");
-        if is_repo_file || is_mod_decl {
-            continue;
-        }
-        // CS-3 gap 4a: the operator-completion orchestrator is the ONE sanctioned production
-        // caller — but ONLY of `complete_operator_pending` (+ its result/error/resolution types).
-        // The still-INACTIVE S7-1 functions must remain uncalled anywhere in src (wired only at
-        // the whole-fence cutover). So the orchestrator file is allowed EXCEPT for any reference
-        // to those functions.
-        let is_orchestrator = path.ends_with("services/reconciliation/operator_completion.rs");
-        let inactive_s7_fns = [
-            "record_outcome",
-            "apply_outcome",
-            "authorize_submission",
-            "resume_crashed_reservation",
-            "list_call_started_without_outcome",
-            "get_active_for_fn",
-            "delivery_reservation::insert",
-        ];
-        if is_orchestrator {
-            // Allowed EXCEPT a reference to any still-INACTIVE S7-1 function.
-            if inactive_s7_fns.iter().any(|f| line.contains(f)) {
-                offenders.push(line.to_string());
-            }
-            continue;
-        }
-        // Any OTHER src file referencing `delivery_reservation` at all is a forbidden caller.
-        offenders.push(line.to_string());
-    }
+// ─── p03: static pin — no production caller of the still-INACTIVE S7-1 lifecycle ──────────
+//
+// The structural scanner lives in `support/inactive_lifecycle_scan.rs` (shared with
+// `migration_033::rg08`). Retargeted after S7-2 (`3f69af5`): `fn_fence_active_tx` is the
+// intentionally-ACTIVE fence read-helper, so the pin targets the INACTIVE S7-1 *lifecycle* symbols
+// (authorize/record/apply/resume/list/insert) STRUCTURALLY (syn AST, not grep), excluding
+// `#[cfg(test)]` scaffolding but NOT `#[cfg(not(test))]`. Teeth: the `p03_bite_*` synthetic controls.
+
+/// p03 (merge pin §6.4, retargeted): the INACTIVE S7-1 delivery lifecycle has NO production caller.
+#[test]
+fn p03_no_production_caller_static_pin() {
+    let hits = scan_src_tree(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        offenders.is_empty(),
-        "delivery_reservation must have NO production caller in src/ (except the operator-completion \
-         orchestrator calling complete_operator_pending); found: {offenders:#?}"
+        hits.is_empty(),
+        "the INACTIVE S7-1 delivery lifecycle (authorize/record/apply/resume/list/insert) must have \
+         NO production caller — `fn_fence_active_tx` (S7-2 fence) and `complete_operator_pending` \
+         (gap 4a) are the sanctioned ACTIVE exceptions; found: {hits:#?}"
+    );
+}
+
+// ─── p03 synthetic bite controls (parsed inline; production scan stays GREEN) ──────────────
+
+#[test]
+fn p03_bite_production_record_outcome_call_is_flagged() {
+    let snippet = r#"
+        async fn caller(tx: &mut Tx) {
+            let _ = crate::db::repositories::delivery_reservation::record_outcome(tx, o, e).await;
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<prod_record>");
+    assert!(
+        hits.iter().any(|h| h.detail.contains("record_outcome")),
+        "a production record_outcome call must be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_production_qualified_insert_is_flagged() {
+    let snippet = r#"
+        async fn caller(tx: &mut Tx) {
+            let _ = delivery_reservation::insert(tx, row).await;
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<prod_insert>");
+    assert!(
+        hits.iter()
+            .any(|h| h.detail.contains("delivery_reservation::insert")),
+        "a production delivery_reservation::insert call must be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_cfg_test_insert_is_not_flagged() {
+    // The SAME forbidden call inside a #[cfg(test)] module is test scaffolding → GREEN.
+    let snippet = r#"
+        #[cfg(test)]
+        mod tests {
+            async fn seed(tx: &mut Tx) {
+                let _ = super::delivery_reservation::insert(tx, row).await;
+            }
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<cfg_test_insert>");
+    assert!(
+        hits.is_empty(),
+        "a #[cfg(test)] lifecycle call must NOT be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_cfg_not_test_call_is_flagged() {
+    // #[cfg(not(test))] is PRODUCTION — a lifecycle call there IS flagged (exclusion is cfg(test)
+    // only, never cfg(not(test))).
+    let snippet = r#"
+        #[cfg(not(test))]
+        mod prod {
+            async fn caller(tx: &mut Tx) {
+                let _ = super::delivery_reservation::record_outcome(tx).await;
+            }
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<cfg_not_test>");
+    assert!(
+        hits.iter().any(|h| h.detail.contains("record_outcome")),
+        "#[cfg(not(test))] is production — must be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_production_fn_fence_active_tx_is_not_flagged() {
+    // The S7-2 fence read-helper is intentionally active — must NOT be flagged.
+    let snippet = r#"
+        async fn writer(tx: &mut Tx) -> anyhow::Result<()> {
+            if delivery_reservation::fn_fence_active_tx(tx, fn_id).await? {
+                return Ok(());
+            }
+            Ok(())
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<prod_fence>");
+    assert!(
+        hits.is_empty(),
+        "fn_fence_active_tx (S7-2 active fence) must NOT be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_production_complete_operator_pending_is_not_flagged() {
+    // The sanctioned gap-4a operator entrypoint — active, must NOT be flagged.
+    let snippet = r#"
+        async fn orchestrate(tx: &mut Tx) {
+            let _ = delivery_reservation::complete_operator_pending(tx, id, res).await;
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<prod_complete>");
+    assert!(
+        hits.is_empty(),
+        "complete_operator_pending (gap 4a) must NOT be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_use_import_of_lifecycle_symbol_is_flagged() {
+    // A bare `use` import (even renamed) of a lifecycle symbol is a production reference → RED.
+    let snippet = r#"
+        use crate::db::repositories::delivery_reservation::apply_outcome as _aliased;
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<use_import>");
+    assert!(
+        hits.iter().any(|h| h.detail.contains("apply_outcome")),
+        "a use-import (even aliased) of a lifecycle symbol must be flagged: {hits:#?}"
     );
 }
