@@ -705,7 +705,9 @@ async fn drive_clean_accept(pool: &SqlitePool, res_byte: u8) {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
              response_provenance = 'PARSED_DPS_ENVELOPE', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Accepted', evidence_text = '4000000001', \
+             remote_correlation_id = '4000000001' \
          WHERE reservation_id = ?",
     )
     .bind(&[res_byte; 16][..])
@@ -749,7 +751,8 @@ async fn t02_rn_oo_not_submitted_clears_marker_ok() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'PreconditionFailed' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -832,7 +835,8 @@ async fn t05_rn_cs_oo_submitted_unknown_ok_and_fences() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'NoResponse', evidence_text = 'Timeout' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -880,7 +884,8 @@ async fn f02_second_reservation_blocked_after_submitted_unknown() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'NoResponse', evidence_text = 'Timeout' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -910,7 +915,9 @@ async fn f03_second_reservation_blocked_after_submitted_with_routing() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
              response_provenance = 'PARSED_DPS_ENVELOPE', routing_class = 'TerminalReject', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Rejected', evidence_text = 'Verify', \
+             evidence_digest = X'0000000000000000000000000000000000000000000000000000000000000000' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -961,7 +968,8 @@ async fn f05_second_reservation_accepted_after_not_submitted() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'PreconditionFailed' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -995,8 +1003,9 @@ async fn i01_settled_routing_null_to_terminalreject_rejected() {
     .execute(&pool)
     .await
     .expect_err("settled OO routing NULL→value must be blocked (immutable)");
+    // Blocked by the 032 immutability trigger AND the 036 matrix (Accepted requires routing NULL).
     assert!(
-        err_has(&err, "immutable") || err_has(&err, "constraint"),
+        err_has(&err, "immutable") || err_has(&err, "constraint") || err_has(&err, "evidence"),
         "{err}"
     );
 }
@@ -1051,20 +1060,24 @@ async fn i04_remote_correlation_id_mutation_after_oo_rejected() {
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
     advance_to_cs(&pool, 0x01).await.unwrap();
-    // Reach OO(SUBMITTED_UNKNOWN) WITH a remote_correlation_id set at the OO step.
+    // Reach OO WITH a remote_correlation_id set at the OO step. Under the 036 evidence matrix
+    // the ONLY leaf that carries a correlation is Accepted (correlation = evidence_text = F),
+    // so the correlation-bearing OO row is a clean accept (routing NULL, F='4000000001').
     sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             remote_correlation_id = 'corr-1', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+         SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
+             response_provenance = 'PARSED_DPS_ENVELOPE', \
+             remote_correlation_id = '4000000001', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Accepted', evidence_text = '4000000001' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect("setting remote_correlation_id at the OO step is legal");
-    // Now mutating it once OO → immutable trigger.
+    .expect("setting remote_correlation_id (= F) at the OO step is legal for a clean accept");
+    // Now mutating it once OO is blocked — by the 032 immutability trigger AND the 036 matrix
+    // (Accepted requires correlation = evidence_text, so 'corr-2' ≠ '4000000001' also aborts).
     let err = sqlx::query(
         "UPDATE delivery_reservation SET remote_correlation_id = 'corr-2' WHERE reservation_id = ?",
     )
@@ -1073,7 +1086,7 @@ async fn i04_remote_correlation_id_mutation_after_oo_rejected() {
     .await
     .expect_err("remote_correlation_id mutation after OO must be blocked (immutable)");
     assert!(
-        err_has(&err, "immutable") || err_has(&err, "constraint"),
+        err_has(&err, "immutable") || err_has(&err, "constraint") || err_has(&err, "evidence"),
         "{err}"
     );
 }
@@ -1339,7 +1352,8 @@ async fn b01_submitted_unknown_no_response_transient_retry_accepted() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'NoResponse', evidence_text = 'Timeout' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -1366,7 +1380,8 @@ async fn n01_sequential_attempts_increment_after_cancel() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'PreconditionFailed' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -1456,6 +1471,10 @@ async fn p01_upgrade_on_nonempty_db_sqlite_master_diff() {
         "delivery_reservation_evidence_insert",
         "delivery_reservation_evidence_matrix_update",
         "delivery_reservation_evidence_immutable",
+        // 037 adds the mandatory-at-OO trigger ON delivery_reservation (evidence_kind NOT
+        // NULL at OUTCOME_OBSERVED). Like the other reservation triggers, the control DB's
+        // DROP TABLE auto-drops it, so it belongs in the filtered-out reservation-object set.
+        "delivery_reservation_evidence_mandatory_update",
     ]
     .into_iter()
     .collect();

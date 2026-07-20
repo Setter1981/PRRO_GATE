@@ -137,7 +137,10 @@ async fn advance_to_oo_clean(pool: &SqlitePool, res_byte: u8) {
              submission_certainty = 'SUBMITTED', \
              response_provenance = 'PARSED_DPS_ENVELOPE', \
              apply_state = 'PENDING_APPLY', \
-             node_effect = 'NoNodeEffect' \
+             node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Accepted', \
+             evidence_text = '4000000001', \
+             remote_correlation_id = '4000000001' \
          WHERE reservation_id = ?",
     )
     .bind(&[res_byte; 16][..])
@@ -489,7 +492,10 @@ async fn h3_05_oo_terminal_reject_with_both_set_accepted() {
              response_provenance = 'PARSED_DPS_ENVELOPE', \
              routing_class = 'TerminalReject', \
              apply_state = 'PENDING_APPLY', \
-             node_effect = 'NoNodeEffect' \
+             node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Rejected', \
+             evidence_text = 'Verify', \
+             evidence_digest = X'0000000000000000000000000000000000000000000000000000000000000000' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -532,8 +538,9 @@ async fn h4_01_clean_accept_with_node_blocked_rejected() {
             || err_has(&err, "node_effect")
             || err_has(&err, "nonodeeffect")
             || err_has(&err, "constraint")
-            || err_has(&err, "abort"),
-        "expected clean/node_effect/nonodeeffect/constraint/abort error, got: {err}"
+            || err_has(&err, "abort")
+            || err_has(&err, "evidence"),
+        "expected clean/node_effect/nonodeeffect/constraint/abort/evidence error, got: {err}"
     );
 }
 
@@ -563,8 +570,9 @@ async fn h4_02_clean_accept_with_mac_reseed_pending_rejected() {
             || err_has(&err, "node_effect")
             || err_has(&err, "nonodeeffect")
             || err_has(&err, "constraint")
-            || err_has(&err, "abort"),
-        "expected clean/node_effect/nonodeeffect/constraint/abort error, got: {err}"
+            || err_has(&err, "abort")
+            || err_has(&err, "evidence"),
+        "expected clean/node_effect/nonodeeffect/constraint/abort/evidence error, got: {err}"
     );
 }
 
@@ -606,7 +614,10 @@ async fn h4_04_non_null_routing_class_accepts_node_blocked() {
              response_provenance = 'PARSED_DPS_ENVELOPE', \
              routing_class = 'TerminalReject', \
              apply_state = 'PENDING_APPLY', \
-             node_effect = 'NodeBlocked' \
+             node_effect = 'NodeBlocked', \
+             evidence_kind = 'Rejected', \
+             evidence_text = 'Offline168', \
+             evidence_digest = X'0000000000000000000000000000000000000000000000000000000000000000' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -638,7 +649,9 @@ async fn h4_05_submitted_unknown_with_routing_class_and_probe_required_accepted(
              response_provenance = 'AUTHENTICATED_PEER', \
              routing_class = 'ProbeRequired', \
              apply_state = 'PENDING_APPLY', \
-             node_effect = 'ProbeRequired' \
+             node_effect = 'ProbeRequired', \
+             evidence_kind = 'RemoteAuthStatus', \
+             evidence_digest = X'0000000000000000000000000000000000000000000000000000000000000000' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])

@@ -282,9 +282,12 @@ async fn ev05_valid_noresponse_ok() {
 }
 
 #[tokio::test]
-async fn ev06_optional_absent_evidence_ok() {
-    // Validate-if-present: a clean-accept OO row with NO evidence at all is allowed
-    // in Slice 2a (Slice 2b flips presence to mandatory).
+async fn ev06_absent_evidence_rejected() {
+    // Mandatory-at-OO (migration 037): a clean-accept OO row with NO evidence at all is now
+    // REFUSED. Slice 2a landed the union as validate-if-present (all-NULL evidence was allowed);
+    // now that the production `record_outcome` writer exists it is mandatory — an OO authority
+    // with no boot-hydratable leaf is unrecoverable (P4). This is the direct counter-test for the
+    // flip: the exact all-NULL clean-accept row ev06 once accepted must now abort.
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc)).await;
@@ -299,9 +302,14 @@ async fn ev06_optional_absent_evidence_ok() {
         digest: None,
         rcid: None,
     };
-    drive_oo(&pool, 0x01, &oo)
+    let err = drive_oo(&pool, 0x01, &oo)
         .await
-        .expect("all-NULL evidence at OO is allowed (validate-if-present)");
+        .expect_err("all-NULL evidence at OO is refused (mandatory-at-OO, migration 037)");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("evidence") && (msg.contains("requires") || msg.contains("mandatory")),
+        "expected the mandatory-at-OO evidence rejection; got: {err}"
+    );
 }
 
 // ───────────────────────────── tg_* — matrix tightness ───────────────────────

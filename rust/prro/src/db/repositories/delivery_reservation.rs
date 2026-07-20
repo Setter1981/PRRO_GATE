@@ -30,6 +30,8 @@ use crate::db::models::enums::DocState;
 use crate::db::models::ids::DocumentId;
 use crate::db::tx::WriteTxConn;
 use crate::db::types::DbDocumentId;
+use prro_domain::delivery::evidence::EvidenceDiscriminant;
+use prro_domain::delivery::{NodeEffect, ObservedOutcomeV1, SubmissionCertainty};
 
 /// Fresh 16-byte reservation identity.  Minimal by design (CS-2 is
 /// INACTIVE): a bare `[u8; 16]` rather than a domain newtype, mirroring
@@ -436,6 +438,141 @@ pub async fn authorize_submission(
         dps_protocol_id,
         protocol_contract_version,
     })
+}
+
+/// Why [`record_outcome`] refused (nothing is mutated on any of these — fail-closed).
+#[derive(Debug, thiserror::Error)]
+pub enum RecordError {
+    /// The record write did not match exactly one row under the FULL authority tuple
+    /// (reservation id + document id + authorized generation + protocol binding + envelope
+    /// hash) AND `state = 'CALL_STARTED'`. The reservation is not the authorized in-flight
+    /// call — superseded, rebound to different bytes, the wrong token, or already recorded.
+    /// A HARD error (plan §2.3 step 7): it must NOT fall back to any legacy record path.
+    #[error("record authority CAS miss (not CALL_STARTED under this exact authority tuple)")]
+    AuthorityMismatch,
+    /// The reservation row vanished between the CAS and the node-effect read (structural breach).
+    #[error("reservation row missing after record CAS")]
+    ReservationMissing,
+    /// A lower-level SQLite error. A migration-036 evidence-matrix `ABORT` surfaces here — an
+    /// illegal/partial evidence combination rolls the whole record back (no half-written authority).
+    #[error(transparent)]
+    Db(sqlx::Error),
+}
+
+/// Durably record a wire outcome: `CALL_STARTED → OUTCOME_OBSERVED + PENDING_APPLY` (CS-3
+/// Slice 7 gap 1, design §8 step 3 / plan §2.3 "record commit").
+///
+/// This is the production record boundary the apply / operator / boot paths were all built
+/// around — each requires an `OUTCOME_OBSERVED + PENDING_APPLY` row, and until now nothing
+/// minted one (the tests wrote the row directly). In the caller's single `BEGIN IMMEDIATE`,
+/// AFTER the sole wire call has returned and been classified, it:
+///   1. serializes the sealed [`ObservedOutcomeV1`] axes + [`EvidenceDiscriminant`] columns
+///      onto the reservation row and transitions it to `OUTCOME_OBSERVED + PENDING_APPLY`;
+///   2. matches on the FULL authority tuple carried by the [`Authorization`] token
+///      (reservation id, document id, authorized generation, protocol binding, envelope hash)
+///      AND `state = 'CALL_STARTED'` — `rows_affected != 1` is [`RecordError::AuthorityMismatch`]
+///      (a hard error, never a legacy fallback: plan §2.3 step 7; a second record of an already
+///      `OUTCOME_OBSERVED` row also lands here — record is call-once);
+///   3. in the SAME transaction, applies the EARLY node-safety mode — a `-11` (`NodeBlocked`)
+///      flips the node `BLOCKED`; any UNRESOLVED outcome (a `SUBMITTED_UNKNOWN` leaf, or a held
+///      `-12`/`-6`/probe verdict) flips it `STOP_MODE`. NO fence release happens here (that is
+///      [`apply_outcome`]) — record owns the durable evidence + the safety halt; apply owns the
+///      seed / SFN / document / pointer projection.
+///
+/// The four axes + four evidence columns are written verbatim from the sealed types, so the
+/// migration-036 fail-closed matrix is satisfied by construction whenever the caller's
+/// [`ObservedOutcomeV1`] and [`EvidenceDiscriminant`] agree (both derive from one
+/// `SubmissionEvidence`). An inconsistent combination trips the matrix trigger and surfaces as
+/// [`RecordError::Db`] with the whole record rolled back.
+///
+/// **INACTIVE (CS-3 Slice 7 gap 1):** no production caller wires it until the S7-1 cutover
+/// composes `authorize → submit_authorized → record_outcome → apply_outcome`. Exercised by
+/// `tests/record_outcome.rs` today.
+pub async fn record_outcome(
+    tx: &mut WriteTxConn<'_>,
+    authority: &Authorization,
+    outcome: &ObservedOutcomeV1,
+    evidence: &EvidenceDiscriminant,
+) -> Result<(), RecordError> {
+    let cols = evidence.to_columns();
+    let certainty = outcome.certainty();
+    let node_effect = outcome.node_effect();
+    let reservation_id = authority.reservation_id();
+
+    // Record-then-apply commit under the full authority CAS + the CALL_STARTED predicate.
+    let updated = sqlx::query(
+        "UPDATE delivery_reservation SET \
+             state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
+             submission_certainty = ?, response_provenance = ?, routing_class = ?, \
+             node_effect = ?, remote_correlation_id = ?, \
+             evidence_kind = ?, evidence_text = ?, evidence_code = ?, evidence_digest = ? \
+         WHERE reservation_id = ? AND document_id = ? AND authorized_generation = ? \
+             AND dps_protocol_id = ? AND protocol_contract_version = ? \
+             AND envelope_hash = ? AND state = 'CALL_STARTED'",
+    )
+    .bind(certainty.as_str())
+    .bind(outcome.provenance().as_str())
+    .bind(outcome.routing().map(|r| r.as_str()))
+    .bind(node_effect.as_str())
+    .bind(
+        outcome
+            .remote_correlation_id()
+            .map(|b| b.as_str().to_string()),
+    )
+    .bind(cols.kind)
+    .bind(cols.text)
+    .bind(cols.code)
+    .bind(cols.digest.map(|d| d.to_vec()))
+    .bind(&reservation_id[..])
+    .bind(DbDocumentId(authority.document_id()))
+    .bind(authority.authorized_generation())
+    .bind(authority.dps_protocol_id())
+    .bind(authority.protocol_contract_version())
+    .bind(&authority.envelope_hash()[..])
+    .execute(&mut **tx)
+    .await
+    .map_err(RecordError::Db)?
+    .rows_affected();
+    if updated != 1 {
+        return Err(RecordError::AuthorityMismatch);
+    }
+
+    // Early node-safety (plan §2.3 step 8): record owns the halt, apply owns the release. The
+    // FN key lives on the row (not the token); read it back for the mode CAS.
+    let fiscal_number: Option<String> = sqlx::query_scalar(
+        "SELECT fiscal_number FROM delivery_reservation WHERE reservation_id = ?",
+    )
+    .bind(&reservation_id[..])
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(RecordError::Db)?;
+    let fiscal_number = fiscal_number.ok_or(RecordError::ReservationMissing)?;
+
+    if node_effect == NodeEffect::NodeBlocked {
+        // `-11 ERROR_OFFLINE_168` — the FN is over the offline ceiling; block it (mirrors the
+        // apply-time `-11` effect, set EARLY here so the halt survives even if apply is deferred).
+        crate::db::repositories::node_state::set_mode_blocked_tx(tx, &fiscal_number)
+            .await
+            .map_err(RecordError::Db)?;
+    } else if certainty == SubmissionCertainty::SubmittedUnknown
+        || matches!(
+            node_effect,
+            NodeEffect::MacReseedPending
+                | NodeEffect::OperatorEscalation
+                | NodeEffect::ProbeRequired
+                | NodeEffect::WrapperBug
+        )
+    {
+        // UNRESOLVED — a `SUBMITTED_UNKNOWN` leaf (NoResponse / UnknownStatus / SaveError /
+        // probe) or a held reject verdict (`-12` MacReseed, `-6` OperatorEscalation). Halt the
+        // node pending operator completion. A clean `Accepted`, a terminal `Rejected`, or an
+        // `FnConfigError` reject is RESOLVED — the apply path releases it, so NO halt here
+        // (coherent with `apply_outcome`'s auto-release / HELD split).
+        crate::db::repositories::node_state::set_mode_stop_mode_tx(tx, &fiscal_number)
+            .await
+            .map_err(RecordError::Db)?;
+    }
+    Ok(())
 }
 
 /// The result of an [`apply_outcome`] call.

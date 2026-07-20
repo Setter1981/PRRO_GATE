@@ -93,7 +93,9 @@ async fn drive_applied(pool: &SqlitePool, res_byte: u8) {
         "UPDATE delivery_reservation \
          SET state='OUTCOME_OBSERVED', submission_certainty='SUBMITTED', \
              response_provenance='PARSED_DPS_ENVELOPE', apply_state='PENDING_APPLY', \
-             node_effect='NoNodeEffect' WHERE reservation_id=?",
+             node_effect='NoNodeEffect', evidence_kind='Accepted', \
+             evidence_text='4000000001', remote_correlation_id='4000000001' \
+             WHERE reservation_id=?",
     )
     .bind(&[res_byte; 16][..])
     .execute(pool)

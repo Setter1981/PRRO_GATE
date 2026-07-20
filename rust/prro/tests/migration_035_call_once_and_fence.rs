@@ -148,7 +148,8 @@ async fn co03_second_reservation_for_unstarted_doc_after_release_ok() {
         "UPDATE delivery_reservation \
          SET state='OUTCOME_OBSERVED', submission_certainty='NOT_SUBMITTED', \
              response_provenance='NO_RESPONSE', routing_class='TransientRetry', \
-             apply_state='PENDING_APPLY', node_effect='NoNodeEffect' WHERE reservation_id=?",
+             apply_state='PENDING_APPLY', node_effect='NoNodeEffect', \
+             evidence_kind='PreconditionFailed' WHERE reservation_id=?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
@@ -179,7 +180,9 @@ async fn fn01_pending_apply_holds_applied_releases() {
         "UPDATE delivery_reservation \
          SET state='OUTCOME_OBSERVED', submission_certainty='SUBMITTED', \
              response_provenance='PARSED_DPS_ENVELOPE', apply_state='PENDING_APPLY', \
-             node_effect='NoNodeEffect' WHERE reservation_id=?",
+             node_effect='NoNodeEffect', evidence_kind='Accepted', \
+             evidence_text='4000000001', remote_correlation_id='4000000001' \
+             WHERE reservation_id=?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
@@ -217,7 +220,8 @@ async fn fn02_submitted_unknown_no_longer_index_held() {
         "UPDATE delivery_reservation \
          SET state='OUTCOME_OBSERVED', submission_certainty='SUBMITTED_UNKNOWN', \
              response_provenance='NO_RESPONSE', routing_class='TransientRetry', \
-             apply_state='PENDING_APPLY', node_effect='NoNodeEffect' WHERE reservation_id=?",
+             apply_state='PENDING_APPLY', node_effect='NoNodeEffect', \
+             evidence_kind='NoResponse', evidence_text='Timeout' WHERE reservation_id=?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)

@@ -225,6 +225,131 @@ async fn advance_cs_to_oo(
     }
 }
 
+/// The migration-036 evidence columns matching a legal `(certainty, provenance, routing,
+/// node_effect)` axes tuple, so an OO-driving write satisfies mandatory-at-OO (migration 037).
+/// One canonical leaf per axes class (SaveError for the parsed SUBMITTED_UNKNOWN/TransientRetry
+/// class; the terminal Rejected verdict for each reject routing/node pair).
+struct Ev {
+    kind: &'static str,
+    text: Option<String>,
+    digest: Option<Vec<u8>>,
+    rcid: Option<String>,
+}
+fn ev_for(certainty: &str, provenance: &str, routing: Option<&str>, node_effect: &str) -> Ev {
+    let d = || Some(vec![0u8; 32]);
+    match (certainty, provenance, routing, node_effect) {
+        ("NOT_SUBMITTED", _, _, "WrapperBug") => Ev {
+            kind: "SigningFailed",
+            text: None,
+            digest: None,
+            rcid: None,
+        },
+        ("NOT_SUBMITTED", ..) => Ev {
+            kind: "PreconditionFailed",
+            text: None,
+            digest: None,
+            rcid: None,
+        },
+        ("SUBMITTED_UNKNOWN", "NO_RESPONSE", ..) => Ev {
+            kind: "NoResponse",
+            text: Some("Timeout".into()),
+            digest: None,
+            rcid: None,
+        },
+        ("SUBMITTED_UNKNOWN", "AUTHENTICATED_PEER", ..) => Ev {
+            kind: "RemoteAuthStatus",
+            text: None,
+            digest: d(),
+            rcid: None,
+        },
+        ("SUBMITTED_UNKNOWN", "PARSED_DPS_ENVELOPE", Some("ProbeRequired"), _) => Ev {
+            kind: "CloseAmbiguous",
+            text: None,
+            digest: d(),
+            rcid: None,
+        },
+        ("SUBMITTED_UNKNOWN", "PARSED_DPS_ENVELOPE", ..) => Ev {
+            kind: "SaveError",
+            text: None,
+            digest: d(),
+            rcid: None,
+        },
+        ("SUBMITTED", _, None, _) => Ev {
+            kind: "Accepted",
+            text: Some("4000000001".into()),
+            digest: None,
+            rcid: Some("4000000001".into()),
+        },
+        ("SUBMITTED", _, Some(r), ne) => {
+            let verdict = match (r, ne) {
+                ("OperatorEscalation", _) => "NotPrevZReport",
+                ("TerminalReject", "NodeBlocked") => "Offline168",
+                ("MacRecovery", _) => "BadHashPrev",
+                ("FnConfigError", _) => "NotRegisteredRro",
+                _ => "Verify",
+            };
+            Ev {
+                kind: "Rejected",
+                text: Some(verdict.into()),
+                digest: d(),
+                rcid: None,
+            }
+        }
+        _ => Ev {
+            kind: "PreconditionFailed",
+            text: None,
+            digest: None,
+            rcid: None,
+        },
+    }
+}
+
+/// Drive `res_byte` to OUTCOME_OBSERVED carrying the axes + the matching evidence leaf (so
+/// mandatory-at-OO / migration 037 is satisfied). NOT_SUBMITTED goes RNS→OO directly (no CS,
+/// generation stays NULL); SUBMITTED* goes RNS→CS→OO. Returns the sqlx `Result` so callers keep
+/// their own error handling (st01 collects, st02/ne01 panic).
+async fn advance_oo(
+    pool: &SqlitePool,
+    res_byte: u8,
+    certainty: &str,
+    provenance: &str,
+    routing: Option<&str>,
+    node_effect: &str,
+) -> Result<(), sqlx::Error> {
+    let ev = ev_for(certainty, provenance, routing, node_effect);
+    if certainty != "NOT_SUBMITTED" {
+        sqlx::query(
+            "UPDATE delivery_reservation \
+             SET state = 'CALL_STARTED', call_started_at = '2026-07-17T00:00:00Z', \
+                 authorized_generation = 1 \
+             WHERE reservation_id = ?",
+        )
+        .bind(&[res_byte; 16][..])
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE delivery_reservation \
+         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
+             submission_certainty = ?, response_provenance = ?, routing_class = ?, \
+             node_effect = ?, evidence_kind = ?, evidence_text = ?, evidence_digest = ?, \
+             remote_correlation_id = ? \
+         WHERE reservation_id = ?",
+    )
+    .bind(certainty)
+    .bind(provenance)
+    .bind(routing)
+    .bind(node_effect)
+    .bind(ev.kind)
+    .bind(ev.text)
+    .bind(ev.digest)
+    .bind(ev.rcid)
+    .bind(&[res_byte; 16][..])
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 fn err_has(err: &sqlx::Error, needle: &str) -> bool {
     err.to_string().to_lowercase().contains(needle)
 }
@@ -683,82 +808,13 @@ async fn st01_every_classifier_output_is_033_storable() {
 
         // Store the record's fields. A NULL generation ⇒ NOT_SUBMITTED ⇒ RNS → OO directly;
         // a Some generation ⇒ RNS → CS(authorized_generation) → OO.
-        let result: Result<(), String> = if rec_gen.is_none() {
-            let rc = rec_routing.expect("NOT_SUBMITTED always has a routing class");
-            sqlx::query(
-                "UPDATE delivery_reservation \
-                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                     submission_certainty = ?, \
-                     response_provenance = ?, \
-                     routing_class = ?, \
-                     node_effect = ? \
-                 WHERE reservation_id = ?",
-            )
-            .bind(rec_cert)
-            .bind(rec_prov)
-            .bind(rc)
-            .bind(rec_ne)
-            .bind(&[res_byte; 16][..])
-            .execute(&pool)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("RNS→OO NOT_SUBMITTED failed: {e}"))
-        } else {
-            let cs = sqlx::query(
-                "UPDATE delivery_reservation \
-                 SET state = 'CALL_STARTED', \
-                     call_started_at = '2026-07-17T00:00:00Z', \
-                     authorized_generation = ? \
-                 WHERE reservation_id = ?",
-            )
-            .bind(rec_gen)
-            .bind(&[res_byte; 16][..])
-            .execute(&pool)
-            .await;
-            match cs {
-                Err(e) => Err(format!("RNS→CS failed: {e}")),
-                Ok(_) => {
-                    let oo = match rec_routing {
-                        Some(rc) => {
-                            sqlx::query(
-                                "UPDATE delivery_reservation \
-                                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                                     submission_certainty = ?, \
-                                     response_provenance = ?, \
-                                     routing_class = ?, \
-                                     node_effect = ? \
-                                 WHERE reservation_id = ?",
-                            )
-                            .bind(rec_cert)
-                            .bind(rec_prov)
-                            .bind(rc)
-                            .bind(rec_ne)
-                            .bind(&[res_byte; 16][..])
-                            .execute(&pool)
-                            .await
-                        }
-                        None => {
-                            // Clean accept: routing_class NULL.
-                            sqlx::query(
-                                "UPDATE delivery_reservation \
-                                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                                     submission_certainty = ?, \
-                                     response_provenance = ?, \
-                                     node_effect = ? \
-                                 WHERE reservation_id = ?",
-                            )
-                            .bind(rec_cert)
-                            .bind(rec_prov)
-                            .bind(rec_ne)
-                            .bind(&[res_byte; 16][..])
-                            .execute(&pool)
-                            .await
-                        }
-                    };
-                    oo.map(|_| ()).map_err(|e| format!("CS→OO failed: {e}"))
-                }
-            }
-        };
+        // Store via the shared OO helper, which also writes the migration-036 evidence leaf
+        // matching these axes (mandatory-at-OO, migration 037). NOT_SUBMITTED skips the CS
+        // step so its authorized_generation stays NULL — the totality witness below.
+        let result: Result<(), String> =
+            advance_oo(&pool, res_byte, rec_cert, rec_prov, rec_routing, rec_ne)
+                .await
+                .map_err(|e| format!("classify→033 store failed: {e}"));
 
         if let Err(msg) = result {
             failures.push(format!("\n  FAIL [{}]: {msg}", row.label));
@@ -897,77 +953,18 @@ async fn st02_stored_columns_read_back_correctly() {
             .await
             .unwrap_or_else(|e| panic!("insert_res {idx}: {e}"));
 
-        // Advance to OO via the correct path.
-        if *certainty == "NOT_SUBMITTED" {
-            let rc = routing.expect("NOT_SUBMITTED always has routing");
-            sqlx::query(
-                "UPDATE delivery_reservation \
-                 SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                     submission_certainty = ?, \
-                     response_provenance = 'NO_RESPONSE', \
-                     routing_class = ?, \
-                     node_effect = ? \
-                 WHERE reservation_id = ?",
-            )
-            .bind(certainty)
-            .bind(rc)
-            .bind(node_effect)
-            .bind(&[res_byte; 16][..])
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("RNS→OO {idx}: {e}"));
-        } else {
-            sqlx::query(
-                "UPDATE delivery_reservation \
-                 SET state = 'CALL_STARTED', \
-                     call_started_at = '2026-07-17T00:00:00Z', \
-                     authorized_generation = 1 \
-                 WHERE reservation_id = ?",
-            )
-            .bind(&[res_byte; 16][..])
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("RNS→CS {idx}: {e}"));
-
-            match routing {
-                Some(rc) => {
-                    sqlx::query(
-                        "UPDATE delivery_reservation \
-                         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                             submission_certainty = ?, \
-                             response_provenance = ?, \
-                             routing_class = ?, \
-                             node_effect = ? \
-                         WHERE reservation_id = ?",
-                    )
-                    .bind(certainty)
-                    .bind(provenance)
-                    .bind(rc)
-                    .bind(node_effect)
-                    .bind(&[res_byte; 16][..])
-                    .execute(&pool)
-                    .await
-                    .unwrap_or_else(|e| panic!("CS→OO with routing {idx}: {e}"));
-                }
-                None => {
-                    sqlx::query(
-                        "UPDATE delivery_reservation \
-                         SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                             submission_certainty = ?, \
-                             response_provenance = ?, \
-                             node_effect = ? \
-                         WHERE reservation_id = ?",
-                    )
-                    .bind(certainty)
-                    .bind(provenance)
-                    .bind(node_effect)
-                    .bind(&[res_byte; 16][..])
-                    .execute(&pool)
-                    .await
-                    .unwrap_or_else(|e| panic!("CS→OO clean accept {idx}: {e}"));
-                }
-            }
-        }
+        // Advance to OO via the shared helper — it also writes the migration-036 evidence leaf
+        // matching these axes so mandatory-at-OO (migration 037) is satisfied.
+        advance_oo(
+            &pool,
+            res_byte,
+            certainty,
+            provenance,
+            *routing,
+            node_effect,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("advance_oo {idx}: {e}"));
 
         // Read back and verify.
         let (sc, rp, rc, ne): (String, String, Option<String>, Option<String>) = sqlx::query_as(
@@ -1207,35 +1204,19 @@ async fn ne01_routing_for_reject_node_effects_all_033_storable() {
             .await
             .unwrap_or_else(|e| panic!("ne01[{idx}] insert: {e}"));
 
-        // All routing_for_reject paths are SUBMITTED + PARSED_DPS_ENVELOPE → CS path.
-        sqlx::query(
-            "UPDATE delivery_reservation \
-             SET state = 'CALL_STARTED', \
-                 call_started_at = '2026-07-17T00:00:00Z', \
-                 authorized_generation = 1 \
-             WHERE reservation_id = ?",
+        // All routing_for_reject paths are SUBMITTED + PARSED_DPS_ENVELOPE → CS→OO; the shared
+        // helper writes the matching terminal Rejected verdict leaf (mandatory-at-OO, mig. 037).
+        advance_oo(
+            &pool,
+            res_byte,
+            "SUBMITTED",
+            "PARSED_DPS_ENVELOPE",
+            Some(*routing_class),
+            node_effect,
         )
-        .bind(&[res_byte; 16][..])
-        .execute(&pool)
-        .await
-        .unwrap_or_else(|e| panic!("ne01[{idx}] CS: {e}"));
-
-        sqlx::query(
-            "UPDATE delivery_reservation \
-             SET state = 'OUTCOME_OBSERVED', apply_state = 'PENDING_APPLY', \
-                 submission_certainty = 'SUBMITTED', \
-                 response_provenance = 'PARSED_DPS_ENVELOPE', \
-                 routing_class = ?, \
-                 node_effect = ? \
-             WHERE reservation_id = ?",
-        )
-        .bind(routing_class)
-        .bind(node_effect)
-        .bind(&[res_byte; 16][..])
-        .execute(&pool)
         .await
         .unwrap_or_else(|e| {
-            panic!("ne01[{idx}] OO routing={routing_class} node_effect={node_effect}: {e}")
+            panic!("ne01[{idx}] advance_oo routing={routing_class} node_effect={node_effect}: {e}")
         });
 
         // Read back the node_effect to confirm it round-trips.
