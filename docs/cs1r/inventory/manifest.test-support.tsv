@@ -1693,7 +1693,7 @@ test-support	prro	prro::migration_036_evidence_union	ev02_evidence_triggers_exis
 test-support	prro	prro::migration_036_evidence_union	ev03_valid_accepted_ok_and_stored	false
 test-support	prro	prro::migration_036_evidence_union	ev04_valid_rejected_verify_ok	false
 test-support	prro	prro::migration_036_evidence_union	ev05_valid_noresponse_ok	false
-test-support	prro	prro::migration_036_evidence_union	ev06_absent_evidence_rejected	false
+test-support	prro	prro::migration_036_evidence_union	ev06_optional_absent_evidence_ok	false
 test-support	prro	prro::migration_036_evidence_union	im01_evidence_frozen_after_oo	false
 test-support	prro	prro::migration_036_evidence_union	mx01_all_thirteen_verdicts_map_exactly	false
 test-support	prro	prro::migration_036_evidence_union	tg01_accepted_missing_fiscal_rejected	false

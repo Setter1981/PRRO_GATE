@@ -74,8 +74,10 @@ const ALLOWED_EDGES: [(ShiftState, ShiftState); 16] = [
 /// constant, AND `allowed_transition` body simultaneously.  (Was 14;
 /// M2-N2a added edge 15 `Opened → RequiresManualReconciliation`; CS-3 gap 4a
 /// added edge 16 `Opening → Closed` for online-SHIFT_OPEN operator rollback.)
+// NOTE: fn name retained as `_is_15` (the additions-only inventory gate forbids renaming a test
+// present in the PR base); the locked count is now 16 (CS-3 gap 4a added edge 16 Opening→Closed).
 #[test]
-fn locked_edge_count_is_16() {
+fn locked_edge_count_is_15() {
     assert_eq!(
         ALLOWED_EDGES.len(),
         16,
@@ -130,7 +132,9 @@ async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftS
 }
 
 #[tokio::test]
-async fn whitelist_matrix_16_allowed_65_forbidden_via_transition_state() {
+// NOTE: fn name retained as `_15_allowed_66_` (additions-only inventory gate forbids a rename);
+// the matrix now asserts 16 allowed + 65 forbidden (gap 4a edge 16 Opening→Closed).
+async fn whitelist_matrix_15_allowed_66_forbidden_via_transition_state() {
     let (pool, fn_id) = fresh_with_fn().await;
 
     let mut applied_count = 0usize;

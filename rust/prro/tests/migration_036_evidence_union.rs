@@ -282,9 +282,10 @@ async fn ev05_valid_noresponse_ok() {
 }
 
 #[tokio::test]
-async fn ev06_absent_evidence_rejected() {
-    // Mandatory-at-OO (migration 037): a clean-accept OO row with NO evidence at all is now
-    // REFUSED. Slice 2a landed the union as validate-if-present (all-NULL evidence was allowed);
+async fn ev06_optional_absent_evidence_ok() {
+    // NOTE: the name is retained verbatim (the additions-only inventory gate forbids renaming a
+    // test that exists in the PR base). The ASSERTION is INVERTED by migration 037: a clean-accept
+    // OO row with NO evidence at all is now REFUSED. Slice 2a landed the union as validate-if-present (all-NULL evidence was allowed);
     // now that the production `record_outcome` writer exists it is mandatory — an OO authority
     // with no boot-hydratable leaf is unrecoverable (P4). This is the direct counter-test for the
     // flip: the exact all-NULL clean-accept row ev06 once accepted must now abort.

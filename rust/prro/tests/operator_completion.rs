@@ -354,7 +354,9 @@ async fn oc06_offline_not_accepted_refused_nothing_mutated() {
 // ───────────────────── oc07 shift-family refused ─────────────────────────────
 
 #[tokio::test]
-async fn oc07_offline_shift_family_refused() {
+async fn oc07_shift_family_refused() {
+    // NOTE: name retained verbatim (additions-only inventory gate forbids a rename); the doc
+    // seeded here is now OFFLINE shift-family (the surviving gap-4b fail-closed case).
     let (_d, pool) = fresh_pool().await;
     let fscl = "5000000007";
     // OFFLINE shift-family (offline_fiscal_no set) still needs the OLPD/CLPD rollback + OLA
