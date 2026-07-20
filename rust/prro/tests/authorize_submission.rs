@@ -139,10 +139,11 @@ async fn az01_authorize_writes_marker_generation_and_pointer() {
         .await
         .expect("fresh document authorizes");
     assert_eq!(
-        auth.authorized_generation, 1,
+        auth.authorized_generation(),
+        1,
         "first authorization consumes generation 1"
     );
-    assert_eq!(auth.reservation_id, [0x01; 16]);
+    assert_eq!(auth.reservation_id(), [0x01; 16]);
 
     // reservation is CALL_STARTED with the marker + generation.
     let (state, cs_at, gen): (String, Option<String>, Option<i64>) = sqlx::query_as(
@@ -244,7 +245,7 @@ async fn az04_no_orphan_rn_after_started_history_but_next_doc_ok() {
     let auth_b = authorize(&pool, new_res(0x02, doc_b, fscl))
         .await
         .expect("the next document reserves after release");
-    assert_eq!(auth_b.authorized_generation, 2);
+    assert_eq!(auth_b.authorized_generation(), 2);
 }
 
 // ───────────────────── az05 — monotone generation ────────────────────────────
@@ -263,9 +264,9 @@ async fn az05_generation_advances_monotonically() {
     let c = authorize(&pool, new_res(0x03, doc_c, fscl)).await.unwrap();
     assert_eq!(
         (
-            a.authorized_generation,
-            b.authorized_generation,
-            c.authorized_generation
+            a.authorized_generation(),
+            b.authorized_generation(),
+            c.authorized_generation()
         ),
         (1, 2, 3)
     );

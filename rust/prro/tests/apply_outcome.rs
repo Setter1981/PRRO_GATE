@@ -209,6 +209,13 @@ async fn read_mode(pool: &SqlitePool, fscl: &str) -> String {
         .await
         .unwrap()
 }
+async fn read_doc_state(pool: &SqlitePool, doc_byte: u8) -> String {
+    sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id=?")
+        .bind(vec![doc_byte; 16])
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
 
 fn is_apply_err(err: &anyhow::Error, pred: impl Fn(&ApplyError) -> bool) -> bool {
     err.downcast_ref::<ApplyError>().is_some_and(pred)
@@ -240,6 +247,11 @@ async fn ap01_online_accepted_stamps_sfn_advances_seed_and_releases() {
     assert!(
         read_pointer(&pool, fscl).await.is_none(),
         "active pointer cleared on release"
+    );
+    assert_eq!(
+        read_doc_state(&pool, 0x11).await,
+        "SENT",
+        "the issued document left Sending for Sent"
     );
 }
 
@@ -311,6 +323,84 @@ async fn ap03_online_reject_offline168_blocks_node_and_releases() {
         read_apply_state(&pool, 0x01).await.as_deref(),
         Some("APPLIED")
     );
+    assert_eq!(
+        read_doc_state(&pool, 0x11).await,
+        "REJECTED",
+        "a definitive pre-SENT reject leaves Sending for Rejected"
+    );
+}
+
+// ────────────────── ap08 / ap09 — online -12 / -6 HOLD (S7-0 gap 5) ───────────
+
+/// Online `-12` (BadHashPrev / MacReseedPending) is a MAC-recovery hold — it must NOT auto-release,
+/// even though it is an online-origin `Rejected`.
+#[tokio::test]
+async fn ap08_online_mac_reseed_pending_holds() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "2000000008";
+    let doc = seed_doc(&pool, fscl, 0x11, None).await;
+    authorize(&pool, new_res(0x01, doc, fscl)).await;
+    record(
+        &pool,
+        0x01,
+        "SUBMITTED",
+        "PARSED_DPS_ENVELOPE",
+        Some("MacRecovery"),
+        "MacReseedPending",
+        "Rejected",
+        Some("BadHashPrev"),
+        Some(&DIG[..]),
+        None,
+    )
+    .await;
+    let err = apply(&pool, 0x01)
+        .await
+        .expect_err("online -12 must HOLD for MAC recovery");
+    assert!(is_apply_err(&err, |e| matches!(
+        e,
+        ApplyError::HeldNotAutoRelease
+    )));
+    // Nothing released — still PENDING, pointer held, doc still Sending.
+    assert_eq!(
+        read_apply_state(&pool, 0x01).await.as_deref(),
+        Some("PENDING_APPLY")
+    );
+    assert!(read_pointer(&pool, fscl).await.is_some());
+    assert_eq!(read_doc_state(&pool, 0x11).await, "SENDING");
+}
+
+/// Online `-6` (NotPrevZReport / OperatorEscalation) is an operator hold — it must NOT auto-release.
+#[tokio::test]
+async fn ap09_online_operator_escalation_holds() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "2000000009";
+    let doc = seed_doc(&pool, fscl, 0x11, None).await;
+    authorize(&pool, new_res(0x01, doc, fscl)).await;
+    record(
+        &pool,
+        0x01,
+        "SUBMITTED",
+        "PARSED_DPS_ENVELOPE",
+        Some("OperatorEscalation"),
+        "OperatorEscalation",
+        "Rejected",
+        Some("NotPrevZReport"),
+        Some(&DIG[..]),
+        None,
+    )
+    .await;
+    let err = apply(&pool, 0x01)
+        .await
+        .expect_err("online -6 must HOLD for the operator");
+    assert!(is_apply_err(&err, |e| matches!(
+        e,
+        ApplyError::HeldNotAutoRelease
+    )));
+    assert_eq!(
+        read_apply_state(&pool, 0x01).await.as_deref(),
+        Some("PENDING_APPLY")
+    );
+    assert!(read_pointer(&pool, fscl).await.is_some());
 }
 
 // ───────────────────────── ap04 — offline reject HOLDs ────────────────────────

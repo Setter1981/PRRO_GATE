@@ -251,16 +251,57 @@ pub async fn get_active_for_fn(
 /// The authorization minted by [`authorize_submission`] — the SOLE permit for a wire call
 /// (CS-3 Slice 3, design §2 lifetime authorization + sole-caller wire gate).
 ///
-/// Carries the reservation identity + the `authorized_generation` snapshot taken at the
-/// `RESERVED_NOT_STARTED → CALL_STARTED` transition.  A caller with no `Authorization` performs
-/// ZERO wire I/O; the token is minted only after the authorization transaction commits.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// **Sealed capability (S7-0 gap 3).**  All fields are private and there is **no `Clone`**: a
+/// caller cannot fabricate one, copy one to authorize a second wire, or rebind its bytes.  It is
+/// minted only after the authorization transaction commits and is meant to be **consumed by value**
+/// at the sole wire function (`submit_authorized`, Slice 7), which recomputes the envelope hash and
+/// checks it against the snapshot carried here.  A caller with no `Authorization` performs ZERO wire
+/// I/O.  It carries the immutable protocol binding + envelope hash of the authorized reservation so
+/// the wire seam cannot be re-bound to different bytes after commit.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Authorization {
-    pub reservation_id: ReservationId,
-    pub document_id: DocumentId,
-    pub attempt_no: i64,
+    reservation_id: ReservationId,
+    document_id: DocumentId,
+    attempt_no: i64,
     /// The `node_state.delivery_generation` snapshot consumed by this authorization (`>= 1`).
-    pub authorized_generation: i64,
+    authorized_generation: i64,
+    /// The immutable 32-byte envelope hash the wire call must carry (rebind guard).
+    envelope_hash: [u8; 32],
+    /// The immutable bound protocol id (`FSCO_ZZD` / `EVPZ_DPS`).
+    dps_protocol_id: String,
+    /// The immutable protocol contract version.
+    protocol_contract_version: i64,
+}
+
+impl Authorization {
+    /// The authorized reservation identity.
+    pub fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+    /// The authorized document.
+    pub fn document_id(&self) -> DocumentId {
+        self.document_id
+    }
+    /// The reservation attempt number.
+    pub fn attempt_no(&self) -> i64 {
+        self.attempt_no
+    }
+    /// The consumed generation snapshot (`>= 1`).
+    pub fn authorized_generation(&self) -> i64 {
+        self.authorized_generation
+    }
+    /// The immutable envelope hash the wire call must carry.
+    pub fn envelope_hash(&self) -> &[u8; 32] {
+        &self.envelope_hash
+    }
+    /// The immutable bound protocol id.
+    pub fn dps_protocol_id(&self) -> &str {
+        &self.dps_protocol_id
+    }
+    /// The immutable protocol contract version.
+    pub fn protocol_contract_version(&self) -> i64 {
+        self.protocol_contract_version
+    }
 }
 
 /// Why [`authorize_submission`] refused (no wire I/O happens on any of these).
@@ -319,6 +360,11 @@ pub async fn authorize_submission(
     let reservation_id = row.reservation_id;
     let document_id = row.document_id;
     let fiscal_number = row.fiscal_number.clone();
+    // Capture the immutable protocol binding + envelope hash for the sealed token before `row`
+    // moves into `insert` (they are the wire-seam rebind guard, plan §2.2).
+    let envelope_hash = row.envelope_hash;
+    let dps_protocol_id = row.dps_protocol_id.clone();
+    let protocol_contract_version = row.protocol_contract_version;
 
     // 1. Explicit call-once guard (design §2) — belt with the DDL index + no_replace clause.
     let already_started: i64 = sqlx::query_scalar(
@@ -386,6 +432,9 @@ pub async fn authorize_submission(
         document_id,
         attempt_no,
         authorized_generation,
+        envelope_hash,
+        dps_protocol_id,
+        protocol_contract_version,
     })
 }
 
@@ -428,6 +477,9 @@ pub enum ApplyError {
     /// An `Accepted` row with no `evidence_text` (the accepted fiscal number).
     #[error("Accepted has no fiscal number (evidence_text)")]
     MissingFiscalNumber,
+    /// The document could not leave `Sending` for its terminal state (wrong from-state / missing).
+    #[error("document could not transition out of Sending: {0:?}")]
+    DocTransitionFailed(crate::db::repositories::fiscal_documents::TransitionOutcome),
     /// A lower-level SQLite error.
     #[error(transparent)]
     Db(sqlx::Error),
@@ -557,19 +609,36 @@ pub async fn apply_outcome(
                 node_advance_seed(tx, &fiscal_number, &arr).await?;
                 seed_advanced = true;
             }
+            // The issued document leaves `Sending` for the terminal issued state `Sent`
+            // (D3: SFN stamped + online seed advanced ⟺ issued).
+            doc_from_sending(tx, doc_id, DocState::Sent).await?;
             stamped_sfn = Some(sfn);
         }
         Some("Rejected") => {
-            // Online-origin definitive reject releases; offline-origin reject is a HOLD.
+            // Offline-origin reject is an operator HOLD (§3.2 row 5).
             if !online {
                 return Err(ApplyError::HeldNotAutoRelease);
             }
-            if node_effect.as_deref() == Some("NodeBlocked") {
-                node_set_blocked(tx, &fiscal_number).await?;
+            // Online-origin: `-12` (MacReseedPending) and `-6` (OperatorEscalation) are held
+            // for MAC/operator resolution (§3.2, plan §0.5) — they must NOT auto-release. `-11`
+            // (NodeBlocked) releases the reservation but flips the node BLOCKED. Every other
+            // definitive verdict releases outright.
+            match node_effect.as_deref() {
+                Some("MacReseedPending") | Some("OperatorEscalation") => {
+                    return Err(ApplyError::HeldNotAutoRelease);
+                }
+                Some("NodeBlocked") => node_set_blocked(tx, &fiscal_number).await?,
+                _ => {}
             }
+            // A definitive pre-SENT reject leaves `Sending` for `Rejected` (D2: seed NOT
+            // advanced, SFN NOT stamped — the row legitimately rests non-issued).
+            doc_from_sending(tx, doc_id, DocState::Rejected).await?;
         }
         Some("PreconditionFailed") | Some("SigningFailed") => {
-            // Safe NotSubmitted preflight failure — local outcome only, no wire effect.
+            // Safe NotSubmitted preflight failure — no wire, no issuance. The document is NOT
+            // transitioned here: a NotSubmitted outcome pairs with a NotStarted reservation
+            // (RN→OO, never CALL_STARTED — the generation↔certainty invariant), so it has no
+            // in-flight `Sending` document to move. Local outcome only.
         }
         // SubmittedUnknown leaves (NoResponse / RemoteAuthStatus / UnknownStatus / SaveError /
         // CloseAmbiguous / MissingStatus / OkButNoFiscalNumber) and NULL evidence are HOLDs.
@@ -641,6 +710,25 @@ async fn node_set_blocked(tx: &mut WriteTxConn<'_>, fn_id: &str) -> Result<(), A
         .await
         .map_err(ApplyError::Db)?;
     Ok(())
+}
+
+/// Move the document out of `Sending` to its terminal apply target (`Sent` on a clean accept,
+/// `Rejected` on a definitive pre-SENT reject). Any non-`Applied` outcome (the document is not in
+/// `Sending`) surfaces as an error so the whole apply rolls back — the pointer must never clear
+/// while the document rests in `Sending`.
+async fn doc_from_sending(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+    to: DocState,
+) -> Result<(), ApplyError> {
+    use crate::db::repositories::fiscal_documents::{transition_state, TransitionOutcome};
+    let outcome = transition_state(tx, doc_id, DocState::Sending, to)
+        .await
+        .map_err(ApplyError::Db)?;
+    match outcome {
+        TransitionOutcome::Applied => Ok(()),
+        other => Err(ApplyError::DocTransitionFailed(other)),
+    }
 }
 
 /// List the reservations resting at `CALL_STARTED` (the crash-mid-send set) for boot resume.
