@@ -28,6 +28,7 @@ pub mod inbox_reaper;
 pub mod last_chk_probe;
 pub mod online_convergence;
 pub mod runtime;
+pub mod sent_not_found;
 
 pub use guard::ReconcileGuard;
 pub use runtime::{ReconciliationRuntime, RuntimeView};

@@ -2063,6 +2063,10 @@ test-support	prro	prro::secure_pool_open	open_secure_pool_chmods_file_to_owner_o
 test-support	prro	prro::secure_pool_open	open_secure_pool_chmods_wal_and_shm_sidecars	false
 test-support	prro	prro::secure_pool_open	open_secure_pool_is_idempotent_on_second_open	false
 test-support	prro	prro::secure_pool_open	open_secure_pool_runs_migrations_secure_and_creates_operators_table	false
+test-support	prro	prro::sent_not_found	sn01_sent_not_found_escalates_atomically	false
+test-support	prro	prro::sent_not_found	sn02_non_sent_document_refused	false
+test-support	prro	prro::sent_not_found	sn03_refusal_leaves_node_mode_unchanged	false
+test-support	prro	prro::sent_not_found	sn04_missing_node_state_rolls_back	false
 test-support	prro	prro::shift_create_primitive	apply_shift_transition_closed_to_created_is_forbidden	false
 test-support	prro	prro::shift_create_primitive	apply_shift_transition_redrive_is_conflict_not_error	false
 test-support	prro	prro::shift_create_primitive	create_shift_tx_from_closed_dual_writes_shifts_and_projection	false
