@@ -11,7 +11,11 @@
 //! - `svc03` Z_REPORT accepted    → shift Closing→Closed, doc SENT;
 //! - `svc04` SHIFT_CLOSE rejected → shift Closing→Opened, doc RMR;
 //! - `svc05` regular SELL accepted → no shift projection (pass-through), doc SENT;
-//! - `svc06` MacReseed on SHIFT_OPEN → refused (`MacReseedOnShiftFamily`), nothing mutated.
+//! - `svc06` MacReseed on SHIFT_OPEN → refused (`MacReseedOnShiftFamily`), nothing mutated;
+//! - `svc07` sole-caller pin for the operator-only edge 16;
+//! - `svc08` (gap 4b) offline SHIFT_OPEN not-accepted → shift OLPD→Closed + cohort cancel + seed;
+//! - `svc09` (gap 4b) offline Z_REPORT not-accepted → shift CLPD→OLPD;
+//! - `svc10` (gap 4b) offline shift Accepted → doc Sent, shift UNCHANGED (drain owns forward edge).
 
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::delivery_reservation::{self, NewReservation, OperatorResolution};
@@ -371,4 +375,211 @@ fn svc07_opening_to_closed_edge_sole_caller_pin() {
         "edge 16 (Opening -> Closed) produced outside the sanctioned sites \
          (shifts.rs whitelist + operator_completion.rs): {offenders:#?}"
     );
+}
+
+// ════════ gap 4b — offline shift-family operator completion (svc08-svc10) ════════
+
+const SESSION: [u8; 16] = [0x5E; 16];
+const TIP: [u8; 32] = [0xEE; 32];
+const PREV: [u8; 32] = [0xBB; 32];
+
+/// Seed FN, node_state (shift_state, current_shift_id, last_known=TIP), a shift in `shift_state`,
+/// a DRAINING offline session, an OFFLINE shift-family doc (SENDING, session, prev=PREV), and one
+/// later OFFLINE_LOCAL_ACK successor. Returns the shift-family doc id.
+async fn seed_offline_shift(
+    pool: &SqlitePool,
+    fscl: &str,
+    doc_byte: u8,
+    doc_type: &str,
+    shift_state: &str,
+) -> DocumentId {
+    sqlx::query(
+        "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES (?, '12345678', 'test')",
+    )
+    .bind(fscl)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO node_state (fiscal_number, mode, shift_state, next_lnd, \
+            current_shift_id, last_known_unsigned_xml_sha256) VALUES (?, 'ONLINE', ?, 1, ?, ?)",
+    )
+    .bind(fscl)
+    .bind(shift_state)
+    .bind(&SHIFT_ID[..])
+    .bind(&TIP[..])
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
+            opened_by_cashier_id) VALUES (?, ?, ?, 'ONLINE', 0, 'cashier-1')",
+    )
+    .bind(&SHIFT_ID[..])
+    .bind(fscl)
+    .bind(shift_state)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'DRAINING', '2026-07-20T00:00:00Z')",
+    )
+    .bind(&SESSION[..])
+    .bind(fscl)
+    .execute(pool)
+    .await
+    .unwrap();
+    seed_offline_doc(pool, fscl, doc_byte, doc_type, 10, "SENDING", Some(PREV)).await;
+    // one later OLA successor (byte 0xEA) to exercise the cohort cancel in the shift path.
+    seed_offline_doc(pool, fscl, 0xEA, "SELL", 11, "OFFLINE_LOCAL_ACK", None).await;
+    DocumentId::from_bytes([doc_byte; 16])
+}
+
+async fn seed_offline_doc(
+    pool: &SqlitePool,
+    fscl: &str,
+    b: u8,
+    doc_type: &str,
+    lnd: i64,
+    state: &str,
+    prev: Option<[u8; 32]>,
+) {
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, \
+            offline_session_id, previous_hash) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'b1', 't1', 'OFFLINE', '2026-07-17T12:34:56Z', '{}', \
+            ?, ?, ?, ?, ?)",
+    )
+    .bind(vec![b; 16])
+    .bind(vec![b ^ 0xFF; 16])
+    .bind(fscl)
+    .bind(&SHIFT_ID[..])
+    .bind(lnd)
+    .bind(doc_type)
+    .bind(state)
+    .bind(vec![0u8; 32])
+    .bind(&[0x77u8; 32][..])
+    .bind(lnd)
+    .bind(&SESSION[..])
+    .bind(prev.map(|h| h.to_vec()))
+    .execute(pool)
+    .await
+    .expect("seed offline doc");
+}
+
+async fn read_seed(pool: &SqlitePool, fscl: &str) -> Option<Vec<u8>> {
+    sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(fscl)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+// svc08 — offline SHIFT_OPEN not-accepted: shift OLPD→Closed + cohort cancel + seed rewind + RMR.
+#[tokio::test]
+async fn svc08_offline_shift_open_not_accepted_rolls_olpd_to_closed() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "8000000008";
+    let doc = seed_offline_shift(
+        &pool,
+        fscl,
+        0x18,
+        "SHIFT_OPEN",
+        "OPENED_LOCAL_PENDING_DRAIN",
+    )
+    .await;
+    held_pending(&pool, 0x08, doc, fscl).await;
+
+    complete(&pool, 0x08, OperatorResolution::NotAcceptedOffline)
+        .await
+        .expect("offline SHIFT_OPEN not-accepted completes");
+
+    assert_eq!(
+        shift_state(&pool).await,
+        "CLOSED",
+        "shift OLPD→Closed rollback"
+    );
+    assert_eq!(
+        doc_state(&pool, 0x18).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    assert_eq!(
+        doc_state(&pool, 0xEA).await,
+        "CANCELLED",
+        "cohort successor cancelled"
+    );
+    assert_eq!(
+        read_seed(&pool, fscl).await.as_deref(),
+        Some(&PREV[..]),
+        "seed rewound"
+    );
+    assert_eq!(apply_state(&pool, 0x08).await.as_deref(), Some("APPLIED"));
+}
+
+// svc09 — offline Z_REPORT not-accepted: shift CLPD→OLPD rollback + core body.
+#[tokio::test]
+async fn svc09_offline_zreport_not_accepted_rolls_clpd_to_olpd() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "8000000009";
+    let doc =
+        seed_offline_shift(&pool, fscl, 0x19, "Z_REPORT", "CLOSING_LOCAL_PENDING_DRAIN").await;
+    held_pending(&pool, 0x09, doc, fscl).await;
+
+    complete(&pool, 0x09, OperatorResolution::NotAcceptedOffline)
+        .await
+        .expect("offline Z_REPORT not-accepted completes");
+
+    assert_eq!(
+        shift_state(&pool).await,
+        "OPENED_LOCAL_PENDING_DRAIN",
+        "shift CLPD→OLPD rollback"
+    );
+    assert_eq!(
+        doc_state(&pool, 0x19).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    assert_eq!(doc_state(&pool, 0xEA).await, "CANCELLED");
+}
+
+// svc10 — offline shift-family ACCEPTED: doc Sent, shift STAYS OLPD (NO forward edge — the drain
+// finalize owns OLPD→Opened), mode GOING_ONLINE.
+#[tokio::test]
+async fn svc10_offline_shift_accepted_does_not_advance_shift() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "8000000010";
+    let doc = seed_offline_shift(
+        &pool,
+        fscl,
+        0x1A,
+        "SHIFT_OPEN",
+        "OPENED_LOCAL_PENDING_DRAIN",
+    )
+    .await;
+    held_pending(&pool, 0x0A, doc, fscl).await;
+
+    complete(
+        &pool,
+        0x0A,
+        OperatorResolution::Accepted {
+            fiscal_number: "4000101010".into(),
+        },
+    )
+    .await
+    .expect("offline shift Accepted completes");
+
+    assert_eq!(
+        shift_state(&pool).await,
+        "OPENED_LOCAL_PENDING_DRAIN",
+        "Accept does NOT advance the shift — the drain finalize owns OLPD→Opened"
+    );
+    assert_eq!(doc_state(&pool, 0x1A).await, "SENT", "issued doc → Sent");
+    assert_eq!(node_mode(&pool, fscl).await, "GOING_ONLINE");
+    // offline Accept advances NO seed (chain already advanced locally at OLA) — seed stays TIP.
+    assert_eq!(read_seed(&pool, fscl).await.as_deref(), Some(&TIP[..]));
 }

@@ -331,16 +331,19 @@ async fn oc05_mode_going_online_when_offline_session_active() {
 
 #[tokio::test]
 async fn oc06_offline_not_accepted_refused_nothing_mutated() {
+    // NOTE: name retained (additions-only inventory gate forbids a rename). gap 4b: a PLAIN
+    // NotAccepted (the ONLINE variant) on an OFFLINE document is an origin mismatch — the offline
+    // path is NotAcceptedOffline (the DB origin is the sole authority). Fail-closed, nothing mutated.
     let (_d, pool) = fresh_pool().await;
     let fscl = "5000000006";
     let doc = seed_doc(&pool, fscl, 0x11, "SELL", Some(500)).await;
     held_pending(&pool, 0x01, doc, fscl).await;
     let err = complete(&pool, 0x01, OperatorResolution::NotAccepted)
         .await
-        .expect_err("offline not-accepted needs cohort cleanup (Slice 5b)");
+        .expect_err("plain NotAccepted on an offline document is an origin mismatch");
     assert!(is_err(&err, |e| matches!(
         e,
-        CompletionError::OfflineCohortCleanupRequired
+        CompletionError::OriginMismatch
     )));
     // Nothing mutated — still PENDING under STOP, doc still SENDING.
     assert_eq!(
@@ -355,27 +358,24 @@ async fn oc06_offline_not_accepted_refused_nothing_mutated() {
 
 #[tokio::test]
 async fn oc07_shift_family_refused() {
-    // NOTE: name retained verbatim (additions-only inventory gate forbids a rename); the doc
-    // seeded here is now OFFLINE shift-family (the surviving gap-4b fail-closed case).
+    // NOTE: name retained (additions-only inventory gate forbids a rename). gap 4b: an OFFLINE
+    // shift-family document is now HANDLED (positive path lives in the operator-completion service,
+    // svc19-21). The surviving CORE-level refusal exercised here is MacReseed on an OFFLINE document
+    // → MacReseedNotOfflineDefined (§3.4 has no offline MacReseed cell). Fail-closed, nothing mutated.
     let (_d, pool) = fresh_pool().await;
     let fscl = "5000000007";
-    // OFFLINE shift-family (offline_fiscal_no set) still needs the OLPD/CLPD rollback + OLA
-    // cohort cleanup + predecessor-seed repair — refused fail-closed (gap 4b). ONLINE
-    // shift-family is now supported via the operator-completion service (gap 4a, oc10-oc13).
     let doc = seed_doc(&pool, fscl, 0x11, "SHIFT_OPEN", Some(0x11)).await;
     held_pending(&pool, 0x01, doc, fscl).await;
     let err = complete(
         &pool,
         0x01,
-        OperatorResolution::Accepted {
-            fiscal_number: "4000777777".into(),
-        },
+        OperatorResolution::MacReseed { seed: [0x99; 32] },
     )
     .await
-    .expect_err("offline shift-family completion is gap 4b");
+    .expect_err("MacReseed on an offline document is not defined");
     assert!(is_err(&err, |e| matches!(
         e,
-        CompletionError::ShiftFamilyNotSupported
+        CompletionError::MacReseedNotOfflineDefined
     )));
     assert_eq!(
         read_apply_state(&pool, 0x01).await.as_deref(),
@@ -451,4 +451,297 @@ async fn oc09_completion_clears_pointer_and_next_doc_authorizes() {
     })
     .await
     .expect("next document authorizes after operator completion");
+}
+
+// ═══════════ gap 4b — offline-cohort operator completion (P3 fork-safety) ═══════════
+
+const SESSION: [u8; 16] = [0x5E; 16];
+const TIP: [u8; 32] = [0xEE; 32]; // a wrong global chain tip the rewind must overwrite
+const PREV: [u8; 32] = [0xBB; 32]; // the predecessor doc's OWN pinned previous_hash
+
+async fn seed_offline_doc(
+    pool: &SqlitePool,
+    fscl: &str,
+    b: u8,
+    lnd: i64,
+    state: &str,
+    prev: Option<[u8; 32]>,
+) {
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, offline_session_id, \
+            previous_hash) \
+         VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'OFFLINE', '2026-07-17T12:34:56Z', '{}', \
+            ?, ?, ?, ?, ?)",
+    )
+    .bind(vec![b; 16])
+    .bind(vec![b ^ 0xFF; 16])
+    .bind(fscl)
+    .bind(lnd)
+    .bind(state)
+    .bind(vec![0u8; 32])
+    .bind(&[0x77u8; 32][..])
+    .bind(lnd)
+    .bind(&SESSION[..])
+    .bind(prev.map(|h| h.to_vec()))
+    .execute(pool)
+    .await
+    .expect("seed offline doc");
+}
+
+/// Seed FN + node_state(last_known=TIP) + a DRAINING offline session + a predecessor doc (SENDING,
+/// offline, `prev`) at `pred_lnd`, plus later successors `(byte, lnd, state)`. Returns the pred id.
+async fn seed_cohort(
+    pool: &SqlitePool,
+    fscl: &str,
+    pred_byte: u8,
+    pred_lnd: i64,
+    prev: Option<[u8; 32]>,
+    succ: &[(u8, i64, &str)],
+) -> DocumentId {
+    sqlx::query(
+        "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
+         VALUES (?, '12345678', 'test')",
+    )
+    .bind(fscl)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO node_state (fiscal_number, mode, shift_state, next_lnd, \
+            last_known_unsigned_xml_sha256) VALUES (?, 'ONLINE', 'CREATED', 1, ?)",
+    )
+    .bind(fscl)
+    .bind(&TIP[..])
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
+         VALUES (?, ?, 'DRAINING', '2026-07-20T00:00:00Z')",
+    )
+    .bind(&SESSION[..])
+    .bind(fscl)
+    .execute(pool)
+    .await
+    .unwrap();
+    seed_offline_doc(pool, fscl, pred_byte, pred_lnd, "SENDING", prev).await;
+    for (b, lnd, st) in succ {
+        seed_offline_doc(pool, fscl, *b, *lnd, st, None).await;
+    }
+    DocumentId::from_bytes([pred_byte; 16])
+}
+
+/// Assert an offline not-accepted completion is REFUSED with `pred`, and NOTHING mutated: the
+/// predecessor stays SENDING, the reservation PENDING_APPLY, node STOP_MODE + seed still TIP, and
+/// each named successor keeps its state.
+async fn assert_cohort_refused(
+    pool: &SqlitePool,
+    fscl: &str,
+    pred: u8,
+    succ: &[(u8, &str)],
+    pred_err: impl Fn(&CompletionError) -> bool,
+) {
+    let err = complete(pool, 0x01, OperatorResolution::NotAcceptedOffline)
+        .await
+        .expect_err("offline not-accepted is refused");
+    assert!(is_err(&err, pred_err), "unexpected error: {err:?}");
+    assert_eq!(
+        read_doc_state(pool, pred).await,
+        "SENDING",
+        "pred unchanged"
+    );
+    assert_eq!(
+        read_apply_state(pool, 0x01).await.as_deref(),
+        Some("PENDING_APPLY")
+    );
+    assert_eq!(read_mode(pool, fscl).await, "STOP_MODE");
+    assert_eq!(
+        read_seed(pool, fscl).await.as_deref(),
+        Some(&TIP[..]),
+        "seed unchanged"
+    );
+    for (b, st) in succ {
+        assert_eq!(read_doc_state(pool, *b).await, *st, "successor unchanged");
+    }
+}
+
+// oc10 — happy: later OLA successors cancelled, seed rewound to the predecessor's previous_hash.
+#[tokio::test]
+async fn oc10_offline_not_accepted_cancels_cohort_and_rewinds_seed() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5100000010";
+    let pred = seed_cohort(
+        &pool,
+        fscl,
+        0x10,
+        10,
+        Some(PREV),
+        &[
+            (0x11, 11, "OFFLINE_LOCAL_ACK"),
+            (0x12, 12, "OFFLINE_LOCAL_ACK"),
+        ],
+    )
+    .await;
+    held_pending(&pool, 0x01, pred, fscl).await;
+    let r = complete(&pool, 0x01, OperatorResolution::NotAcceptedOffline)
+        .await
+        .expect("offline not-accepted completes");
+    assert_eq!(read_doc_state(&pool, 0x11).await, "CANCELLED");
+    assert_eq!(read_doc_state(&pool, 0x12).await, "CANCELLED");
+    // rewound to the predecessor's OWN previous_hash (NOT the wrong global TIP) — derive-not-trust.
+    assert_eq!(read_seed(&pool, fscl).await.as_deref(), Some(&PREV[..]));
+    assert_eq!(
+        read_doc_state(&pool, 0x10).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    assert_eq!(
+        read_apply_state(&pool, 0x01).await.as_deref(),
+        Some("APPLIED")
+    );
+    assert_eq!(r.cancelled_cohort.len(), 2);
+    assert_eq!(r.rewound_predecessor_seed, Some(Some(PREV)));
+}
+
+// oc11 — a later REJECTED successor is ISSUED (the exact rev1 break) → fail-closed, nothing mutated.
+#[tokio::test]
+async fn oc11_later_rejected_successor_is_fork_guarded() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5100000011";
+    let pred = seed_cohort(&pool, fscl, 0x10, 10, Some(PREV), &[(0x11, 11, "REJECTED")]).await;
+    held_pending(&pool, 0x01, pred, fscl).await;
+    assert_cohort_refused(&pool, fscl, 0x10, &[(0x11, "REJECTED")], |e| {
+        matches!(e, CompletionError::LaterSuccessorIssued(..))
+    })
+    .await;
+}
+
+// oc12 — a later SENDING successor is in-flight → fail-closed, nothing mutated.
+#[tokio::test]
+async fn oc12_later_sending_successor_is_in_flight_guarded() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5100000012";
+    let pred = seed_cohort(&pool, fscl, 0x10, 10, Some(PREV), &[(0x11, 11, "SENDING")]).await;
+    held_pending(&pool, 0x01, pred, fscl).await;
+    assert_cohort_refused(&pool, fscl, 0x10, &[(0x11, "SENDING")], |e| {
+        matches!(e, CompletionError::LaterSuccessorInFlight(_))
+    })
+    .await;
+}
+
+// oc13 — a later ERROR_RETRYABLE successor is ISSUED → fail-closed, no auto-redrive.
+#[tokio::test]
+async fn oc13_later_error_retryable_successor_is_issued_guarded() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5100000013";
+    let pred = seed_cohort(
+        &pool,
+        fscl,
+        0x10,
+        10,
+        Some(PREV),
+        &[(0x11, 11, "ERROR_RETRYABLE")],
+    )
+    .await;
+    held_pending(&pool, 0x01, pred, fscl).await;
+    assert_cohort_refused(&pool, fscl, 0x10, &[(0x11, "ERROR_RETRYABLE")], |e| {
+        matches!(e, CompletionError::LaterSuccessorIssued(..))
+    })
+    .await;
+}
+
+// oc14 — a later pre-OLA SIGNED successor is a structural breach → fail-closed.
+#[tokio::test]
+async fn oc14_later_signed_successor_is_invalid_state() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5100000014";
+    let pred = seed_cohort(&pool, fscl, 0x10, 10, Some(PREV), &[(0x11, 11, "SIGNED")]).await;
+    held_pending(&pool, 0x01, pred, fscl).await;
+    assert_cohort_refused(&pool, fscl, 0x10, &[(0x11, "SIGNED")], |e| {
+        matches!(e, CompletionError::LaterSuccessorInvalidState(..))
+    })
+    .await;
+}
+
+// oc15 — genesis: the predecessor chained off genesis (previous_hash NULL) → seed rewound to NULL.
+#[tokio::test]
+async fn oc15_genesis_predecessor_rewinds_seed_to_null() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5100000015";
+    let pred = seed_cohort(
+        &pool,
+        fscl,
+        0x10,
+        10,
+        None,
+        &[(0x11, 11, "OFFLINE_LOCAL_ACK")],
+    )
+    .await;
+    held_pending(&pool, 0x01, pred, fscl).await;
+    let r = complete(&pool, 0x01, OperatorResolution::NotAcceptedOffline)
+        .await
+        .expect("genesis offline not-accepted completes");
+    assert_eq!(read_doc_state(&pool, 0x11).await, "CANCELLED");
+    assert!(
+        read_seed(&pool, fscl).await.is_none(),
+        "seed rewound to genesis NULL"
+    );
+    assert_eq!(r.rewound_predecessor_seed, Some(None));
+}
+
+// oc16 — NotAcceptedOffline on an ONLINE document → OriginMismatch, no seed overwrite.
+#[tokio::test]
+async fn oc16_not_accepted_offline_on_online_doc_is_origin_mismatch() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5100000016";
+    // an ONLINE doc (offline_fiscal_no None) via the ordinary seed_doc.
+    let doc = seed_doc(&pool, fscl, 0x10, "SELL", None).await;
+    held_pending(&pool, 0x01, doc, fscl).await;
+    let err = complete(&pool, 0x01, OperatorResolution::NotAcceptedOffline)
+        .await
+        .expect_err("NotAcceptedOffline on an online doc is an origin mismatch");
+    assert!(is_err(&err, |e| matches!(
+        e,
+        CompletionError::OriginMismatch
+    )));
+    assert_eq!(read_doc_state(&pool, 0x10).await, "SENDING");
+    assert_eq!(
+        read_apply_state(&pool, 0x01).await.as_deref(),
+        Some("PENDING_APPLY")
+    );
+}
+
+// oc22 — atomicity: a 0-row mode CAS AFTER the cancels rolls the WHOLE tx back (single envelope).
+#[tokio::test]
+async fn oc22_mode_cas_failure_rolls_back_cohort_and_seed() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5100000022";
+    let pred = seed_cohort(
+        &pool,
+        fscl,
+        0x10,
+        10,
+        Some(PREV),
+        &[(0x11, 11, "OFFLINE_LOCAL_ACK")],
+    )
+    .await;
+    held_pending(&pool, 0x01, pred, fscl).await;
+    // Force the tail STOP_MODE->target CAS to match 0 rows by moving the node OUT of STOP_MODE.
+    sqlx::query("UPDATE node_state SET mode = 'BLOCKED' WHERE fiscal_number = ?")
+        .bind(fscl)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = complete(&pool, 0x01, OperatorResolution::NotAcceptedOffline)
+        .await
+        .expect_err("mode CAS 0-rows fails the completion");
+    assert!(is_err(&err, |e| matches!(
+        e,
+        CompletionError::NodeNotStopMode
+    )));
+    // The whole tx rolled back: the successor is NOT cancelled and the seed is NOT rewound.
+    assert_eq!(read_doc_state(&pool, 0x11).await, "OFFLINE_LOCAL_ACK");
+    assert_eq!(read_seed(&pool, fscl).await.as_deref(), Some(&TIP[..]));
+    assert_eq!(read_doc_state(&pool, 0x10).await, "SENDING");
 }

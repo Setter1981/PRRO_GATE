@@ -100,32 +100,54 @@ pub async fn complete_operator_resolution(
     let doc_type = doc_type.0;
     let online = offline_fiscal_no.is_none();
 
-    // 3. ONLINE shift-family: apply the shift-state projection FIRST (same tx). The rollback edge
-    //    `Opening -> Closed` is reachable ONLY through this call (pinned by the sole-caller test).
-    //    OFFLINE shift-family falls through to the core, which returns `ShiftFamilyNotSupported`.
-    if online {
-        if let Some((from, to)) = shift_projection(doc_type, &resolution)? {
-            let shift_id = shift_id.ok_or(OperatorCompletionError::ShiftMissing)?.0;
-            let outcome = apply_shift_transition(tx, &fiscal_number, shift_id, from, to)
-                .await
-                .map_err(|e| OperatorCompletionError::Db(e.to_string()))?;
-            if outcome != TransitionOutcome::Applied {
-                return Err(OperatorCompletionError::ShiftProjectionFailed(outcome));
-            }
+    // 3. Shift-state projection (design §3.4): for a shift-family document, apply the shift edge
+    //    FIRST in the same tx. The operator-only rollback edges 16/17/18 are reachable ONLY here
+    //    (pinned by the sole-caller test). ONLINE not-accepted rolls Opening->Closed / Closing->
+    //    Opened; OFFLINE not-accepted rolls OLPD->Closed / CLPD->OLPD. OFFLINE **Accepted** gets
+    //    NO operator shift edge — the drain finalize owns OLPD->Opened / CLPD->Closed
+    //    (`backlog_drain.rs`); `shift_projection` returns None so the shift stays pending-drain.
+    if let Some((from, to)) = shift_projection(doc_type, &resolution, online)? {
+        let shift_id = shift_id.ok_or(OperatorCompletionError::ShiftMissing)?.0;
+        let outcome = apply_shift_transition(tx, &fiscal_number, shift_id, from, to)
+            .await
+            .map_err(|e| OperatorCompletionError::Db(e.to_string()))?;
+        if outcome != TransitionOutcome::Applied {
+            return Err(OperatorCompletionError::ShiftProjectionFailed(outcome));
         }
     }
 
     // 4. Repository core: document / SFN / seed / APPLIED / pointer / verified mode.
     let result = complete_operator_pending(tx, reservation_id, resolution.clone()).await?;
 
-    // 5. Critical audit (durable operator evidence, design §3.4).
+    // 5. Critical audit (durable operator evidence, design §3.4). P4 — itemise the cancelled OLA
+    //    cohort (document_id + lnd) and the rewound predecessor seed, so the record proves exactly
+    //    which locally-issued documents were cancelled and where the chain was rewound.
     let entity = hex_lower(&reservation_id);
+    let cancelled: Vec<String> = result
+        .cancelled_cohort
+        .iter()
+        .map(|(id, lnd)| {
+            format!(
+                "{{\"doc\":\"{}\",\"lnd\":{}}}",
+                hex_lower(id.as_bytes()),
+                lnd
+            )
+        })
+        .collect();
+    let rewound_seed = match &result.rewound_predecessor_seed {
+        None => "null".to_string(),
+        Some(None) => "\"genesis\"".to_string(),
+        Some(Some(h)) => format!("\"{}\"", hex_lower(h)),
+    };
     let payload = format!(
-        "{{\"resolution\":\"{}\",\"applied\":{},\"seed_advanced\":{},\"mode_target\":\"{:?}\"}}",
+        "{{\"resolution\":\"{}\",\"applied\":{},\"seed_advanced\":{},\"mode_target\":\"{:?}\",\
+         \"cancelled_cohort\":[{}],\"rewound_seed\":{}}}",
         resolution_tag(&resolution),
         result.applied,
         result.seed_advanced,
         result.mode_target,
+        cancelled.join(","),
+        rewound_seed,
     );
     audit_log::append_tx(
         tx,
@@ -142,30 +164,38 @@ pub async fn complete_operator_resolution(
     Ok(result)
 }
 
-/// The shift-state edge for an online shift-family document + resolution (design §3.4). Returns
-/// `None` for a non-shift-family document (no projection). `MacReseed` on a shift-family document
-/// has no defined cell → error.
+/// The shift-state edge for a shift-family document + resolution + DB-derived origin (design §3.4).
+/// Returns `None` for a non-shift-family document, for an OFFLINE **Accepted** shift-family doc
+/// (the drain finalize owns the forward edge), and for an origin-mismatched resolution (the core's
+/// origin cross-check is the authority — it fails those closed). `MacReseed` on any shift-family
+/// document has no defined cell → `MacReseedOnShiftFamily`.
 fn shift_projection(
     doc_type: DocType,
     resolution: &OperatorResolution,
+    online: bool,
 ) -> Result<Option<(ShiftState, ShiftState)>, OperatorCompletionError> {
+    use DocType::{ShiftClose, ShiftOpen, ZReport};
+    use OperatorResolution as R;
     use ShiftState::*;
-    let edge = match doc_type {
-        DocType::ShiftOpen => match resolution {
-            OperatorResolution::Accepted { .. } => (Opening, Opened),
-            OperatorResolution::NotAccepted => (Opening, Closed),
-            OperatorResolution::MacReseed { .. } => {
-                return Err(OperatorCompletionError::MacReseedOnShiftFamily)
-            }
-        },
-        DocType::ShiftClose | DocType::ZReport => match resolution {
-            OperatorResolution::Accepted { .. } => (Closing, Closed),
-            OperatorResolution::NotAccepted => (Closing, Opened),
-            OperatorResolution::MacReseed { .. } => {
-                return Err(OperatorCompletionError::MacReseedOnShiftFamily)
-            }
-        },
-        // Not a shift-family document — no shift projection.
+    let edge = match (doc_type, online, resolution) {
+        // ── online shift-family (gap 4a) ──
+        (ShiftOpen, true, R::Accepted { .. }) => (Opening, Opened),
+        (ShiftOpen, true, R::NotAccepted) => (Opening, Closed),
+        (ShiftClose | ZReport, true, R::Accepted { .. }) => (Closing, Closed),
+        (ShiftClose | ZReport, true, R::NotAccepted) => (Closing, Opened),
+        // ── offline shift-family NOT-accepted rollback (gap 4b) ──
+        (ShiftOpen, false, R::NotAcceptedOffline) => (OpenedLocalPendingDrain, Closed),
+        (ShiftClose | ZReport, false, R::NotAcceptedOffline) => {
+            (ClosingLocalPendingDrain, OpenedLocalPendingDrain)
+        }
+        // offline shift-family Accepted: NO operator shift edge (drain finalize owns edge 5/13).
+        (ShiftOpen | ShiftClose | ZReport, false, R::Accepted { .. }) => return Ok(None),
+        // MacReseed on any shift-family document has no §3.4 cell.
+        (ShiftOpen | ShiftClose | ZReport, _, R::MacReseed { .. }) => {
+            return Err(OperatorCompletionError::MacReseedOnShiftFamily)
+        }
+        // Non-shift-family, or an origin-mismatched resolution — no shift edge; the core's origin
+        // cross-check fails the mismatch closed.
         _ => return Ok(None),
     };
     Ok(Some(edge))
@@ -175,6 +205,7 @@ fn resolution_tag(r: &OperatorResolution) -> &'static str {
     match r {
         OperatorResolution::Accepted { .. } => "Accepted",
         OperatorResolution::NotAccepted => "NotAccepted",
+        OperatorResolution::NotAcceptedOffline => "NotAcceptedOffline",
         OperatorResolution::MacReseed { .. } => "MacReseed",
     }
 }

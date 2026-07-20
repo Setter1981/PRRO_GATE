@@ -937,9 +937,15 @@ pub async fn resume_crashed_reservation(
 pub enum OperatorResolution {
     /// DPS accepted the document; the operator supplies the observed non-empty fiscal number.
     Accepted { fiscal_number: String },
-    /// DPS did not accept it; the document goes to its manual/terminal state.
+    /// DPS did not accept it; the document goes to its manual/terminal state. ONLINE origin only
+    /// (the offline analogue is [`NotAcceptedOffline`], which additionally cleans the OLA cohort).
     NotAccepted,
-    /// `MacReseedPending` (-12): the operator supplies the corrected chain seed.
+    /// CS-3 gap 4b — an OFFLINE-origin document DPS did not accept. Carries NO operator seed: the
+    /// chain is rewound to the document's own immutable `previous_hash` (the value it saw at
+    /// signing), and every LATER offline `OFFLINE_LOCAL_ACK` successor in the session is cancelled
+    /// atomically (any later ISSUED successor fails the completion closed — a fork guard).
+    NotAcceptedOffline,
+    /// `MacReseedPending` (-12): the operator supplies the corrected chain seed. ONLINE origin only.
     MacReseed { seed: [u8; 32] },
 }
 
@@ -968,6 +974,14 @@ pub struct CompletionResult {
     pub mode_target: ModeTarget,
     pub seed_advanced: bool,
     pub server_fiscal_no: Option<String>,
+    /// CS-3 gap 4b — the OLA cohort successors cancelled by an offline not-accepted completion
+    /// (`(document_id, lnd)`, in `lnd` order). Empty for every other resolution. The caller's
+    /// Critical audit itemises these (P4 — the cancellation set must be on the record).
+    pub cancelled_cohort: Vec<(DocumentId, i64)>,
+    /// CS-3 gap 4b — the predecessor seed the chain was rewound to by an offline not-accepted
+    /// completion: `None` = no rewind (any other resolution); `Some(None)` = rewound to GENESIS
+    /// (the document chained off genesis); `Some(Some(h))` = rewound to the 32-byte predecessor hash.
+    pub rewound_predecessor_seed: Option<Option<[u8; 32]>>,
 }
 
 /// Why [`complete_operator_pending`] refused (nothing is mutated on any of these).
@@ -991,20 +1005,32 @@ pub enum CompletionError {
     MissingSeedHash,
     #[error("the document could not move Sending -> RMR: {0:?}")]
     DocTransitionFailed(crate::db::repositories::fiscal_documents::TransitionOutcome),
-    /// Slice-5b boundary: a SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT document needs the shift-family
-    /// rollback matrix (design §3.4). Refused fail-closed here, never half-applied.
-    /// Gap-4b boundary: an OFFLINE-origin shift-family document (SHIFT_OPEN / SHIFT_CLOSE /
-    /// Z_REPORT) needs the OLPD/CLPD rollback + OLA cohort cleanup + predecessor-seed repair.
-    /// Online shift-family IS supported (gap 4a). Refused fail-closed, never half-applied.
+    /// CS-3 gap 4b — the resolution variant's origin claim contradicts the DB-derived origin
+    /// (`NotAccepted` on an offline doc, or `NotAcceptedOffline` on an online doc). The DB row is
+    /// the sole origin authority; a mismatch is fail-closed (else an offline seed rewind could
+    /// clobber a live online chain).
+    #[error("resolution origin does not match the document's origin")]
+    OriginMismatch,
+    /// CS-3 gap 4b — a `MacReseed` resolution on an OFFLINE-origin document. §3.4 has no offline
+    /// MacReseed cell; refused rather than blindly advancing the offline seed (a fork hazard).
+    #[error("MacReseed is not defined for an offline-origin document")]
+    MacReseedNotOfflineDefined,
+    /// CS-3 gap 4b — a later offline successor in the session is already ISSUED (advanced the local
+    /// MAC seed at OFFLINE_LOCAL_ACK: SENT / KVT1 / KVT2 / ERROR_RETRYABLE / REJECTED / RMR / ACK).
+    /// Rewinding this predecessor would fork the chain — fail-closed, nothing mutated.
     #[error(
-        "offline shift-family operator completion (SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT) is gap 4b"
+        "later offline successor is already issued (doc {0}, lnd {1}, state {2}) — fork guard"
     )]
-    ShiftFamilyNotSupported,
-    /// Gap-4b boundary: an offline-origin not-accepted needs the mandatory OLA-successor cohort
-    /// cleanup + predecessor-seed repair (design §3.4). Refused fail-closed (a fork hazard
-    /// otherwise), never half-applied.
-    #[error("offline not-accepted needs OLA-successor cohort cleanup (gap 4b)")]
-    OfflineCohortCleanupRequired,
+    LaterSuccessorIssued(String, i64, String),
+    /// CS-3 gap 4b — a later offline successor is mid-wire on the online ladder (`SENDING`).
+    /// Fail-closed, nothing mutated.
+    #[error("later offline successor is in-flight (doc {0}) — fork guard")]
+    LaterSuccessorInFlight(String),
+    /// CS-3 gap 4b — a later offline successor rests in a pre-OLA staging state
+    /// (`PREPARED` / `SIGNED` / `ENCRYPTED`) that cannot legitimately exist for a committed offline
+    /// cohort. Structural breach — fail-closed, nothing mutated.
+    #[error("later offline successor in invalid staging state (doc {0}, state {1})")]
+    LaterSuccessorInvalidState(String, String),
     /// The `STOP_MODE -> target` mode CAS matched no row: the node left STOP_MODE concurrently
     /// (a BLOCKED `-11` node, or a racing reset). The operator resolution is stale — the whole tx
     /// rolls back rather than APPLYING under an unexpected mode.
@@ -1080,31 +1106,46 @@ pub async fn complete_operator_pending(
         .try_into()
         .map_err(|_| CompletionError::Db(sqlx::Error::Decode("document_id != 16 bytes".into())))?;
     let doc_id = DocumentId::from_bytes(doc_id_arr);
-    let doc: Option<(String, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT doc_type, offline_fiscal_no, unsigned_xml_sha256 FROM fiscal_documents \
-         WHERE document_id = ?",
+    #[allow(clippy::type_complexity)]
+    let doc: Option<(
+        Option<i64>,     // offline_fiscal_no
+        Option<Vec<u8>>, // unsigned_xml_sha256
+        Option<Vec<u8>>, // offline_session_id
+        i64,             // lnd
+        Option<Vec<u8>>, // previous_hash
+    )> = sqlx::query_as(
+        "SELECT offline_fiscal_no, unsigned_xml_sha256, offline_session_id, lnd, previous_hash \
+         FROM fiscal_documents WHERE document_id = ?",
     )
     .bind(DbDocumentId(doc_id))
     .fetch_optional(&mut **tx)
     .await
     .map_err(CompletionError::Db)?;
-    let (doc_type, offline_fiscal_no, unsigned_sha) =
+    let (offline_fiscal_no, unsigned_sha, offline_session_id, doc_lnd, doc_previous_hash) =
         doc.ok_or(CompletionError::DocumentMissing)?;
     let online = offline_fiscal_no.is_none();
-    let shift_family = matches!(doc_type.as_str(), "SHIFT_OPEN" | "SHIFT_CLOSE" | "Z_REPORT");
-    // CS-3 gap 4a: an ONLINE shift-family completion is now supported here — this core handles
-    // the document / SFN / seed uniformly (accepted issues `Sending -> Sent`, not-accepted moves
-    // `Sending -> RMR`), and the operator-completion SERVICE applies the shift-state projection
-    // (`Opening -> Opened` / `Opening -> Closed`, etc.) via `apply_shift_transition` in the same
-    // tx (the sole `node_state.shift_state` writer — a repository must not invert into it). An
-    // OFFLINE-origin shift-family document still needs the OLA cohort cleanup + predecessor-seed
-    // repair, which is Slice-5b / gap 4b — refused fail-closed here, never half-applied.
-    if !online && shift_family {
-        return Err(CompletionError::ShiftFamilyNotSupported);
+
+    // CS-3 gap 4b — origin cross-check: the DB row is the SOLE origin authority (the resolution
+    // variant supplies payload/intent only). A variant whose origin contradicts the row is
+    // fail-closed BEFORE any mutation — an offline seed rewind on an online doc (or vice versa)
+    // would fork a live chain. Online shift-family is handled uniformly here (the shift-state
+    // projection is the operator-completion service's `apply_shift_transition`); offline
+    // shift-family is likewise doc/cohort/seed here + the OLPD/CLPD rollback in the service.
+    match &resolution {
+        OperatorResolution::NotAccepted if !online => return Err(CompletionError::OriginMismatch),
+        OperatorResolution::NotAcceptedOffline if online => {
+            return Err(CompletionError::OriginMismatch)
+        }
+        OperatorResolution::MacReseed { .. } if !online => {
+            return Err(CompletionError::MacReseedNotOfflineDefined)
+        }
+        _ => {}
     }
 
     let mut seed_advanced = false;
     let mut stamped_sfn: Option<String> = None;
+    let mut cancelled_cohort: Vec<(DocumentId, i64)> = Vec::new();
+    let mut rewound_predecessor_seed: Option<Option<[u8; 32]>> = None;
     match &resolution {
         OperatorResolution::Accepted { fiscal_number: f } => {
             if f.is_empty() {
@@ -1135,9 +1176,39 @@ pub async fn complete_operator_pending(
             stamped_sfn = Some(f.clone());
         }
         OperatorResolution::NotAccepted => {
-            if !online {
-                return Err(CompletionError::OfflineCohortCleanupRequired);
+            // Online-origin not-accepted (the cross-check ensured `online`): manual/terminal,
+            // seed unchanged.
+            doc_to_rmr(tx, doc_id).await?;
+        }
+        OperatorResolution::NotAcceptedOffline => {
+            // CS-3 gap 4b (the cross-check ensured `!online`): atomically cancel the later OLA
+            // cohort (fork guard — any later ISSUED successor fails closed) + rewind the chain to
+            // THIS document's own immutable `previous_hash`, then move the doc manual/terminal.
+            let session = offline_session_id.as_deref().ok_or_else(|| {
+                CompletionError::Db(sqlx::Error::Decode(
+                    "offline not-accepted document has no offline_session_id".into(),
+                ))
+            })?;
+            let cancelled = offline_cohort_cleanup(tx, &fiscal_number, session, doc_lnd).await?;
+            let prev: Option<[u8; 32]> = match &doc_previous_hash {
+                Some(v) => Some(v.as_slice().try_into().map_err(|_| {
+                    CompletionError::Db(sqlx::Error::Decode("previous_hash != 32 bytes".into()))
+                })?),
+                None => None,
+            };
+            // Rewind (Some -> predecessor, None -> genesis NULL). `false` = missing FN -> breach.
+            let ok = crate::db::repositories::node_state::set_last_known_xml_sha_nullable_tx(
+                tx,
+                &fiscal_number,
+                prev.as_ref(),
+            )
+            .await
+            .map_err(CompletionError::Db)?;
+            if !ok {
+                return Err(CompletionError::NodeStateMissing);
             }
+            cancelled_cohort = cancelled;
+            rewound_predecessor_seed = Some(prev);
             doc_to_rmr(tx, doc_id).await?;
         }
         OperatorResolution::MacReseed { seed } => {
@@ -1206,7 +1277,98 @@ pub async fn complete_operator_pending(
         mode_target,
         seed_advanced,
         server_fiscal_no: stamped_sfn,
+        cancelled_cohort,
+        rewound_predecessor_seed,
     })
+}
+
+/// CS-3 gap 4b — atomically clean the OFFLINE OLA cohort of successors LATER than `this_lnd` in
+/// the same offline session, on the caller's `WriteTxConn` (design §3.4, fork-safety rev2 §2.2).
+///
+/// **Fork fence.** The later-successor read is TX-BOUND — the same `BEGIN IMMEDIATE` snapshot the
+/// RESERVED write-lock already froze against concurrent drain writers (NEVER the pool-bound
+/// `list_pending_for_session`). ALL rows are classified BEFORE any mutation: only a later
+/// `OFFLINE_LOCAL_ACK` successor is cancellable (via the sole `(OfflineLocalAck, Cancelled)` edge);
+/// a `CANCELLED` / `ABORTED` successor is dead and ignored; a `SENDING` successor is in-flight; a
+/// pre-OLA `PREPARED` / `SIGNED` / `ENCRYPTED` successor is a structural breach; anything else is
+/// ISSUED (advanced the local MAC seed at OLA — `OFFLINE_ISSUED_STATES`) and rewinding this
+/// predecessor would fork the chain. Each of those fails the completion closed, mutating nothing
+/// (a late `Err` still rolls the whole tx back). Each cancel CAS is asserted `Applied` (the in-tx
+/// TOCTOU re-check). Returns the cancelled `(document_id, lnd)` list for the caller's P4 audit.
+async fn offline_cohort_cleanup(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+    offline_session_id: &[u8],
+    this_lnd: i64,
+) -> Result<Vec<(DocumentId, i64)>, CompletionError> {
+    use crate::db::repositories::fiscal_documents::{transition_state, TransitionOutcome};
+    // C2 — tx-bound later-successor read (same snapshot as the RESERVED lock).
+    let rows: Vec<(Vec<u8>, String, i64)> = sqlx::query_as(
+        "SELECT document_id, state, lnd FROM fiscal_documents \
+         WHERE fiscal_number = ? AND offline_session_id = ? AND lnd > ? ORDER BY lnd ASC",
+    )
+    .bind(fiscal_number)
+    .bind(offline_session_id)
+    .bind(this_lnd)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(CompletionError::Db)?;
+
+    // C3 — classify ALL rows first (fork fence); never mutate mid-scan.
+    let mut cancellable: Vec<(DocumentId, i64)> = Vec::new();
+    for (id_blob, state, lnd) in &rows {
+        let arr: [u8; 16] = id_blob.as_slice().try_into().map_err(|_| {
+            CompletionError::Db(sqlx::Error::Decode(
+                "successor document_id != 16 bytes".into(),
+            ))
+        })?;
+        let id = DocumentId::from_bytes(arr);
+        let id_hex = hex_lower_bytes(id_blob);
+        match state.as_str() {
+            "OFFLINE_LOCAL_ACK" => cancellable.push((id, *lnd)),
+            // Dead / non-issued — not a live fork, ignore.
+            "CANCELLED" | "ABORTED" => {}
+            // Mid-wire on the online ladder.
+            "SENDING" => return Err(CompletionError::LaterSuccessorInFlight(id_hex)),
+            // Pre-OLA staging cannot legitimately exist for a committed offline cohort.
+            "PREPARED" | "SIGNED" | "ENCRYPTED" => {
+                return Err(CompletionError::LaterSuccessorInvalidState(
+                    id_hex,
+                    state.clone(),
+                ))
+            }
+            // Everything else (SENT / KVT1 / KVT2 / ERROR_RETRYABLE / REJECTED / RMR / ACK / any
+            // unknown) is ISSUED or unrecognised → fork guard.
+            _ => {
+                return Err(CompletionError::LaterSuccessorIssued(
+                    id_hex,
+                    *lnd,
+                    state.clone(),
+                ))
+            }
+        }
+    }
+
+    // C4 — cancel every cancellable OLA successor; assert `Applied` (in-tx TOCTOU re-check).
+    for (id, _lnd) in &cancellable {
+        let outcome = transition_state(tx, *id, DocState::OfflineLocalAck, DocState::Cancelled)
+            .await
+            .map_err(CompletionError::Db)?;
+        if outcome != TransitionOutcome::Applied {
+            return Err(CompletionError::DocTransitionFailed(outcome));
+        }
+    }
+    Ok(cancellable)
+}
+
+/// Lowercase-hex a byte slice (for typed-error document ids). Local — avoids a repo→service
+/// dependency on `write_path::types::hex_encode_lower`.
+fn hex_lower_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Move a `Sending` document to `RequiresManualReconciliation` (the operator manual/terminal edge,
