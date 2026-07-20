@@ -26,6 +26,7 @@
 //!   constraint is the backstop.
 //! - `get_active_for_fn` is pool-bound (read-only fence lookup).
 
+use crate::db::models::enums::DocState;
 use crate::db::models::ids::DocumentId;
 use crate::db::tx::WriteTxConn;
 use crate::db::types::DbDocumentId;
@@ -703,4 +704,278 @@ pub async fn resume_crashed_reservation(
             .map_err(ApplyError::Db)?;
     }
     Ok(converted)
+}
+
+/// The typed operator resolution for a PENDING reservation (CS-3 Slice 5, design §3.4).
+/// Trusted administrative input, always durable in the audit log at the call site.
+#[derive(Clone, Debug)]
+pub enum OperatorResolution {
+    /// DPS accepted the document; the operator supplies the observed non-empty fiscal number.
+    Accepted { fiscal_number: String },
+    /// DPS did not accept it; the document goes to its manual/terminal state.
+    NotAccepted,
+    /// `MacReseedPending` (-12): the operator supplies the corrected chain seed.
+    MacReseed { seed: [u8; 32] },
+}
+
+/// The node mode selected after a successful operator completion (design §3.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeTarget {
+    /// No active offline session — the FN returns directly to ONLINE.
+    Online,
+    /// An active OPEN/DRAINING offline session must finish draining first.
+    GoingOnline,
+}
+
+impl ModeTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "ONLINE",
+            Self::GoingOnline => "GOING_ONLINE",
+        }
+    }
+}
+
+/// The result of a successful [`complete_operator_pending`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionResult {
+    pub applied: bool,
+    pub mode_target: ModeTarget,
+    pub seed_advanced: bool,
+    pub server_fiscal_no: Option<String>,
+}
+
+/// Why [`complete_operator_pending`] refused (nothing is mutated on any of these).
+#[derive(Debug, thiserror::Error)]
+pub enum CompletionError {
+    #[error("reservation not found")]
+    ReservationNotFound,
+    #[error("reservation is not OUTCOME_OBSERVED / PENDING_APPLY")]
+    NotPendingApply,
+    #[error("node_state row missing")]
+    NodeStateMissing,
+    #[error("document row missing")]
+    DocumentMissing,
+    /// The full authority predicate failed: the stored generation no longer equals the node's,
+    /// or the active pointer no longer names this reservation — the operator resolution is stale.
+    #[error("stale authority (generation / active-pointer CAS miss)")]
+    StaleAuthority,
+    #[error("Accepted requires a non-empty fiscal number")]
+    EmptyFiscalNumber,
+    #[error("online Accepted has no unsigned_xml_sha256 to advance the seed")]
+    MissingSeedHash,
+    #[error("the document could not move Sending -> RMR: {0:?}")]
+    DocTransitionFailed(crate::db::repositories::fiscal_documents::TransitionOutcome),
+    /// Slice-5b boundary: a SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT document needs the shift-family
+    /// rollback matrix (design §3.4). Refused fail-closed here, never half-applied.
+    #[error("shift-family operator completion (SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT) is Slice 5b")]
+    ShiftFamilyNotSupported,
+    /// Slice-5b boundary: an offline-origin not-accepted needs the mandatory OLA-successor cohort
+    /// cleanup + predecessor-seed repair (design §3.4). Refused fail-closed (a fork hazard
+    /// otherwise), never half-applied.
+    #[error("offline not-accepted needs OLA-successor cohort cleanup (Slice 5b)")]
+    OfflineCohortCleanupRequired,
+    #[error(transparent)]
+    Db(sqlx::Error),
+}
+
+/// Operator completion of a PENDING reservation held under STOP_MODE (CS-3 Slice 5, design §3.4).
+///
+/// The single release surface for a `SubmittedUnknown` / crashed reservation. Runs in the caller's
+/// `BEGIN IMMEDIATE` **after** the caller has performed the pre-transaction `status_rro` probe
+/// (outside the tx — invariant #1); the caller passes the derived [`OperatorResolution`]. Steps:
+///
+/// 1. re-read the reservation (must be `OUTCOME_OBSERVED` + `PENDING_APPLY`);
+/// 2. the full authority CAS — stored `authorized_generation` == node generation AND
+///    `active_delivery_reservation_id` == this reservation ([`CompletionError::StaleAuthority`]
+///    otherwise, whole tx rolls back);
+/// 3. the origin-split effect per resolution:
+///    - `Accepted{F}` — stamp F; **online** advances the seed from the document's immutable
+///      `unsigned_xml_sha256`, **offline** performs zero seed writes (chain already advanced);
+///    - `NotAccepted` (online) — document `Sending -> RequiresManualReconciliation`, seed unchanged;
+///    - `MacReseed{seed}` — install the operator seed, move the document to its manual state;
+/// 4. mark `APPLIED` and clear the active pointer (the sole pointer-clearing branch, §3.4);
+/// 5. select the mode target — `GOING_ONLINE` iff an active OPEN/DRAINING offline session exists,
+///    else `ONLINE` — and CAS the node out of STOP_MODE.
+///
+/// **Fail-closed boundaries (Slice 5b):** a shift-family document → [`ShiftFamilyNotSupported`];
+/// an **offline** `NotAccepted` → [`OfflineCohortCleanupRequired`] (never half-applied — cancelling
+/// an OLA cohort or refusing is mandatory to avoid a fork). The `-11` BLOCKED branch + the
+/// admin-command probe wiring / `open_shift` agreement are also Slice 5b.
+///
+/// **INACTIVE (CS-3 Slice 5):** invoked by the extended `reset_stop_mode` admin path only after the
+/// whole-fence cutover (Slice 7); exercised by operator-completion tests today.
+pub async fn complete_operator_pending(
+    tx: &mut WriteTxConn<'_>,
+    reservation_id: ReservationId,
+    resolution: OperatorResolution,
+) -> Result<CompletionResult, CompletionError> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, Option<String>, Option<i64>, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT state, apply_state, authorized_generation, fiscal_number, document_id \
+         FROM delivery_reservation WHERE reservation_id = ?",
+    )
+    .bind(&reservation_id[..])
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(CompletionError::Db)?;
+    let (state, apply_state, authed_gen, fiscal_number, doc_id_blob) =
+        row.ok_or(CompletionError::ReservationNotFound)?;
+    if state != "OUTCOME_OBSERVED" || apply_state.as_deref() != Some("PENDING_APPLY") {
+        return Err(CompletionError::NotPendingApply);
+    }
+
+    // Full authority CAS (design §3.4): generation + active pointer must still name this row.
+    let ns: Option<(i64, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT delivery_generation, active_delivery_reservation_id FROM node_state \
+         WHERE fiscal_number = ?",
+    )
+    .bind(&fiscal_number)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(CompletionError::Db)?;
+    let (cur_gen, active_ptr) = ns.ok_or(CompletionError::NodeStateMissing)?;
+    if authed_gen != Some(cur_gen) || active_ptr.as_deref() != Some(&reservation_id[..]) {
+        return Err(CompletionError::StaleAuthority);
+    }
+
+    // Immutable document origin + family.
+    let doc_id_arr: [u8; 16] = doc_id_blob
+        .as_slice()
+        .try_into()
+        .map_err(|_| CompletionError::Db(sqlx::Error::Decode("document_id != 16 bytes".into())))?;
+    let doc_id = DocumentId::from_bytes(doc_id_arr);
+    let doc: Option<(String, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT doc_type, offline_fiscal_no, unsigned_xml_sha256 FROM fiscal_documents \
+         WHERE document_id = ?",
+    )
+    .bind(DbDocumentId(doc_id))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(CompletionError::Db)?;
+    let (doc_type, offline_fiscal_no, unsigned_sha) =
+        doc.ok_or(CompletionError::DocumentMissing)?;
+    if matches!(doc_type.as_str(), "SHIFT_OPEN" | "SHIFT_CLOSE" | "Z_REPORT") {
+        return Err(CompletionError::ShiftFamilyNotSupported);
+    }
+    let online = offline_fiscal_no.is_none();
+
+    let mut seed_advanced = false;
+    let mut stamped_sfn: Option<String> = None;
+    match &resolution {
+        OperatorResolution::Accepted { fiscal_number: f } => {
+            if f.is_empty() {
+                return Err(CompletionError::EmptyFiscalNumber);
+            }
+            fd_set_server_fiscal_no(tx, doc_id, f)
+                .await
+                .map_err(completion_from_apply)?;
+            if online {
+                let sha = unsigned_sha.ok_or(CompletionError::MissingSeedHash)?;
+                let arr: [u8; 32] = sha.as_slice().try_into().map_err(|_| {
+                    CompletionError::Db(sqlx::Error::Decode(
+                        "unsigned_xml_sha256 != 32 bytes".into(),
+                    ))
+                })?;
+                node_advance_seed(tx, &fiscal_number, &arr)
+                    .await
+                    .map_err(completion_from_apply)?;
+                seed_advanced = true;
+            }
+            stamped_sfn = Some(f.clone());
+        }
+        OperatorResolution::NotAccepted => {
+            if !online {
+                return Err(CompletionError::OfflineCohortCleanupRequired);
+            }
+            doc_to_rmr(tx, doc_id).await?;
+        }
+        OperatorResolution::MacReseed { seed } => {
+            node_advance_seed(tx, &fiscal_number, seed)
+                .await
+                .map_err(completion_from_apply)?;
+            seed_advanced = true;
+            doc_to_rmr(tx, doc_id).await?;
+        }
+    }
+
+    // Mark APPLIED + clear the active pointer (the sole pointer-clearing branch).
+    let applied_rows = sqlx::query(
+        "UPDATE delivery_reservation SET apply_state = 'APPLIED' \
+         WHERE reservation_id = ? AND apply_state = 'PENDING_APPLY'",
+    )
+    .bind(&reservation_id[..])
+    .execute(&mut **tx)
+    .await
+    .map_err(CompletionError::Db)?
+    .rows_affected();
+    if applied_rows != 1 {
+        return Err(CompletionError::NotPendingApply);
+    }
+    sqlx::query(
+        "UPDATE node_state SET active_delivery_reservation_id = NULL WHERE fiscal_number = ?",
+    )
+    .bind(&fiscal_number)
+    .execute(&mut **tx)
+    .await
+    .map_err(CompletionError::Db)?;
+
+    // Verified mode target: GOING_ONLINE iff an active drain must finish, else ONLINE.
+    let active_session: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM offline_sessions \
+         WHERE fiscal_number = ? AND state IN ('OPENING','OPEN','DRAINING') LIMIT 1",
+    )
+    .bind(&fiscal_number)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(CompletionError::Db)?;
+    let mode_target = if active_session.is_some() {
+        ModeTarget::GoingOnline
+    } else {
+        ModeTarget::Online
+    };
+    sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ? AND mode = 'STOP_MODE'")
+        .bind(mode_target.as_str())
+        .bind(&fiscal_number)
+        .execute(&mut **tx)
+        .await
+        .map_err(CompletionError::Db)?;
+
+    Ok(CompletionResult {
+        applied: true,
+        mode_target,
+        seed_advanced,
+        server_fiscal_no: stamped_sfn,
+    })
+}
+
+/// Move a `Sending` document to `RequiresManualReconciliation` (the operator manual/terminal edge,
+/// design §3.4). Any non-`Applied` outcome (wrong from-state / missing) surfaces as an error so the
+/// whole completion rolls back.
+async fn doc_to_rmr(tx: &mut WriteTxConn<'_>, doc_id: DocumentId) -> Result<(), CompletionError> {
+    use crate::db::repositories::fiscal_documents::{transition_state, TransitionOutcome};
+    let outcome = transition_state(
+        tx,
+        doc_id,
+        DocState::Sending,
+        DocState::RequiresManualReconciliation,
+    )
+    .await
+    .map_err(CompletionError::Db)?;
+    match outcome {
+        TransitionOutcome::Applied => Ok(()),
+        other => Err(CompletionError::DocTransitionFailed(other)),
+    }
+}
+
+/// Map an [`ApplyError`] from a shared adapter (`fd_set_server_fiscal_no` / `node_advance_seed`)
+/// into the corresponding [`CompletionError`].
+fn completion_from_apply(e: ApplyError) -> CompletionError {
+    match e {
+        ApplyError::DocumentMissing => CompletionError::DocumentMissing,
+        ApplyError::NodeStateMissing => CompletionError::NodeStateMissing,
+        ApplyError::Db(db) => CompletionError::Db(db),
+        // The adapters only ever produce the three above.
+        other => CompletionError::Db(sqlx::Error::Decode(format!("unexpected: {other}").into())),
+    }
 }

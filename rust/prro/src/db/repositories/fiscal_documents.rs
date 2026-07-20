@@ -204,6 +204,12 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             // hop through ErrorRetryable, because the situation is not retryable
             // (DPS state and local state diverged at the protocol layer).
             | (Sent, RequiresManualReconciliation)
+            // CS-3 Slice 5 (design §3.4): the one missing live document edge for operator
+            // completion of a crashed / SubmittedUnknown send — a `Sending` document with a
+            // matching CALL_STARTED / PENDING reservation whose operator resolution is
+            // not-accepted (or MAC) is moved to the existing manual/terminal state.  Callable
+            // only from the operator-completion branch (`complete_operator_pending`); NOT a resend.
+            | (Sending, RequiresManualReconciliation)
             | (Kvt1, Kvt2)
             | (Kvt1, ErrorRetryable)
             | (Kvt2, Ack)
