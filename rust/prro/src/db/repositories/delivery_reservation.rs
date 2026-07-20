@@ -246,3 +246,144 @@ pub async fn get_active_for_fn(
         updated_at: r.updated_at,
     }))
 }
+
+/// The authorization minted by [`authorize_submission`] — the SOLE permit for a wire call
+/// (CS-3 Slice 3, design §2 lifetime authorization + sole-caller wire gate).
+///
+/// Carries the reservation identity + the `authorized_generation` snapshot taken at the
+/// `RESERVED_NOT_STARTED → CALL_STARTED` transition.  A caller with no `Authorization` performs
+/// ZERO wire I/O; the token is minted only after the authorization transaction commits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Authorization {
+    pub reservation_id: ReservationId,
+    pub document_id: DocumentId,
+    pub attempt_no: i64,
+    /// The `node_state.delivery_generation` snapshot consumed by this authorization (`>= 1`).
+    pub authorized_generation: i64,
+}
+
+/// Why [`authorize_submission`] refused (no wire I/O happens on any of these).
+#[derive(Debug, thiserror::Error)]
+pub enum AuthorizeError {
+    /// P2 lifetime call-once: this document EVER crossed `CALL_STARTED` before.  Refused by the
+    /// explicit NOT-EXISTS guard (design §2) — the `ux_delivery_document_ever_started` index +
+    /// `delivery_reservation_no_replace` historical clause are the fail-closed backstop.
+    #[error("call-once: document already crossed CALL_STARTED")]
+    CallOnceAlreadyStarted,
+    /// The fresh RESERVED_NOT_STARTED insert was refused — the §3.1 FN fence already holds an
+    /// active reservation, or a reservation-id / (document_id, attempt_no) collision.
+    #[error("fence/collision on reserve: {0}")]
+    FenceOrCollision(#[source] sqlx::Error),
+    /// No `node_state` row exists for the fiscal number (the FN is not configured).
+    #[error("node_state row missing for the fiscal number")]
+    NodeStateMissing,
+    /// The generation / pointer UPDATE did not affect exactly one row.
+    #[error("node_state generation/pointer update did not affect exactly one row")]
+    GenerationUpdateFailed,
+    /// The RN → CALL_STARTED transition did not affect exactly one row.
+    #[error("RN → CALL_STARTED transition did not affect exactly one row")]
+    TransitionFailed,
+    /// A lower-level SQLite error.
+    #[error(transparent)]
+    Db(sqlx::Error),
+}
+
+/// Authorize a wire submission for a document (CS-3 Slice 3, design §2).
+///
+/// In the caller's SINGLE `BEGIN IMMEDIATE`:
+///   1. **call-once** (design §2): refuse if the document EVER crossed `CALL_STARTED`
+///      (explicit `NOT EXISTS` on a non-NULL `call_started_at`);
+///   2. **fence + reserve**: insert a fresh `RESERVED_NOT_STARTED` row — the `no_replace`
+///      trigger enforces the §3.1 FN fence + the historical-document-started guard, so a
+///      second active reservation for the FN or a re-reserve of a started document aborts;
+///   3. **generation**: snapshot `node_state.delivery_generation`, advance it by one (the
+///      monotone `034` trigger permits the increase), and point
+///      `active_delivery_reservation_id` at the new reservation;
+///   4. **marker**: transition `RESERVED_NOT_STARTED → CALL_STARTED`, committing
+///      `call_started_at` + `authorized_generation` together (the `034` cs-pairing trigger
+///      requires both).
+///
+/// Returns an [`Authorization`] on success.  Any refusal (call-once / fence / missing node /
+/// non-single-row update) returns an [`AuthorizeError`]; the caller propagates it so the
+/// whole transaction rolls back and NO wire I/O is performed (sole-caller wire gate).
+///
+/// **INACTIVE (CS-3 Slice 3):** no production caller is wired yet; the live send path
+/// (`stage_send::run`) is gated on this only at the whole-fence cutover (Slice 7).  Exercised
+/// by authorization tests today.
+pub async fn authorize_submission(
+    tx: &mut WriteTxConn<'_>,
+    row: NewReservation,
+    call_started_at: &str,
+) -> Result<Authorization, AuthorizeError> {
+    let reservation_id = row.reservation_id;
+    let document_id = row.document_id;
+    let fiscal_number = row.fiscal_number.clone();
+
+    // 1. Explicit call-once guard (design §2) — belt with the DDL index + no_replace clause.
+    let already_started: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM delivery_reservation \
+         WHERE document_id = ? AND call_started_at IS NOT NULL)",
+    )
+    .bind(DbDocumentId(document_id))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(AuthorizeError::Db)?;
+    if already_started == 1 {
+        return Err(AuthorizeError::CallOnceAlreadyStarted);
+    }
+
+    // 2. Reserve (RESERVED_NOT_STARTED). The no_replace trigger is the fail-closed backstop
+    //    for the FN fence + historical-document-started guard.
+    let attempt_no = insert(tx, row)
+        .await
+        .map_err(AuthorizeError::FenceOrCollision)?;
+
+    // 3. Snapshot + advance the node fence generation, and point at the new reservation.
+    let current_gen: i64 =
+        sqlx::query_scalar("SELECT delivery_generation FROM node_state WHERE fiscal_number = ?")
+            .bind(&fiscal_number)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(AuthorizeError::Db)?
+            .ok_or(AuthorizeError::NodeStateMissing)?;
+    let authorized_generation = current_gen + 1;
+
+    let gen_rows = sqlx::query(
+        "UPDATE node_state SET delivery_generation = ?, active_delivery_reservation_id = ? \
+         WHERE fiscal_number = ?",
+    )
+    .bind(authorized_generation)
+    .bind(&reservation_id[..])
+    .bind(&fiscal_number)
+    .execute(&mut **tx)
+    .await
+    .map_err(AuthorizeError::Db)?
+    .rows_affected();
+    if gen_rows != 1 {
+        return Err(AuthorizeError::GenerationUpdateFailed);
+    }
+
+    // 4. RN → CALL_STARTED with the durable marker + generation snapshot (pair required by 034).
+    let cs_rows = sqlx::query(
+        "UPDATE delivery_reservation \
+         SET state = 'CALL_STARTED', call_started_at = ?, authorized_generation = ? \
+         WHERE reservation_id = ? AND state = 'RESERVED_NOT_STARTED'",
+    )
+    .bind(call_started_at)
+    .bind(authorized_generation)
+    .bind(&reservation_id[..])
+    .execute(&mut **tx)
+    .await
+    .map_err(AuthorizeError::Db)?
+    .rows_affected();
+    if cs_rows != 1 {
+        return Err(AuthorizeError::TransitionFailed);
+    }
+
+    Ok(Authorization {
+        reservation_id,
+        document_id,
+        attempt_no,
+        authorized_generation,
+    })
+}
