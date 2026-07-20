@@ -16,11 +16,13 @@
 //!   back to CALL_STARTED (proves the fail-closed matrix bites THROUGH record_outcome);
 //! - `rc07` authority CAS: a boot-resumed (now OO) reservation refuses a late record of the same
 //!   in-flight call (`AuthorityMismatch`) — the boot conversion wins, no double-record.
+//! - `rc08` AttemptObservation lifecycle: the post-wire observation minted from a token with a
+//!   full non-None 5-binding carries every component + the evidence through to a matching CAS.
 
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::delivery_reservation::{
-    authorize_submission, record_outcome, resume_crashed_reservation, Authorization,
-    NewReservation, RecordError,
+    authorize_submission, record_outcome, resume_crashed_reservation, AttemptObservation,
+    Authorization, NewReservation, RecordError,
 };
 use prro::db::tx::with_immediate;
 use prro_domain::delivery::evidence::EvidenceDiscriminant;
@@ -105,16 +107,17 @@ async fn authorize(pool: &SqlitePool, res_byte: u8, doc: DocumentId, fscl: &str)
     .expect("authorize")
 }
 
-/// Record an observed outcome. Consumes the (non-Clone) token — a record spends the authority.
+/// Record an observed outcome. Consumes the (non-Clone) post-wire `AttemptObservation` — a
+/// record spends the observation (which itself consumed the sealed authority token).
 async fn record(
     pool: &SqlitePool,
-    authority: Authorization,
+    obs: AttemptObservation,
     outcome: ObservedOutcomeV1,
     evidence: EvidenceDiscriminant,
 ) -> Result<(), anyhow::Error> {
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            record_outcome(tx, &authority, &outcome, &evidence)
+            record_outcome(tx, &obs, &outcome, &evidence)
                 .await
                 .map_err(anyhow::Error::from)
         })
@@ -212,7 +215,8 @@ async fn rc01_accepted_records_oo_pending_correlation_and_no_halt() {
         NonEmptyFiscalNumber::from_transport("4000123456".into()).unwrap(),
     )));
     let (disc, outcome) = build(&ev, Some("4000123456"), 1);
-    record(&pool, auth, outcome, disc)
+    let obs = AttemptObservation::from_authorization(auth, ev);
+    record(&pool, obs, outcome, disc)
         .await
         .expect("Accepted records");
 
@@ -239,7 +243,8 @@ async fn rc02_terminal_reject_records_and_does_not_halt() {
 
     let ev = from_code(-1); // Verify → TerminalReject / NoNodeEffect
     let (disc, outcome) = build(&ev, None, 1);
-    record(&pool, auth, outcome, disc)
+    let obs = AttemptObservation::from_authorization(auth, ev);
+    record(&pool, obs, outcome, disc)
         .await
         .expect("terminal reject records");
 
@@ -266,7 +271,8 @@ async fn rc03_submitted_unknown_halts_stop_mode() {
 
     let ev = started(SendResponse::no_response(NoResponseCause::Timeout));
     let (disc, outcome) = build(&ev, None, 1);
-    record(&pool, auth, outcome, disc)
+    let obs = AttemptObservation::from_authorization(auth, ev);
+    record(&pool, obs, outcome, disc)
         .await
         .expect("NoResponse records");
 
@@ -291,7 +297,8 @@ async fn rc04_offline168_blocks_node() {
 
     let ev = from_code(-11); // Offline168 → NodeBlocked
     let (disc, outcome) = build(&ev, None, 1);
-    record(&pool, auth, outcome, disc)
+    let obs = AttemptObservation::from_authorization(auth, ev);
+    record(&pool, obs, outcome, disc)
         .await
         .expect("-11 records");
 
@@ -313,7 +320,8 @@ async fn rc05_bad_hash_prev_held_stop_mode() {
 
     let ev = from_code(-12); // BadHashPrev → MacReseedPending (held)
     let (disc, outcome) = build(&ev, None, 1);
-    record(&pool, auth, outcome, disc)
+    let obs = AttemptObservation::from_authorization(auth, ev);
+    record(&pool, obs, outcome, disc)
         .await
         .expect("-12 records");
 
@@ -340,7 +348,8 @@ async fn rc06_accepted_without_correlation_trips_matrix_and_rolls_back() {
         NonEmptyFiscalNumber::from_transport("4000123456".into()).unwrap(),
     )));
     let (disc, outcome) = build(&ev, None, 1); // <-- NO correlation
-    let err = record(&pool, auth, outcome, disc)
+    let obs = AttemptObservation::from_authorization(auth, ev);
+    let err = record(&pool, obs, outcome, disc)
         .await
         .expect_err("the 036 matrix refuses Accepted without correlation");
     assert!(
@@ -382,7 +391,8 @@ async fn rc07_boot_resumed_reservation_refuses_late_record() {
     // longer CALL_STARTED, so the full-authority CAS matches zero rows.
     let ev = from_code(-1);
     let (disc, outcome) = build(&ev, None, 1);
-    let err = record(&pool, auth, outcome, disc)
+    let obs = AttemptObservation::from_authorization(auth, ev);
+    let err = record(&pool, obs, outcome, disc)
         .await
         .expect_err("a boot-resumed reservation refuses a late record");
     assert!(
@@ -397,4 +407,58 @@ async fn rc07_boot_resumed_reservation_refuses_late_record() {
     assert_eq!(kind.as_deref(), Some("NoResponse"));
     assert_eq!(text.as_deref(), Some("CrashedBeforeObservation"));
     assert_eq!(read_mode(&pool, fscl).await, "STOP_MODE");
+}
+
+// ── rc08 — AttemptObservation carries the FULL 5-binding token→obs→record CAS ──────
+
+#[tokio::test]
+async fn rc08_attempt_observation_carries_full_binding_and_evidence() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "7000000008";
+    let doc = seed_doc(&pool, fscl, 0x11).await;
+
+    // Authorize with the two EXTRA binding pins set (cap / endpoint = non-None). The
+    // AttemptObservation minted from that token must carry ALL FIVE binding components, so the
+    // record full-authority CAS (which includes `capability_profile_version IS ? AND
+    // endpoint_config_revision IS ?`) still matches. If `from_authorization` dropped a component,
+    // the obs would carry NULL, the CAS would miss the row (which holds 7 / 3), and record → miss.
+    let row = NewReservation {
+        capability_profile_version: Some(7),
+        endpoint_config_revision: Some(3),
+        ..new_res(0x08, doc, fscl)
+    };
+    let auth = with_immediate(&pool, move |tx| {
+        Box::pin(async move {
+            authorize_submission(tx, row, TS)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .expect("authorize with full binding");
+    assert_eq!(auth.capability_profile_version(), Some(7));
+    assert_eq!(auth.endpoint_config_revision(), Some(3));
+
+    let ev = from_code(-1); // Verify → TerminalReject
+    let (disc, outcome) = build(&ev, None, 1);
+    let obs = AttemptObservation::from_authorization(auth, ev.clone());
+    // The observation carries the token's full binding + the observed evidence verbatim.
+    assert_eq!(
+        obs.capability_profile_version(),
+        Some(7),
+        "obs carries cap binding"
+    );
+    assert_eq!(
+        obs.endpoint_config_revision(),
+        Some(3),
+        "obs carries endpoint binding"
+    );
+    assert_eq!(obs.evidence(), &ev, "obs carries the observed evidence");
+
+    record(&pool, obs, outcome, disc)
+        .await
+        .expect("a full-binding observation matches the record CAS");
+    let (state, apply, ..) = read_row(&pool, 0x08).await;
+    assert_eq!(state, "OUTCOME_OBSERVED");
+    assert_eq!(apply.as_deref(), Some("PENDING_APPLY"));
 }

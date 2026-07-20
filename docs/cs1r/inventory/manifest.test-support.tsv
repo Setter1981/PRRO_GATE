@@ -1903,6 +1903,7 @@ test-support	prro	prro::record_outcome	rc04_offline168_blocks_node	false
 test-support	prro	prro::record_outcome	rc05_bad_hash_prev_held_stop_mode	false
 test-support	prro	prro::record_outcome	rc06_accepted_without_correlation_trips_matrix_and_rolls_back	false
 test-support	prro	prro::record_outcome	rc07_boot_resumed_reservation_refuses_late_record	false
+test-support	prro	prro::record_outcome	rc08_attempt_observation_carries_full_binding_and_evidence	false
 test-support	prro	prro::repo_audit_log	append_outlives_entity_no_fk_check	false
 test-support	prro	prro::repo_audit_log	append_returns_monotonic_audit_id_and_list_returns_desc	false
 test-support	prro	prro::repo_audit_log	list_for_entity_isolates_by_entity_type_and_id	false

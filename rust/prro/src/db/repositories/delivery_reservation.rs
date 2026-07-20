@@ -31,7 +31,9 @@ use crate::db::models::ids::DocumentId;
 use crate::db::tx::WriteTxConn;
 use crate::db::types::DbDocumentId;
 use prro_domain::delivery::evidence::EvidenceDiscriminant;
-use prro_domain::delivery::{NodeEffect, ObservedOutcomeV1, SubmissionCertainty};
+use prro_domain::delivery::{
+    NodeEffect, ObservedOutcomeV1, SubmissionCertainty, SubmissionEvidence,
+};
 
 /// Fresh 16-byte reservation identity.  Minimal by design (CS-2 is
 /// INACTIVE): a bare `[u8; 16]` rather than a domain newtype, mirroring
@@ -352,6 +354,97 @@ impl Authorization {
     }
 }
 
+/// The post-wire observation produced by the sole wire function
+/// (`services::write_path::submit_authorized`, S7-1) — spec #4B `AttemptObservation`
+/// (design §2 Layer 3, §4 step 1).
+///
+/// It is minted **only** by consuming an [`Authorization`] by value (its authority tuple is
+/// therefore always genuine — copied from a sealed token that `authorize_submission` alone can
+/// mint) and attaching the observed [`SubmissionEvidence`].  It carries **no wire capability**:
+/// there is no method that reaches the DPS channel, so an `AttemptObservation` cannot authorize a
+/// (second) wire.  It is the single value the record/apply path consumes AFTER the one wire call —
+/// `record_outcome` reads its full authority tuple for the CAS; the caller's `classify` step reads
+/// [`evidence`](Self::evidence) to derive the `ObservedOutcomeV1` + `EvidenceDiscriminant`.
+///
+/// **Not `Clone`.**  A wire produces exactly one post-wire value; duplicating it is meaningless
+/// and disallowed (mirrors the sealed [`Authorization`] discipline).
+#[derive(Debug)]
+pub struct AttemptObservation {
+    reservation_id: ReservationId,
+    document_id: DocumentId,
+    attempt_no: i64,
+    authorized_generation: i64,
+    envelope_hash: [u8; 32],
+    dps_protocol_id: String,
+    protocol_contract_version: i64,
+    capability_profile_version: Option<i64>,
+    endpoint_config_revision: Option<i64>,
+    evidence: SubmissionEvidence,
+}
+
+impl AttemptObservation {
+    /// Mint an `AttemptObservation` by **consuming** the [`Authorization`] that permitted the
+    /// wire and attaching the observed evidence.  Consuming the token by value is what guarantees
+    /// (a) the authority tuple is genuine and (b) the same token can never authorize a second wire
+    /// (design §2 Layer 3).  This is the ONLY constructor.
+    pub fn from_authorization(auth: Authorization, evidence: SubmissionEvidence) -> Self {
+        Self {
+            reservation_id: auth.reservation_id,
+            document_id: auth.document_id,
+            attempt_no: auth.attempt_no,
+            authorized_generation: auth.authorized_generation,
+            envelope_hash: auth.envelope_hash,
+            dps_protocol_id: auth.dps_protocol_id,
+            protocol_contract_version: auth.protocol_contract_version,
+            capability_profile_version: auth.capability_profile_version,
+            endpoint_config_revision: auth.endpoint_config_revision,
+            evidence,
+        }
+    }
+
+    /// The authorized reservation identity.
+    pub fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+    /// The authorized document.
+    pub fn document_id(&self) -> DocumentId {
+        self.document_id
+    }
+    /// The reservation attempt number.
+    pub fn attempt_no(&self) -> i64 {
+        self.attempt_no
+    }
+    /// The consumed generation snapshot (`>= 1`).
+    pub fn authorized_generation(&self) -> i64 {
+        self.authorized_generation
+    }
+    /// The immutable envelope hash the wire call carried.
+    pub fn envelope_hash(&self) -> &[u8; 32] {
+        &self.envelope_hash
+    }
+    /// The immutable bound protocol id.
+    pub fn dps_protocol_id(&self) -> &str {
+        &self.dps_protocol_id
+    }
+    /// The immutable protocol contract version.
+    pub fn protocol_contract_version(&self) -> i64 {
+        self.protocol_contract_version
+    }
+    /// The immutable capability profile version (`NULL` unless pinned).
+    pub fn capability_profile_version(&self) -> Option<i64> {
+        self.capability_profile_version
+    }
+    /// The immutable endpoint config revision (`NULL` unless pinned).
+    pub fn endpoint_config_revision(&self) -> Option<i64> {
+        self.endpoint_config_revision
+    }
+    /// The observed wire evidence — the caller's `classify` step derives the durable
+    /// `ObservedOutcomeV1` + `EvidenceDiscriminant` from this before calling `record_outcome`.
+    pub fn evidence(&self) -> &SubmissionEvidence {
+        &self.evidence
+    }
+}
+
 /// Why [`authorize_submission`] refused (no wire I/O happens on any of these).
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorizeError {
@@ -518,7 +611,7 @@ pub enum RecordError {
 /// AFTER the sole wire call has returned and been classified, it:
 ///   1. serializes the sealed [`ObservedOutcomeV1`] axes + [`EvidenceDiscriminant`] columns
 ///      onto the reservation row and transitions it to `OUTCOME_OBSERVED + PENDING_APPLY`;
-///   2. matches on the FULL authority tuple carried by the [`Authorization`] token
+///   2. matches on the FULL authority tuple carried by the post-wire [`AttemptObservation`]
 ///      (reservation id, document id, authorized generation, protocol binding, envelope hash)
 ///      AND `state = 'CALL_STARTED'` — `rows_affected != 1` is [`RecordError::AuthorityMismatch`]
 ///      (a hard error, never a legacy fallback: plan §2.3 step 7; a second record of an already
@@ -540,14 +633,14 @@ pub enum RecordError {
 /// `tests/record_outcome.rs` today.
 pub async fn record_outcome(
     tx: &mut WriteTxConn<'_>,
-    authority: &Authorization,
+    obs: &AttemptObservation,
     outcome: &ObservedOutcomeV1,
     evidence: &EvidenceDiscriminant,
 ) -> Result<(), RecordError> {
     let cols = evidence.to_columns();
     let certainty = outcome.certainty();
     let node_effect = outcome.node_effect();
-    let reservation_id = authority.reservation_id();
+    let reservation_id = obs.reservation_id();
 
     // Record-then-apply commit under the full authority CAS + the CALL_STARTED predicate.
     let updated = sqlx::query(
@@ -576,13 +669,13 @@ pub async fn record_outcome(
     .bind(cols.code)
     .bind(cols.digest.map(|d| d.to_vec()))
     .bind(&reservation_id[..])
-    .bind(DbDocumentId(authority.document_id()))
-    .bind(authority.authorized_generation())
-    .bind(authority.dps_protocol_id())
-    .bind(authority.protocol_contract_version())
-    .bind(&authority.envelope_hash()[..])
-    .bind(authority.capability_profile_version())
-    .bind(authority.endpoint_config_revision())
+    .bind(DbDocumentId(obs.document_id()))
+    .bind(obs.authorized_generation())
+    .bind(obs.dps_protocol_id())
+    .bind(obs.protocol_contract_version())
+    .bind(&obs.envelope_hash()[..])
+    .bind(obs.capability_profile_version())
+    .bind(obs.endpoint_config_revision())
     .execute(&mut **tx)
     .await
     .map_err(RecordError::Db)?
