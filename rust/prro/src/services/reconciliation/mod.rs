@@ -27,6 +27,7 @@ pub mod guard;
 pub mod inbox_reaper;
 pub mod last_chk_probe;
 pub mod online_convergence;
+pub mod operator_completion;
 pub mod runtime;
 pub mod sent_not_found;
 

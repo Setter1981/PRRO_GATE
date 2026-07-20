@@ -1611,10 +1611,34 @@ async fn p03_no_production_caller_static_pin() {
         if is_repo_file || is_mod_decl {
             continue;
         }
+        // CS-3 gap 4a: the operator-completion orchestrator is the ONE sanctioned production
+        // caller — but ONLY of `complete_operator_pending` (+ its result/error/resolution types).
+        // The still-INACTIVE S7-1 functions must remain uncalled anywhere in src (wired only at
+        // the whole-fence cutover). So the orchestrator file is allowed EXCEPT for any reference
+        // to those functions.
+        let is_orchestrator = path.ends_with("services/reconciliation/operator_completion.rs");
+        let inactive_s7_fns = [
+            "record_outcome",
+            "apply_outcome",
+            "authorize_submission",
+            "resume_crashed_reservation",
+            "list_call_started_without_outcome",
+            "get_active_for_fn",
+            "delivery_reservation::insert",
+        ];
+        if is_orchestrator {
+            // Allowed EXCEPT a reference to any still-INACTIVE S7-1 function.
+            if inactive_s7_fns.iter().any(|f| line.contains(f)) {
+                offenders.push(line.to_string());
+            }
+            continue;
+        }
+        // Any OTHER src file referencing `delivery_reservation` at all is a forbidden caller.
         offenders.push(line.to_string());
     }
     assert!(
         offenders.is_empty(),
-        "delivery_reservation must have NO production caller in src/; found: {offenders:#?}"
+        "delivery_reservation must have NO production caller in src/ (except the operator-completion \
+         orchestrator calling complete_operator_pending); found: {offenders:#?}"
     );
 }
