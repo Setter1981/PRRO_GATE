@@ -29,9 +29,12 @@ use std::time::Duration;
 use prro::config::AppConfig;
 use prro::db::models::enums::FiscalMode;
 use prro::db::models::enums::{NodeMode, ShiftState};
+use prro::db::models::ids::DocumentId;
+use prro::db::repositories::delivery_reservation::{self, NewReservation};
 use prro::db::repositories::fiscal_number_config as fn_repo;
 use prro::db::repositories::fiscal_number_config::NewFnConfig;
 use prro::db::repositories::node_state;
+use prro::db::tx::with_immediate;
 use prro::services::offline_sync::offline_code_replenish::OfflineCodeReplenishService;
 use prro::transports::dps::dto::OfflineCodesResponse;
 use prro::transports::dps::error::DpsError;
@@ -116,6 +119,103 @@ fn new_scripted() -> Arc<ScriptedDps> {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     ))
+}
+
+/// Seed a CALL_STARTED delivery reservation (a `SENDING` doc + an active reservation)
+/// for FN, so the S7-2 fence must fire.
+async fn seed_active_reservation(pool: &sqlx::SqlitePool) {
+    let doc = [0x33u8; 16];
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical) \
+         VALUES (?, ?, ?, 5, 'SELL', 'SENDING', 'b1', 't1', 'ONLINE', \
+            '2026-07-17T12:34:56Z', '{}', ?)",
+    )
+    .bind(&doc[..])
+    .bind(&[0xCCu8; 16][..])
+    .bind(FN)
+    .bind(&[0u8; 32][..])
+    .execute(pool)
+    .await
+    .expect("seed SENDING doc");
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            delivery_reservation::insert(
+                tx,
+                NewReservation {
+                    reservation_id: [0x44; 16],
+                    document_id: DocumentId::from_bytes(doc),
+                    fiscal_number: FN.to_string(),
+                    dps_protocol_id: "FSCO_ZZD".to_string(),
+                    protocol_contract_version: 1,
+                    capability_profile_version: None,
+                    endpoint_config_revision: None,
+                    envelope_hash: [0xAB; 32],
+                },
+            )
+            .await
+            .map_err(Into::into)
+        })
+    })
+    .await
+    .expect("insert reservation");
+    sqlx::query(
+        "UPDATE delivery_reservation SET state='CALL_STARTED', \
+         call_started_at='2026-07-17T00:00:00Z', authorized_generation=1 \
+         WHERE reservation_id=?",
+    )
+    .bind(&[0x44u8; 16][..])
+    .execute(pool)
+    .await
+    .expect("mark CALL_STARTED");
+}
+
+// ─── S7-2 fence BITE — behavioural (replaces the string-only static pin here) ──
+//
+// With an active delivery reservation, `replenish` must REFUSE and leave the chain
+// seed UNCHANGED. This proves the fence fires BEFORE the seed advance: if the guard
+// were moved AFTER `update_last_known_xml_sha_tx`, the seed would advance to
+// sha256(request_xml) and the seed assertion would RED.
+#[tokio::test]
+async fn replenish_refused_while_reservation_active_seed_unchanged() {
+    let (_dir, app) = boot_app().await;
+    let prior_seed = [0x11u8; 32];
+    seed_fn(&app, Some(prior_seed)).await;
+    seed_active_reservation(app.db()).await;
+
+    let stub = new_scripted();
+    stub.push_ask_codes(Ok(codes_resp(&["code-X"])));
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+
+    let res = svc.replenish(FN, TN, 1, 1).await;
+    assert!(
+        res.is_err(),
+        "replenish MUST be refused while a delivery reservation is active (S7-2 fence)"
+    );
+
+    let seed: Vec<u8> = sqlx::query_scalar(
+        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        seed,
+        prior_seed.to_vec(),
+        "chain seed must NOT advance when the fence refuses (guard is BEFORE the mutation)"
+    );
+
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ? AND dps_code IS NOT NULL",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "no codes persisted when the fence refuses");
 }
 
 // ─── (a) persists codes + assigns ordinals ────────────────────────────────────

@@ -487,6 +487,7 @@ live-dps	prro	prro	services::cert_refresher::stale_read_tests::key_roll_atomic_d
 live-dps	prro	prro	services::offline_sync::backlog_drain::eligible_arm_tests::c6_eligible_arm_commits_mode_session_audits_and_finalizes_summary	false
 live-dps	prro	prro	services::offline_sync::backlog_drain::eligible_arm_tests::c6_finalize_closes_closing_local_pending_drain_ladder_to_closed	false
 live-dps	prro	prro	services::offline_sync::backlog_drain::eligible_arm_tests::c6_finalize_closes_opened_local_pending_drain_ladder_to_opened	false
+live-dps	prro	prro	services::offline_sync::backlog_drain::eligible_arm_tests::end_mint_refused_while_reservation_active_no_doc_no_lnd	false
 live-dps	prro	prro	services::offline_sync::backlog_drain::w12_control_surface_tests::build_finalize_payload_includes_all_three_w12_counters	false
 live-dps	prro	prro	services::offline_sync::backlog_drain::w12_control_surface_tests::eligible_only_when_all_w12_counters_zero_and_acked_complete	false
 live-dps	prro	prro	services::offline_sync::backlog_drain::w12_control_surface_tests::er_redrive_queued_blocks_finalize_with_docs_er_redrive_queued	false
@@ -1769,6 +1770,7 @@ live-dps	prro	prro::offline_code_replenish	replenish_advances_chain_seed_to_requ
 live-dps	prro	prro::offline_code_replenish	replenish_dps_call_outside_tx	false
 live-dps	prro	prro::offline_code_replenish	replenish_is_idempotent_on_code_overlap	false
 live-dps	prro	prro::offline_code_replenish	replenish_persists_opaque_codes_and_assigns_ordinals	false
+live-dps	prro	prro::offline_code_replenish	replenish_refused_while_reservation_active_seed_unchanged	false
 live-dps	prro	prro::offline_code_replenish	replenish_reject_path_no_persist_no_seed_advance	false
 live-dps	prro	prro::offline_code_replenish	replenish_transport_error_no_retry	false
 live-dps	prro	prro::offline_codes_dps_code	dps_code_batch_with_partial_dedupe	false
@@ -2398,6 +2400,8 @@ live-dps	prro	prro::write_path_inline	sell_dps_reject_does_not_escalate_shift	fa
 live-dps	prro	prro::write_path_inline	sign_crypto_failure_is_sign_failure_and_terminalises_inbox	false
 live-dps	prro	prro::write_path_inline	z_report_dps_reject_escalates_shift_to_manual_recon	false
 live-dps	prro	prro::write_path_stage1_acquire	e_acquire_premint_refused_when_non_issued_sibling_rests	false
+live-dps	prro	prro::write_path_stage1_acquire	s7_2_offline_origin_passes_online_write_gate_covered_by_stage_sign_fence	false
+live-dps	prro	prro::write_path_stage1_acquire	s7_2_online_write_gate_covers_reservation_sending_sibling	false
 live-dps	prro	prro::write_path_stage1_acquire	stage1_command_inbox_doc_type_mismatch_rejects_no_doc_no_lnd	false
 live-dps	prro	prro::write_path_stage1_acquire	stage1_command_inbox_hash_mismatch_rejects_no_doc_no_lnd	false
 live-dps	prro	prro::write_path_stage1_acquire	stage1_concurrent_writers_lnd_monotonic	false

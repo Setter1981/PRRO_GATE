@@ -2653,7 +2653,7 @@ async fn ensure_and_drain_session_end(
     // mid-flow), STEP A is skipped and we re-drive it from its current row via
     // the shared send/confirm tail below (its doc_id is re-read by request_id).
     let request_id_typed = if existing.is_none() {
-        mint_session_end_prepared(pool, deps, fiscal_number, shift_id).await?
+        mint_session_end_prepared(pool, fiscal_number, shift_id).await?
     } else {
         // Re-derive the deterministic synthetic request_id to re-fetch the row.
         session_end_request_id(fiscal_number)
@@ -2704,7 +2704,6 @@ fn session_end_request_id(fiscal_number: &str) -> crate::db::models::ids::Reques
 /// which rejects under GoingOnline).  Returns the synthetic `RequestId`.
 async fn mint_session_end_prepared(
     pool: &SqlitePool,
-    _deps: &RuntimeView<'_>,
     fiscal_number: &str,
     shift_id: ShiftId,
 ) -> Result<crate::db::models::ids::RequestId, BootError> {
@@ -3726,6 +3725,94 @@ mod eligible_arm_tests {
         .await
         .unwrap();
         shift_id
+    }
+
+    /// Seed a CALL_STARTED delivery reservation (a `SENDING` doc + an active
+    /// reservation) for FN so the S7-2 fence must fire.
+    async fn seed_active_reservation(pool: &sqlx::SqlitePool) {
+        use crate::db::models::ids::DocumentId;
+        use crate::db::repositories::delivery_reservation::NewReservation;
+        let doc = [0x33u8; 16];
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                payload_json, payload_sha256_canonical) \
+             VALUES (?, ?, ?, 5, 'SELL', 'SENDING', 'b1', 't1', 'ONLINE', \
+                '2026-07-17T12:34:56Z', '{}', ?)",
+        )
+        .bind(&doc[..])
+        .bind(&[0xCCu8; 16][..])
+        .bind(FN)
+        .bind(&[0u8; 32][..])
+        .execute(pool)
+        .await
+        .unwrap();
+        with_immediate(pool, move |tx| {
+            Box::pin(async move {
+                delivery_reservation::insert(
+                    tx,
+                    NewReservation {
+                        reservation_id: [0x44; 16],
+                        document_id: DocumentId::from_bytes(doc),
+                        fiscal_number: FN.to_string(),
+                        dps_protocol_id: "FSCO_ZZD".to_string(),
+                        protocol_contract_version: 1,
+                        capability_profile_version: None,
+                        endpoint_config_revision: None,
+                        envelope_hash: [0xAB; 32],
+                    },
+                )
+                .await
+                .map_err(Into::into)
+            })
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE delivery_reservation SET state='CALL_STARTED', \
+             call_started_at='2026-07-17T00:00:00Z', authorized_generation=1 \
+             WHERE reservation_id=?",
+        )
+        .bind(&[0x44u8; 16][..])
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// S7-2 fence BITE — the direct END mint. With an active delivery reservation,
+    /// `mint_session_end_prepared` MUST refuse: NO END doc, LND unchanged. Proves the
+    /// fence fires BEFORE `allocate_next_lnd` + `insert_prepared_tx` (revert the guard
+    /// → the END is minted, LND advances, and both assertions RED).
+    #[tokio::test]
+    async fn end_mint_refused_while_reservation_active_no_doc_no_lnd() {
+        let (_dir, pool) = fresh_pool().await;
+        seed_node_state_going_online(&pool).await; // next_lnd = 100
+        let shift_id = seed_shift_in_state(&pool, "CLOSING_LOCAL_PENDING_DRAIN").await;
+        seed_active_reservation(&pool).await;
+
+        let res = mint_session_end_prepared(&pool, FN, shift_id).await;
+        assert!(
+            res.is_err(),
+            "END mint MUST be refused while a delivery reservation is active (S7-2 fence)"
+        );
+
+        let end_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = ?",
+        )
+        .bind(FN)
+        .bind(crate::db::models::enums::DocType::OfflineSessionEnd.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(end_count, 0, "no END doc minted when the fence refuses");
+
+        let lnd: i64 =
+            sqlx::query_scalar("SELECT next_lnd FROM node_state WHERE fiscal_number = ?")
+                .bind(FN)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lnd, 100, "LND must not advance when the fence refuses");
     }
 
     async fn read_shift_state(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> String {

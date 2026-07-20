@@ -287,6 +287,29 @@ via a companion global query `list_outcome_observed_pending_apply`) **must treat
 as an EXPECTED hold** (log Warning + continue) — a `-12`/`-6` PENDING hold is valid and must not abort boot
 (propagating it as a `BootError` violates frozen invariant #9). Only after both passes may the per-FN loop run.
 
+### 7.2 NC-03 (lost `node_state`) interleave — why the boot fence is EXCLUDED, not merely harmless
+
+The §7.1 apply pass can hit `NodeStateMissing` for an FN whose `node_state` row was lost while the
+`fiscal_documents` ledger + `delivery_reservation` rows survived (the NC-03 condition). A naive global pass would
+propagate `NodeStateMissing` and abort boot **before** the NC-03 reconstruction ever runs, so an NC-03 FN that
+also carries an active reservation would be **unreachable** despite the S7-2 exclusion. The pass therefore
+**defers-then-retries**, and the NC-03 seed repair (`boot_phase.rs:1814`) is DELIBERATELY left **unfenced**
+because a live PENDING reservation is EXPECTED during it:
+
+1. **normalize** every `CALL_STARTED` reservation (`resume_crashed_reservation → NoResponse{Crashed}` + PENDING +
+   STOP), deferring any whose `node_state` is missing;
+2. **apply** every `OUTCOME_OBSERVED + PENDING_APPLY` via the shared orchestration; on `NodeStateMissing` **DEFER**
+   that FN (record it, do NOT fail boot); on `HeldNotAutoRelease` log + continue (§7.1);
+3. run **NC-03 reconstruction** for the deferred FNs — rebuild `node_state` (LND + seed from the surviving
+   ledger) and set **BLOCKED** (`boot_phase.rs:1814`). This step MUST run with a live PENDING reservation present,
+   which is exactly why it carries **no** `fn_fence_active_tx`;
+4. **retry** the deferred normalize/apply (now `node_state` exists);
+5. only then run the ordinary per-FN dispatch loop.
+
+The boot fence exclusion is thus **load-bearing, not harmless**: fencing `boot_phase.rs:1814` would refuse step 3
+whenever a reservation is PENDING, stranding the deferred apply with no `node_state` — an unrecoverable boot. The
+S7-2 `fence_wired_into_writers_static_pin` records this exclusion + rationale.
+
 | Crash window | Reservation state at boot | Boot action | Re-wire? |
 |---|---|---|---|
 | before 4-pre commit | none (rolled back) | fresh doc; a later authorize is clean | no |
