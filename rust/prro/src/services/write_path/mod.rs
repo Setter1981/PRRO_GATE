@@ -27,5 +27,7 @@ pub mod stage_finalize;
 pub mod stage_offline_ack;
 pub mod stage_send;
 pub mod stage_sign;
+/// CS-3 S7-1 — the sole wire function: `Authorization` → one `send_chk_observed` → `AttemptObservation`.
+pub mod submit;
 pub mod tax_summary;
 pub mod types;
