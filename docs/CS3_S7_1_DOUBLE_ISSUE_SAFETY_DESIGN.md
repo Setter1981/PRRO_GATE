@@ -1,6 +1,6 @@
 # CS-3 Slice-7 (S7-1) — Live-Cutover Double-Issue-Safety Design-of-Record
 
-**Status:** rev2 design-of-record after external adversarial review. **NOT an implementation authorization.**
+**Status:** rev2 + round-2 resolution — design **FROZEN** (build checklist §11). **NOT an implementation authorization; the live cutover still needs its own explicit GO.**
 **Baseline:** worktree `cs3-de-slice2`, branch `cs3-de-slice7-s0` @ `53c5b13` (S7-0 5/5 landed, CI #335 green).
 **Predecessor process:** mirrors `CS3_GAP4B_FORK_SAFETY_DESIGN.md` (design-gate → external round → GO → implement).
 **Gate provenance:** adversarial design-gate `wf_8b8c2be9-095` followed by an independent external review.
@@ -275,6 +275,18 @@ than an assumed property of the landed helpers:
 constructs a fresh `NewReservation`. Merely landing the helper is insufficient: S7-1 owns the production boot
 wiring and its ordering.
 
+### 7.1 Boot-pass insertion point (round-2 #4)
+
+The reservation pass is **global** (`list_call_started_without_outcome`, `delivery_reservation.rs:878`, has no FN
+filter) and must be wired **once, pre-loop, in `reconcile_pending_inner` (`app.rs`), BEFORE the `for fn_cfg in
+&fns` loop** — NOT inside per-FN `run_boot_reconciliation`. Inserting it per-FN is unsafe: the early returns in
+`run_boot_reconciliation` (branch-f STOP_MODE/Blocked/CryptoDegraded `boot_phase.rs:1901-1942`, manual-recon
+`:1953`, `OfflineModeRefusal` `:1882`, which under the ctx-free boot path returns an error before later FNs run)
+would skip a later FN's `CALL_STARTED` rows for the whole boot. Step 2 (apply every `OUTCOME_OBSERVED+PENDING_APPLY`,
+via a companion global query `list_outcome_observed_pending_apply`) **must treat `ApplyError::HeldNotAutoRelease`
+as an EXPECTED hold** (log Warning + continue) — a `-12`/`-6` PENDING hold is valid and must not abort boot
+(propagating it as a `BootError` violates frozen invariant #9). Only after both passes may the per-FN loop run.
+
 | Crash window | Reservation state at boot | Boot action | Re-wire? |
 |---|---|---|---|
 | before 4-pre commit | none (rolled back) | fresh doc; a later authorize is clean | no |
@@ -317,9 +329,13 @@ So R6 is **also** the crash-window guard.
 - **S7-P3-4 (pre-wire predecessor):** an online signed doc snapshots H0; a foreign writer commits H1 before
   authorize; authorize refuses before the counting channel. Removing the §2.1 equality check makes the wire
   count become one and REDs the test.
-- **S7-P4-BOOT:** seed one `CALL_STARTED` and one `OUTCOME_OBSERVED+PENDING_APPLY`, run the production boot
-  entrypoint, assert the reservation pass runs before ordinary dispatch, wire count stays zero, the first becomes
-  crash evidence/STOP and the second is applied once. Removing either boot pass or swapping the order REDs.
+- **S7-P4-BOOT (tightened, round-2 #5):** seed one `CALL_STARTED` reservation **+ its `Sending` doc** and one
+  `OUTCOME_OBSERVED+PENDING_APPLY`, run the production boot entrypoint, assert wire count stays zero, the first
+  becomes crash evidence/STOP and the second is applied once. The **order-swap** revert-canary must assert the
+  **intermediate reservation STATE** — after boot the `CALL_STARTED` row is `OUTCOME_OBSERVED+PENDING_APPLY` (the
+  reservation pass converted it) **and** its doc reached `ErrorRetryable`, NOT still `CALL_STARTED` — because in the
+  INACTIVE state wire-count is 0 either way, so wire-count alone cannot RED the order-swap. Also assert a
+  `HeldNotAutoRelease` (a `MacReseedPending` PENDING_APPLY row) in step 2 does **not** surface as a boot error.
 - **S7-APPLY-GRAPH:** all legal evidence rows traverse `record → persisted row → boot/shared apply`; assert the
   exact full 7D ApplyPlan graph, including `FnConfigError`, shift/closing-cash, trace, audit and fence.
 - **S7-FENCE (S7-2):** `fence_race_replenish` (active `CALL_STARTED` + `offline_code_replenish` seed install → MUST
@@ -367,5 +383,30 @@ explicit GO after the teeth are demonstrated.
   (boot `RetryableServer` vs kvt2 `RetryableTransport`). Confirm each keeps its own semantics when bundling the
   `sent_not_found_to_manual` escalation (helper is agnostic; implementer must preserve).
 - **R-Q4:** S7-1 is release-critical and requires its own explicit GO; no unilateral activation.
+
+---
+
+## 11. Round-2 resolution — FROZEN build checklist
+
+External model-decorrelated round-2 (Sonnet ×5 + Fable critic, `wf_4350aaff-63e`) verdict: **NOT-YET, but no
+double-issue and no chain-fork defect survives** — the P2 core (L1 call-once index `035:43`, sealed `Authorization`
+lifecycle, R6 Redrive retirement) is proven sound (corrections 1/5/7/8/10 HOLD). The critic's two claims
+(`NoResponse`=4th delta; stranded `CALL_STARTED`=BRICK) were **refuted, grounded**. Per the hard-cut rule
+(external NOT-YET = last design round; one targeted fix for a surviving BRICK → freeze; **no round-3**), the 5
+surviving defects are folded here as the frozen build checklist. **This design is FROZEN.** Further findings become
+backlog, not a new review round.
+
+| # | Sev | Defect (anchor) | Fix | Lands in |
+|---|---|---|---|---|
+| 1 | **BRICK** | `reset_stop_mode` (`admin.rs:300-396`) has no active-`PENDING_APPLY` guard. An operator calling it instead of `complete_operator_pending` on a held doc clears STOP → next boot (`GOING_ONLINE`, branch-f skipped) `resume_sending_to_error_retryable` (`boot_phase.rs:3804`)→ER→R6→RMR → then `complete_operator_pending`'s `doc_to_rmr` (`delivery_reservation.rs:1214`) expects `Sending`, finds `RMR` → `DocTransitionFailed` → operator resolution permanently bricked. Zero exposure pre-cutover. | In the `reset_stop_mode` `BEGIN IMMEDIATE` (before the mode CAS `admin.rs:341`): `SELECT COUNT(*) FROM delivery_reservation WHERE fiscal_number=? AND state='OUTCOME_OBSERVED' AND apply_state='PENDING_APPLY'`; if >0 → new `AdminError::PendingResolutionRequired` (direct to `complete_operator_pending`). Race-safe (in-tx, not pre-read). | **cutover** (= the operator-recovery activation, no longer deferrable) |
+| 2 | oper | `Authorization` (`delivery_reservation.rs:264-276`) carries 3 of 5 binding fields — missing `capability_profile_version`/`endpoint_config_revision` (present in `NewReservation:58-60`, table, `ReservationRow:129-130`); `record_outcome` CAS WHERE (`:509-511`) omits them too. Latent (both always None at 53c5b13, `grpc.rs:683-684`); `submit_authorized` cannot enforce AO-2 echo-check from the token alone. | Add the 2 `Option<i64>` private fields + accessors; capture at `:365-369`; add to `Authorization::Ok` ctor `:432-440`; extend CAS WHERE with `AND capability_profile_version IS ? AND endpoint_config_revision IS ?` (NULL-safe `IS`). Zero blast radius (INACTIVE struct, 0 callers). | **foundation** |
+| 3 | oper | `FnConfigError` (−13/−14) is a 4th delta: `routing_for_reject` (`prro-domain/.../mod.rs:1013`) → `(FnConfigError, NodeEffect::FnConfigError)`, discriminant `Rejected`; in `apply_outcome` online-Rejected arm (`delivery_reservation.rs:763-769`) `FnConfigError` hits the `_ => {}` catchall `:768` → falls to `doc_from_sending(…, Rejected)` `:772`. Post-cutover a −13/−14 permanently Rejects (R6 only escalates `ErrorRetryable`, never `Rejected`). No test covers it. | Add explicit `Some("FnConfigError") => doc_from_sending(tx, doc_id, DocState::ErrorRetryable)` before the catchall (edge `fiscal_documents.rs:255` legal); R6 then → RMR+STOP without a wire. Extend S7-APPLY-GRAPH tooth + add `ap10` test. | **foundation** |
+| 4 | oper | Boot-pass insertion point unspecified → per-FN insertion skips later FNs on early return. | Resolved in **§7.1**: global pre-loop in `reconcile_pending_inner` before the FN loop; `HeldNotAutoRelease` = expected hold. | **§7.1 (done)** |
+| 5 | oper | `S7-P4-BOOT` canary asserts wire-count, which is 0 either way in INACTIVE → order-swap can't RED. | Resolved in **§8**: assert intermediate reservation STATE (`OUTCOME_OBSERVED` + doc `ErrorRetryable`), not wire-count. | **§8 (done)** |
+
+**Slice order unchanged (§9):** S7-2 fence (additive) → S7-1 INACTIVE foundation (now incl. #2, #3) → atomic
+cutover (now incl. #1 guard) on explicit GO → S7-3 cleanup. #4/#5 are already folded above.
+
+---
 
 **Nothing in this document has been implemented.** Live send-path code is untouched.
