@@ -851,6 +851,8 @@ live-dps	prro	prro::apply_outcome	ap04_offline_reject_holds_and_mutates_nothing	
 live-dps	prro	prro::apply_outcome	ap05_submitted_unknown_holds	false
 live-dps	prro	prro::apply_outcome	ap06_replay_is_idempotent	false
 live-dps	prro	prro::apply_outcome	ap07_stale_generation_drops_without_mutation	false
+live-dps	prro	prro::apply_outcome	ap08_online_mac_reseed_pending_holds	false
+live-dps	prro	prro::apply_outcome	ap09_online_operator_escalation_holds	false
 live-dps	prro	prro::apply_outcome	br01_crashed_call_started_resumes_to_pending_stop	false
 live-dps	prro	prro::apply_outcome	br02_resume_is_idempotent	false
 live-dps	prro	prro::apply_outcome	br03_resumed_reservation_holds_the_fn_fence	false
@@ -1705,7 +1707,7 @@ live-dps	prro	prro::migration_036_evidence_union	ev02_evidence_triggers_exist	fa
 live-dps	prro	prro::migration_036_evidence_union	ev03_valid_accepted_ok_and_stored	false
 live-dps	prro	prro::migration_036_evidence_union	ev04_valid_rejected_verify_ok	false
 live-dps	prro	prro::migration_036_evidence_union	ev05_valid_noresponse_ok	false
-live-dps	prro	prro::migration_036_evidence_union	ev06_optional_absent_evidence_ok	false
+live-dps	prro	prro::migration_036_evidence_union	ev06_absent_evidence_rejected	false
 live-dps	prro	prro::migration_036_evidence_union	im01_evidence_frozen_after_oo	false
 live-dps	prro	prro::migration_036_evidence_union	mx01_all_thirteen_verdicts_map_exactly	false
 live-dps	prro	prro::migration_036_evidence_union	tg01_accepted_missing_fiscal_rejected	false
@@ -1876,6 +1878,13 @@ live-dps	prro	prro::re_sign_after_mac_recovery	re_sign_provider_receives_rebuilt
 live-dps	prro	prro::re_sign_after_mac_recovery	re_sign_z_number_overflow_returns_range_error	false
 live-dps	prro	prro::re_sign_after_mac_recovery	re_sign_z_report_propagates_z_number_into_canonical_xml	false
 live-dps	prro	prro::reconcile_guard_compile_fail	reconcile_guard_enforcement_compile_fail	false
+live-dps	prro	prro::record_outcome	rc01_accepted_records_oo_pending_correlation_and_no_halt	false
+live-dps	prro	prro::record_outcome	rc02_terminal_reject_records_and_does_not_halt	false
+live-dps	prro	prro::record_outcome	rc03_submitted_unknown_halts_stop_mode	false
+live-dps	prro	prro::record_outcome	rc04_offline168_blocks_node	false
+live-dps	prro	prro::record_outcome	rc05_bad_hash_prev_held_stop_mode	false
+live-dps	prro	prro::record_outcome	rc06_accepted_without_correlation_trips_matrix_and_rolls_back	false
+live-dps	prro	prro::record_outcome	rc07_boot_resumed_reservation_refuses_late_record	false
 live-dps	prro	prro::repo_audit_log	append_outlives_entity_no_fk_check	false
 live-dps	prro	prro::repo_audit_log	append_returns_monotonic_audit_id_and_list_returns_desc	false
 live-dps	prro	prro::repo_audit_log	list_for_entity_isolates_by_entity_type_and_id	false
