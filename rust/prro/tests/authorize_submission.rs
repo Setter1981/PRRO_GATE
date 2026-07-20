@@ -132,6 +132,38 @@ async fn count_reservations(pool: &SqlitePool) -> i64 {
 
 // ───────────────────────────── az01 — success ────────────────────────────────
 
+/// Round-2 #2: the sealed Authorization carries ALL FIVE binding components, incl.
+/// capability_profile_version + endpoint_config_revision, so `submit_authorized` can
+/// echo-check AO-2 from the token alone (not just protocol id/version). Revert-canary:
+/// drop the cpv/ecr capture in `authorize_submission` → the accessors return None → RED.
+#[tokio::test]
+async fn az07_authorization_carries_full_five_component_binding() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "1000000007";
+    let doc = seed_doc(&pool, fscl, 0x11, 1).await;
+    let row = NewReservation {
+        capability_profile_version: Some(7),
+        endpoint_config_revision: Some(9),
+        ..new_res(0x07, doc, fscl)
+    };
+    let auth = authorize(&pool, row)
+        .await
+        .expect("fresh document authorizes");
+    assert_eq!(auth.dps_protocol_id(), "FSCO_ZZD");
+    assert_eq!(auth.protocol_contract_version(), 1);
+    assert_eq!(
+        auth.capability_profile_version(),
+        Some(7),
+        "token must carry the capability profile version (4th binding component)"
+    );
+    assert_eq!(
+        auth.endpoint_config_revision(),
+        Some(9),
+        "token must carry the endpoint config revision (5th binding component)"
+    );
+    assert_eq!(auth.envelope_hash(), &[0xAB; 32]);
+}
+
 #[tokio::test]
 async fn az01_authorize_writes_marker_generation_and_pointer() {
     let (_d, pool) = fresh_pool().await;

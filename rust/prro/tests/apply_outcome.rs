@@ -283,6 +283,51 @@ async fn ap02_offline_accepted_stamps_sfn_but_no_seed() {
 
 // ───────────────────────────── ap03 — online reject (-11) ────────────────────
 
+/// Round-2 #3: an online `-13`/`-14` (FN / signer not registered → routing FnConfigError,
+/// node_effect FnConfigError) reject retains the incumbent `ErrorRetryable` doc target —
+/// NOT the blanket `Rejected` projection — so the R6 convergence policy routes it to
+/// RMR/STOP without a wire. The node is NOT blocked. Revert-canary: drop the FnConfigError
+/// arm in apply_outcome → the doc falls through to `Rejected` and this REDs.
+#[tokio::test]
+async fn ap10_online_fn_config_error_targets_error_retryable_not_rejected() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "2000000010";
+    let doc = seed_doc(&pool, fscl, 0x11, None).await;
+    authorize(&pool, new_res(0x01, doc, fscl)).await;
+    record(
+        &pool,
+        0x01,
+        "SUBMITTED",
+        "PARSED_DPS_ENVELOPE",
+        Some("FnConfigError"),
+        "FnConfigError",
+        "Rejected",
+        Some("NotRegisteredRro"),
+        Some(&DIG[..]),
+        None,
+    )
+    .await;
+
+    let r = apply(&pool, 0x01)
+        .await
+        .expect("online FnConfigError reject applies");
+    assert!(r.applied && !r.seed_advanced && r.server_fiscal_no.is_none());
+    assert_eq!(
+        read_doc_state(&pool, 0x11).await,
+        "ERROR_RETRYABLE",
+        "FnConfigError retains ErrorRetryable (not Rejected) so R6 can escalate it to RMR/STOP"
+    );
+    assert_ne!(
+        read_mode(&pool, fscl).await,
+        "BLOCKED",
+        "FnConfigError does not block the node"
+    );
+    assert_eq!(
+        read_apply_state(&pool, 0x01).await.as_deref(),
+        Some("APPLIED")
+    );
+}
+
 #[tokio::test]
 async fn ap03_online_reject_offline168_blocks_node_and_releases() {
     let (_d, pool) = fresh_pool().await;

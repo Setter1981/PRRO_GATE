@@ -305,6 +305,10 @@ pub struct Authorization {
     dps_protocol_id: String,
     /// The immutable protocol contract version.
     protocol_contract_version: i64,
+    /// The immutable capability profile version (`NULL` unless pinned; `>= 1`).
+    capability_profile_version: Option<i64>,
+    /// The immutable endpoint config revision (`NULL` unless pinned; `>= 1`).
+    endpoint_config_revision: Option<i64>,
 }
 
 impl Authorization {
@@ -335,6 +339,16 @@ impl Authorization {
     /// The immutable protocol contract version.
     pub fn protocol_contract_version(&self) -> i64 {
         self.protocol_contract_version
+    }
+    /// The immutable capability profile version (`NULL` unless pinned) — the 4th binding
+    /// component `submit_authorized` echo-checks against the port snapshot (AO-2).
+    pub fn capability_profile_version(&self) -> Option<i64> {
+        self.capability_profile_version
+    }
+    /// The immutable endpoint config revision (`NULL` unless pinned) — the 5th binding
+    /// component `submit_authorized` echo-checks against the port snapshot (AO-2).
+    pub fn endpoint_config_revision(&self) -> Option<i64> {
+        self.endpoint_config_revision
     }
 }
 
@@ -399,6 +413,8 @@ pub async fn authorize_submission(
     let envelope_hash = row.envelope_hash;
     let dps_protocol_id = row.dps_protocol_id.clone();
     let protocol_contract_version = row.protocol_contract_version;
+    let capability_profile_version = row.capability_profile_version;
+    let endpoint_config_revision = row.endpoint_config_revision;
 
     // 1. Explicit call-once guard (design §2) — belt with the DDL index + no_replace clause.
     let already_started: i64 = sqlx::query_scalar(
@@ -469,6 +485,8 @@ pub async fn authorize_submission(
         envelope_hash,
         dps_protocol_id,
         protocol_contract_version,
+        capability_profile_version,
+        endpoint_config_revision,
     })
 }
 
@@ -540,7 +558,9 @@ pub async fn record_outcome(
              evidence_kind = ?, evidence_text = ?, evidence_code = ?, evidence_digest = ? \
          WHERE reservation_id = ? AND document_id = ? AND authorized_generation = ? \
              AND dps_protocol_id = ? AND protocol_contract_version = ? \
-             AND envelope_hash = ? AND state = 'CALL_STARTED'",
+             AND envelope_hash = ? \
+             AND capability_profile_version IS ? AND endpoint_config_revision IS ? \
+             AND state = 'CALL_STARTED'",
     )
     .bind(certainty.as_str())
     .bind(outcome.provenance().as_str())
@@ -561,6 +581,8 @@ pub async fn record_outcome(
     .bind(authority.dps_protocol_id())
     .bind(authority.protocol_contract_version())
     .bind(&authority.envelope_hash()[..])
+    .bind(authority.capability_profile_version())
+    .bind(authority.endpoint_config_revision())
     .execute(&mut **tx)
     .await
     .map_err(RecordError::Db)?
@@ -796,12 +818,25 @@ pub async fn apply_outcome(
                 Some("MacReseedPending") | Some("OperatorEscalation") => {
                     return Err(ApplyError::HeldNotAutoRelease);
                 }
-                Some("NodeBlocked") => node_set_blocked(tx, &fiscal_number).await?,
-                _ => {}
+                Some("NodeBlocked") => {
+                    node_set_blocked(tx, &fiscal_number).await?;
+                    // A definitive pre-SENT reject leaves `Sending` for `Rejected` (D2:
+                    // seed NOT advanced, SFN NOT stamped — the row rests non-issued).
+                    doc_from_sending(tx, doc_id, DocState::Rejected).await?;
+                }
+                Some("FnConfigError") => {
+                    // Round-2 #3: `-13`/`-14` (FN / signer not registered) retains the
+                    // incumbent `ErrorRetryable` target — NOT the blanket `Rejected`
+                    // projection. The R6 convergence policy then routes it to RMR/STOP
+                    // WITHOUT a wire; a `Rejected` doc would never be escalated.
+                    doc_from_sending(tx, doc_id, DocState::ErrorRetryable).await?;
+                }
+                _ => {
+                    // A definitive pre-SENT reject leaves `Sending` for `Rejected` (D2:
+                    // seed NOT advanced, SFN NOT stamped — the row rests non-issued).
+                    doc_from_sending(tx, doc_id, DocState::Rejected).await?;
+                }
             }
-            // A definitive pre-SENT reject leaves `Sending` for `Rejected` (D2: seed NOT
-            // advanced, SFN NOT stamped — the row legitimately rests non-issued).
-            doc_from_sending(tx, doc_id, DocState::Rejected).await?;
         }
         Some("PreconditionFailed") | Some("SigningFailed") => {
             // Safe NotSubmitted preflight failure — no wire, no issuance. The document is NOT
