@@ -97,7 +97,11 @@ use syn::visit::Visit;
 /// substring overlap `from_transport_digest` ⊃ `from_transport` is harmless: all matching is on
 /// exact idents (`from_transport_digest != from_transport`), and the macro token-tree check is a
 /// deliberately conservative superset where double-flagging one line is still just a violation.
-const MINT_SYMBOLS: &[&str] = &["from_transport_digest", "from_transport", "from_durable_evidence"];
+const MINT_SYMBOLS: &[&str] = &[
+    "from_transport_digest",
+    "from_transport",
+    "from_durable_evidence",
+];
 
 /// The gated `(Type, ctor)` delivery authority pairs (two-segment `Type::ctor` tail match).
 const DELIVERY_CTORS: &[(&str, &str)] = &[
