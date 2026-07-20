@@ -15,3 +15,4 @@
 #   <repo-relative-path>	<approved-git-blob-sha>	<provenance-note>
 rust/prro/tests/invariant_fuzzer/model.rs	c19654a4f1115cd500cef6bf67372a48ef7d197f	fuzzer oracle fix 32166cc (offline SHIFT_OPEN resets model cash_on_hand)
 rust/prro/tests/repo_fiscal_documents_state_cas.rs	098b80cdcc82435074062ef525d62d8c54ddc006	CS-3 Slice 5 operator-completion edge 86648df ((Sending,RequiresManualReconciliation) allowed; allowed_count 22->23, negative pin removed)
+rust/prro/tests/shift_state_whitelist_matrix.rs	90b87dcb9e760d95d86ff5f1cc9ff489958f0719	CS-3 gap 4a: whitelist edge 16 Opening->Closed (operator-completion rollback); count 15->16, 65 forbidden

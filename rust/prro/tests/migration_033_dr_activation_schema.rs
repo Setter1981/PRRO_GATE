@@ -1172,11 +1172,31 @@ async fn rg08_no_production_caller_static_pin() {
         if is_repo_file || is_mod_decl {
             continue;
         }
+        // CS-3 gap 4a (mirrors migration_032 p03): the operator-completion orchestrator is the ONE
+        // sanctioned production caller — allowed ONLY to reference `complete_operator_pending`. The
+        // still-INACTIVE S7-1 functions must remain uncalled anywhere in src (wired at cutover).
+        let is_orchestrator = path.ends_with("services/reconciliation/operator_completion.rs");
+        let inactive_s7_fns = [
+            "record_outcome",
+            "apply_outcome",
+            "authorize_submission",
+            "resume_crashed_reservation",
+            "list_call_started_without_outcome",
+            "get_active_for_fn",
+            "delivery_reservation::insert",
+        ];
+        if is_orchestrator {
+            if inactive_s7_fns.iter().any(|f| line.contains(f)) {
+                offenders.push(line.to_string());
+            }
+            continue;
+        }
         offenders.push(line.to_string());
     }
     assert!(
         offenders.is_empty(),
-        "delivery_reservation must have NO production caller in src/ after 033; found: {offenders:#?}"
+        "delivery_reservation must have NO production caller in src/ after 033 (except the \
+         operator-completion orchestrator calling complete_operator_pending); found: {offenders:#?}"
     );
 }
 
