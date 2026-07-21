@@ -26,7 +26,15 @@ that matches the dossier's origin rule.
 
 | Leaf | incumbent (LIVE, locked) | target (declared, cutover flips to) | diverges on |
 |---|---|---|---|
-| **UnknownStatus** (`-4`/unmapped non-zero) | route Decode arm `error_routing.rs:360-370`: `(ErrorRetryable, ProbeRequired, none, None, StageSendDecodeUnknown/Warning, ProbeRequired[DecodeUnknown], HELD)` | classify `routing_for_indeterminate(UnknownStatus)=TransientRetry` `mod.rs:1024`: `(ErrorRetryable, TransientRetry, none, None, StageSendTransientRetry/Warning, no-probe, HELD)` | retry_class, audit, probe |
+| **UnrecognizedNonZeroOutsideProtoEnum** (e.g. `-17`, `2` — a non-zero code NOT in the proto enum) | live `Status::try_from` **Err** → `Decode` arm (`dto.rs:247`, `error_routing.rs:360`): `(ErrorRetryable, ProbeRequired, none, None, StageSendDecodeUnknown/Warning, ProbeRequired[DecodeUnknown], HELD)` | shadow mints `ServerCode`→`UnknownStatus` (`dto.rs:315`, `mod.rs:1024`): `(ErrorRetryable, TransientRetry, none, None, StageSendTransientRetry/Warning, no-probe, HELD)` | retry_class, audit, probe |
+
+> **`-4` is NOT this delta (correction — do not confuse).** `-4` = `Status::ErrorUnknown` is IN the proto
+> enum → `DpsError::Indeterminate` → `TransientRetry` (`dto.rs:277`), which EQUALS its `classify(UnknownStatus)`
+> target (`TransientRetry`) → **exact, not a delta**. Likewise `0` = `MissingStatus` → `Decode` → `ProbeRequired`
+> = `classify` `ProbeRequired` → exact. Only a non-zero code that fails `Status::try_from` (outside the enum)
+> forks: live `Decode/ProbeRequired` vs shadow `ServerCode→UnknownStatus/TransientRetry`. The existing faithful
+> drift-pin already encodes this exactly (`grpc.rs:738/739` `-4`/`0` in equal-rows; `grpc.rs:771` `-17` as delta 2)
+> — the pin MUST mirror that split (delta count stays **3**, no rev11 reduction).
 | **TLS RemoteAuthStatus** | route RemoteStatus arm `error_routing.rs:314-322`: `(ErrorRetryable, TransientRetry, none, None, StageSendTransientRetry/Warning, no-probe, HELD)` | classify RemoteStatus arm `mod.rs:947-952` projected: `(ErrorRetryable, ProbeRequired, none, ProbeRequired, StageSendProbeRequired/Warning, ProbeRequired[AuthenticatedPeerReply], HELD)` | retry_class, node_effect, audit, probe |
 | **OkButNoFiscalNumber** (OK+empty id) | empty-id `EmptyServerFiscalNo` GuardAbort sentinel `stage_send.rs:1596` (doc stays Sending, no ApplyPlan) | `(ErrorRetryable, ProbeRequired, none, ProbeRequired, StageSendProbeRequired/Warning, ProbeRequired[OkButNoFiscalNumber], HELD)` | whole tuple (guard→held) |
 
