@@ -647,6 +647,9 @@ test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_cap
 test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_passes_short_strings_unchanged	false
 test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_respects_utf8_boundaries	false
 test-support	prro	prro	services::write_path::stage_send::tests::wire_decision_to_outcome_kind_maps_per_w10_table	false
+test-support	prro	prro	transports::dps::apply_plan_pin::s7_applyplan_missing_status_audit_is_decode_unknown_not_probe_required	false
+test-support	prro	prro	transports::dps::apply_plan_pin::s7_applyplan_ok_arms_route_to_sent	false
+test-support	prro	prro	transports::dps::apply_plan_pin::s7_applyplan_routing_projection_is_locked	false
 test-support	prro	prro	transports::dps::digest_framing::tests::check_response_shape_matches_independent_preimage	false
 test-support	prro	prro	transports::dps::digest_framing::tests::distinct_content_yields_distinct_digest	false
 test-support	prro	prro	transports::dps::digest_framing::tests::grpc_status_uses_numeric_code_not_debug	false

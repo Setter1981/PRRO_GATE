@@ -18,6 +18,10 @@
 //! typed surface (`DpsChannel`, the DTOs, `DpsError`); raw prost /
 //! tonic shapes do NOT belong in any production code path.
 
+/// CS-3 S7-APPLY-GRAPH — routing-projection normative lock (test-only, crate-internal for the
+/// faithful `observe_check_reply` decode). See `docs/CS3_S7_APPLYPLAN_RECONCILIATION.md`.
+#[cfg(test)]
+mod apply_plan_pin;
 pub mod channel;
 pub(crate) mod digest_framing;
 pub mod dto;
