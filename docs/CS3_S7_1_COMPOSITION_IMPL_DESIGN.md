@@ -436,6 +436,87 @@ the new apply entrypoint boot calls (it no longer calls `apply_outcome` directly
 
 ---
 
+---
+
+## §6 POST-REVIEW CORRECTIONS (decorrelated round: internal 5-lens workflow + external model-decorrelated)
+
+The composition passed the decorrelated round on ARCHITECTURE (P2 call-once, P3 pre-wire equality +
+fence + gen-CAS, crash-safety record→apply split, Q1 fixed binding, Q3 shift/apply, Q4 MAC-loop
+removal, closing-cash, call-once/concurrency — all GO from both reviewers; **no double-issue /
+chain-fork / crash-loss found**). FOUR local fixes (no new entities) are folded here and SUPERSEDE the
+affected Q's above. External verdict: **GO on implementation after B1 + B2.**
+
+### FIX B1 (external BLOCKER, missed by internal) — SUPERSEDES Q5: ONE full-envelope hash
+
+Q5's two-hash split is WRONG. The token/reservation `envelope_hash` = `SHA256(check_sign)` and
+`submit_authorized`'s rebind check (`submit.rs:52-56`) covers ONLY `check_sign` — so after authorize,
+`rro_fn / date_time / local_number / check_type / id_offline / id_cancel` can change WITHOUT changing
+`check_sign` and the rebind guard passes → tampered wire bytes. **Fix: ONE hash** —
+`compute_envelope_hash(&envelope) = SHA256(prost(gen::Check))` (the FULL wire proto,
+`stage_send.rs:795`) — used for `NewReservation.envelope_hash` (token), `submit_authorized`'s rebind
+check (CHANGE `submit.rs:54` from `Sha256::digest(&envelope.check_sign)` to the full prost hash), AND
+the trace `request_envelope_sha256`. So token.envelope_hash == trace.request_envelope_sha256 ==
+`compute_envelope_hash(envelope)`. Delete the two-hash concept from Q5. Drift tests for the external
+fields already exist (`stage_send.rs:2440`). Strictly STRONGER rebind guard + one value, simpler.
+
+### FIX B2 (external BLOCKER, missed by internal — internal's byte-eq lens ENDORSED the flawed Q2) — SUPERSEDES Q2: TARGET is the single post-wire authority
+
+Q2 (drive trace/audit/return from the legacy `WireDecision`) is WRONG. For the 3 declared deltas the
+legacy routing ≠ the target classify → SPLIT-BRAIN. Acute failure — DPS OK with empty fiscal number:
+target = `OkButNoFiscalNumber → ProbeRequired` (`prro-domain .../mod.rs:1028`) HOLD, but legacy =
+`WireDecision::Sent{server_fiscal_no:""}` → `build_attempt_completion` writes the empty SFN as an OK
+row (`stage_send.rs:920-923`) → the `transport_trace` OK-CHECK **rolls back the whole RECORD tx** (this
+is exactly why the old code had the early empty-id guard `:1589`, now deleted) → the typed outcome is
+NOT saved → reservation stuck `CALL_STARTED`. On the other 2 deltas the tx passes but
+reservation/trace/audit/return report DIFFERENT semantics.
+
+**Fix: the TARGET (`ClassifiedOutcome` + `EvidenceDiscriminant`, from `classify(obs.evidence())` +
+`EvidenceDiscriminant::from_evidence`) is the SINGLE post-wire authority for ALL of: `record_outcome`
+(already), trace completion, audit, AND the returned `StageSendOutcome`.** Construct a TARGET
+`WireDecision` from the evidence — `EvidenceDiscriminant::Accepted{sfn} → WireDecision::Sent{sfn}`
+(the SFN comes from the discriminant, NEVER a legacy `Sent{""}`), else `WireDecision::Routed(target
+routing)` — via projection glue (`retry_class → OutcomeKind`, target routing → `AuditEvent`,
+`EvidenceDiscriminant → StageSendOutcome`), and feed THAT target `WireDecision` to the unchanged
+`build_attempt_completion` / audit / `stage_send_outcome_from`. The **legacy `WireDecision`
+(`route_send_result(legacy,…)`) is retained ONLY for the drift-pin TEST** that proves target == legacy
+for the ~25 unchanged leaves + the exact 3 declared delta pairs — NOT as live post-wire authority.
+Byte-equivalence for unchanged rows holds BY target==legacy there; the projection glue must be pinned
+against the landed ApplyPlan (`apply_plan_pin.rs`, A2) so no 4th delta appears. `submit_authorized`
+STILL surfaces `_legacy` (Q2.1) — but only to feed the drift-pin, not live behavior.
+
+### FIX C (internal CONFIRMED == external clarification #3, CONVERGED) — REFINES Q3: error contract + HELD is expected
+
+`apply_recorded_outcome`'s error type is self-contradictory in Q3 (`:189 ApplyOrchestrationError`
+[undefined], `:201 ApplyError`, body returns `anyhow::Result`, caller uses undefined `bridge_apply`).
+`ApplyError::HeldNotAutoRelease` is the NORMAL result for `-12`/`-6`/SubmittedUnknown
+(`delivery_reservation.rs:738`); it must NOT propagate as a fatal error. **Fix: the contract is
+`apply_recorded_outcome(pool, res_id) -> anyhow::Result<ApplyResult>`** (`apply_outcome(tx).await?`
+preserves the `ApplyError` as the anyhow source, so the boot consumer's `downcast_ref::<ApplyError>()`
+[`reservation_boot_pass.rs:98`] still classifies `HeldNotAutoRelease`/`NodeStateMissing` — boot
+classifier UNCHANGED). The **live caller** (Phase 4) treats `HeldNotAutoRelease` as an EXPECTED hold
+(the doc rests PENDING, STOP already set in record) — swallow it, return the target `StageSendOutcome`;
+real structural/DB errors propagate. The shared orchestration does the same. DELETE
+`ApplyOrchestrationError` and `bridge_apply` — they do not exist.
+
+### FIX D (internal MINOR == external note, CONVERGED) — REFINES Q4: SubmitRefused fail-closed
+
+`SubmitRefused` (EnvelopeRebind/BindingMismatch) fires AFTER `CALL_STARTED` — unreachable by
+construction (fixed binding + the same envelope moved to the wire) but the defensive branch must be
+**fail-closed**: set node STOP + return a structural error, so the doc does not silently rest at
+`Sending` with an unrecorded `CALL_STARTED`. Boot then normalizes the `CALL_STARTED` reservation
+(`resume_crashed_reservation → NoResponse{Crashed} + PENDING + STOP`) without a re-wire. Both reviewers:
+operationally annoying, NOT a blocker.
+
+### Model-decorrelation lesson (recorded)
+
+The external (different model lineage) caught B1 + B2 — two real blockers the same-model 5-lens internal
+workflow MISSED (the internal byte-equivalence lens actively ENDORSED the flawed legacy-driven Q2).
+Reaffirms: model-decorrelated review is load-bearing on the fiscal hot path; same-model adversarial
+(even multi-lens) has blind spots. One round → freeze (no spiral): apply B1–D, then build.
+
+---
+
 **Nothing in this document has been implemented.** It is the executable build spec for the atomic
 cutover (Phase-T teeth RED-first → Phase-C composition → delete 4-b → R1-R7 → #1 → static-pin flip →
-Phase-G empty-in-flight gate), per `CS3_S7_1_CUTOVER_BUILD_SEQUENCE.md` build order.
+Phase-G empty-in-flight gate), per `CS3_S7_1_CUTOVER_BUILD_SEQUENCE.md` build order. §6 corrections are
+authoritative over the affected Q's.
