@@ -38,7 +38,7 @@ use crate::db::models::{
     ids::DocumentId,
 };
 use crate::db::repositories::{
-    audit_log, document_files,
+    audit_log, delivery_reservation, document_files,
     document_files::DocumentFileKind,
     fiscal_documents::{self as fd, DocumentRow, TransitionOutcome},
     fiscal_number_config as fn_config, node_state, offline_sessions,
@@ -989,6 +989,14 @@ async fn resolve_offline_dps_code(
     // the fuzzer proved violates #192: a PREPARED doc resting on an empty pool
     // is a `StuckNonTerminalDoc` because nothing re-drives it before the next
     // quiescent scan.)
+    // CS-3 S7-2 — fail-closed FN fence: refuse consuming an offline code (which
+    // stamps offline issuance + advances the chain) while a delivery reservation
+    // is in-flight (INACTIVE today).
+    if delivery_reservation::fn_fence_active_tx(tx, fn_id).await? {
+        return Err(anyhow::anyhow!(
+            "stage_sign offline-code refused: FN {fn_id} has an active delivery reservation (S7-2 fence)"
+        ));
+    }
     let acquired = match offline_sessions::acquire_code_tx(tx, fn_id, doc_id).await {
         Ok(a) => a,
         Err(offline_sessions::OfflineSessionError::CodePoolExhausted { .. }) => {

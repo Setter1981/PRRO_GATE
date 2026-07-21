@@ -344,6 +344,10 @@ fn allowed_transition_exhaustive_matrix() {
         (Sending, Sent),
         (Sending, ErrorRetryable),
         (Sending, Rejected),
+        // CS-3 Slice 5 (design §3.4): operator completion of a crashed / SubmittedUnknown
+        // send moves the Sending document to its manual/terminal state. Callable only from
+        // the operator-completion branch; NOT a resend.
+        (Sending, RequiresManualReconciliation),
         (ErrorRetryable, Sending),
         // 1 W10.5 addition: MAC recovery dispatch terminal — orchestrator
         // CounterExhausted / HashNotExtractable / second-`-12`-after-Resigned
@@ -389,13 +393,11 @@ fn allowed_transition_exhaustive_matrix() {
         }
     }
     assert_eq!(
-        allowed_count, 22,
-        "29 pre-PR-B minus the 7 sfn-less/policy-dead dormant edges removed in \
-         A.3 PR-B step 6: (Encrypted,Sent), (Sent,Rejected), (OfflineLocalAck,Sent), \
-         (OfflineLocalAck,Kvt2), (ErrorRetryable,Sent), (ErrorRetryable,Kvt1), \
-         (Sending,Kvt1) = 22 allowed pairs (each negatively pinned below)"
+        allowed_count, 23,
+        "22 (post A.3 PR-B) + 1 CS-3 Slice 5 operator-completion edge \
+         (Sending, RequiresManualReconciliation) = 23 allowed pairs"
     );
-    assert_eq!(forbidden_count, 169 - 22);
+    assert_eq!(forbidden_count, 169 - 23);
 }
 
 /// A.3 PR-B step 6 — the seven dormant edges REMOVED from
@@ -464,8 +466,10 @@ fn intentional_whitelist_gaps_remain_forbidden() {
     assert!(!fd::allowed_transition(Kvt2, ErrorRetryable));
     // Sending direct shortcuts that would defeat Pattern B safety.
     assert!(!fd::allowed_transition(Sending, Ack));
-    assert!(
-        !fd::allowed_transition(Sending, RequiresManualReconciliation),
-        "operator escalation must go via ErrorRetryable"
-    );
+    // NOTE: (Sending, RequiresManualReconciliation) was previously pinned forbidden here
+    // ("operator escalation must go via ErrorRetryable"). CS-3 Slice 5 (design §3.4) adds it
+    // as the operator-completion edge for a crashed / SubmittedUnknown send whose reservation
+    // is not-accepted or MAC — it is now ALLOWED (asserted in the exhaustive matrix above),
+    // callable only from the operator-completion branch. So it is deliberately NOT pinned
+    // forbidden anymore.
 }

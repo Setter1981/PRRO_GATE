@@ -22,6 +22,10 @@ use prro::db::tx::with_immediate;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
+#[path = "support/inactive_lifecycle_scan.rs"]
+mod inactive_lifecycle_scan;
+use inactive_lifecycle_scan::scan_src_tree;
+
 // ─────────────────────────── fixtures ───────────────────────────
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -127,7 +131,9 @@ async fn advance_to_oo_clean(pool: &SqlitePool, res_byte: u8) {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
              response_provenance = 'PARSED_DPS_ENVELOPE', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Accepted', evidence_text = '4000000001', \
+             remote_correlation_id = '4000000001' \
          WHERE reservation_id = ?",
     )
     .bind(&[res_byte; 16][..])
@@ -684,43 +690,134 @@ async fn ne02_node_effect_check_rejects_bad_value() {
 async fn ne03_node_effect_accepts_all_valid_vocabulary_values() {
     // Each of the valid node_effect values (grounded on error_routing.rs) must be accepted.
     // We use a fresh pool per value to avoid fence/immutability collisions.
-    let valid_values = [
-        "NodeBlocked",        // -11 ERROR_OFFLINE_168 → NodeMode::Blocked flip
-        "MacReseedPending",   // -12 ERROR_BAD_HASH_PREV → mac_recovery orchestrator
-        "ProbeRequired",      // Decode / -2 close-shift / -15 close-shift → last_chk probe
-        "OperatorEscalation", // -6 ERROR_NOT_PREV_ZREPORT → operator-recoverable
-        "FnConfigError",      // -13/-14 NOT_REGISTERED → FnConfigError class
-        "WrapperBug",         // Internal / NotFound / FiscalIdMismatch → WrapperBug
-        "NoNodeEffect",       // TerminalReject (clean), TransientRetry (no node impact)
+    // Each valid node_effect value must be storable at OO — now via the matrix-legal leaf that
+    // CARRIES it (migration 036 couples node_effect to the evidence leaf; 037 makes evidence
+    // mandatory at OO). Fresh pool per case to avoid fence/immutability collisions.
+    // (certainty, provenance, routing, node_effect, evidence_kind, evidence_text, needs_digest, via_cs)
+    #[allow(clippy::type_complexity)]
+    let cases: &[(
+        &str,
+        &str,
+        Option<&str>,
+        &str,
+        &str,
+        Option<&str>,
+        bool,
+        bool,
+    )] = &[
+        // -11 Offline168, -12 BadHashPrev, probe (CloseAmbiguous), -6 NotPrevZReport, -13/-14.
+        (
+            "SUBMITTED",
+            "PARSED_DPS_ENVELOPE",
+            Some("TerminalReject"),
+            "NodeBlocked",
+            "Rejected",
+            Some("Offline168"),
+            true,
+            true,
+        ),
+        (
+            "SUBMITTED",
+            "PARSED_DPS_ENVELOPE",
+            Some("MacRecovery"),
+            "MacReseedPending",
+            "Rejected",
+            Some("BadHashPrev"),
+            true,
+            true,
+        ),
+        (
+            "SUBMITTED_UNKNOWN",
+            "PARSED_DPS_ENVELOPE",
+            Some("ProbeRequired"),
+            "ProbeRequired",
+            "CloseAmbiguous",
+            None,
+            true,
+            true,
+        ),
+        (
+            "SUBMITTED",
+            "PARSED_DPS_ENVELOPE",
+            Some("OperatorEscalation"),
+            "OperatorEscalation",
+            "Rejected",
+            Some("NotPrevZReport"),
+            true,
+            true,
+        ),
+        (
+            "SUBMITTED",
+            "PARSED_DPS_ENVELOPE",
+            Some("FnConfigError"),
+            "FnConfigError",
+            "Rejected",
+            Some("NotRegisteredRro"),
+            true,
+            true,
+        ),
+        // WrapperBug is the NOT_SUBMITTED SigningFailed leaf (no CS step → generation stays NULL).
+        (
+            "NOT_SUBMITTED",
+            "NO_RESPONSE",
+            Some("WrapperBug"),
+            "WrapperBug",
+            "SigningFailed",
+            None,
+            false,
+            false,
+        ),
+        // NoNodeEffect is the clean Accept leaf (routing NULL, correlation = fiscal number).
+        (
+            "SUBMITTED",
+            "PARSED_DPS_ENVELOPE",
+            None,
+            "NoNodeEffect",
+            "Accepted",
+            Some("4000000001"),
+            false,
+            true,
+        ),
     ];
-    for val in valid_values {
+    for &(cert, prov, routing, node_effect, ev_kind, ev_text, needs_digest, via_cs) in cases {
         let (_d, pool) = fresh_pool().await;
         let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
         insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
-        // Under 034 H3/H4, node_effect must be set AT the OO commit (H3: non-NULL at OO)
-        // and is frozen thereafter (033 immutability), so it cannot be applied as a
-        // follow-up UPDATE on top of advance_to_oo_clean. Set it together with state→OO.
-        // H4: a clean accept (routing_class NULL) requires node_effect='NoNodeEffect';
-        // every non-NoNodeEffect value therefore needs a non-clean routing_class.
-        advance_to_cs(&pool, 0x01).await;
-        let routing_class = if val == "NoNodeEffect" {
-            None // clean accept
+        // node_effect is set AT the OO commit (034 H3 non-NULL) and frozen thereafter (033
+        // immutability), so it is committed together with state→OO and its matching leaf.
+        if via_cs {
+            advance_to_cs(&pool, 0x01).await;
+        }
+        let digest_blob: Option<Vec<u8>> = if needs_digest {
+            Some(vec![0u8; 32])
         } else {
-            Some("TransientRetry") // non-clean: satisfies H4 + the 032 routing couplings
+            None
         };
+        let rcid: Option<&str> = if ev_kind == "Accepted" { ev_text } else { None };
         sqlx::query(
             "UPDATE delivery_reservation \
-             SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
-                 response_provenance = 'PARSED_DPS_ENVELOPE', \
-                 routing_class = ?, apply_state = 'PENDING_APPLY', node_effect = ? \
+             SET state = 'OUTCOME_OBSERVED', submission_certainty = ?, response_provenance = ?, \
+                 routing_class = ?, apply_state = 'PENDING_APPLY', node_effect = ?, \
+                 evidence_kind = ?, evidence_text = ?, evidence_digest = ?, \
+                 remote_correlation_id = ? \
              WHERE reservation_id = ?",
         )
-        .bind(routing_class)
-        .bind(val)
+        .bind(cert)
+        .bind(prov)
+        .bind(routing)
+        .bind(node_effect)
+        .bind(ev_kind)
+        .bind(ev_text)
+        .bind(digest_blob)
+        .bind(rcid)
         .bind(&[0x01u8; 16][..])
         .execute(&pool)
         .await
-        .unwrap_or_else(|e| panic!("node_effect '{val}' must be accepted at OO commit; got: {e}"));
+        .unwrap_or_else(|e| {
+            panic!(
+                "node_effect '{node_effect}' must be storable at OO via its matrix leaf; got: {e}"
+            )
+        });
     }
 }
 
@@ -734,19 +831,24 @@ async fn ne04_node_effect_immutable_once_set() {
     // the follow-up mutation is not masked by 034 H4 (which only constrains routing NULL);
     // the rejection is then the intended 033 node_effect immutability trigger.
     advance_to_cs(&pool, 0x01).await;
+    // A non-clean OO carrying node_effect=NodeBlocked is the Offline168 (-11) Rejected leaf
+    // (SUBMITTED / PARSED / TerminalReject / NodeBlocked) — the matrix-legal way to reach it.
     sqlx::query(
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
-             response_provenance = 'PARSED_DPS_ENVELOPE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NodeBlocked' \
+             response_provenance = 'PARSED_DPS_ENVELOPE', routing_class = 'TerminalReject', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NodeBlocked', \
+             evidence_kind = 'Rejected', evidence_text = 'Offline168', \
+             evidence_digest = X'0000000000000000000000000000000000000000000000000000000000000000' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect("non-clean OO with node_effect=NodeBlocked is legal");
+    .expect("non-clean OO with node_effect=NodeBlocked (Offline168 leaf) is legal");
 
-    // Mutation: NodeBlocked → MacReseedPending (frozen once set).
+    // Mutation: NodeBlocked → MacReseedPending (frozen once set). Blocked by the 033 node_effect
+    // immutability trigger AND the 036 matrix (Rejected/Offline168 pins node_effect=NodeBlocked).
     let err = sqlx::query(
         "UPDATE delivery_reservation SET node_effect = 'MacReseedPending' WHERE reservation_id = ?",
     )
@@ -757,8 +859,8 @@ async fn ne04_node_effect_immutable_once_set() {
         "node_effect must be immutable once set (NodeBlocked → MacReseedPending must ABORT)",
     );
     assert!(
-        err_has(&err, "immutable") || err_has(&err, "constraint"),
-        "expected immutable/constraint error, got: {err}"
+        err_has(&err, "immutable") || err_has(&err, "constraint") || err_has(&err, "evidence"),
+        "expected immutable/constraint/evidence error, got: {err}"
     );
 }
 
@@ -780,11 +882,14 @@ async fn ne05_node_effect_cannot_be_cleared_once_set() {
             .execute(&pool)
             .await
             .expect_err("node_effect → NULL (clearing) must be blocked");
+    // Blocked by 034 H3 (OO completeness) / 033 immutability / the 036 matrix (Accepted pins
+    // node_effect=NoNodeEffect, so NULL aborts) — any of the three layers is a correct rejection.
     assert!(
         err_has(&err, "immutable")
             || err_has(&err, "constraint")
-            || err_has(&err, "partial authority"),
-        "expected immutable/constraint/H3 error, got: {err}"
+            || err_has(&err, "partial authority")
+            || err_has(&err, "evidence"),
+        "expected immutable/constraint/H3/evidence error, got: {err}"
     );
 }
 
@@ -898,10 +1003,25 @@ async fn rg01_column_count_is_now_20() {
             "033 new column {col} must exist; have {names:?}"
         );
     }
+    // 036 adds four evidence-union columns (Slice 2a). open_pool applies ALL
+    // migrations, so the head total is 24 (17 from 032 + 3 from 033 + 4 from 036).
+    // The 033-specific guarantee is the loop above; the total tracks the current
+    // head. (Test id kept — the additions-only inventory gate forbids renaming it.)
+    for col in [
+        "evidence_kind",
+        "evidence_text",
+        "evidence_code",
+        "evidence_digest",
+    ] {
+        assert!(
+            names.contains(col),
+            "036 evidence column {col} must exist at head; have {names:?}"
+        );
+    }
     assert_eq!(
         names.len(),
-        20,
-        "total column count must be 20 (17 from 032 + 3 from 033); have {names:?}"
+        24,
+        "total column count must be 24 (17 from 032 + 3 from 033 + 4 from 036); have {names:?}"
     );
 }
 
@@ -1036,31 +1156,18 @@ async fn rg07_node_state_now_has_delivery_generation_and_pointer_columns() {
     );
 }
 
-#[tokio::test]
-async fn rg08_no_production_caller_static_pin() {
-    // Static call-graph pin: delivery_reservation must still have NO production
-    // caller in src/ (mirrors migration_032 p03 — identical predicate).
-    use std::process::Command;
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let src = format!("{manifest}/src");
-    let out = Command::new("grep")
-        .args(["-rn", "delivery_reservation", &src])
-        .output()
-        .expect("grep runs");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut offenders = Vec::new();
-    for line in text.lines() {
-        let path = line.split(':').next().unwrap_or("");
-        let is_repo_file = path.ends_with("repositories/delivery_reservation.rs");
-        let is_mod_decl = path.ends_with("repositories/mod.rs");
-        if is_repo_file || is_mod_decl {
-            continue;
-        }
-        offenders.push(line.to_string());
-    }
+/// rg08 (retargeted, mirrors `migration_032::p03`): the INACTIVE S7-1 delivery lifecycle has NO
+/// production caller after 033. Uses the shared structural scanner
+/// (`support/inactive_lifecycle_scan.rs`); its teeth are proven by the `p03_bite_*` synthetic
+/// controls in `migration_032`.
+#[test]
+fn rg08_no_production_caller_static_pin() {
+    let hits = scan_src_tree(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        offenders.is_empty(),
-        "delivery_reservation must have NO production caller in src/ after 033; found: {offenders:#?}"
+        hits.is_empty(),
+        "delivery_reservation INACTIVE S7-1 lifecycle must have NO production caller after 033 \
+         (fn_fence_active_tx / complete_operator_pending are the sanctioned ACTIVE exceptions); \
+         found: {hits:#?}"
     );
 }
 

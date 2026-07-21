@@ -74,6 +74,7 @@
 use crate::db::models::enums::{DocState, DocType, NodeMode, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, OfflineSessionId};
 use crate::db::repositories::audit_log;
+use crate::db::repositories::delivery_reservation;
 use crate::db::repositories::fiscal_documents::{self as fd, TransitionOutcome};
 use crate::db::repositories::node_state;
 use crate::db::repositories::offline_sessions;
@@ -195,6 +196,14 @@ pub async fn run(
     with_immediate(pool, move |tx| {
         let fn_id = fn_id_for_envelope;
         Box::pin(async move {
+            // CS-3 S7-2 — fail-closed FN fence: refuse the offline-ack issuance
+            // (Signed→OfflineLocalAck CAS + chain-seed advance) while a delivery
+            // reservation is in-flight (INACTIVE today; guards the chain tip).
+            if delivery_reservation::fn_fence_active_tx(tx, &fn_id).await? {
+                return Err(anyhow::anyhow!(
+                    "stage_offline_ack refused: FN {fn_id} has an active delivery reservation (S7-2 fence)"
+                ));
+            }
             // ─── Step 1: re-read node_state (fresh snapshot) ────────
             let ns = match node_state::get_tx(tx, &fn_id).await? {
                 Some(ns) => ns,

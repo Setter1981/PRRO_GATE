@@ -176,6 +176,29 @@ pub async fn update_last_known_xml_sha_tx(
     Ok(res.rows_affected() == 1)
 }
 
+/// CS-3 gap 4b — set (or CLEAR to genesis NULL) the chain seed for an FN, tx-bound.
+///
+/// Unlike [`update_last_known_xml_sha_tx`] (which only ever writes a non-NULL 32-byte hash), the
+/// offline-cohort operator completion must be able to REWIND the seed to the current document's
+/// own `previous_hash`, which is `None` when the current doc chained off GENESIS. `Some(h)` writes
+/// the 32-byte hash; `None` writes SQL NULL (genesis). Returns `false` iff no `node_state` row
+/// existed for `fn_id` — the caller MUST treat that as a structural breach (roll back), never a
+/// silent ignore.
+pub async fn set_last_known_xml_sha_nullable_tx(
+    tx: &mut WriteTxConn<'_>,
+    fn_id: &str,
+    hash: Option<&[u8; 32]>,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? WHERE fiscal_number = ?",
+    )
+    .bind(hash.map(|h| h.to_vec()))
+    .bind(fn_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// W10.3 — flip `node_state.mode` to `BLOCKED` for the FN.  Mirror of
 /// [`update_last_known_xml_sha_tx`]: tx-bound, single UPDATE,
 /// returns `bool` (`true` = row existed and was updated; `false` =

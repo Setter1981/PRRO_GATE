@@ -39,6 +39,7 @@ use sqlx::SqlitePool;
 use crate::db::models::enums::{OfflineSessionState, Severity};
 use crate::db::models::ids::OfflineSessionId;
 use crate::db::repositories::audit_log;
+use crate::db::repositories::delivery_reservation;
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
 use crate::db::repositories::offline_sessions::{self, NewOpeningSession};
 use crate::db::tx::with_immediate;
@@ -78,6 +79,14 @@ impl OfflineSessionService {
 
         with_immediate(&self.pool, move |tx| {
             Box::pin(async move {
+                // CS-3 S7-2 — fail-closed FN fence: refuse opening an offline session
+                // while a delivery reservation is in-flight (INACTIVE today; uniform
+                // coverage of the closed writer inventory).
+                if delivery_reservation::fn_fence_active_tx(tx, &fn_owned).await? {
+                    return Err(anyhow::anyhow!(
+                        "open_session refused: FN {fn_owned} has an active delivery reservation (S7-2 fence)"
+                    ));
+                }
                 offline_sessions::insert_opening(
                     tx,
                     &NewOpeningSession {

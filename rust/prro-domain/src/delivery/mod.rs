@@ -25,6 +25,10 @@
 
 use crate::enums::DocType;
 
+/// CS-3 Slice 2b — the durable, payload-carrying `EvidenceDiscriminant` + its
+/// serialization to / hydration from the migration-036 evidence-union columns.
+pub mod evidence;
+
 // ─── Protocol binding ────────────────────────────────────────────────────────
 
 /// Identifies the DPS wire protocol (032:81).
@@ -125,6 +129,13 @@ impl DecodedResponseDigest {
     pub fn from_transport_digest(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+    /// Boot-hydration constructor (CS-3 Slice 2b, design §4.4): re-materialise a digest
+    /// from its durable `evidence_digest` column bytes. DISTINCT from the transport mint
+    /// (`from_transport_digest`) so the source-policy lint keeps gating fresh wire mints
+    /// to the decoder while boot hydration reads back already-recorded authority.
+    pub fn from_durable_evidence(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
     /// The 32-byte digest (read-only).
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -143,6 +154,11 @@ pub struct GrpcStatusDigest([u8; 32]);
 impl GrpcStatusDigest {
     /// The SOLE constructor: the framed 32-byte hash computed by the transport decoder.
     pub fn from_transport_digest(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    /// Boot-hydration constructor (CS-3 Slice 2b, design §4.4): re-materialise from the
+    /// durable `evidence_digest` column bytes. DISTINCT from the transport mint.
+    pub fn from_durable_evidence(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
     /// The 32-byte digest (read-only).

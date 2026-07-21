@@ -126,8 +126,8 @@ async fn cas_blocks_when_state_diverged() {
 #[tokio::test]
 async fn allowed_transition_table_matrix() {
     use ShiftState::*;
-    // M3b W14a-2a: 14-edge whitelist per spec §4.1.
-    // Allowed (must be true) — 14 edges.
+    // M3b W14a-2a: whitelist per spec §4.1 — now 18 edges (M2-N2a #15; CS-3 gap 4a #16; gap 4b #17,#18).
+    // Allowed (must be true) — 14 base edges + 4 later additions.
     assert!(shifts::allowed_transition(Created, Opening)); // 1
     assert!(shifts::allowed_transition(Created, OpenedLocalPendingDrain)); // 2
     assert!(shifts::allowed_transition(Opening, Opened)); // 3
@@ -157,6 +157,17 @@ async fn allowed_transition_table_matrix() {
         ClosingLocalPendingDrain,
         RequiresManualReconciliation
     )); // 14
+        // Later additions (operator/M2-N2a rollback edges):
+    assert!(shifts::allowed_transition(
+        Opened,
+        RequiresManualReconciliation
+    )); // 15 (M2-N2a)
+    assert!(shifts::allowed_transition(Opening, Closed)); // 16 (gap 4a operator rollback)
+    assert!(shifts::allowed_transition(OpenedLocalPendingDrain, Closed)); // 17 (gap 4b operator rollback)
+    assert!(shifts::allowed_transition(
+        ClosingLocalPendingDrain,
+        OpenedLocalPendingDrain
+    )); // 18 (gap 4b operator rollback)
 
     // Forbidden (must be false) — sample of structural violations.
     // Per spec §4.4: Error is reachable ONLY via force_to_error_with_audit seam;
@@ -175,8 +186,7 @@ async fn allowed_transition_table_matrix() {
         ClosingLocalPendingDrain,
         Opened
     ));
-    // Forbidden: OpenedLocalPendingDrain → Closed directly (must route via ClosingLocalPendingDrain)
-    assert!(!shifts::allowed_transition(OpenedLocalPendingDrain, Closed));
+    // (OpenedLocalPendingDrain → Closed is now allowed — gap-4b operator rollback edge 17.)
     // Forbidden: OpenedLocalPendingDrain → Opening (forward-only on open-side)
     assert!(!shifts::allowed_transition(
         OpenedLocalPendingDrain,

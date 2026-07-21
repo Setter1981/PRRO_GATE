@@ -36,10 +36,10 @@ pub struct ShiftRow {
 /// M3b W14a-2a — whitelist of allowed shift state transitions per spec
 /// `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` §4.1.
 ///
-/// Drift-guard: edge count is locked at **14**.  Any addition / removal
+/// Drift-guard: edge count is locked at **18**.  Any addition / removal
 /// MUST update both this function body AND the matching scanner test
 /// `tests/shift_state_whitelist_matrix.rs` (9×9 = 81 (from, to) pairs:
-/// 14 Applied + 67 Forbidden).
+/// 18 Applied + 63 Forbidden).
 ///
 /// Per spec §4.4 forbidden patterns:
 /// - **`Error` is reachable via `force_to_error_with_audit` seam (operator-driven)
@@ -71,6 +71,19 @@ pub struct ShiftRow {
 ///       reject of an offline-origin predecessor on an online-opened shift that
 ///       went OFFLINE mid-shift — a normal state-machine branch, NOT an operator
 ///       override.  Same drain-reject class as 6 / 14, from a plain `Opened` shift.)
+///   16. Opening → Closed  (CS-3 gap 4a: operator-completion rollback of an
+///       online SHIFT_OPEN whose ambiguous send the operator resolves as NOT
+///       accepted — the shift never opened at DPS, so it rolls straight to
+///       Closed.  Authorized ONLY by the operator-completion service
+///       (`services::reconciliation::operator_completion`); NOT a normal ingress
+///       edge.  Pinned as such by the sole-caller test.)
+///   17. OpenedLocalPendingDrain → Closed  (CS-3 gap 4b: operator-completion rollback
+///       of an OFFLINE SHIFT_OPEN resolved NOT-accepted — the never-opened offline shift
+///       rolls straight to Closed.  Offline analogue of edge 16.  Operator-completion only.)
+///   18. ClosingLocalPendingDrain → OpenedLocalPendingDrain  (CS-3 gap 4b: operator-completion
+///       rollback of an OFFLINE SHIFT_CLOSE / Z_REPORT resolved NOT-accepted — the not-closed
+///       offline shift rolls back to its open pending-drain state.  Offline analogue of edge 11.
+///       Operator-completion only.)
 pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
     use ShiftState::*;
     matches!(
@@ -90,6 +103,9 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
             | (ClosingLocalPendingDrain, Closed)            // 13
             | (ClosingLocalPendingDrain, RequiresManualReconciliation) // 14
             | (Opened, RequiresManualReconciliation) // 15 (M2-N2a)
+            | (Opening, Closed) // 16 (CS-3 gap 4a)
+            | (OpenedLocalPendingDrain, Closed) // 17 (CS-3 gap 4b)
+            | (ClosingLocalPendingDrain, OpenedLocalPendingDrain) // 18 (CS-3 gap 4b)
     )
 }
 

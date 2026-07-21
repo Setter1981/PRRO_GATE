@@ -1716,103 +1716,90 @@ pub async fn run_stuck_doc_guard(pool: &SqlitePool, fiscal_number: &str) -> anyh
     Ok(stuck.len())
 }
 
-pub async fn run_boot_reconciliation(
-    _guard: &super::ReconcileGuard<'_>,
+/// NC-03 recovery — reconstruct a LOST `node_state` row from the surviving ledger.
+///
+/// (external-critic FT, adjudicated 2026-06-11; AUD-L6-1 2026-06-14; SEAM-D-1 2026-06-12.)
+/// When `node_state` is absent but `fiscal_documents` holds ANY row, node_state was LOST while the
+/// ledger SURVIVED (partial restore / corruption / rebaseline) — NOT a fresh FN. A silent bootstrap
+/// would reset the LND allocator to 1 (the allocator reads `node_state.next_lnd`) → the next write
+/// duplicates lnd / forks the MAC chain. Reconstruct the allocator (`next_lnd = MAX(lnd)+1`) + project
+/// the MAC seed from the highest-lnd EVER-ISSUED doc (`last_issued_unsigned_xml_sha256`, per AUD-L6-1,
+/// NOT the ACK-only tail), surface any surviving OPEN shift in the CRITICAL audit (SEAM-D-1: it is NOT
+/// auto-recovered), then BLOCK. One `with_immediate` envelope; the transient `Online` is never
+/// observable (boot runs before ingress).
+///
+/// Returns `true` when it reconstructed (ledger non-empty), `false` when the ledger is empty (a
+/// genuinely fresh FN — the caller keeps the original bootstrap). Extracted from branch-(a) so the
+/// S7-1 boot-first reservation pass (§7.2 step 3) can invoke the SAME repair for a deferred FN —
+/// UNFENCED there because a live PENDING reservation is EXPECTED during it (fencing this write would
+/// strand the deferred apply — S7-2 exclusion).
+///
+/// **`restore`** (CS-3 S7-1 A3 cutover fix, external review): branch-(a) passes `None` — node ends
+/// **BLOCKED**, `active_delivery_reservation_id = NULL` (a lost node_state with no surviving
+/// reservation is operator-led). The reservation pass passes `Some(reservation_id)` for a deferred FN
+/// whose active reservation survived: the node's authority columns are restored **in the same tx** to
+/// that reservation's captured `authorized_generation` + pointer, and the node ends **STOP_MODE** (not
+/// BLOCKED) — WITHOUT this, both `apply_outcome` and `complete_operator_pending` fail the identical
+/// generation/pointer CAS forever and the reservation is unrecoverable (the "operator-led" path is a
+/// dead end). Single active reservation per FN (the §3.1 fence) + node_state loss (no other survivor)
+/// ⇒ no fork / no stale-generation collision.
+pub(crate) async fn reconstruct_lost_node_state(
     pool: &SqlitePool,
     fiscal_number: &str,
-    deps: Option<&super::RuntimeView<'_>>,
-) -> anyhow::Result<BranchOutcome> {
+    restore: Option<crate::db::repositories::delivery_reservation::ReservationId>,
+) -> anyhow::Result<bool> {
     use crate::db::repositories::{fiscal_documents, node_state};
 
-    let row = node_state::get(pool, fiscal_number).await?;
-
-    // ── Branch (a) — FN row absent ───────────────────────────────
-    let Some(row) = row else {
-        // NC-03 (external-critic FT, adjudicated 2026-06-11): the `node_state`
-        // row is absent.  Before bootstrapping a FRESH FN (next_lnd=1, genesis
-        // seed), cross-check the ledger.  If ANY `fiscal_documents` row exists,
-        // node_state was LOST while the ledger SURVIVED (partial restore /
-        // corruption / rebaseline) — NOT a fresh FN.  A silent bootstrap would
-        // reset the LND allocator to 1 (the allocator reads `node_state.next_lnd`)
-        // → the next write either fail-closes on `ux_fd_fn_lnd` OR (sparse
-        // history) allocates BELOW the tail and signs with `previous_hash=None`
-        // → duplicate lnd / forked MAC chain.  Reconstruct the allocator
-        // (`next_lnd = MAX(lnd)+1`) + project the MAC seed from the highest-lnd
-        // EVER-ISSUED doc.  **AUD-L6-1 (FT, 2026-06-14):** project from
-        // `last_issued_unsigned_xml_sha256` (online ACK OR offline-origin that
-        // reached OFFLINE_LOCAL_ACK), NOT the ACK-only `last_ack_…`.  Since M2-01
-        // the seed advances at OFFLINE_LOCAL_ACK for offline-origin docs (and
-        // `stage_finalize` skips the advance for them), so when the FN tail is an
-        // offline-origin doc with lnd > the last online ACK, projecting from the
-        // last ACK is a STALE seed → the next write forks the legal MAC chain.
-        // Shares `OFFLINE_ISSUED_STATES` with the M2-N2b invariant_scan walk, so
-        // the projected seed equals the walk's final `expected`.  `None` when no
-        // issued doc = genesis.  Then BLOCK + CRITICAL: a node whose node_state
-        // vanished under it is NOT healthy and must not silently resume trading.
-        if let Some(max_lnd) = fiscal_documents::max_lnd_any_state(pool, fiscal_number).await? {
-            let next_lnd = max_lnd + 1;
-            let projected_seed: Option<[u8; 32]> =
-                match fiscal_documents::last_issued_unsigned_xml_sha256(pool, fiscal_number).await? {
-                    Some(bytes) => Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-                        anyhow::anyhow!(
-                            "AUD-L6-1: last issued unsigned_xml_sha256 for FN {fiscal_number} is not \
-                             32 bytes — corrupted MAC seed, refusing to project"
-                        )
-                    })?),
-                    None => None,
-                };
-            // SEAM-D-1 (functional seam-pass, 2026-06-12): `node_state.shift_state`
-            // is a MIRROR of the `shifts` table.  NC-03 reconstructs it as `Closed`
-            // (current_shift_id NULL), but NC-03's domain (node_state lost, ledger
-            // survived) lives in the SAME DB file, so a surviving OPEN `shifts` row
-            // can coexist — and boot shift-recovery keys on
-            // `node_state.shift_state == Opened`, so a `Closed` reconstruction would
-            // MASK it (the hazard node_state.rs's caller-contract warns about).  We do
-            // NOT auto-resume the shift here (a node whose node_state vanished is
-            // operator-led, and Branch (f) freezes a Blocked node anyway) — instead we
-            // SURFACE the surviving active shift in the CRITICAL audit so the operator
-            // reconciles it BEFORE clearing the block (RUNBOOK step).
-            let surviving_open_shift =
-                match crate::db::repositories::shifts::active_shift_for_fn(pool, fiscal_number)
-                    .await?
-                {
-                    Some((id_bytes, state)) => serde_json::json!({
-                        "shift_id": hex_lower(&id_bytes),
-                        "state": state,
-                    }),
-                    None => serde_json::Value::Null,
-                };
-            let fn_owned = fiscal_number.to_string();
-            let payload = serde_json::json!({
-                "fiscal_number": fiscal_number,
-                "branch": "a-block",
-                "recovered_next_lnd": next_lnd,
-                "max_ledger_lnd": max_lnd,
-                "mac_seed_projected": projected_seed.is_some(),
-                // SEAM-D-1: non-null ⇒ a surviving OPEN shift the operator MUST
-                // reconcile before unblocking (it is NOT auto-recovered here).
-                "surviving_open_shift": surviving_open_shift,
-                "rationale":
-                    "node_state row LOST while the fiscal_documents ledger SURVIVED — LND allocator + MAC seed reconstructed from the ledger; node BLOCKED (no silent bootstrap, no trading until an operator clears the block). If surviving_open_shift is non-null, the operator MUST reconcile that shift before clearing the block — it is surfaced here, NOT auto-recovered.",
-            });
-            // One envelope: create the row with the reconstructed allocator,
-            // project the seed, then flip to BLOCKED via the existing W10.3
-            // setter (the row now exists), + CRITICAL audit.  The transient
-            // Online is never observable — boot runs before ingress is accepted
-            // and the flip commits atomically.
-            with_immediate(pool, move |tx| {
-                Box::pin(async move {
-                    node_state::upsert_initial_tx(
-                        tx,
-                        &fn_owned,
-                        NodeMode::Online,
-                        ShiftState::Closed,
-                        next_lnd,
-                    )
-                    .await?;
-                    if let Some(seed) = projected_seed {
-                        node_state::update_last_known_xml_sha_tx(tx, &fn_owned, &seed).await?;
-                    }
+    let Some(max_lnd) = fiscal_documents::max_lnd_any_state(pool, fiscal_number).await? else {
+        return Ok(false); // empty ledger → genuinely fresh FN (caller bootstraps)
+    };
+    let next_lnd = max_lnd + 1;
+    let projected_seed: Option<[u8; 32]> =
+        match fiscal_documents::last_issued_unsigned_xml_sha256(pool, fiscal_number).await? {
+            Some(bytes) => Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                anyhow::anyhow!(
+                    "AUD-L6-1: last issued unsigned_xml_sha256 for FN {fiscal_number} is not \
+                     32 bytes — corrupted MAC seed, refusing to project"
+                )
+            })?),
+            None => None,
+        };
+    let surviving_open_shift =
+        match crate::db::repositories::shifts::active_shift_for_fn(pool, fiscal_number).await? {
+            Some((id_bytes, state)) => serde_json::json!({
+                "shift_id": hex_lower(&id_bytes),
+                "state": state,
+            }),
+            None => serde_json::Value::Null,
+        };
+    let fn_owned = fiscal_number.to_string();
+    // The branch-(a) BLOCKED payload — kept byte-identical (existing NC-03 tests pin it).
+    let blocked_payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "branch": "a-block",
+        "recovered_next_lnd": next_lnd,
+        "max_ledger_lnd": max_lnd,
+        "mac_seed_projected": projected_seed.is_some(),
+        // SEAM-D-1: non-null ⇒ a surviving OPEN shift the operator MUST reconcile before unblocking.
+        "surviving_open_shift": surviving_open_shift.clone(),
+        "rationale":
+            "node_state row LOST while the fiscal_documents ledger SURVIVED — LND allocator + MAC seed reconstructed from the ledger; node BLOCKED (no silent bootstrap, no trading until an operator clears the block). If surviving_open_shift is non-null, the operator MUST reconcile that shift before clearing the block — it is surfaced here, NOT auto-recovered.",
+    });
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            node_state::upsert_initial_tx(
+                tx,
+                &fn_owned,
+                NodeMode::Online,
+                ShiftState::Closed,
+                next_lnd,
+            )
+            .await?;
+            if let Some(seed) = projected_seed {
+                node_state::update_last_known_xml_sha_tx(tx, &fn_owned, &seed).await?;
+            }
+            match restore {
+                None => {
                     let blocked = node_state::set_mode_blocked_tx(tx, &fn_owned).await?;
                     anyhow::ensure!(
                         blocked,
@@ -1825,13 +1812,92 @@ pub async fn run_boot_reconciliation(
                         "BOOT_LEDGER_WITHOUT_NODE_STATE_BLOCKED",
                         crate::db::models::enums::Severity::Critical,
                         None,
-                        Some(&payload.to_string()),
+                        Some(&blocked_payload.to_string()),
                     )
                     .await?;
-                    Ok::<(), anyhow::Error>(())
-                })
-            })
-            .await?;
+                }
+                Some(res_id) => {
+                    // Restore the surviving reservation's authority so the operator can complete it:
+                    // set delivery_generation = R.authorized_generation and the active pointer = R,
+                    // matching authorize_submission's write (delivery_reservation.rs:542). STOP (not
+                    // BLOCKED) so complete_operator_pending's STOP_MODE→target mode-CAS matches.
+                    let gen: Option<i64> = sqlx::query_scalar(
+                        "SELECT authorized_generation FROM delivery_reservation \
+                         WHERE reservation_id = ?",
+                    )
+                    .bind(&res_id[..])
+                    .fetch_one(&mut **tx)
+                    .await?;
+                    let gen = gen.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "NC-03 restore: active reservation for FN {fn_owned} has no \
+                             authorized_generation"
+                        )
+                    })?;
+                    sqlx::query(
+                        "UPDATE node_state SET delivery_generation = ?, \
+                             active_delivery_reservation_id = ? WHERE fiscal_number = ?",
+                    )
+                    .bind(gen)
+                    .bind(&res_id[..])
+                    .bind(&fn_owned)
+                    .execute(&mut **tx)
+                    .await?;
+                    let stopped = node_state::set_mode_stop_mode_tx(tx, &fn_owned).await?;
+                    anyhow::ensure!(
+                        stopped,
+                        "NC-03 restore: node_state row vanished mid-bootstrap for FN {fn_owned}"
+                    );
+                    let restore_payload = serde_json::json!({
+                        "fiscal_number": fn_owned,
+                        "branch": "a-block-reservation-restored",
+                        "recovered_next_lnd": next_lnd,
+                        "max_ledger_lnd": max_lnd,
+                        "mac_seed_projected": projected_seed.is_some(),
+                        "surviving_open_shift": surviving_open_shift,
+                        "restored_reservation_id": hex_lower(&res_id),
+                        "restored_generation": gen,
+                        "rationale":
+                            "node_state row LOST while the ledger AND a live delivery reservation SURVIVED — allocator + MAC seed reconstructed, and the reservation's authority (generation + active pointer) restored so operator completion can resolve it; node STOP_MODE (not trading) pending operator resolution.",
+                    });
+                    audit_log::append_tx(
+                        tx,
+                        "node_state",
+                        &fn_owned,
+                        "BOOT_LEDGER_WITHOUT_NODE_STATE_RESERVATION_RESTORED",
+                        crate::db::models::enums::Severity::Critical,
+                        None,
+                        Some(&restore_payload.to_string()),
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await?;
+    Ok(true)
+}
+
+pub async fn run_boot_reconciliation(
+    _guard: &super::ReconcileGuard<'_>,
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    deps: Option<&super::RuntimeView<'_>>,
+) -> anyhow::Result<BranchOutcome> {
+    use crate::db::repositories::{fiscal_documents, node_state};
+
+    let row = node_state::get(pool, fiscal_number).await?;
+
+    // ── Branch (a) — FN row absent ───────────────────────────────
+    let Some(row) = row else {
+        // NC-03 (external-critic FT, adjudicated 2026-06-11; AUD-L6-1; SEAM-D-1): the `node_state`
+        // row is absent.  If ANY `fiscal_documents` row survived, node_state was LOST (partial
+        // restore / corruption) — NOT a fresh FN.  A silent bootstrap would reset the LND allocator
+        // to 1 → duplicate lnd / forked MAC chain, so reconstruct the allocator + MAC seed and BLOCK.
+        // Extracted to `reconstruct_lost_node_state` (shared verbatim with the S7-1 boot-first
+        // reservation pass §7.2 step 3, which invokes the SAME repair UNFENCED for a deferred FN).
+        if reconstruct_lost_node_state(pool, fiscal_number, None).await? {
             return Ok(BranchOutcome::BlockedLedgerWithoutNodeState);
         }
 

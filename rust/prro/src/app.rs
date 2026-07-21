@@ -564,6 +564,35 @@ impl App {
         // PR-B (RS-4, spec §B-1.4) — boot stale-tip guard master switch.
         let tip_guard_enabled = self.inner.config.backup.tip_guard_enabled;
         let mut summary = ReconciliationSummary::default();
+
+        // CS-3 S7-1 · A3 — boot-first delivery-reservation pass (§7.1/§7.2). GLOBAL and pre-loop:
+        // it normalises crashed `CALL_STARTED` reservations, applies recorded `OUTCOME_OBSERVED +
+        // PENDING_APPLY` ones, and reconstructs any FN whose `node_state` was lost, BEFORE the per-FN
+        // dispatch runs.  No wire I/O (invariant #1); runs under the recon mutex.  INACTIVE until the
+        // Slice-7 cutover mints reservations — the queries are empty today, so this is a no-op.
+        // Ordering is LOAD-BEARING (S7-P4-BOOT order-swap canary): running it after the loop would let
+        // the loop resume a crashed `Sending` doc to `ErrorRetryable` before the STOP flip.
+        let res_pass =
+            crate::services::reconciliation::reservation_boot_pass::run(&_recon_guard, pool)
+                .await
+                .map_err(|e| match e.downcast::<sqlx::Error>() {
+                    Ok(sqlx_err) => BootError::Database(sqlx_err),
+                    Err(other) => BootError::ReconciliationFailed {
+                        fiscal_number: "<boot-reservation-pass>".to_string(),
+                        source: other,
+                    },
+                })?;
+        if res_pass.is_active() {
+            tracing::info!(
+                normalized = res_pass.normalized,
+                applied = res_pass.applied,
+                held = res_pass.held,
+                reconstructed = res_pass.reconstructed,
+                dropped = res_pass.dropped,
+                "boot-first reservation pass resolved crashed/pending delivery reservations"
+            );
+        }
+
         for fn_cfg in &fns {
             // M3a hardening pass 1: resolve per-FN RuntimeView BEFORE
             // dispatching.  `ReconciliationRuntime::resolve` returns

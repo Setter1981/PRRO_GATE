@@ -30,6 +30,10 @@ use prro::db::tx::with_immediate;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
+#[path = "support/inactive_lifecycle_scan.rs"]
+mod inactive_lifecycle_scan;
+use inactive_lifecycle_scan::{scan_inactive_lifecycle_refs, scan_src_tree};
+
 // ─────────────────────────── fixtures ───────────────────────────
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -705,7 +709,9 @@ async fn drive_clean_accept(pool: &SqlitePool, res_byte: u8) {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
              response_provenance = 'PARSED_DPS_ENVELOPE', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Accepted', evidence_text = '4000000001', \
+             remote_correlation_id = '4000000001' \
          WHERE reservation_id = ?",
     )
     .bind(&[res_byte; 16][..])
@@ -719,14 +725,19 @@ async fn t01_rn_cs_oo_happy_path_ok() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
-    // RN→CS→OO clean accept. After clean accept the fence is RELEASED (routing NULL).
+    // RN→CS→OO clean accept. §3.1: holds at PENDING_APPLY, releases at APPLIED.
     drive_clean_accept(&pool, 0x01).await;
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
     let active = delivery_reservation::get_active_for_fn(&pool, FN_A)
         .await
         .unwrap();
     assert!(
         active.is_none(),
-        "clean accept (SUBMITTED + routing NULL) releases the fence"
+        "clean accept (SUBMITTED + routing NULL) at APPLIED releases the fence"
     );
 }
 
@@ -744,17 +755,27 @@ async fn t02_rn_oo_not_submitted_clears_marker_ok() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'PreconditionFailed' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect("RN→OO(NOT_SUBMITTED) is a legal edge and releases the fence");
+    .expect("RN→OO(NOT_SUBMITTED) is a legal edge");
+    // §3.1: releases only at APPLIED (PENDING_APPLY holds).
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
     let active = delivery_reservation::get_active_for_fn(&pool, FN_A)
         .await
         .unwrap();
-    assert!(active.is_none(), "NOT_SUBMITTED cancel releases the fence");
+    assert!(
+        active.is_none(),
+        "NOT_SUBMITTED cancel at APPLIED releases the fence"
+    );
 }
 
 #[tokio::test]
@@ -818,7 +839,8 @@ async fn t05_rn_cs_oo_submitted_unknown_ok_and_fences() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'NoResponse', evidence_text = 'Timeout' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -866,7 +888,8 @@ async fn f02_second_reservation_blocked_after_submitted_unknown() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'NoResponse', evidence_text = 'Timeout' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -896,7 +919,9 @@ async fn f03_second_reservation_blocked_after_submitted_with_routing() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
              response_provenance = 'PARSED_DPS_ENVELOPE', routing_class = 'TerminalReject', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Rejected', evidence_text = 'Verify', \
+             evidence_digest = X'0000000000000000000000000000000000000000000000000000000000000000' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -919,11 +944,17 @@ async fn f04_second_reservation_accepted_after_clean_accept() {
     let doc1 = seed_doc(&pool, FN_A, 0x11, 1).await;
     let doc2 = seed_doc(&pool, FN_A, 0x22, 2).await;
     insert_res(&pool, new_res(0x01, doc1, FN_A)).await.unwrap();
-    drive_clean_accept(&pool, 0x01).await; // SUBMITTED + routing NULL → fence released
-                                           // Fence released → a NEW reservation on the FN is ACCEPTED.
+    drive_clean_accept(&pool, 0x01).await; // SUBMITTED + routing NULL, PENDING_APPLY → STILL fenced (§3.1)
+                                           // §3.1: a clean accept RELEASES the fence only once APPLIED (PENDING_APPLY holds until then).
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Fence released at APPLIED → a NEW reservation on the FN is ACCEPTED.
     insert_res(&pool, new_res(0x02, doc2, FN_A))
         .await
-        .expect("2nd reservation after clean accept must be accepted (fence released)");
+        .expect("2nd reservation after clean accept APPLIED must be accepted (fence released)");
     let active = delivery_reservation::get_active_for_fn(&pool, FN_A)
         .await
         .unwrap()
@@ -941,16 +972,23 @@ async fn f05_second_reservation_accepted_after_not_submitted() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'PreconditionFailed' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
     .unwrap();
+    // §3.1: PENDING_APPLY still holds the fence; NOT_SUBMITTED releases only at APPLIED.
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
     insert_res(&pool, new_res(0x02, doc2, FN_A))
         .await
-        .expect("2nd reservation after NOT_SUBMITTED cancel must be accepted");
+        .expect("2nd reservation after NOT_SUBMITTED cancel (APPLIED) must be accepted");
 }
 
 // ═══════════════════════════ immutability ═══════════════════════════
@@ -969,8 +1007,9 @@ async fn i01_settled_routing_null_to_terminalreject_rejected() {
     .execute(&pool)
     .await
     .expect_err("settled OO routing NULL→value must be blocked (immutable)");
+    // Blocked by the 032 immutability trigger AND the 036 matrix (Accepted requires routing NULL).
     assert!(
-        err_has(&err, "immutable") || err_has(&err, "constraint"),
+        err_has(&err, "immutable") || err_has(&err, "constraint") || err_has(&err, "evidence"),
         "{err}"
     );
 }
@@ -1025,20 +1064,24 @@ async fn i04_remote_correlation_id_mutation_after_oo_rejected() {
     let doc = seed_doc(&pool, FN_A, 0x11, 1).await;
     insert_res(&pool, new_res(0x01, doc, FN_A)).await.unwrap();
     advance_to_cs(&pool, 0x01).await.unwrap();
-    // Reach OO(SUBMITTED_UNKNOWN) WITH a remote_correlation_id set at the OO step.
+    // Reach OO WITH a remote_correlation_id set at the OO step. Under the 036 evidence matrix
+    // the ONLY leaf that carries a correlation is Accepted (correlation = evidence_text = F),
+    // so the correlation-bearing OO row is a clean accept (routing NULL, F='4000000001').
     sqlx::query(
         "UPDATE delivery_reservation \
-         SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
-             response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             remote_correlation_id = 'corr-1', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+         SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED', \
+             response_provenance = 'PARSED_DPS_ENVELOPE', \
+             remote_correlation_id = '4000000001', \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'Accepted', evidence_text = '4000000001' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
-    .expect("setting remote_correlation_id at the OO step is legal");
-    // Now mutating it once OO → immutable trigger.
+    .expect("setting remote_correlation_id (= F) at the OO step is legal for a clean accept");
+    // Now mutating it once OO is blocked — by the 032 immutability trigger AND the 036 matrix
+    // (Accepted requires correlation = evidence_text, so 'corr-2' ≠ '4000000001' also aborts).
     let err = sqlx::query(
         "UPDATE delivery_reservation SET remote_correlation_id = 'corr-2' WHERE reservation_id = ?",
     )
@@ -1047,7 +1090,7 @@ async fn i04_remote_correlation_id_mutation_after_oo_rejected() {
     .await
     .expect_err("remote_correlation_id mutation after OO must be blocked (immutable)");
     assert!(
-        err_has(&err, "immutable") || err_has(&err, "constraint"),
+        err_has(&err, "immutable") || err_has(&err, "constraint") || err_has(&err, "evidence"),
         "{err}"
     );
 }
@@ -1313,7 +1356,8 @@ async fn b01_submitted_unknown_no_response_transient_retry_accepted() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'SUBMITTED_UNKNOWN', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'NoResponse', evidence_text = 'Timeout' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
@@ -1340,13 +1384,20 @@ async fn n01_sequential_attempts_increment_after_cancel() {
         "UPDATE delivery_reservation \
          SET state = 'OUTCOME_OBSERVED', submission_certainty = 'NOT_SUBMITTED', \
              response_provenance = 'NO_RESPONSE', routing_class = 'TransientRetry', \
-             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect' \
+             apply_state = 'PENDING_APPLY', node_effect = 'NoNodeEffect', \
+             evidence_kind = 'PreconditionFailed' \
          WHERE reservation_id = ?",
     )
     .bind(&[0x01u8; 16][..])
     .execute(&pool)
     .await
     .unwrap();
+    // §3.1: release the fence at APPLIED (attempt 1 never started, so call-once allows a 2nd).
+    sqlx::query("UPDATE delivery_reservation SET apply_state = 'APPLIED' WHERE reservation_id = ?")
+        .bind(&[0x01u8; 16][..])
+        .execute(&pool)
+        .await
+        .unwrap();
     // attempt 2 for the SAME document — repo computes MAX(attempt_no)+1 = 2.
     let a2 = insert_res(&pool, new_res(0x02, doc, FN_A)).await.unwrap();
     assert_eq!(
@@ -1390,6 +1441,10 @@ async fn p01_upgrade_on_nonempty_db_sqlite_master_diff() {
         "delivery_reservation",
         "ux_fd_docid_fn",
         "ux_reservation_active",
+        // 035 adds the per-document lifetime call-once index (P2); like the other
+        // reservation objects, the control DB drops the table (auto-dropping this
+        // partial index), so it belongs in the filtered-out reservation-object set.
+        "ux_delivery_document_ever_started",
         "ix_reservation_call_started",
         "delivery_reservation_insert_state",
         "delivery_reservation_no_replace",
@@ -1411,6 +1466,19 @@ async fn p01_upgrade_on_nonempty_db_sqlite_master_diff() {
         "delivery_reservation_cs_pairing_update",
         "delivery_reservation_oo_completeness",
         "delivery_reservation_clean_accept_node_effect",
+        // 036 adds three more triggers ON delivery_reservation (Slice 2a evidence
+        // union: pre-OO/insert null-guard, fail-closed matrix, evidence immutability).
+        // The control DB's DROP TABLE auto-drops them, so they belong in the
+        // filtered-out reservation-object set. (036's four evidence COLUMNS are part
+        // of the delivery_reservation table DDL, which is already filtered out via the
+        // table itself — only the triggers are separate sqlite_master rows.)
+        "delivery_reservation_evidence_insert",
+        "delivery_reservation_evidence_matrix_update",
+        "delivery_reservation_evidence_immutable",
+        // 037 adds the mandatory-at-OO trigger ON delivery_reservation (evidence_kind NOT
+        // NULL at OUTCOME_OBSERVED). Like the other reservation triggers, the control DB's
+        // DROP TABLE auto-drops it, so it belongs in the filtered-out reservation-object set.
+        "delivery_reservation_evidence_mandatory_update",
     ]
     .into_iter()
     .collect();
@@ -1520,37 +1588,183 @@ async fn p02_normal_fiscalisation_leaves_reservation_empty() {
     );
 }
 
-/// Static call-graph pin (merge pin §6.4): the `delivery_reservation` repo is
-/// referenced ONLY by the migration / persistence tests, NEVER by a production
-/// caller.  Grep-based over `src/` — the sole allowed reference is the module
-/// declaration in `repositories/mod.rs` and the repo's own file.
-#[tokio::test]
-async fn p03_no_production_caller_static_pin() {
-    use std::process::Command;
-    // Find the crate src root relative to this test binary via CARGO_MANIFEST_DIR.
-    let manifest = env!("CARGO_MANIFEST_DIR"); // .../rust/prro
-    let src = format!("{manifest}/src");
-    let out = Command::new("grep")
-        .args(["-rn", "delivery_reservation", &src])
-        .output()
-        .expect("grep runs");
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Allowed references in src/: the module declaration in repositories/mod.rs
-    // and everything inside the repo's own source file.  Anything ELSE is a
-    // production caller and fails this pin.
-    let mut offenders = Vec::new();
-    for line in text.lines() {
-        // line format: <path>:<lineno>:<content>
-        let path = line.split(':').next().unwrap_or("");
-        let is_repo_file = path.ends_with("repositories/delivery_reservation.rs");
-        let is_mod_decl = path.ends_with("repositories/mod.rs");
-        if is_repo_file || is_mod_decl {
-            continue;
-        }
-        offenders.push(line.to_string());
-    }
+// ─── p03: static pin — no production caller of the still-INACTIVE S7-1 lifecycle ──────────
+//
+// The structural scanner lives in `support/inactive_lifecycle_scan.rs` (shared with
+// `migration_033::rg08`). Retargeted after S7-2 (`3f69af5`): `fn_fence_active_tx` is the
+// intentionally-ACTIVE fence read-helper, so the pin targets the INACTIVE S7-1 *lifecycle* symbols
+// (authorize/record/apply/resume/list/insert) STRUCTURALLY (syn AST, not grep), excluding
+// `#[cfg(test)]` scaffolding but NOT `#[cfg(not(test))]`. Teeth: the `p03_bite_*` synthetic controls.
+
+/// p03 (merge pin §6.4, retargeted): the INACTIVE S7-1 delivery lifecycle has NO production caller.
+#[test]
+fn p03_no_production_caller_static_pin() {
+    let hits = scan_src_tree(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        offenders.is_empty(),
-        "delivery_reservation must have NO production caller in src/; found: {offenders:#?}"
+        hits.is_empty(),
+        "the INACTIVE S7-1 delivery lifecycle (authorize/record/apply/resume/list/insert) must have \
+         NO production caller — `fn_fence_active_tx` (S7-2 fence) and `complete_operator_pending` \
+         (gap 4a) are the sanctioned ACTIVE exceptions; found: {hits:#?}"
     );
+}
+
+// ─── p03 synthetic bite controls (parsed inline; production scan stays GREEN) ──────────────
+
+#[test]
+fn p03_bite_production_record_outcome_call_is_flagged() {
+    let snippet = r#"
+        async fn caller(tx: &mut Tx) {
+            let _ = crate::db::repositories::delivery_reservation::record_outcome(tx, o, e).await;
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<prod_record>");
+    assert!(
+        hits.iter().any(|h| h.detail.contains("record_outcome")),
+        "a production record_outcome call must be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_production_qualified_insert_is_flagged() {
+    let snippet = r#"
+        async fn caller(tx: &mut Tx) {
+            let _ = delivery_reservation::insert(tx, row).await;
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<prod_insert>");
+    assert!(
+        hits.iter()
+            .any(|h| h.detail.contains("delivery_reservation::insert")),
+        "a production delivery_reservation::insert call must be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_cfg_test_insert_is_not_flagged() {
+    // The SAME forbidden call inside a #[cfg(test)] module is test scaffolding → GREEN.
+    let snippet = r#"
+        #[cfg(test)]
+        mod tests {
+            async fn seed(tx: &mut Tx) {
+                let _ = super::delivery_reservation::insert(tx, row).await;
+            }
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<cfg_test_insert>");
+    assert!(
+        hits.is_empty(),
+        "a #[cfg(test)] lifecycle call must NOT be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_cfg_not_test_call_is_flagged() {
+    // #[cfg(not(test))] is PRODUCTION — a lifecycle call there IS flagged (exclusion is cfg(test)
+    // only, never cfg(not(test))).
+    let snippet = r#"
+        #[cfg(not(test))]
+        mod prod {
+            async fn caller(tx: &mut Tx) {
+                let _ = super::delivery_reservation::record_outcome(tx).await;
+            }
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<cfg_not_test>");
+    assert!(
+        hits.iter().any(|h| h.detail.contains("record_outcome")),
+        "#[cfg(not(test))] is production — must be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_production_fn_fence_active_tx_is_not_flagged() {
+    // The S7-2 fence read-helper is intentionally active — must NOT be flagged.
+    let snippet = r#"
+        async fn writer(tx: &mut Tx) -> anyhow::Result<()> {
+            if delivery_reservation::fn_fence_active_tx(tx, fn_id).await? {
+                return Ok(());
+            }
+            Ok(())
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<prod_fence>");
+    assert!(
+        hits.is_empty(),
+        "fn_fence_active_tx (S7-2 active fence) must NOT be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_production_complete_operator_pending_is_not_flagged() {
+    // The sanctioned gap-4a operator entrypoint — active, must NOT be flagged.
+    let snippet = r#"
+        async fn orchestrate(tx: &mut Tx) {
+            let _ = delivery_reservation::complete_operator_pending(tx, id, res).await;
+        }
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<prod_complete>");
+    assert!(
+        hits.is_empty(),
+        "complete_operator_pending (gap 4a) must NOT be flagged: {hits:#?}"
+    );
+}
+
+#[test]
+fn p03_bite_use_import_of_lifecycle_symbol_is_flagged() {
+    // A bare `use` import (even renamed) of a lifecycle symbol is a production reference → RED.
+    let snippet = r#"
+        use crate::db::repositories::delivery_reservation::apply_outcome as _aliased;
+    "#;
+    let hits = scan_inactive_lifecycle_refs(snippet, "<use_import>");
+    assert!(
+        hits.iter().any(|h| h.detail.contains("apply_outcome")),
+        "a use-import (even aliased) of a lifecycle symbol must be flagged: {hits:#?}"
+    );
+}
+
+/// A3 (S7-1 §7.2): the boot-first reservation pass is the SANCTIONED production caller of the
+/// still-INACTIVE lifecycle helpers — but ONLY of the read/resume/apply subset. This positive
+/// allowlist pin guards the file-wide exclusion in `scan_src_tree` (so the exclusion is not a
+/// denylist hole): the pass must reference EXACTLY the read/resume/apply subset and NEVER a
+/// mint/authority symbol (`authorize_submission` / `record_outcome` / `delivery_reservation::insert`
+/// / `get_active_for_fn`), which stay cutover-only.
+#[test]
+fn boot_pass_references_only_the_sanctioned_read_apply_subset() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/services/reconciliation/reservation_boot_pass.rs"
+    );
+    let text = std::fs::read_to_string(path).expect("read reservation_boot_pass.rs");
+    let details: Vec<String> = scan_inactive_lifecycle_refs(&text, "reservation_boot_pass.rs")
+        .into_iter()
+        .map(|h| h.detail)
+        .collect();
+    // Match the EXACT backticked symbol the scanner records — never a substring.
+    let refs = |sym: &str| details.iter().any(|d| d.contains(&format!("`{sym}`")));
+
+    // Load-bearing: the pass DOES reference the read/resume/apply subset — proves the file-wide
+    // scan exclusion is real, not vacuous.
+    for sym in [
+        "resume_crashed_reservation",
+        "apply_outcome",
+        "list_call_started_without_outcome",
+        "list_outcome_observed_pending_apply",
+    ] {
+        assert!(
+            refs(sym),
+            "boot pass must reference `{sym}` (§7.2): {details:#?}"
+        );
+    }
+    // Forbidden: the pass must NEVER touch a mint / authority symbol — those activate at cutover.
+    for sym in [
+        "authorize_submission",
+        "record_outcome",
+        "delivery_reservation::insert",
+        "get_active_for_fn",
+    ] {
+        assert!(
+            !refs(sym),
+            "boot pass must NOT reference the mint/authority symbol `{sym}` (cutover-only): {details:#?}"
+        );
+    }
 }
