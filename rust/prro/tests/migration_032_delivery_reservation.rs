@@ -1721,3 +1721,50 @@ fn p03_bite_use_import_of_lifecycle_symbol_is_flagged() {
         "a use-import (even aliased) of a lifecycle symbol must be flagged: {hits:#?}"
     );
 }
+
+/// A3 (S7-1 §7.2): the boot-first reservation pass is the SANCTIONED production caller of the
+/// still-INACTIVE lifecycle helpers — but ONLY of the read/resume/apply subset. This positive
+/// allowlist pin guards the file-wide exclusion in `scan_src_tree` (so the exclusion is not a
+/// denylist hole): the pass must reference EXACTLY the read/resume/apply subset and NEVER a
+/// mint/authority symbol (`authorize_submission` / `record_outcome` / `delivery_reservation::insert`
+/// / `get_active_for_fn`), which stay cutover-only.
+#[test]
+fn boot_pass_references_only_the_sanctioned_read_apply_subset() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/services/reconciliation/reservation_boot_pass.rs"
+    );
+    let text = std::fs::read_to_string(path).expect("read reservation_boot_pass.rs");
+    let details: Vec<String> = scan_inactive_lifecycle_refs(&text, "reservation_boot_pass.rs")
+        .into_iter()
+        .map(|h| h.detail)
+        .collect();
+    // Match the EXACT backticked symbol the scanner records — never a substring.
+    let refs = |sym: &str| details.iter().any(|d| d.contains(&format!("`{sym}`")));
+
+    // Load-bearing: the pass DOES reference the read/resume/apply subset — proves the file-wide
+    // scan exclusion is real, not vacuous.
+    for sym in [
+        "resume_crashed_reservation",
+        "apply_outcome",
+        "list_call_started_without_outcome",
+        "list_outcome_observed_pending_apply",
+    ] {
+        assert!(
+            refs(sym),
+            "boot pass must reference `{sym}` (§7.2): {details:#?}"
+        );
+    }
+    // Forbidden: the pass must NEVER touch a mint / authority symbol — those activate at cutover.
+    for sym in [
+        "authorize_submission",
+        "record_outcome",
+        "delivery_reservation::insert",
+        "get_active_for_fn",
+    ] {
+        assert!(
+            !refs(sym),
+            "boot pass must NOT reference the mint/authority symbol `{sym}` (cutover-only): {details:#?}"
+        );
+    }
+}

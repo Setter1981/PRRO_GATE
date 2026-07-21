@@ -26,6 +26,12 @@ use syn::visit::Visit;
 /// - `complete_operator_pending` — the sanctioned gap-4a operator-completion entrypoint (sole
 ///   caller = `services::reconciliation::operator_completion`).
 ///
+/// The S7-1 boot-first reservation pass (`reconciliation/reservation_boot_pass.rs`) IS a production
+/// caller of `resume`/`apply`/`list_*`, but is INACTIVE (empty queries pre-cutover); it is excluded
+/// FILE-WIDE in [`scan_src_tree`] and its reference set is positively pinned by
+/// `migration_032::boot_pass_references_only_the_sanctioned_read_apply_subset` (an allowlist, so the
+/// file-exclusion is not a denylist hole).
+///
 /// `insert` is matched ONLY as the qualified `delivery_reservation::insert` (the bare name collides
 /// with `HashMap::insert`, sqlx, etc.).
 const UNIQUE_INACTIVE_LIFECYCLE: &[&str] = &[
@@ -229,6 +235,10 @@ pub fn scan_src_tree(manifest_dir: &str) -> Vec<LifecycleRef> {
             .to_string();
         if rel.ends_with("repositories/delivery_reservation.rs")
             || rel.ends_with("repositories/mod.rs")
+            // The S7-1 §7.2 boot-first reservation pass is the SANCTIONED (still-INACTIVE,
+            // empty-in-production) caller of `resume`/`apply`/`list_*`; its exact reference set is
+            // positively pinned by `migration_032::boot_pass_references_only_the_sanctioned_read_apply_subset`.
+            || rel.ends_with("reconciliation/reservation_boot_pass.rs")
         {
             continue;
         }

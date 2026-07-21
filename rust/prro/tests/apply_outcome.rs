@@ -16,8 +16,8 @@
 
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::delivery_reservation::{
-    self, apply_outcome, list_call_started_without_outcome, resume_crashed_reservation, ApplyError,
-    ApplyResult, Authorization, NewReservation,
+    self, apply_outcome, list_call_started_without_outcome, list_outcome_observed_pending_apply,
+    resume_crashed_reservation, ApplyError, ApplyResult, Authorization, NewReservation,
 };
 use prro::db::tx::with_immediate;
 use sqlx::SqlitePool;
@@ -668,4 +668,33 @@ async fn br03_resumed_reservation_holds_the_fn_fence() {
     assert!(err
         .downcast_ref::<delivery_reservation::AuthorizeError>()
         .is_some());
+}
+
+#[tokio::test]
+async fn lr01_list_outcome_observed_pending_apply_returns_only_pending() {
+    let (_d, pool) = fresh_pool().await;
+    // Three reservations on distinct FNs (the §3.1 fence permits one active reservation per FN):
+    //   A — CALL_STARTED (crashed, no outcome)       → EXCLUDED
+    //   B — OUTCOME_OBSERVED + PENDING_APPLY (Accepted) → INCLUDED
+    //   C — APPLIED (Accepted, then applied)          → EXCLUDED
+    let (fa, fb, fc) = ("3100000001", "3100000002", "3100000003");
+    let doc_a = seed_doc(&pool, fa, 0x11, None).await;
+    let doc_b = seed_doc(&pool, fb, 0x22, None).await;
+    let doc_c = seed_doc(&pool, fc, 0x33, None).await;
+    insert_authorize_only(&pool, 0x0A, doc_a, fa).await; // CALL_STARTED
+    authorize(&pool, new_res(0x0B, doc_b, fb)).await;
+    record_accepted(&pool, 0x0B, "5000000001").await; // OUTCOME_OBSERVED + PENDING_APPLY
+    authorize(&pool, new_res(0x0C, doc_c, fc)).await;
+    record_accepted(&pool, 0x0C, "5000000002").await;
+    let applied_c = apply(&pool, 0x0C).await.expect("apply C"); // online Accepted → APPLIED
+    assert!(applied_c.applied, "C is applied");
+    assert_eq!(
+        read_apply_state(&pool, 0x0C).await.as_deref(),
+        Some("APPLIED")
+    );
+
+    let pending = list_outcome_observed_pending_apply(&pool).await.unwrap();
+    assert_eq!(pending.len(), 1, "only the OO+PENDING_APPLY row is listed");
+    assert_eq!(pending[0].0, [0x0B; 16]);
+    assert_eq!(pending[0].1, fb);
 }

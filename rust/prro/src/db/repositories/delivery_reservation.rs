@@ -1053,6 +1053,33 @@ pub async fn list_call_started_without_outcome(
     Ok(out)
 }
 
+/// List the reservations resting at `OUTCOME_OBSERVED` + `PENDING_APPLY` (the recorded-but-not-yet-
+/// applied set) for the boot-first apply pass (CS-3 S7-1 §7.2 step 2).
+///
+/// Companion to [`list_call_started_without_outcome`]: after boot normalises the crashed
+/// `CALL_STARTED` rows, this enumerates every reservation whose outcome was recorded but whose apply
+/// did not commit before a crash, so the shared [`apply_outcome`] orchestration can be replayed once
+/// per row in its own transaction (design §4.3 / S7-1 §7.2). An `APPLIED` row (or a still-crashed
+/// `CALL_STARTED` row) is excluded. Returns `(reservation_id, fiscal_number)`. Read-only, pool-bound.
+pub async fn list_outcome_observed_pending_apply(
+    pool: &sqlx::SqlitePool,
+) -> sqlx::Result<Vec<(ReservationId, String)>> {
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+        "SELECT reservation_id, fiscal_number FROM delivery_reservation \
+         WHERE state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, fscl) in rows {
+        let arr: [u8; 16] = id.as_slice().try_into().map_err(|_| {
+            sqlx::Error::Decode("delivery_reservation.reservation_id != 16 bytes".into())
+        })?;
+        out.push((arr, fscl));
+    }
+    Ok(out)
+}
+
 /// Boot-resume a crashed `CALL_STARTED` reservation (CS-3 Slice 4, design §4.3 step 5).
 ///
 /// Converts, in the caller's single `BEGIN IMMEDIATE`, a `CALL_STARTED` reservation with no
