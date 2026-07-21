@@ -112,8 +112,27 @@ code never reaches (the workflow flagged exactly this). Therefore:
   wording yields to this visibility constraint; note the deviation in the pin's doc-comment.
 - The pin asserts each leaf's live `RoutingDecision` (target_state, retry_class, audit_event,
   node_mode_flip, probe) against the locked rev10 table; the 3 declared deltas as the (incumbent,
-  target-literal) pair; the `apply_outcome` seed/SFN/shift/fence dims as a SEPARATE follow-on
-  (DB-driven per outcome class) so the first pin commit stays pure + tractable.
+  target-literal) pair.
+
+### 7D graph coverage — a COMPOSITION of REQUIRED pins, not one file (implementation finding)
+
+The full 7D graph is already covered by four REQUIRED-gated surfaces; a single monolithic pin would
+DUPLICATE the existing apply/record coverage (against the minimal-diff / anti-duplication bias). The
+seam maps cleanly onto the dims:
+
+| dims | surface | status |
+|---|---|---|
+| target_state, retry_class, audit, severity, probe, node_mode_flip (per code, full tuple) | `transports::dps::apply_plan_pin` (`s7_applyplan_*`) | **NEW (this slice)** — the genuine gap: drift_pin normalises audit/severity/probe away |
+| route-vs-classify DELTA set (all leaves, 3 deltas + equal rows) | `grpc.rs::pin_d_section_4_6_drift_pin` | existing REQUIRED |
+| SFN / seed / fence RELEASE-vs-HELD / node BLOCKED / online-offline origin | `tests/apply_outcome.rs` (`ap01`–`ap10`, `br01`) | existing REQUIRED |
+| record: evidence columns, `PENDING_APPLY`, early STOP/BLOCKED halt | `tests/record_outcome.rs` (`rc01`–`rc08`) | existing REQUIRED |
+| leaf-set exhaustiveness (a NEW `EvidenceDiscriminant` variant breaks the pin) | `evidence.rs::roundtrip_all_eleven_leaves` | existing |
+
+So A2's genuine new pin work is the **route full-tuple lock + the rev10 MissingStatus scoping** (this
+slice, canary-verified). The apply/record/delta/leaf-count dims need NO new pin — building one would
+re-test `apply_outcome.rs` / `record_outcome.rs`. The cutover (B) still adds the apply-side gaps
+(shift-confirm, seed-drift gate, audit/trace) named above; those are activation deliverables, and the
+existing `apply_outcome.rs` pins the current (correct) apply behaviour they extend.
 
 ## apply_outcome coverage — cutover gaps (NOT pin blockers; flagged for B cutover)
 
