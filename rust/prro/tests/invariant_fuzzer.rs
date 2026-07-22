@@ -318,8 +318,10 @@ async fn teeth_d5_superseded_drain_predicts_error_retryable_rmr() {
 }
 
 /// U1 D5 (POS tooth) — a `[Ack, NotFound]` drain is differential-checked: the
-/// head doc → `SENT` (SentNotFoundDowngrade — held pending), shift unchanged,
-/// successors held.  (Pre-D5 both exotic scripts routed to Fault → resync.)
+/// head doc → `SENT` (SentFresh confirm → StructuralDrift, held pending), shift
+/// unchanged, successors held.  (Pre-D5 both exotic scripts routed to Fault →
+/// resync.)  NB: the cross-tick SentReplay-NotFound path now escalates to RMR +
+/// STOP (CS-3 S7-1 F2-kvt2); it is not driven by this single-tick script.
 #[tokio::test]
 async fn teeth_d5_send_ack_notfound_drain_predicts_sent_held() {
     let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
@@ -1000,8 +1002,9 @@ fn model_drain_reject_halts_and_escalates_manual() {
     assert!(matches!(out, ExpectedOutcome::Mutated(_)));
     assert_eq!(
         m.docs.get(&1),
-        Some(&DocState::Rejected),
-        "first backlog doc → REJECTED"
+        Some(&DocState::Sending),
+        "CS-3 S7-1: first backlog doc HELD at SENDING (a drain reject is a recorded HOLD under \
+         PENDING_APPLY, not a terminal Rejected)"
     );
     assert_eq!(
         m.docs.get(&2),
@@ -1891,9 +1894,16 @@ async fn mirrors_catch_seeded_mirror2_desync() {
 /// forced out.  Reject-halt legitimately rests at `GoingOnline + RMR`; the
 /// system must NOT auto-settle from there, so RMR is settled-for-scan.  Used by
 /// BOTH the per-op scan gate and the terminal settle.
+///
+/// CS-3 S7-1: a HELD send outcome (-12 / ambiguous / drain reject) flips the node to
+/// `StopMode` and rests the doc at SENDING under a PENDING_APPLY reservation — a legitimate
+/// operator-pending resting state (recovery is operator/boot-driven, not auto). So `StopMode`
+/// is a settled resting mode too; a held doc under STOP is NOT a liveness violation.
 fn is_settled(mode: NodeMode, shift: ShiftState) -> bool {
-    matches!(mode, NodeMode::Online | NodeMode::Offline)
-        || shift == ShiftState::RequiresManualReconciliation
+    matches!(
+        mode,
+        NodeMode::Online | NodeMode::Offline | NodeMode::StopMode
+    ) || shift == ShiftState::RequiresManualReconciliation
 }
 
 /// The shift states a real drain can make progress on (`backlog_drain.rs`
@@ -2959,14 +2969,15 @@ async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
 
-    // Drain (via GoOnline) with a leading reject → head doc REJECTED, shift →
-    // RequiresManualReconciliation, drain halts (the successor stays held).
+    // Drain (via GoOnline) with a leading reject → CS-3 S7-1: the head doc is a recorded HOLD
+    // (SENDING under PENDING_APPLY, not terminal Rejected), shift → RequiresManualReconciliation,
+    // drain halts (the successor stays held).
     let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
     let ledger = ctx.read_ledger().await;
     assert_eq!(
         ledger.get(&1),
-        Some(&DocState::Rejected),
-        "head backlog doc is REJECTED by the leading reject"
+        Some(&DocState::Sending),
+        "CS-3 S7-1: head backlog doc HELD at SENDING by the leading reject (recorded HOLD, not Rejected)"
     );
     assert_eq!(
         ledger.get(&2),

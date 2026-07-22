@@ -695,6 +695,29 @@ pub async fn record_outcome(
     .map_err(RecordError::Db)?;
     let fiscal_number = fiscal_number.ok_or(RecordError::ReservationMissing)?;
 
+    // CS-3 S7-1: an OFFLINE-ORIGIN reject is a HOLD in `apply_outcome` (§3.2 row 5: `if !online →
+    // HeldNotAutoRelease`), for EVERY node_effect (the `!online` gate precedes the node_effect
+    // match). The held doc rests `SENDING` + `PENDING_APPLY` and is never auto-released. Unlike an
+    // ONLINE terminal reject (which apply releases to `REJECTED` and needs no halt), the held
+    // offline reject MUST carry an EARLY durable STOP here — `record` owns the halt — so that
+    //   (a) operator completion is reachable (the STOP marker is the completion gate), and
+    //   (b) the invariant_scan quiescent-`SENDING` exemption (which admits a held pair ONLY when the
+    //       node is STOP_MODE|BLOCKED) recognises this as a legitimate hold, not an orphan.
+    // `NodeBlocked` (-11 offline) is handled by the BLOCKED branch below and already satisfies the
+    // exemption; the query short-circuits on non-reject leaves (no read for Accepted/Unknown).
+    let offline_reject_hold =
+        cols.kind == "Rejected" && node_effect != NodeEffect::NodeBlocked && {
+            let offline_fiscal_no: Option<Option<i64>> = sqlx::query_scalar(
+                "SELECT offline_fiscal_no FROM fiscal_documents WHERE document_id = ?",
+            )
+            .bind(DbDocumentId(obs.document_id()))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(RecordError::Db)?;
+            // offline-origin ⟺ offline_fiscal_no IS NOT NULL (mirrors apply_outcome's `online`).
+            matches!(offline_fiscal_no, Some(Some(_)))
+        };
+
     if node_effect == NodeEffect::NodeBlocked {
         // `-11 ERROR_OFFLINE_168` — the FN is over the offline ceiling; block it (mirrors the
         // apply-time `-11` effect, set EARLY here so the halt survives even if apply is deferred).
@@ -702,6 +725,7 @@ pub async fn record_outcome(
             .await
             .map_err(RecordError::Db)?;
     } else if certainty == SubmissionCertainty::SubmittedUnknown
+        || offline_reject_hold
         || matches!(
             node_effect,
             NodeEffect::MacReseedPending
@@ -711,10 +735,11 @@ pub async fn record_outcome(
         )
     {
         // UNRESOLVED — a `SUBMITTED_UNKNOWN` leaf (NoResponse / UnknownStatus / SaveError /
-        // probe) or a held reject verdict (`-12` MacReseed, `-6` OperatorEscalation). Halt the
-        // node pending operator completion. A clean `Accepted`, a terminal `Rejected`, or an
-        // `FnConfigError` reject is RESOLVED — the apply path releases it, so NO halt here
-        // (coherent with `apply_outcome`'s auto-release / HELD split).
+        // probe), an OFFLINE-ORIGIN reject held by apply (`offline_reject_hold`), or a held reject
+        // verdict (`-12` MacReseed, `-6` OperatorEscalation). Halt the node pending operator
+        // completion. A clean `Accepted`, an ONLINE terminal `Rejected`, or an `FnConfigError`
+        // reject is RESOLVED — the apply path releases it, so NO halt here (coherent with
+        // `apply_outcome`'s auto-release / HELD split).
         crate::db::repositories::node_state::set_mode_stop_mode_tx(tx, &fiscal_number)
             .await
             .map_err(RecordError::Db)?;
@@ -1143,6 +1168,10 @@ pub enum ModeTarget {
     Online,
     /// An active OPEN/DRAINING offline session must finish draining first.
     GoingOnline,
+    /// B5 (§4.2) — the hold was under BLOCKED (an offline `-11`, over the 168h ceiling). Completion
+    /// resolves the doc + clears the fence, but the over-ceiling node STAYS BLOCKED: it must NOT be
+    /// re-enabled here (INV-05 — offline is bounded), un-blocking is a separate ceiling-recovery.
+    Blocked,
 }
 
 impl ModeTarget {
@@ -1150,6 +1179,7 @@ impl ModeTarget {
         match self {
             Self::Online => "ONLINE",
             Self::GoingOnline => "GOING_ONLINE",
+            Self::Blocked => "BLOCKED",
         }
     }
 }
@@ -1274,15 +1304,15 @@ pub async fn complete_operator_pending(
     }
 
     // Full authority CAS (design §3.4): generation + active pointer must still name this row.
-    let ns: Option<(i64, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT delivery_generation, active_delivery_reservation_id FROM node_state \
+    let ns: Option<(i64, Option<Vec<u8>>, String)> = sqlx::query_as(
+        "SELECT delivery_generation, active_delivery_reservation_id, mode FROM node_state \
          WHERE fiscal_number = ?",
     )
     .bind(&fiscal_number)
     .fetch_optional(&mut **tx)
     .await
     .map_err(CompletionError::Db)?;
-    let (cur_gen, active_ptr) = ns.ok_or(CompletionError::NodeStateMissing)?;
+    let (cur_gen, active_ptr, cur_mode) = ns.ok_or(CompletionError::NodeStateMissing)?;
     if authed_gen != Some(cur_gen) || active_ptr.as_deref() != Some(&reservation_id[..]) {
         return Err(CompletionError::StaleAuthority);
     }
@@ -1428,33 +1458,46 @@ pub async fn complete_operator_pending(
     .await
     .map_err(CompletionError::Db)?;
 
-    // Verified mode target: GOING_ONLINE iff an active drain must finish, else ONLINE.
-    let active_session: Option<String> = sqlx::query_scalar(
-        "SELECT state FROM offline_sessions \
-         WHERE fiscal_number = ? AND state IN ('OPENING','OPEN','DRAINING') LIMIT 1",
-    )
-    .bind(&fiscal_number)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(CompletionError::Db)?;
-    let mode_target = if active_session.is_some() {
-        ModeTarget::GoingOnline
-    } else {
-        ModeTarget::Online
+    // Verified mode target, per the held-halt mode (B5, §4.2):
+    //   - STOP_MODE hold → GOING_ONLINE iff an active drain must finish, else ONLINE (unchanged);
+    //   - BLOCKED hold (offline `-11`, over the 168h ceiling) → STAYS BLOCKED. Completion resolves
+    //     the held doc + clears the fence, but the over-ceiling node is NOT re-enabled here
+    //     (INV-05 — offline is bounded; blindly flipping ONLINE would let it issue offline again).
+    //     Un-blocking is a separate ceiling-recovery, not a side-effect of doc resolution.
+    let mode_target = match cur_mode.as_str() {
+        "BLOCKED" => ModeTarget::Blocked,
+        "STOP_MODE" => {
+            let active_session: Option<String> = sqlx::query_scalar(
+                "SELECT state FROM offline_sessions \
+                 WHERE fiscal_number = ? AND state IN ('OPENING','OPEN','DRAINING') LIMIT 1",
+            )
+            .bind(&fiscal_number)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(CompletionError::Db)?;
+            if active_session.is_some() {
+                ModeTarget::GoingOnline
+            } else {
+                ModeTarget::Online
+            }
+        }
+        // The generation + active-pointer authority passed, but the node is in neither halt mode —
+        // a racing reset left it inconsistent. Fail closed rather than APPLY under an unexpected
+        // mode (roll the whole tx back).
+        _ => return Err(CompletionError::NodeNotStopMode),
     };
-    let mode_rows = sqlx::query(
-        "UPDATE node_state SET mode = ? WHERE fiscal_number = ? AND mode = 'STOP_MODE'",
-    )
-    .bind(mode_target.as_str())
-    .bind(&fiscal_number)
-    .execute(&mut **tx)
-    .await
-    .map_err(CompletionError::Db)?
-    .rows_affected();
-    // Core fix: the STOP_MODE → target CAS must move exactly one row. A PENDING reservation is
-    // held under STOP_MODE, so a 0-row CAS means the node left STOP_MODE concurrently (a BLOCKED
-    // `-11` node or a racing reset) — the operator resolution is stale; roll the whole tx back
-    // rather than silently APPLYING under an unexpected mode.
+    // The <held-mode> → target CAS must move exactly one row. The `WHERE mode = <cur_mode>` guard
+    // (STOP_MODE or BLOCKED) means a 0-row CAS = the node left its held-halt concurrently — the
+    // operator resolution is stale; roll the whole tx back rather than APPLYING under a surprise.
+    let mode_rows =
+        sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ? AND mode = ?")
+            .bind(mode_target.as_str())
+            .bind(&fiscal_number)
+            .bind(&cur_mode)
+            .execute(&mut **tx)
+            .await
+            .map_err(CompletionError::Db)?
+            .rows_affected();
     if mode_rows != 1 {
         return Err(CompletionError::NodeNotStopMode);
     }

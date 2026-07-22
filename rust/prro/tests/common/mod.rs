@@ -169,6 +169,22 @@ impl DpsChannel for StubDpsChannel {
             .expect("StubDpsChannel response queue empty (caller forgot to enqueue)")
     }
 
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::RawSendObservation,
+    ) {
+        // CS-3 S7-1: the cutover derives the record/apply evidence from `observation.evidence()`. The
+        // trait DEFAULT degrades server-status rejects to `NoResponse` (mock-only), which would
+        // mis-drive the composed path. Build the SAME faithful observation the production
+        // `GrpcDpsChannel` mints (`observe_faithful_from_legacy`) so this mock mirrors prod fidelity.
+        let legacy = self.send_chk(envelope).await;
+        let observation = prro::transports::dps::dto::observe_faithful_from_legacy(&legacy);
+        (legacy, observation)
+    }
+
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_chk_calls.fetch_add(1, Ordering::SeqCst);
         self.last_chk_responses

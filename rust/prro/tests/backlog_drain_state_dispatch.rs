@@ -127,6 +127,16 @@ impl DpsChannel for DualQueueStub {
             .expect("DualQueueStub.send_chk: empty queue")
     }
 
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
+
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_chk_calls.fetch_add(1, Ordering::SeqCst);
         self.last_chk_q
@@ -662,80 +672,79 @@ async fn c5_kvt1_doc_w12_reentry_advances_to_ack() {
     );
 }
 
-// ─── Test 3: ERROR_RETRYABLE doc → re-drive via stage_send → KVT1 ────
+// ─── Test 3: CS-3 S7-1 — SEMANTIC REGRESSION (`legacy inventory-stable name`) ─────
 //
-// W9b ER-class-guard 2026-05-22 rewrite: durable `TransientRetry` +
-// under-budget attempts MUST be seeded in `transport_trace` before
-// asserting wire redrive.  Previously, this test asserted re-drive
-// against a plain ER doc with no trace history — locking the unsafe
-// behavior fixed by HIGH-M3B-01 (the ER class guard now holds
-// `HoldIndeterminate` for that input).
-
+// The pre-cutover "ER (TransientRetry, under-budget) → stage_send RE-DRIVE → Sent → ACK" contract
+// is RETIRED.  R6 collapsed the transient ER-redrive edge into `EscalateManual`: a stuck
+// `ErrorRetryable` doc can no longer be re-wired (that would be a SECOND wire for an already
+// `CALL_STARTED` doc — double-issue), so it escalates to `RequiresManualReconciliation` + STOP
+// WITHOUT a wire, exactly like the budget-exhausted / non-retryable classes below.  (Post-cutover a
+// doc no longer REACHES `ErrorRetryable` via a transient — that path now HOLDS in `SENDING`; an ER
+// doc carrying a `TransientRetry` trace is a legacy artifact, handled safely here.)  The name is
+// kept ONLY so the test-inventory gate stays stable.
 #[tokio::test]
 async fn c5_error_retryable_doc_re_driven_via_stage_send_to_ack_via_w12() {
-    // **M3b W12 Commit 4b.3 (2026-05-22)** — refactored from
-    // pre-W12 `c5_error_retryable_doc_re_driven_via_stage_send_to_kvt1`.
-    // ER → stage_send re-drive → Sent → confirm_drain_doc(SentFresh)
-    // → Envelope 1a + Envelope 2 → ACK (full W12 chain).
     let (_d, pool) = fresh_pool().await;
-    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
-    let shift_id = seed_open_shift(&pool).await;
-    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    // ERROR_RETRYABLE — stage_send 4-pre W9a source whitelist accepts.
-    // server_fiscal_no NULL because 4-b never stamps it on transient
-    // failure paths.
-    let doc = seed_doc_in_state(&pool, 1, 100, session_id, shift_id, "ERROR_RETRYABLE", None).await;
-    // W9b ER-class-guard authorization gate: durable TransientRetry
-    // last-attempt + attempts_used = 1 < MAX_BOOT_ATTEMPTS (5).
-    seed_transport_trace_attempt(&pool, doc, 1, Some("TransientRetry")).await;
-    // W12 chain bootstrap — single doc.
-    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+    // ER + TransientRetry, attempts_used = 1 < MAX_BOOT_ATTEMPTS (5) — the exact case that USED to
+    // re-drive; R6 now routes it to EscalateManual (no wire).
+    let (doc, shift_id, _sess) = seed_er_with_class(&pool, "TransientRetry", 1).await;
+    // escalate_drain_to_manual reads node_state.current_shift_id (plain Opened → whitelist edge 15).
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(DbShiftId(shift_id))
+        .bind(FN)
+        .execute(&pool)
         .await
         .unwrap();
-    common::seed_w12_finalize_prereqs(
-        &pool,
-        FN,
-        doc,
-        common::chain_anchor(0x00),
-        common::chain_anchor(0x01),
-    )
-    .await
-    .unwrap();
 
-    let c = carriers(
-        vec![Ok(ack("DPS-FN-RETRIED", vec![1, 2, 3]))],
-        vec![Ok(ack("DPS-FN-RETRIED", vec![0xAA; 64]))],
-    );
+    // NO wire responses queued — the doc MUST NOT reach stage_send.
+    let c = carriers(vec![], vec![]);
     let view = view_for(&c);
 
     let summary = backlog_drain::drain(&common::drain_test_guard(), &pool, &view, FN)
         .await
         .unwrap();
 
+    // No re-drive: zero wire, zero ACK advance.
+    assert_eq!(
+        c.dps.send_chk_count(),
+        0,
+        "R6: a transient ER doc is NOT re-driven via stage_send (P2: at-most-one-wire)"
+    );
+    assert_eq!(c.dps.last_chk_count(), 0);
     assert_eq!(
         summary.advanced_to_ack(),
-        1,
-        "ER re-drive → W12 SentFresh chain → ACK"
-    );
-    assert_eq!(summary.advanced_to_kvt1(), 0, "no DeferredKvt1 post-W12");
-    assert_eq!(
-        summary.advanced_via_lastchk_replay(),
         0,
-        "no replay flag — wire re-drive (SentFresh), not lastChk replay (SentReplay)"
+        "no ACK — the doc escalates to Manual, it is not re-driven"
     );
-    assert_eq!(c.dps.send_chk_count(), 1, "stage_send re-drove the doc");
-    assert_eq!(c.dps.last_chk_count(), 1, "confirm_drain_doc lastChk × 1");
-    assert_eq!(read_doc_state(&pool, doc).await, "ACK");
+    assert_eq!(summary.per_doc_failures().len(), 1);
 
-    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_KVT2_ADVANCED")
+    // The doc CAS'd off ERROR_RETRYABLE into RequiresManualReconciliation (R6 EscalateManual).
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_ER_ESCALATED_TO_MANUAL").await,
+        1
+    );
+    let p = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
         .await
         .unwrap();
-    // from_state is the cohort-walker snapshot (ERROR_RETRYABLE) per
-    // plan §65-70 LOW-PR70-R12-02 cohort-entry convention.
-    assert_eq!(payload["from_state"], "ERROR_RETRYABLE");
-    assert_eq!(payload["to_state"], "KVT2");
-    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
-    assert_eq!(payload["evidence_source"], "lastChk");
+    assert_eq!(p["retry_class"], "TransientRetry");
+    assert_eq!(p["manual_recon_class"], true);
+    assert_eq!(p["dispatch_via"], "er_class_guard");
+
+    // Strict-sequential: escalates the FN shift to Manual (plain Opened → edge 15) + halt audit.
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(DbShiftId(shift_id))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
 }
 
 // ─── W9b ER-class-guard 2026-05-22 negative-coverage matrix ──────────
@@ -1657,28 +1666,40 @@ async fn c5b2_sent_replay_lastchk_match_persists_kvt1_raw_byte_for_byte() {
     );
 }
 
-// ─── Test 8: SentReplay lastChk NotFound → HoldFnDrain ErRedriveQueued ──
+// ─── Test 8: SentReplay lastChk NotFound → escalate Manual + STOP ──────
 
-/// **M3b W12 Commit 5b.2 (plan §412 HIGH-C5-3 safe-redrive seam,
-/// 2026-05-24)** — refactored from pre-W12 `c5_sent_doc_lastchk_not_
-/// found_downgrades_to_error_retryable_non_manual`.  Behavioral pivot:
-/// pre-W12 per-doc failure (Transport, manual_recon=false, drain
-/// continued) → W12 `HoldFnDrain { ErRedriveQueued }` HALTS this-tick
-/// drain (DocVerdict::HoldFnDrain consumer logic at backlog_drain
-/// line 884 → break).
+/// **CS-3 S7-1 re-audit F2-kvt2 (2026-07-22)** — offline-drain twin of the
+/// boot-side F2 fix (`52f562f`).  A `SENT` doc whose `last_chk` probe returns
+/// `NotFound` is issuance-AMBIGUOUS (DPS may hold the receipt or never saw it).
+/// The pre-fix path CAS'd `Sent → ErrorRetryable` and queued a two-tick ER
+/// redrive (`HoldFnDrain { ErRedriveQueued }`); R6 retired that redrive, so the
+/// old arm merely WEDGED the drain (`DocsErRedriveQueued` blocks finalize) — and
+/// worse, an ER doc with a stamped SFN reads as issued, so a successor could
+/// become a chain-fork head.  The fix escalates atomically to
+/// `RequiresManualReconciliation` + node `STOP_MODE` (no blind re-drive), wiring
+/// the previously-DEAD `sent_not_found::sent_not_found_to_manual`.
 ///
-/// Forensic chain: Envelope 1c-pre allocates trace row → DPS NotFound
+/// Forensic chain: Envelope 1c-pre allocates the trace row → DPS `NotFound`
 /// classified to `Kvt2ConfirmOutcome::SentNotFoundDowngrade` → Envelope
-/// 1c-post (bundled: trace.complete RetryableTransport + Sent→ER CAS
-/// + OFFLINE_DRAIN_DOC_FAILED audit) → `Ok(HoldFnDrain {
-/// ErRedriveQueued })`.  Next tick: W9b ER-class-guard reads
-/// `retry_class=TransientRetry` + attempts_used<MAX → bounded Pattern
-/// B redrive through `stage_send::run`.
+/// `1c-manual` (bundled: `Sent → RMR` + node `STOP_MODE` + Critical
+/// `SENT_NOT_FOUND_ESCALATED_MANUAL` audit + trace.complete `RetryableServer`,
+/// `retry_class = NULL`) → `ConfirmDrainOutcome::SentNotFoundEscalated` →
+/// consumer `DocVerdict::Failed { NotFound, manual_recon: true }` → the drain
+/// loop escalates the FN shift to Manual (`OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL`)
+/// and HALTS.  No wire re-drive; `er_redrive_queued` stays 0.
 #[tokio::test]
-async fn c5b2_sent_replay_lastchk_not_found_holds_fn_drain_er_redrive_queued() {
+async fn c5b2_sent_replay_lastchk_not_found_escalates_manual_with_stop() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool).await;
+    // escalate_drain_to_manual reads node_state.current_shift_id (plain Opened
+    // → whitelist edge 15); without it the escalation finds no shift.
+    sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
+        .bind(DbShiftId(shift_id))
+        .bind(FN)
+        .execute(&pool)
+        .await
+        .unwrap();
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
     let doc = seed_doc_in_state(
         &pool,
@@ -1698,44 +1719,62 @@ async fn c5b2_sent_replay_lastchk_not_found_holds_fn_drain_er_redrive_queued() {
         .await
         .unwrap();
 
-    // Doc downgraded to ER via Envelope 1c-post (Sent→ER CAS bundled
-    // з trace.complete + audit atomically).
-    assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
-    // W12 HoldFnDrain projection accounting: ErRedriveQueued counter
-    // (NOT per_doc_failures — that's pre-W12 path).
+    // Doc escalated to RMR (NOT downgraded to ER) — issuance-ambiguous, no
+    // blind re-drive.
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "REQUIRES_MANUAL_RECONCILIATION"
+    );
+    // Node halted to STOP_MODE atomically with the doc CAS (fork-guard: the
+    // SENT doc left the cohort, so a successor must not become the chain head).
+    assert_eq!(read_node_mode_state_dispatch(&pool).await, "STOP_MODE");
+    // Strict-sequential: the FN shift is escalated to Manual + the drain halts.
+    let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
+        .bind(DbShiftId(shift_id))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
+
+    // R6 retired the ER redrive — the counter stays 0 (was 1 pre-fix).
     assert_eq!(
         summary.er_redrive_queued(),
-        1,
-        "SentNotFoundDowngrade MUST record ErRedriveQueued projection"
-    );
-    assert_eq!(
-        summary.held_at_sent(),
         0,
-        "NotFound is downgrade (Sent→ER), not Hold-at-Sent"
+        "SentNotFound no longer queues an ER redrive; it escalates Manual"
     );
+    assert_eq!(summary.held_at_sent(), 0);
     assert_eq!(summary.advanced_to_kvt1(), 0);
     assert_eq!(summary.advanced_to_ack(), 0);
     assert_eq!(c.dps.send_chk_count(), 0, "no wire-resend in this tick");
     assert_eq!(c.dps.last_chk_count(), 1);
 
-    // OFFLINE_DRAIN_DOC_FAILED audit comes from Envelope 1c-post,
-    // not the pre-W12 downgrade_sent_to_error_retryable_for_retry
-    // path.  Payload shape differs: `dispatch_via=kvt2_confirm`,
-    // `probe_outcome=NotFound`, `downgrade_to=ERROR_RETRYABLE`,
-    // `manual_recon_class=false`, `failure_class=transport`.
-    let payload = audit_latest_payload(&pool, "OFFLINE_DRAIN_DOC_FAILED")
-        .await
-        .unwrap();
-    assert_eq!(payload["failure_class"], "transport");
-    assert_eq!(payload["probe_outcome"], "NotFound");
-    assert_eq!(payload["downgrade_to"], "ERROR_RETRYABLE");
-    assert_eq!(payload["expected_server_fiscal_no"], "DPS-FN-REPLAY");
-    assert_eq!(payload["manual_recon_class"], false);
-    assert_eq!(payload["dispatch_via"], "kvt2_confirm");
+    // Critical operator-handoff audit from sent_not_found_to_manual (the
+    // producer); the old OFFLINE_DRAIN_DOC_FAILED transport row is gone.
+    assert_eq!(
+        audit_count(&pool, "SENT_NOT_FOUND_ESCALATED_MANUAL").await,
+        1
+    );
+    assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_FAILED").await, 0);
+    // Drain-loop halt audit from escalate_drain_to_manual.
+    assert_eq!(
+        audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
+        1
+    );
+
+    // The recovery trace row is completed with retry_class = NULL (R6 — no
+    // dispatcher re-drives it).
+    let retry_class: Option<String> = sqlx::query_scalar(
+        "SELECT retry_class FROM transport_trace WHERE document_id = ? \
+         ORDER BY attempt_no DESC LIMIT 1",
+    )
+    .bind(DbDocumentId(doc))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert!(
-        payload["trace_attempt_no"].is_i64(),
-        "1c-post payload MUST carry trace_attempt_no from 1c-pre allocation; \
-         got: {payload:?}"
+        retry_class.is_none(),
+        "SentNotFound trace MUST complete with retry_class = NULL (no re-drive); \
+         got {retry_class:?}"
     );
 }
 

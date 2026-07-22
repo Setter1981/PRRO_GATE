@@ -13,10 +13,10 @@
 use crate::db::repositories::delivery_reservation::{AttemptObservation, Authorization};
 use crate::services::write_path::shadow_map::map_send_reply;
 use crate::transports::dps::channel::DpsChannel;
-use crate::transports::dps::dto::CheckEnvelope;
+use crate::transports::dps::dto::{CheckAck, CheckEnvelope};
+use crate::transports::dps::error::DpsError;
 use prro_domain::delivery::{DpsProtocolBinding, EnvelopeHash, SubmissionEvidence};
 use prro_domain::enums::DocType;
-use sha2::{Digest, Sha256};
 
 /// Why [`submit_authorized`] refused BEFORE performing any wire I/O. Both variants guarantee ZERO
 /// `send_chk_observed` calls — the token is dropped without ever reaching the channel.
@@ -40,18 +40,22 @@ pub enum SubmitRefused {
 ///   token's `envelope_hash`.
 /// - `doc_type` — consumed only by the evidence map for the close/non-close (`-2/-15`) split.
 ///
-/// On success returns an [`AttemptObservation`] carrying the token's immutable identity/binding/hash
-/// plus a `Started` evidence over the observed wire response. It carries NO wire capability.
+/// On success returns the post-wire [`AttemptObservation`] (the authority-bearing value, carrying NO
+/// wire capability) PLUS the byte-identical legacy `Result<CheckAck, DpsError>` (CS-3 S7-1 §Q2.1). The
+/// caller routes the legacy result through `route_send_result` for the trace/audit drift-pin; the
+/// `AttemptObservation` remains the sole value that can gate a (second) wire — which it cannot.
 pub async fn submit_authorized(
     channel: &dyn DpsChannel,
     port_binding: &DpsProtocolBinding,
     auth: Authorization,
     envelope: CheckEnvelope,
     doc_type: DocType,
-) -> Result<AttemptObservation, SubmitRefused> {
+) -> Result<(AttemptObservation, Result<CheckAck, DpsError>), SubmitRefused> {
     // 1. Rebind guard — the wire bytes MUST hash to the authorized envelope hash (design §2 Layer 3).
-    //    SHA-256 of the CMS-signed blob is the bound-envelope identity (`EnvelopeHash`, 032:85).
-    let computed: [u8; 32] = <Sha256 as Digest>::digest(&envelope.check_sign).into();
+    //    CS-3 S7-1 (B1): the FULL prost-`gen::Check` hash covering EVERY wire field (`CheckEnvelope::
+    //    wire_hash`), NOT just `check_sign` — a `check_sign`-only guard left rro_fn / date_time /
+    //    local_number / check_type / id_offline / id_cancel mutable between authorize and send.
+    let computed = envelope.wire_hash();
     if &computed != auth.envelope_hash() {
         return Err(SubmitRefused::EnvelopeRebind);
     }
@@ -76,9 +80,11 @@ pub async fn submit_authorized(
     let envelope_hash = EnvelopeHash(*auth.envelope_hash());
 
     // 3. The SOLE wire call. Post-`CALL_STARTED`, evidence is ALWAYS `Started` (SE-1) — even a crash
-    //    surfaces as `Started{NoResponse(CrashedBeforeObservation)}`. The `_legacy` arm is the
-    //    reconciliation-degraded projection; the authoritative evidence is `observation.evidence()`.
-    let (_legacy, observation) = channel.send_chk_observed(envelope).await;
+    //    surfaces as `Started{NoResponse(CrashedBeforeObservation)}`. The `legacy` arm is the
+    //    byte-identical former `send_chk` result, surfaced (§Q2.1) so the caller can drive the
+    //    trace/audit drift-pin via `route_send_result`; the authoritative evidence is
+    //    `observation.evidence()`.
+    let (legacy, observation) = channel.send_chk_observed(envelope).await;
 
     // 4. Map the transport-minted evidence into the typed `SendResponse` and wrap it as `Started`
     //    over the authorized binding + hash (AO-2 holds by construction: the binding IS auth's).
@@ -89,6 +95,10 @@ pub async fn submit_authorized(
         envelope_hash,
     };
 
-    // 5. Mint the post-wire observation, CONSUMING the token by value (P2 Layer 3).
-    Ok(AttemptObservation::from_authorization(auth, evidence))
+    // 5. Mint the post-wire observation, CONSUMING the token by value (P2 Layer 3). Surface the legacy
+    //    result alongside for the caller's trace/audit routing (§Q2.1).
+    Ok((
+        AttemptObservation::from_authorization(auth, evidence),
+        legacy,
+    ))
 }

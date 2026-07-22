@@ -312,6 +312,15 @@ impl DpsChannel for DpsStub {
             .pop_front()
             .expect("send_q empty")
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_calls.fetch_add(1, Ordering::SeqCst);
         self.last_q
@@ -1382,7 +1391,10 @@ async fn boot_branch_a_fresh_fn_empty_ledger_bootstraps_unchanged() {
 }
 
 // ─── Batch B (AUD-L4-1) — tip-guard NotFound on a non-ACK in-flight SENT tip ──
-//     must DEFER to the drain's safe-redrive, not BLOCK the FN.
+//     must DEFER (not BLOCK the FN) to the drain, which — post CS-3 S7-1 R5
+//     (F2-kvt2) — escalates the issuance-ambiguous SENT doc to RMR + STOP
+//     (double-issue-safe, operator-recoverable) rather than the old auto
+//     safe-redrive Sent→ER.
 
 /// Seed an in-flight offline-origin doc (sfn set) at `state` — the AUD-L4-1
 /// scenario: the FN's newest SUBMITTED tip is a non-ACK in-flight doc.
@@ -1490,8 +1502,15 @@ async fn tip_guard_inflight_sent_notfound_defers_to_drain() {
     assert_eq!(deferred, 1, "one TIP_GUARD_DEFERRED_INFLIGHT audit");
 
     // ── Phase 2: the drain now OWNS the deferred SENT doc.  lastChk(SFN-2) →
-    //    NotFound → HIGH-C5-3 safe-redrive (Sent → ER).  This proves the defer
-    //    enables recovery END-TO-END — no permanent wedge (spec §B pin). ──
+    //    NotFound → CS-3 S7-1 R5 (F2-kvt2): a Sent doc DPS reports NotFound is
+    //    issuance-AMBIGUOUS, so the drain does NOT blindly re-drive it (that
+    //    second wire is the double-issue hazard R6 retired).  It escalates
+    //    atomically to RMR + node STOP + a Critical operator-handoff audit — an
+    //    operator-recoverable halt (resolve-operator-pending), NOT the old auto
+    //    Sent→ER safe-redrive.  The defer still avoids the AUD-L4-1 *permanent
+    //    silent* wedge: the drain is NOT gated out and the SENT doc reaches a
+    //    surfaced, recoverable terminal (spec §B pin — recovery is now
+    //    operator-gated + double-issue-safe, per the deliberate P2>liveness pin). ──
     let stub_drain = DpsStub::new();
     stub_drain.push_last(Err(DpsError::NotFound));
     let view_drain = RuntimeView {
@@ -1512,12 +1531,30 @@ async fn tip_guard_inflight_sent_notfound_defers_to_drain() {
     .await
     .unwrap();
     assert_eq!(skipped, 0, "drain must NOT be gated out after the defer");
-    // ... and safe-redrove the deferred SENT doc to ERROR_RETRYABLE (next tick
-    // re-sends it via Pattern-B) — the SENT doc is no longer stranded.
+    // ... and escalated the deferred SENT doc to RequiresManualReconciliation +
+    // node STOP (issuance-ambiguous → no blind re-drive; CS-3 S7-1 R5 F2-kvt2).
+    // The SENT doc is no longer silently stranded — it rests at a surfaced,
+    // operator-recoverable terminal instead of the old double-issue-unsafe
+    // Sent→ER auto-redrive.
     assert_eq!(
         read_doc_state(&env.pool, 2).await,
-        "ERROR_RETRYABLE",
-        "the deferred SENT doc safe-redrives (Sent → ER), proving no wedge"
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "the deferred SENT doc escalates to RMR (issuance-ambiguous, no blind re-drive)"
+    );
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "STOP_MODE",
+        "the escalation halts the node to STOP_MODE atomically (fork-guard)"
+    );
+    let escalated: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'SENT_NOT_FOUND_ESCALATED_MANUAL'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        escalated, 1,
+        "one Critical SENT_NOT_FOUND_ESCALATED_MANUAL operator-handoff audit"
     );
 }
 

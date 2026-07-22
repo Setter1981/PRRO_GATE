@@ -28,8 +28,12 @@ use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftStat
 /// `teeth_d3_forked_set_matches_prod_const`, so a prod-side boundary change turns
 /// the differential RED (a conscious model update) instead of silently
 /// propagating into the oracle (anti-shared-const).
-pub const MODEL_OFFLINE_ISSUED_STATES: [&str; 7] = [
+pub const MODEL_OFFLINE_ISSUED_STATES: [&str; 8] = [
     "OFFLINE_LOCAL_ACK",
+    // CS-3 S7-1: a HELD send outcome (ambiguous / transient / -12 / drain-reject) rests the
+    // offline-origin doc at SENDING under a PENDING_APPLY reservation — a legitimate issued
+    // (non-lost) state, mirroring prod `fiscal_documents::OFFLINE_ISSUED_STATES`.
+    "SENDING",
     "SENT",
     "KVT1",
     "ERROR_RETRYABLE",
@@ -366,7 +370,12 @@ impl RefModel {
             // interpreter: the ledger is unchanged) — so mirror only the forced
             // mode, no fiscal mutation / no row.
             Op::OfflineSellDuringGoingOnline => {
-                self.mode = NodeMode::GoingOnline;
+                // CS-3 S7-1: mirror the interp — this adversarial force must NOT un-halt an
+                // already-halted node (a held doc's STOP is only operator-cleared). When halted,
+                // leave the halt; the sell is refused on STOP/BLOCKED just the same.
+                if !matches!(self.mode, NodeMode::StopMode | NodeMode::Blocked) {
+                    self.mode = NodeMode::GoingOnline;
+                }
                 ExpectedOutcome::NoMutation
             }
             Op::SellWithClosedShift => {
@@ -503,6 +512,11 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
+        if doc_state == DocState::Sending {
+            // CS-3 S7-1: a HELD online outcome (ambiguous / Superseded / transient after
+            // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
+            self.mode = NodeMode::StopMode;
+        }
         self.docs.insert(lnd, doc_state);
         self.next_lnd += 1;
         if Self::online_origin_advances_seed(doc_state) {
@@ -648,6 +662,11 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
+        if doc_state == DocState::Sending {
+            // CS-3 S7-1: a HELD online outcome (ambiguous / Superseded / transient after
+            // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
+            self.mode = NodeMode::StopMode;
+        }
         self.docs.insert(lnd, doc_state);
         self.next_lnd += 1;
         if Self::online_origin_advances_seed(doc_state) {
@@ -712,6 +731,11 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
+        if doc_state == DocState::Sending {
+            // CS-3 S7-1: a HELD online outcome (ambiguous / Superseded / transient after
+            // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
+            self.mode = NodeMode::StopMode;
+        }
         self.docs.insert(lnd, doc_state);
         self.shift_lifecycle_lnds.insert(lnd);
         self.next_lnd += 1;
@@ -873,6 +897,11 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
+        if doc_state == DocState::Sending {
+            // CS-3 S7-1: a HELD online outcome (ambiguous / Superseded / transient after
+            // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
+            self.mode = NodeMode::StopMode;
+        }
         self.docs.insert(lnd, doc_state);
         self.shift_lifecycle_lnds.insert(lnd);
         self.next_lnd += 1;
@@ -1064,6 +1093,10 @@ impl RefModel {
                 let previous_hash = self.seed;
                 let unsigned_hash = synth_unsigned_hash(lnd);
                 let doc_state = online_outcome_state(script);
+                if doc_state == DocState::Sending {
+                    // CS-3 S7-1: a HELD online outcome flips the node to STOP_MODE.
+                    self.mode = NodeMode::StopMode;
+                }
                 self.docs.insert(lnd, doc_state); // the row IS minted (lnd allocated)
                 self.next_lnd += 1;
                 // A.3 / C6 — online-origin advances the seed at the SEND crossing
@@ -1408,41 +1441,53 @@ impl RefModel {
             }
             [WireResponse::Reject, ..] => {
                 let first = backlog[0];
-                self.docs.insert(first, DocState::Rejected);
+                // CS-3 S7-1: a drain reject of an OFFLINE_LOCAL_ACK backlog doc is a recorded HOLD
+                // — record_outcome commits PENDING_APPLY + STOP and the Sending→Rejected doc CAS is
+                // deferred to APPLY (never runs), so the HEAD doc rests SENDING, NOT terminal Rejected.
+                self.docs.insert(first, DocState::Sending);
                 self.shift_state = ShiftState::RequiresManualReconciliation;
-                // mode stays GoingOnline (drain halted); seed unchanged.
+                // CS-3 S7-1: the offline-origin reject-hold flips the node to STOP_MODE
+                // (record_outcome's `offline_reject_hold` early halt); seed unchanged; no 2nd wire
+                // (S7-2 fence). The STOP is cleared only by operator completion.
+                self.mode = NodeMode::StopMode;
                 ExpectedOutcome::Mutated(Mutation {
                     lnd: first,
-                    doc_state: DocState::Rejected,
+                    doc_state: DocState::Sending,
                     seed_after: self.seed,
                     previous_hash,
                     code_consumed: None,
                     shift_state_after: Some(self.shift_state),
                 })
             }
-            // U1 D5 — Superseded tip: the strict-sequential drain escalates to
-            // manual.  Empirically probe-derived (the `classify_check_result`
-            // Superseded arm, kvt2_confirm.rs:~357): the HEAD backlog doc →
-            // ERROR_RETRYABLE, the shift → RMR (EscalateManual, M3b §16.7); mode
-            // stays GoingOnline (set by `apply_go_online`); successors held at
-            // OFFLINE_LOCAL_ACK; the seed does NOT re-advance (offline-origin
-            // advanced it at issuance).
+            // U1 D5 — Superseded tip: the strict-sequential drain escalates to manual.
+            // CS-3 S7-1: a Superseded (ServerFiscalIdMismatch → WrapperBug) after CALL_STARTED is a
+            // recorded HOLD — the HEAD backlog doc rests SENDING under PENDING_APPLY (the doc CAS is
+            // deferred to APPLY, never runs), NOT ERROR_RETRYABLE; the shift → RMR (EscalateManual,
+            // M3b §16.7); mode stays GoingOnline; successors held at OFFLINE_LOCAL_ACK; the seed does
+            // NOT re-advance (offline-origin advanced it at issuance).
             [WireResponse::Superseded, ..] => {
                 let first = backlog[0];
-                self.docs.insert(first, DocState::ErrorRetryable);
+                self.docs.insert(first, DocState::Sending);
                 self.shift_state = ShiftState::RequiresManualReconciliation;
+                // CS-3 S7-1: the WrapperBug HOLD flips the node to STOP_MODE (record_outcome halt).
+                self.mode = NodeMode::StopMode;
                 ExpectedOutcome::Mutated(Mutation {
                     lnd: first,
-                    doc_state: DocState::ErrorRetryable,
+                    doc_state: DocState::Sending,
                     seed_after: self.seed,
                     previous_hash,
                     code_consumed: None,
                     shift_state_after: Some(self.shift_state),
                 })
             }
-            // U1 D5 — send Ack'd, last_chk NotFound: the HEAD doc is HELD at SENT
-            // (`SentNotFoundDowngrade`, kvt2_confirm.rs:~330); shift unchanged,
-            // mode stays GoingOnline, successors held, seed unchanged.
+            // U1 D5 — send Ack'd this tick, then last_chk NotFound: this is the
+            // SentFresh confirm path → StructuralDrift, so the freshly-sent HEAD
+            // doc is HELD at SENT (no CAS); shift unchanged, mode stays
+            // GoingOnline, successors held, seed unchanged.  NB (CS-3 S7-1
+            // F2-kvt2): a *cross-tick* SentReplay re-probe returning NotFound now
+            // ESCALATES the doc to RMR + node STOP (kvt2_confirm
+            // SentNotFoundEscalated); the current alphabet does not drive that
+            // cross-tick SentReplay drain, so this single-tick arm is unaffected.
             [WireResponse::Ack, WireResponse::NotFound, ..] => {
                 let first = backlog[0];
                 self.docs.insert(first, DocState::Sent);
@@ -1681,6 +1726,10 @@ fn online_outcome_state(script: &DpsScript) -> DocState {
         [WireResponse::Ack, WireResponse::Ack, ..] => DocState::Ack,
         [WireResponse::Reject, ..] => DocState::Rejected,
         [WireResponse::Ack, WireResponse::NotFound, ..] => DocState::Sent,
-        _ => DocState::ErrorRetryable,
+        // CS-3 S7-1: every other (ambiguous / transient / Superseded / escalate) online outcome
+        // after CALL_STARTED is a recorded HOLD — the doc rests SENDING under a PENDING_APPLY
+        // reservation (node → STOP_MODE), NOT auto-retryable ErrorRetryable. The doc-target CAS is
+        // deferred to the APPLY orchestration and never runs on a held outcome.
+        _ => DocState::Sending,
     }
 }

@@ -643,6 +643,29 @@ pub async fn doc_state_by_request_id_tx(
     Ok(row)
 }
 
+/// CS-3 S7-1 — read the current `state` of a document by id (pool-bound, no tx).
+///
+/// Used by the inline write-path to report the ACTUAL persisted document state on a
+/// `202 IN_PROGRESS` outcome, instead of the routing-target guess.  Post-cutover the composed
+/// apply HOLDS a transient (`SubmittedUnknown`) in `SENDING` (`PENDING_APPLY` + STOP), so the
+/// routing target (`ErrorRetryable`) is no longer the persisted state; the FnConfigError path DOES
+/// persist `ErrorRetryable`.  Both classify to `InProgress` (202), but the reported
+/// `document_state` string must be truthful (first-pass ↔ replay parity: the re-poll path already
+/// reads `fd.state`).  `None` ⟺ no such row.
+pub async fn state_by_document_id(
+    pool: &SqlitePool,
+    id: DocumentId,
+) -> sqlx::Result<Option<DocState>> {
+    let row: Option<DocState> = sqlx::query_scalar::<_, DbDocState>(
+        "SELECT state FROM fiscal_documents WHERE document_id = ? LIMIT 1",
+    )
+    .bind(DbDocumentId(id))
+    .fetch_optional(pool)
+    .await?
+    .map(|w| w.0);
+    Ok(row)
+}
+
 /// B9 Slice A — slim `SIGNED → OFFLINE_LOCAL_ACK` state CAS with **no** column
 /// writes.  Used by `stage_offline_ack` when the offline-issuance columns were
 /// already stamped at sign (the [`stamp_offline_issuance_tx`] path): the
@@ -1174,8 +1197,16 @@ pub async fn last_ack_unsigned_xml_sha256(
 /// [`last_issued_unsigned_xml_sha256`] (AUD-L6-1 boot seed projection) so the two
 /// CANNOT diverge — the boot projection must equal the walk's final `expected`.
 /// Online-origin docs issue ONLY at `ACK` (handled separately, NOT in this set).
-pub const OFFLINE_ISSUED_STATES: [&str; 7] = [
+///
+/// **CS-3 S7-1 (2026-07-21):** `SENDING` joins the set. Under the composed HOLD contract an
+/// offline-origin doc whose drain wire is HELD (offline reject / submitted-unknown) rests durably
+/// in `SENDING` (`PENDING_APPLY`), yet it already crossed `OFFLINE_LOCAL_ACK` and advanced the
+/// seed (M2-01) — so it is STILL issued. Omitting it would break the MAC-walk (a held offline
+/// predecessor would drop out of the chain → false `ChainBreak` at its successor) and the boot
+/// `last_issued_unsigned_xml_sha256` projection (a held tip would be skipped).
+pub const OFFLINE_ISSUED_STATES: [&str; 8] = [
     "OFFLINE_LOCAL_ACK",
+    "SENDING",
     "SENT",
     "KVT1",
     "ERROR_RETRYABLE",

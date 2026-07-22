@@ -150,6 +150,23 @@ impl From<DpsCheckType> for gen::check::Type {
     }
 }
 
+impl CheckEnvelope {
+    /// CS-3 S7-1 (composition impl-design §6-B1): the canonical bound-envelope identity — SHA-256
+    /// over the FULL prost-encoded `gen::Check` (EVERY wire field: `rro_fn`, `date_time`,
+    /// `check_sign`, `local_number`, `check_type`, `id_offline`, `id_cancel`), NOT just `check_sign`.
+    ///
+    /// This single value is the reservation/token `envelope_hash`, the `submit_authorized` rebind
+    /// check, AND the `transport_trace.request_envelope_sha256` — so a post-authorize tamper of ANY
+    /// wire field (not only the CMS blob) is caught before the wire. A `check_sign`-only hash left the
+    /// other six fields mutable between authorize and send.
+    pub fn wire_hash(&self) -> [u8; 32] {
+        use prost::Message;
+        use sha2::{Digest, Sha256};
+        let proto: gen::Check = self.clone().into();
+        Sha256::digest(proto.encode_to_vec()).into()
+    }
+}
+
 impl From<CheckEnvelope> for gen::Check {
     fn from(e: CheckEnvelope) -> Self {
         gen::Check {
@@ -353,6 +370,80 @@ pub(in crate::transports::dps) fn observe_check_reply(
     };
     let legacy = try_decode_check_response(r);
     (legacy, raw, diag)
+}
+
+/// CS-3 S7-1 test-support: build the SAME faithful `RawSendObservation` the production
+/// `GrpcDpsChannel` would mint, from a mock's already-collapsed `Result<CheckAck, DpsError>`.
+///
+/// The cutover's `submit_authorized` derives the record/apply evidence from
+/// `observation.evidence()`, so a mock that only implements `send_chk` (and thus gets the DEGRADED
+/// `observe_from_legacy` default — Accepted/NoResponse only) would mis-drive the composed path for
+/// server-status rejects. This reverse-constructs the raw `gen::CheckResponse` for the results that
+/// map to a real DPS status (`Ok`/`Accepted`, `Authorization{code}`, `Server{code}`, `Decode`→0) and
+/// runs the SAME `observe_check_reply` decode the live channel uses. Genuine transport / wrapper
+/// errors (`Transport`, `RemoteStatus`, `NotFound`, `Internal`, …) have NO faithful reply, so they
+/// fall back to `observe_from_legacy` (correctly `NoResponse`), matching production.
+#[cfg(any(test, feature = "test-support"))]
+pub fn observe_faithful_from_legacy(
+    legacy: &Result<CheckAck, DpsError>,
+) -> super::raw_reply::RawSendObservation {
+    let reconstructed: Option<gen::CheckResponse> = match legacy {
+        Ok(ack) => Some(gen::CheckResponse {
+            id: ack.id.clone(),
+            status: 1,
+            id_sign: ack.id_sign.clone(),
+            data_sign: ack.data_sign.clone(),
+            error_message: String::new(),
+        }),
+        Err(DpsError::Authorization { code, message, .. }) => Some(gen::CheckResponse {
+            id: String::new(),
+            status: *code,
+            id_sign: Vec::new(),
+            data_sign: Vec::new(),
+            error_message: message.clone(),
+        }),
+        Err(DpsError::Server { code, message }) => Some(gen::CheckResponse {
+            id: String::new(),
+            status: *code,
+            id_sign: Vec::new(),
+            data_sign: Vec::new(),
+            error_message: message.clone(),
+        }),
+        Err(DpsError::Decode(msg)) => Some(gen::CheckResponse {
+            id: String::new(),
+            status: 0,
+            id_sign: Vec::new(),
+            data_sign: Vec::new(),
+            error_message: msg.clone(),
+        }),
+        _ => None,
+    };
+    match reconstructed {
+        Some(chk) => {
+            let (_legacy, raw, diag) = observe_check_reply(chk);
+            super::raw_reply::RawSendObservation::new(raw, diag)
+        }
+        None => super::raw_reply::observe_from_legacy(legacy),
+    }
+}
+
+/// CS-3 S7-1 — the shared `send_chk_observed` body for scripted test mocks.
+///
+/// `send_chk_observed` has NO trait default (removed by design so a forgotten mock cannot silently
+/// degrade to `NoResponse` and mis-drive the composed apply). A normal scripted mock's override is
+/// just `scripted_observation(self.send_chk(env).await)`: it pairs the legacy `Result` with the
+/// faithful observation ([`observe_faithful_from_legacy`]) from ONE call. A mock that specifically
+/// exercises the ABSENCE of a trusted reply must NOT use this — it returns an explicit `NoResponse`
+/// observation instead. Production `GrpcDpsChannel` overrides with the lossless single-decode body.
+#[cfg(any(test, feature = "test-support"))]
+pub fn scripted_observation(
+    legacy: Result<CheckAck, DpsError>,
+) -> (
+    Result<CheckAck, DpsError>,
+    super::raw_reply::RawSendObservation,
+) {
+    let observation = observe_faithful_from_legacy(&legacy);
+    (legacy, observation)
 }
 
 /// Same dispatch shape for `StatusResponse` — the proto's status enum

@@ -149,6 +149,15 @@ mod tests {
         async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
             unreachable!("stub: send_chk not exercised in probe tests");
         }
+        async fn send_chk_observed(
+            &self,
+            envelope: CheckEnvelope,
+        ) -> (
+            Result<CheckAck, DpsError>,
+            crate::transports::dps::raw_reply::RawSendObservation,
+        ) {
+            crate::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+        }
         async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
             // Clone the scripted response (CheckAck + DpsError are not
             // Clone in general — re-construct manually for these tests).

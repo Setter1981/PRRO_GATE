@@ -74,6 +74,15 @@ impl DpsChannel for ProbeStubChannel {
     async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
         unreachable!("ProbeStubChannel: send_chk not exercised by W8b boot tests")
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         unreachable!("ProbeStubChannel: last_chk not exercised")
     }

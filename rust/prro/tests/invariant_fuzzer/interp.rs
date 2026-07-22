@@ -2092,7 +2092,20 @@ async fn sell_with_closed_shift(ctx: &mut FuzzCtx) -> RealOutcome {
 /// `OfflineSellDuringGoingOnline` (invalid intent): force GoingOnline, then
 /// attempt a SELL — the dispatcher refuses (mode is mid-transition).
 async fn offline_sell_during_going_online(ctx: &mut FuzzCtx) -> RealOutcome {
-    ctx.force_node_mode(NodeMode::GoingOnline).await;
+    // CS-3 S7-1: a HELD doc's invariant-scan exemption depends on the node staying halted
+    // (STOP_MODE|BLOCKED) — a halt is cleared ONLY by operator completion, never spontaneously.
+    // This adversarial op forces GoingOnline to test the mid-transition sell refusal, but it must
+    // NOT un-halt an already-halted node (prod never does), else it would strand a legitimately-
+    // held SENDING doc under a non-halted mode. When already halted, leave the halt and run the
+    // sell on it — a STOP/BLOCKED node refuses the sell just the same.
+    let mode: String = sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+        .bind(ctx.fn_id.as_str())
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    if !matches!(mode.as_str(), "STOP_MODE" | "BLOCKED") {
+        ctx.force_node_mode(NodeMode::GoingOnline).await;
+    }
     let row = ctx.seed_inbox_sell().await;
     let dps = ctx.new_dps();
     let guard = ctx.gate.clone().lock_owned().await;

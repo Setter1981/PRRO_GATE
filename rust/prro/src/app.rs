@@ -476,7 +476,8 @@ impl App {
     ///     that crashed between sign and send in a prior tick).
     ///   - SENT → `dispatch_sent_via_probe` (3-way `last_chk`
     ///     classification: Match → KVT1, Mismatch → RM, NotFound →
-    ///     ER tick-1 of two-tick retry).
+    ///     RMR + node STOP — issuance-ambiguous escalation, CS-3 S7-1 F2;
+    ///     the old two-tick Sent → ErrorRetryable redrive was retired by R6).
     ///   - ERROR_RETRYABLE → `dispatch_error_retryable_by_class`
     ///     reads durable `retry_class` from `transport_trace` and
     ///     routes: TransientRetry → `stage_send::run`;

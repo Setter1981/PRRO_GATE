@@ -36,6 +36,10 @@
 //! return_online_probe re-validates connectivity BEFORE full `Online`
 //! promotion.
 
+use crate::db::repositories::delivery_reservation::{
+    complete_operator_pending, CompletionError, CompletionResult, ModeTarget, OperatorResolution,
+    ReservationId,
+};
 use crate::db::tx::with_immediate;
 use sqlx::SqlitePool;
 use std::path::Path;
@@ -64,6 +68,19 @@ pub enum AdminError {
         fiscal_number: String,
         observed_mode: String,
     },
+
+    /// B1 re-audit (CRITICAL): `reset_stop_mode` refused because an `OUTCOME_OBSERVED +
+    /// PENDING_APPLY` delivery reservation is still unresolved for this FN. Blindly flipping
+    /// `STOP_MODE → GOING_ONLINE` would PERMANENTLY BRICK completion: `complete_operator_pending`'s
+    /// `WHERE mode='STOP_MODE'` CAS would then match 0 rows forever, the fence would block every
+    /// future authorize, and the seed would never advance against an accepted DPS receipt (lost
+    /// issuance). The operator must resolve the pending reservation first.
+    #[error(
+        "admin: fiscal_number {fiscal_number:?} has an unresolved OUTCOME_OBSERVED + PENDING_APPLY \
+         reservation — resolve it via `resolve-operator-pending` BEFORE reset-stop-mode (a blind \
+         STOP_MODE → GOING_ONLINE flip would permanently brick completion and lose the issuance)"
+    )]
+    PendingResolutionRequired { fiscal_number: String },
 
     /// Empty / whitespace-only `--reason` arg.  Forensic accountability
     /// requires explicit human-readable reason для audit_log trail.
@@ -161,6 +178,33 @@ pub enum AdminError {
     /// can retry.  Server rejects also land here (DPS returned a non-0 code).
     #[error("admin: request-offline-codes replenish failed: {0}")]
     ReplenishFailed(String),
+
+    /// B1 (part 2, §4.1) — `resolve-operator-pending`: the operator's `--fiscal-number` does not
+    /// own the named reservation (a real reservation id belonging to ANOTHER FN). Fail-closed
+    /// BEFORE any mutation — else the admin surface would silently resolve a reservation the
+    /// operator did not intend (a typo hitting a different FN's held row).
+    #[error(
+        "admin: reservation {reservation_id} belongs to fiscal_number {reservation_fn:?}, not \
+         {fiscal_number:?} — check the --fiscal-number / --reservation-id arguments"
+    )]
+    ReservationFnMismatch {
+        fiscal_number: String,
+        reservation_id: String,
+        reservation_fn: String,
+    },
+
+    /// B1 (part 2, §4.1) — `resolve-operator-pending`: the underlying `complete_operator_pending`
+    /// refused the resolution (not PENDING_APPLY, stale authority, origin mismatch, offline fork
+    /// guard, …). The whole tx rolled back — NOTHING was mutated. `reason` is the typed
+    /// `CompletionError` display so the operator sees the precise cause.
+    #[error(
+        "admin: resolve-operator-pending for fiscal_number {fiscal_number:?} refused: {reason} \
+         (nothing was mutated)"
+    )]
+    ResolutionRefused {
+        fiscal_number: String,
+        reason: String,
+    },
 }
 
 impl AdminError {
@@ -172,6 +216,7 @@ impl AdminError {
             // EX_USAGE (64): operator command misuse.
             AdminError::FiscalNumberNotFound(_)
             | AdminError::NotInStopMode { .. }
+            | AdminError::PendingResolutionRequired { .. }
             | AdminError::EmptyReason
             | AdminError::FiscalNumberNotInConfig(_)
             | AdminError::DuplicateActiveCashier(_)
@@ -180,7 +225,10 @@ impl AdminError {
             | AdminError::PasswordMismatch
             | AdminError::NotInExpectedMode { .. }
             | AdminError::InvalidCodeRange { .. }
-            | AdminError::CodeRangeOverlapsExistingPool { .. } => 64,
+            | AdminError::CodeRangeOverlapsExistingPool { .. }
+            | AdminError::ReservationFnMismatch { .. } => 64,
+            // EX_DATAERR (65): the operator's resolution is stale / invalid — nothing mutated.
+            AdminError::ResolutionRefused { .. } => 65,
             // EX_UNAVAILABLE (69): the gated offline surface is not enabled yet.
             AdminError::OfflineSurfaceNotReady => 69,
             // EX_IOERR (74): input device failure.
@@ -199,6 +247,24 @@ pub struct ResetOutcome {
     /// Number of `fiscal_documents` rows that had `consecutive_holds > 0`
     /// reset to 0.  Reflects scope of admin intervention.
     pub docs_reset_count: i64,
+}
+
+/// B1 (part 2, §4.1) — outcome of a successful `resolve_operator_pending` (для CLI stdout / logs).
+#[derive(Debug)]
+pub struct ResolveOutcome {
+    pub fiscal_number: String,
+    /// Lower-hex of the resolved reservation id.
+    pub reservation_id_hex: String,
+    /// The reservation moved `PENDING_APPLY → APPLIED` (always true on the Ok path).
+    pub applied: bool,
+    /// Node mode the completion CAS selected out of STOP_MODE: `"ONLINE"` or `"GOING_ONLINE"`.
+    pub mode_target: &'static str,
+    /// Whether the chain seed advanced (online Accepted / MacReseed).
+    pub seed_advanced: bool,
+    /// The stamped/observed server fiscal number, if any (Accepted).
+    pub server_fiscal_no: Option<String>,
+    /// gap-4b offline-cohort successors cancelled (non-zero only for an offline not-accepted).
+    pub cancelled_cohort_count: usize,
 }
 
 /// A′.3 PR-O1 — outcome of a successful `go_offline` (the mode flip +
@@ -329,6 +395,26 @@ pub async fn reset_stop_mode(
         });
     }
 
+    // (2b) B1 re-audit (CRITICAL): refuse to flip STOP_MODE → GOING_ONLINE while an
+    // OUTCOME_OBSERVED + PENDING_APPLY reservation is unresolved.  `complete_operator_pending`'s
+    // completion CAS requires `mode='STOP_MODE'`; flipping first would make it match 0 rows forever
+    // → the FN is permanently bricked (fence blocks all sells, seed never advances vs an accepted
+    // DPS receipt = lost issuance).  Fail loud, pointing the operator at `resolve-operator-pending`.
+    let pending_apply: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM delivery_reservation \
+         WHERE fiscal_number = ? AND state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY' \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AdminError::Infrastructure(format!("read pending-apply reservation: {e}")))?;
+    if pending_apply.is_some() {
+        return Err(AdminError::PendingResolutionRequired {
+            fiscal_number: fiscal_number.to_string(),
+        });
+    }
+
     // (3) Atomic envelope: mode CAS + counter reset + audit row.
     let fn_owned = fiscal_number.to_string();
     let reason_owned = reason.to_string();
@@ -392,6 +478,93 @@ pub async fn reset_stop_mode(
     Ok(ResetOutcome {
         fiscal_number: fiscal_number.to_string(),
         docs_reset_count,
+    })
+}
+
+/// B1 (part 2, §4.1) — the operator RESOLUTION surface for a `PENDING_APPLY` reservation.
+///
+/// The B1 guard (`98a356f`) makes `reset_stop_mode` REFUSE while an `OUTCOME_OBSERVED +
+/// PENDING_APPLY` reservation is unresolved (a blind `STOP_MODE → GOING_ONLINE` flip would brick
+/// completion forever). This is the missing counterpart: the operator supplies a typed
+/// [`OperatorResolution`] and the reservation is completed via the repository's
+/// [`complete_operator_pending`] — the single release surface (full authority CAS + origin-split
+/// effect + `APPLIED` + active-pointer clear + mode CAS out of STOP_MODE), all in ONE
+/// `BEGIN IMMEDIATE`. A refusal rolls the whole tx back (nothing mutated).
+///
+/// The `fiscal_number` argument is a SAFETY cross-check: the named FN must own the reservation
+/// (a typo that names the wrong FN — but a real reservation id belonging to ANOTHER FN — is
+/// refused BEFORE the tx). No pre-tx DPS probe is performed: the operator's resolution IS the
+/// verified outcome (a probe is an optional future hardening, §4.1).
+pub async fn resolve_operator_pending(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    reservation_id: ReservationId,
+    resolution: OperatorResolution,
+) -> Result<ResolveOutcome, AdminError> {
+    let reservation_id_hex: String = reservation_id.iter().map(|b| format!("{b:02x}")).collect();
+
+    // (1) Pre-read (read-only, OUTSIDE the tx — invariant #1): the reservation must exist AND the
+    // operator's --fiscal-number must own it. A mismatch is refused before any mutation.
+    let reservation_fn: Option<String> = sqlx::query_scalar(
+        "SELECT fiscal_number FROM delivery_reservation WHERE reservation_id = ?",
+    )
+    .bind(&reservation_id[..])
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AdminError::Infrastructure(format!("read reservation fiscal_number: {e}")))?;
+    match reservation_fn {
+        None => {
+            return Err(AdminError::ResolutionRefused {
+                fiscal_number: fiscal_number.to_string(),
+                reason: format!("reservation {reservation_id_hex} not found"),
+            })
+        }
+        Some(f) if f != fiscal_number => {
+            return Err(AdminError::ReservationFnMismatch {
+                fiscal_number: fiscal_number.to_string(),
+                reservation_id: reservation_id_hex,
+                reservation_fn: f,
+            })
+        }
+        Some(_) => {}
+    }
+
+    // (2) Atomic completion. `complete_operator_pending` fails CLOSED (whole tx rolls back) on any
+    // stale-authority / origin / fork-guard breach — mapped to a typed AdminError below.
+    let fn_for_err = fiscal_number.to_string();
+    let result: CompletionResult = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            complete_operator_pending(tx, reservation_id, resolution)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .map_err(|e| match e.downcast::<CompletionError>() {
+        // Infra DB error inside the envelope → EX_NOINPUT, not a stale-resolution refusal.
+        Ok(CompletionError::Db(dbe)) => {
+            AdminError::Infrastructure(format!("resolve envelope db: {dbe}"))
+        }
+        Ok(ce) => AdminError::ResolutionRefused {
+            fiscal_number: fn_for_err.clone(),
+            reason: ce.to_string(),
+        },
+        Err(other) => AdminError::Infrastructure(format!("resolve envelope: {other}")),
+    })?;
+
+    let mode_target = match result.mode_target {
+        ModeTarget::Online => "ONLINE",
+        ModeTarget::GoingOnline => "GOING_ONLINE",
+        ModeTarget::Blocked => "BLOCKED",
+    };
+    Ok(ResolveOutcome {
+        fiscal_number: fiscal_number.to_string(),
+        reservation_id_hex,
+        applied: result.applied,
+        mode_target,
+        seed_advanced: result.seed_advanced,
+        server_fiscal_no: result.server_fiscal_no,
+        cancelled_cohort_count: result.cancelled_cohort.len(),
     })
 }
 
@@ -1373,6 +1546,20 @@ pub async fn run_reset_stop_mode(
         .await
         .map_err(|e| AdminError::Infrastructure(format!("open db pool: {e}")))?;
     let outcome = reset_stop_mode(&pool, fiscal_number, reason).await?;
+    drop(pool);
+    Ok(outcome)
+}
+
+/// CLI entry-point for `prro admin resolve-operator-pending` (B1 part 2, §4.1).
+pub async fn run_resolve_operator_pending(
+    config_path: &Path,
+    fiscal_number: &str,
+    reservation_id: ReservationId,
+    resolution: OperatorResolution,
+) -> Result<ResolveOutcome, AdminError> {
+    let (_lock, pool) = open_admin_pool(config_path).await?;
+    let outcome =
+        resolve_operator_pending(&pool, fiscal_number, reservation_id, resolution).await?;
     drop(pool);
     Ok(outcome)
 }

@@ -562,3 +562,202 @@ async fn pin1e_null_driver_reject_escalates_durably_never_silent() {
         "a build-reject auto-Z must ESCALATE durably, got {outcome:?}"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// PIN 1f (🦷 QUIESCENCE-POISONING) — a non-terminal in-flight receipt (a held
+//   `SENDING` SELL) over the shift's 24h wall MUST NOT poison the auto-Z's
+//   deterministic inbox row.  Before the fix, the auto-Z minted its
+//   `autoz-<fn>-<shift_hex>` Z row unconditionally and drove it through
+//   `inline::run`; `inline`'s C10 gate found the shift NOT quiesced and
+//   TERMINALISED that row to REJECTED (`terminalise_inbox_pre_acquire`).
+//   Because the key is deterministic, EVERY later tick then `Replay`s the
+//   REJECTED row and `acquire` (status='NEW') can never re-drive it → the shift
+//   stays OPENED FOREVER even after the operator clears the blocker.
+//
+//   The fix runs the SAME quiescence pass FIRST and, on `Pending`, mints NOTHING
+//   (no inbox row → no poison) + reports NotDue.  So:
+//     - Tick 1 (blocker present): NO Z, NO poisoned autoz REJECTED row.
+//     - resolve the blocker (SENDING → ACK).
+//     - Tick 2: a durable Z is issued and the shift leaves OPENED.
+//     - Tick 3: no-op (still exactly one Z, shift no longer OPENED).
+//
+//   RED against UNFIXED code: tick 1 mints + terminalises → the autoz row exists
+//   as REJECTED (assertion 3 fails); and tick 2 `Replay`s that REJECTED row → no
+//   Z ever issues (assertions 4/5 fail).  The quiescence gate is the teeth:
+//   remove it → RED again.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The deterministic auto-Z idempotency key for the (single) open shift on `FN`.
+/// Mirrors `auto_z::auto_z_idempotency_key` (`autoz-<fn>-<hex(shift_id)>`); the
+/// helper is crate-private, so we reconstruct it from the shift_id BLOB in
+/// `node_state` to probe the inbox for the poisonable row.
+async fn autoz_key_for_open_shift(pool: &SqlitePool) -> String {
+    let shift_id: Vec<u8> =
+        sqlx::query_scalar("SELECT current_shift_id FROM node_state WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(pool)
+            .await
+            .expect("open shift must have a current_shift_id");
+    let shift_hex: String = shift_id.iter().map(|b| format!("{b:02x}")).collect();
+    format!("autoz-{FN}-{shift_hex}")
+}
+
+/// The `(status)` of the auto-Z inbox row for this shift, or `None` if it was
+/// never minted.  Before the fix, tick 1 leaves it as `REJECTED` (poison);
+/// after the fix it does not exist at all until the shift is quiesced.
+async fn autoz_inbox_status(pool: &SqlitePool) -> Option<String> {
+    let key = autoz_key_for_open_shift(pool).await;
+    sqlx::query_scalar("SELECT status FROM ingress_inbox WHERE idempotency_key = ?")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+/// Seed a non-terminal `SENDING` SELL receipt bound to the open shift — this is a
+/// Z-quiescence BLOCKER (`list_shift_pending_receipts_for_z_quiescence` counts
+/// `SENDING` SELL rows).  Returns the 16-byte `document_id` so the test can later
+/// advance it to `ACK` (clearing the blocker).
+async fn seed_blocking_sending_sell(pool: &SqlitePool) -> Vec<u8> {
+    let shift_id: Vec<u8> =
+        sqlx::query_scalar("SELECT current_shift_id FROM node_state WHERE fiscal_number = ?")
+            .bind(FN)
+            .fetch_one(pool)
+            .await
+            .expect("open shift must have a current_shift_id");
+    // A fresh lnd past every existing doc (ux_fd_fn_lnd is UNIQUE per FN).
+    let max_lnd: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(lnd), 0) FROM fiscal_documents WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let doc_bytes = vec![0x5Eu8; 16];
+    // A VALID stored-receipt payload (both `items` + `payments`, the shapes the
+    // Z aggregation requires) so that once this doc reaches ACK it aggregates
+    // cleanly into the Z at tick 2 — the point under test is the QUIESCENCE
+    // gate, not aggregation robustness.
+    let payload = r#"{"items":[{"sum_kop":15000}],"payments":[{"name":"CASH","sum_kop":15000,"type_code":"0"}]}"#;
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
+            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical) \
+         VALUES (?, ?, ?, ?, ?, 'SELL', 'SENDING', 'b', 't', 'ONLINE', \
+            '2026-07-08T11:00:00Z', ?, ?)",
+    )
+    .bind(&doc_bytes)
+    .bind(vec![0xA1u8; 16])
+    .bind(FN)
+    .bind(&shift_id)
+    .bind(max_lnd + 1)
+    .bind(payload)
+    .bind(vec![0u8; 32])
+    .execute(pool)
+    .await
+    .expect("seed blocking SENDING SELL");
+    // Advance node_state.next_lnd past the seeded doc so the later BEGIN / Z lnd
+    // allocation does not collide on the ux_fd_fn_lnd UNIQUE index (we bypassed
+    // the write path's own next_lnd advance by inserting the doc directly).
+    sqlx::query("UPDATE node_state SET next_lnd = ? WHERE fiscal_number = ?")
+        .bind(max_lnd + 2)
+        .bind(FN)
+        .execute(pool)
+        .await
+        .expect("advance next_lnd past the seeded doc");
+    doc_bytes
+}
+
+#[tokio::test]
+async fn pin_auto_z_quiescence_pending_does_not_poison_then_closes_after_clear() {
+    let app = boot_offline_opened_shift_enforcement_off().await;
+    // A held SENDING receipt on the shift blocks Z-quiescence. (Node mode is
+    // irrelevant to the auto-Z; the offline shift is already open.)
+    let blocker_doc = seed_blocking_sending_sell(app.db()).await;
+
+    let (dps, sign_ctx, fn_sign) = offline_view();
+    let view = RuntimeView {
+        dps: dps.as_ref(),
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let clock = FixedClock::from_rfc3339(CLOCK_OVER_24H);
+
+    // ── TICK 1 — the shift is NOT quiesced (SENDING blocker present). ──────────
+    let t1 = app
+        .auto_z_close_over_limit_for_fn(FN, &clock, &view)
+        .await
+        .expect("tick 1 must not error");
+    assert_eq!(
+        t1,
+        AutoZOutcome::NotDue,
+        "tick 1: shift not quiesced → auto-Z mints nothing and retries next tick"
+    );
+    assert_eq!(
+        doc_count_by_type(app.db(), "Z_REPORT").await,
+        0,
+        "tick 1: no Z minted while a receipt is in flight"
+    );
+    // No DPS wire fired (offline stub queue is empty; a mint+drive would have
+    // needed a code / wire).  The shift is still OPENED.
+    assert_eq!(
+        shift_state(app.db()).await,
+        "OPENED",
+        "tick 1: shift stays OPENED (nothing was closed)"
+    );
+    // THE RED ASSERTION (poisoning): the deterministic autoz inbox row must NOT
+    // exist as a terminal REJECTED.  Before the fix, tick 1 minted it and
+    // `inline`'s C10 gate terminalised it REJECTED → this fails.
+    let status = autoz_inbox_status(app.db()).await;
+    assert!(
+        status.as_deref() != Some("REJECTED"),
+        "POISONING: the auto-Z inbox row must NOT be a terminal REJECTED after a \
+         quiescence-pending tick (deterministic key would replay it forever), got {status:?}"
+    );
+
+    // ── resolve the blocker: the operator's receipt reaches terminal ACK. ──────
+    let n = sqlx::query("UPDATE fiscal_documents SET state = 'ACK' WHERE document_id = ?")
+        .bind(&blocker_doc)
+        .execute(app.db())
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(n, 1, "advanced the blocking SENDING receipt to ACK");
+
+    // ── TICK 2 — shift now quiesces Clear → the durable auto-Z issues. ─────────
+    let t2 = app
+        .auto_z_close_over_limit_for_fn(FN, &clock, &view)
+        .await
+        .expect("tick 2 must not error");
+    assert_eq!(
+        t2,
+        AutoZOutcome::Issued,
+        "tick 2: with the blocker cleared, the auto-Z issues a durable Z (NOT poisoned)"
+    );
+    assert_eq!(
+        doc_count_by_type(app.db(), "Z_REPORT").await,
+        1,
+        "tick 2: exactly one Z minted"
+    );
+    assert_ne!(
+        shift_state(app.db()).await,
+        "OPENED",
+        "tick 2: the shift left OPENED toward close — the 24h wall did not silently pass"
+    );
+
+    // ── TICK 3 — no-op: the shift already left OPENED, still exactly one Z. ─────
+    let t3 = app
+        .auto_z_close_over_limit_for_fn(FN, &clock, &view)
+        .await
+        .expect("tick 3 must not error");
+    assert_eq!(
+        t3,
+        AutoZOutcome::NotDue,
+        "tick 3: the shift already closed → NotDue (idempotent)"
+    );
+    assert_eq!(
+        doc_count_by_type(app.db(), "Z_REPORT").await,
+        1,
+        "tick 3: still exactly one Z — no double-Z"
+    );
+}

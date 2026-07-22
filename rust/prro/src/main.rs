@@ -73,6 +73,33 @@ enum AdminCmd {
         reason: String,
     },
 
+    /// B1 (part 2, §4.1) — resolve an `OUTCOME_OBSERVED + PENDING_APPLY` delivery reservation
+    /// held under STOP_MODE.  The counterpart to the `reset-stop-mode` B1 guard: it completes
+    /// the reservation with the operator's typed resolution (issuing / manual-terminating the
+    /// doc), clears the active pointer, and releases the node out of STOP_MODE — one atomic
+    /// envelope.  Refuses (nothing mutated) on stale authority / origin / fork-guard breach, or
+    /// if the named `--fiscal-number` does not own the reservation.
+    ResolveOperatorPending {
+        #[arg(long)]
+        config: PathBuf,
+        /// Fiscal number that owns the held reservation (cross-checked).
+        #[arg(long)]
+        fiscal_number: String,
+        /// Reservation id — 32 hex characters (16 bytes), from the forensic audit / logs.
+        #[arg(long)]
+        reservation_id: String,
+        /// One of: `accepted` | `not-accepted` | `not-accepted-offline` | `mac-reseed`.
+        #[arg(long)]
+        resolution: String,
+        /// The DPS-observed fiscal number — REQUIRED when `--resolution accepted`.
+        #[arg(long)]
+        accepted_fiscal_number: Option<String>,
+        /// The corrected chain seed — 64 hex characters (32 bytes); REQUIRED when
+        /// `--resolution mac-reseed`.
+        #[arg(long)]
+        mac_seed: Option<String>,
+    },
+
     /// A′.3 PR-O1 — operator GO_OFFLINE.  Flips node mode ONLINE→OFFLINE and
     /// opens an OFFLINE session atomically (one envelope).  Gated behind
     /// `FULL_OFFLINE_SURFACE_READY`: fails closed until A′.3 O2 lands the
@@ -417,6 +444,57 @@ async fn await_shutdown_signal() -> anyhow::Result<&'static str> {
     }
 }
 
+/// Parse an exact-length hex string into `[u8; N]` (N bytes ⇒ 2·N hex characters). Used by the
+/// `resolve-operator-pending` admin command for the reservation id + optional MAC seed.
+fn parse_hex_fixed<const N: usize>(s: &str, what: &str) -> Result<[u8; N], String> {
+    let s = s.trim();
+    if s.len() != N * 2 {
+        return Err(format!(
+            "{what} must be {} hex characters ({N} bytes), got {}",
+            N * 2,
+            s.len()
+        ));
+    }
+    let mut out = [0u8; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("{what} contains a non-hex character"))?;
+    }
+    Ok(out)
+}
+
+/// Build the typed `OperatorResolution` from the CLI `--resolution` kind + optional payload args.
+fn build_operator_resolution(
+    kind: &str,
+    accepted_fiscal_number: Option<&str>,
+    mac_seed: Option<&str>,
+) -> Result<prro::db::repositories::delivery_reservation::OperatorResolution, String> {
+    use prro::db::repositories::delivery_reservation::OperatorResolution;
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "accepted" => {
+            let f = accepted_fiscal_number
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("--resolution accepted requires a non-empty --accepted-fiscal-number")?;
+            Ok(OperatorResolution::Accepted {
+                fiscal_number: f.to_string(),
+            })
+        }
+        "not-accepted" => Ok(OperatorResolution::NotAccepted),
+        "not-accepted-offline" => Ok(OperatorResolution::NotAcceptedOffline),
+        "mac-reseed" => {
+            let hex = mac_seed
+                .ok_or("--resolution mac-reseed requires --mac-seed (64 hex characters)")?;
+            let seed = parse_hex_fixed::<32>(hex, "--mac-seed")?;
+            Ok(OperatorResolution::MacReseed { seed })
+        }
+        other => Err(format!(
+            "unknown --resolution {other:?} (expected: accepted | not-accepted | \
+             not-accepted-offline | mac-reseed)"
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -506,6 +584,61 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(err.exit_code());
                 }
             },
+            AdminCmd::ResolveOperatorPending {
+                config,
+                fiscal_number,
+                reservation_id,
+                resolution,
+                accepted_fiscal_number,
+                mac_seed,
+            } => {
+                let res_id = match parse_hex_fixed::<16>(&reservation_id, "--reservation-id") {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("prro admin resolve-operator-pending: {e}");
+                        std::process::exit(64);
+                    }
+                };
+                let resolution = match build_operator_resolution(
+                    &resolution,
+                    accepted_fiscal_number.as_deref(),
+                    mac_seed.as_deref(),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("prro admin resolve-operator-pending: {e}");
+                        std::process::exit(64);
+                    }
+                };
+                match prro::admin::run_resolve_operator_pending(
+                    &config,
+                    &fiscal_number,
+                    res_id,
+                    resolution,
+                )
+                .await
+                {
+                    Ok(o) => {
+                        println!(
+                            "ADMIN_RESOLVE_OPERATOR_PENDING OK fiscal_number={} reservation_id={} \
+                             applied={} mode_target={} seed_advanced={} server_fiscal_no={} \
+                             cancelled_cohort={}",
+                            o.fiscal_number,
+                            o.reservation_id_hex,
+                            o.applied,
+                            o.mode_target,
+                            o.seed_advanced,
+                            o.server_fiscal_no.as_deref().unwrap_or("-"),
+                            o.cancelled_cohort_count,
+                        );
+                        Ok(())
+                    }
+                    Err(err) => {
+                        eprintln!("prro admin resolve-operator-pending: {err}");
+                        std::process::exit(err.exit_code());
+                    }
+                }
+            }
             AdminCmd::GoOffline {
                 config,
                 fiscal_number,

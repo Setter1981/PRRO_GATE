@@ -17,8 +17,9 @@
 //!     CAS) call `fiscal_documents::transition_state(tx, doc_id,
 //!     DocState::X, DocState::Y)` directly, then do supplementary
 //!     writes + audit inline (sites `advance_sent_to_kvt1_from_probe`,
-//!     `cas_sent_to_manual_reconciliation_from_probe`,
-//!     `cas_sent_to_error_retryable_from_probe`).
+//!     `cas_sent_to_manual_reconciliation_from_probe`). The `NotFound`
+//!     arm's CAS moved to `sent_not_found::sent_not_found_to_manual`
+//!     (S7-1 F2), so it is no longer scanned here.
 //!
 //! Both paths route through the whitelist gate that
 //! `fiscal_documents::transition_state` enforces.  No raw
@@ -52,12 +53,16 @@ const BOOT_PHASE_SRC: &str = include_str!("../src/services/reconciliation/boot_p
 ///   - `resume_sending_to_error_retryable`             (SENDING        → ERROR_RETRYABLE)              — helper
 ///   - `advance_sent_to_kvt1_from_probe`               (SENT           → KVT1)                         — direct `transition_state`
 ///   - `cas_sent_to_manual_reconciliation_from_probe`  (SENT           → REQUIRES_MANUAL_RECONCILIATION) — direct `transition_state`
-///   - `cas_sent_to_error_retryable_from_probe`        (SENT           → ERROR_RETRYABLE)              — direct `transition_state`
 ///   - `cas_error_retryable_to_manual_reconciliation`  (ERROR_RETRYABLE → REQUIRES_MANUAL_RECONCILIATION) — helper
 ///   - `cas_error_retryable_budget_exhausted`          (ERROR_RETRYABLE → REQUIRES_MANUAL_RECONCILIATION) — helper
 ///   - branch (c) `Encrypted` reroute (inline)          (ENCRYPTED      → ERROR_RETRYABLE)              — helper
 ///   - `abort_signed_on_offline_code_exhaustion`        (SIGNED         → ABORTED)                      — helper (P1 boot twin of #192)
-const EXPECTED_HELPER_CALL_SITES: usize = 8;
+///
+/// S7-1 F2 (re-audit): the `NotFound` arm's `Sent → …` CAS is GONE from `boot_phase.rs` — the new
+/// `cas_sent_not_found_to_manual_from_probe` delegates to `sent_not_found::sent_not_found_to_manual`
+/// (Sent → RMR + STOP), whose `transition_state` lives in `sent_not_found.rs`, so it is not scanned
+/// here (count 8 → 7). The old `Sent → ErrorRetryable` two-tick edge is retired.
+const EXPECTED_HELPER_CALL_SITES: usize = 7;
 
 #[derive(Debug, Clone, PartialEq)]
 struct CasCallSite {

@@ -714,6 +714,15 @@ impl prro::transports::dps::channel::DpsChannel for LocalStatusStub {
     ) -> Result<prro::transports::dps::dto::CheckAck, DpsError> {
         unreachable!("LocalStatusStub: send_chk not exercised");
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: prro::transports::dps::dto::CheckEnvelope,
+    ) -> (
+        Result<prro::transports::dps::dto::CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
     async fn last_chk(
         &self,
         _: &CheckSignBlob,

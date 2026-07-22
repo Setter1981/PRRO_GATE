@@ -96,6 +96,15 @@ impl DpsChannel for RecordingDps {
             .pop_front()
             .expect("RecordingDps send queue empty")
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_chks
             .lock()
@@ -276,6 +285,32 @@ fn drain_carriers(n_docs: usize) -> DrainCarriers {
     let sends: Vec<_> = (0..n_docs)
         .map(|i| Ok(ack(&format!("DPS-DRAIN-{i}"))))
         .collect();
+    let lasts: Vec<_> = (0..n_docs)
+        .map(|i| {
+            Ok(CheckAck {
+                id: format!("DPS-DRAIN-{i}"),
+                id_sign: vec![],
+                data_sign: vec![(i as u8).wrapping_add(0xA0); 64],
+            })
+        })
+        .collect();
+    DrainCarriers {
+        dps: Arc::new(RecordingDps::new(sends, lasts)),
+        signing_ctx: det_signing_ctx(),
+        fn_sign: CheckSignBlob(vec![0xAB, 0xCD]),
+    }
+}
+
+/// Like `drain_carriers` but the LAST send (the session-END) FAILS with a transport error.
+/// Exercises the B2 re-audit escalation: a stuck session-END → RequiresManualReconciliation,
+/// NOT the old silent `_ => Ok(false)` that spun the drain forever (session Draining, no RMR/STOP).
+fn drain_carriers_end_send_fails(n_docs: usize) -> DrainCarriers {
+    let mut sends: Vec<Result<CheckAck, DpsError>> = (0..n_docs.saturating_sub(1))
+        .map(|i| Ok(ack(&format!("DPS-DRAIN-{i}"))))
+        .collect();
+    sends.push(Err(DpsError::Transport(
+        "net drop on session-END send".into(),
+    )));
     let lasts: Vec<_> = (0..n_docs)
         .map(|i| {
             Ok(CheckAck {
@@ -495,6 +530,100 @@ async fn b10_drain_sends_begin_first_content_then_end_last() {
         1
     );
     prro::db::invariant_scan::assert_clean(app.db()).await;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// B2 re-audit — a stuck session-END (send fails, never reaches Sent) escalates the
+// FN to RequiresManualReconciliation instead of the old silent `_ => Ok(false)` drain
+// spin (session Draining, node GoingOnline, no RMR/STOP forever).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn b2_drain_session_end_send_fails_escalates_manual_not_spin() {
+    let app = boot_app().await;
+    let registry = build_registry(&app, shift_open_only_dps()).await;
+    seed_boot_baseline(app.db()).await;
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
+
+    // online SHIFT_OPEN
+    let open = drive(
+        &*write_path,
+        app.db(),
+        entry("SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, "idem-OPEN", None),
+    )
+    .await
+    .expect("online SHIFT_OPEN must ACK");
+    assert_eq!(open.document_state, DocState::Ack);
+
+    // GO_OFFLINE + seed codes, one offline SELL (lazily mints the BEGIN).
+    prro::admin::go_offline(app.db(), FN, "net drop")
+        .await
+        .expect("go_offline");
+    let codes: Vec<String> = (0..6).map(|i| format!("CODE-{i}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN, &codes)
+        .await
+        .expect("seed codes");
+    let sell = drive(
+        &*write_path,
+        app.db(),
+        entry("SELL", SELL_PAYLOAD, "idem-SELL", Some(TOTAL_KOP)),
+    )
+    .await
+    .expect("offline SELL");
+    assert_eq!(sell.document_state, DocState::OfflineLocalAck);
+
+    // GO_ONLINE + DRAIN, but the END (LAST) send FAILS with a transport error.
+    prro::admin::go_online(app.db(), FN, "restored")
+        .await
+        .expect("go_online");
+    let carriers = drain_carriers_end_send_fails(3); // BEGIN + SELL ok, END fails
+    let view = drain_view(&carriers);
+    let outcome = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("drain must run (escalation is a clean Ok, not an error)");
+    let summary = match outcome {
+        ScheduledDrainOutcome::Ran(s) => s,
+        ScheduledDrainOutcome::SkippedBackoff { .. } => panic!("first tick must run"),
+    };
+
+    // B2: the stuck session-END does NOT finalize the drain...
+    assert!(
+        !summary.finalized(),
+        "B2: a session-END that never reached Sent must NOT finalize the drain"
+    );
+
+    // ...and instead of the old silent spin, the shift escalated to RMR — the load-bearing halt
+    // (next-tick drain entry guard refuses to re-drain an RMR shift, breaking the infinite spin).
+    let shift_state: String = sqlx::query_scalar(
+        "SELECT state FROM shifts WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .expect("read shift state");
+    assert_eq!(
+        shift_state, "REQUIRES_MANUAL_RECONCILIATION",
+        "B2: a stuck session-END escalates the shift to RMR (not a silent Draining spin)"
+    );
+
+    // The Critical halt audit fired (the escalation path, not some other RMR route).
+    let halt_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL'",
+    )
+    .fetch_one(app.db())
+    .await
+    .expect("count halt audits");
+    assert_eq!(
+        halt_audits, 1,
+        "B2: the escalation emits exactly one OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL audit"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════

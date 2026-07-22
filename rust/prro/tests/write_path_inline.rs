@@ -80,6 +80,15 @@ impl DpsChannel for DualStub {
             .take()
             .expect("DualStub.send_chk: called more than once")
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_chk
             .lock()
@@ -606,7 +615,10 @@ async fn online_sell_transient_send_returns_in_progress() {
     seed_node_state_online(&pool, shift_id).await;
     let row = seed_inbox_sell(&pool).await;
 
-    // send_chk transient failure → stage_send routes to ErrorRetryable.
+    // CS-3 S7-1: a transient send failure (Transport → SubmittedUnknown) is now HELD in SENDING
+    // (PENDING_APPLY + node STOP), NOT routed to ErrorRetryable — the ER-redrive edge is retired
+    // (R1/R2), so there is no auto-redrive; resolution is probe/operator. Still a 202 IN_PROGRESS
+    // (classify_outcome maps SENDING → InProgress, same as the old ErrorRetryable).
     let dps = DualStub::new(
         Err(DpsError::Transport("net blip".into())),
         Ok(ack(SERVER_FISCAL_NO, vec![0x01; 64])), // unused on this path
@@ -631,10 +643,10 @@ async fn online_sell_transient_send_returns_in_progress() {
 
     assert_eq!(
         outcome.document_state,
-        prro::db::models::enums::DocState::ErrorRetryable
+        prro::db::models::enums::DocState::Sending
     );
     assert_eq!(outcome.fiscal_id, None);
-    assert_eq!(read_doc_state(&pool, FN).await, "ERROR_RETRYABLE");
+    assert_eq!(read_doc_state(&pool, FN).await, "SENDING");
 }
 
 /// **A2.1b-core incr.3 — inline lastChk Hold → 202 Sent.** The wire send
@@ -1015,7 +1027,8 @@ async fn online_z_report_quiescence_pending_is_503_and_rejects_inbox() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_online(&pool, shift_id).await;
 
-    // A SELL whose send fails transiently rests at ErrorRetryable (in-flight).
+    // A SELL whose send fails transiently is now HELD in SENDING (in-flight, non-quiescent) —
+    // CS-3 S7-1: transient → SubmittedUnknown → held, no ErrorRetryable redrive. Still blocks Z.
     let sell_row = seed_inbox_sell(&pool).await;
     let sell_dps = DualStub::new(
         Err(DpsError::Transport("transient send".into())),
@@ -1040,7 +1053,7 @@ async fn online_z_report_quiescence_pending_is_503_and_rejects_inbox() {
         .expect("transient SELL is a 202 in-flight, not an Err");
         assert_eq!(
             sell.document_state,
-            prro::db::models::enums::DocState::ErrorRetryable
+            prro::db::models::enums::DocState::Sending
         );
     }
 

@@ -1723,11 +1723,16 @@ fn p03_bite_use_import_of_lifecycle_symbol_is_flagged() {
 }
 
 /// A3 (S7-1 §7.2): the boot-first reservation pass is the SANCTIONED production caller of the
-/// still-INACTIVE lifecycle helpers — but ONLY of the read/resume/apply subset. This positive
+/// still-INACTIVE lifecycle helpers — but ONLY of the read/resume subset. This positive
 /// allowlist pin guards the file-wide exclusion in `scan_src_tree` (so the exclusion is not a
-/// denylist hole): the pass must reference EXACTLY the read/resume/apply subset and NEVER a
+/// denylist hole): the pass must reference EXACTLY the read/resume subset and NEVER a
 /// mint/authority symbol (`authorize_submission` / `record_outcome` / `delivery_reservation::insert`
 /// / `get_active_for_fn`), which stay cutover-only.
+///
+/// S7-1 B3 (re-audit fix): the boot APPLY now routes through
+/// `apply_orchestration::apply_recorded_outcome` (which fires the online shift edges 3/10), NOT the
+/// bare repo `apply_outcome` — so the pass no longer references `apply_outcome` directly, and this
+/// pin asserts the corrected wiring positively.
 #[test]
 fn boot_pass_references_only_the_sanctioned_read_apply_subset() {
     let path = concat!(
@@ -1742,11 +1747,10 @@ fn boot_pass_references_only_the_sanctioned_read_apply_subset() {
     // Match the EXACT backticked symbol the scanner records — never a substring.
     let refs = |sym: &str| details.iter().any(|d| d.contains(&format!("`{sym}`")));
 
-    // Load-bearing: the pass DOES reference the read/resume/apply subset — proves the file-wide
+    // Load-bearing: the pass DOES reference the read/resume subset — proves the file-wide
     // scan exclusion is real, not vacuous.
     for sym in [
         "resume_crashed_reservation",
-        "apply_outcome",
         "list_call_started_without_outcome",
         "list_outcome_observed_pending_apply",
     ] {
@@ -1755,6 +1759,13 @@ fn boot_pass_references_only_the_sanctioned_read_apply_subset() {
             "boot pass must reference `{sym}` (§7.2): {details:#?}"
         );
     }
+    // S7-1 B3: the APPLY step is routed through the shared orchestration (which fires shift edges
+    // 3/10), NOT the bare repo `apply_outcome`. Assert the corrected wiring positively.
+    assert!(
+        text.contains("apply_orchestration::apply_recorded_outcome"),
+        "boot pass must route apply through `apply_orchestration::apply_recorded_outcome` (S7-1 B3 — \
+         the bare `apply_outcome` skips the online shift edges and strands SHIFT_OPEN/Z in Opening/Closing)"
+    );
     // Forbidden: the pass must NEVER touch a mint / authority symbol — those activate at cutover.
     for sym in [
         "authorize_submission",
@@ -1765,6 +1776,89 @@ fn boot_pass_references_only_the_sanctioned_read_apply_subset() {
         assert!(
             !refs(sym),
             "boot pass must NOT reference the mint/authority symbol `{sym}` (cutover-only): {details:#?}"
+        );
+    }
+}
+
+/// CS-3 S7-1 Slice-4 CUTOVER — positive pin closing the `stage_send.rs` file-wide scan exclusion.
+/// The live cutover activates `authorize_submission` (4-pre mint) + `record_outcome` (record tx) in
+/// `stage_send::run_one_attempt`, and NOTHING ELSE from the delivery lifecycle — the apply projection
+/// goes through `apply_orchestration::apply_recorded_outcome` (not a scanned symbol), never the repo
+/// `apply_outcome`; boot-resume / list / active-read are the reconciliation pass's territory.
+#[test]
+fn stage_send_references_only_the_authorize_record_subset() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/services/write_path/stage_send.rs"
+    );
+    let text = std::fs::read_to_string(path).expect("read stage_send.rs");
+    let details: Vec<String> = scan_inactive_lifecycle_refs(&text, "stage_send.rs")
+        .into_iter()
+        .map(|h| h.detail)
+        .collect();
+    let refs = |sym: &str| details.iter().any(|d| d.contains(&format!("`{sym}`")));
+
+    // Load-bearing: the cutover DOES reference the mint + record symbols — proves the exclusion is
+    // real, not vacuous.
+    for sym in ["authorize_submission", "record_outcome"] {
+        assert!(
+            refs(sym),
+            "stage_send must reference the sanctioned cutover symbol `{sym}`: {details:#?}"
+        );
+    }
+    // Forbidden: stage_send must NEVER call the repo apply / boot-resume / list / active-read / insert
+    // symbols directly.
+    for sym in [
+        "apply_outcome",
+        "resume_crashed_reservation",
+        "list_call_started_without_outcome",
+        "list_outcome_observed_pending_apply",
+        "get_active_for_fn",
+        "delivery_reservation::insert",
+    ] {
+        assert!(
+            !refs(sym),
+            "stage_send must NOT reference `{sym}` directly (apply goes via apply_orchestration): \
+             {details:#?}"
+        );
+    }
+}
+
+/// CS-3 S7-1 Q3 — positive pin closing the `apply_orchestration.rs` file-wide scan exclusion. The
+/// shared orchestration wraps EXACTLY `apply_outcome` (with the online shift edges) and touches no
+/// mint / record / boot-resume / list symbol.
+#[test]
+fn apply_orchestration_references_only_the_apply_subset() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/services/write_path/apply_orchestration.rs"
+    );
+    let text = std::fs::read_to_string(path).expect("read apply_orchestration.rs");
+    let details: Vec<String> = scan_inactive_lifecycle_refs(&text, "apply_orchestration.rs")
+        .into_iter()
+        .map(|h| h.detail)
+        .collect();
+    let refs = |sym: &str| details.iter().any(|d| d.contains(&format!("`{sym}`")));
+
+    // Load-bearing: the orchestration DOES wrap `apply_outcome`.
+    assert!(
+        refs("apply_outcome"),
+        "apply_orchestration must reference `apply_outcome` (it wraps it with the shift edges): \
+         {details:#?}"
+    );
+    // Forbidden: it must NEVER mint / record / boot-resume / list.
+    for sym in [
+        "authorize_submission",
+        "record_outcome",
+        "resume_crashed_reservation",
+        "list_call_started_without_outcome",
+        "list_outcome_observed_pending_apply",
+        "get_active_for_fn",
+        "delivery_reservation::insert",
+    ] {
+        assert!(
+            !refs(sym),
+            "apply_orchestration must NOT reference the mint/record/boot symbol `{sym}`: {details:#?}"
         );
     }
 }

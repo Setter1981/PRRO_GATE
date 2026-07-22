@@ -219,9 +219,9 @@ async fn live_smoke_b_kvt1_reentry_by_server_fiscal_no_typed_response() {
     match result {
         Err(DpsError::NotFound) => {
             println!(
-                "Smoke B PASS: NotFound — W12 SentNotFoundDowngrade path \
-                 would correctly produce HoldFnDrain {{ ErRedriveQueued }} \
-                 per REC-1 + REC-2."
+                "Smoke B PASS: NotFound — the SentReplay SentNotFound path now \
+                 escalates to RequiresManualReconciliation + node STOP (CS-3 \
+                 S7-1 F2-kvt2; R6 retired the old ErRedriveQueued redrive)."
             );
         }
         Err(DpsError::ServerFiscalIdMismatch {

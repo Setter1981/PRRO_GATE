@@ -1075,8 +1075,14 @@ async fn event_has_severity(pool: &SqlitePool, event_type: &str, severity: &str)
     n > 0
 }
 
-// (g) Redrive: an ER doc (TransientRetry) is driven to Sent by the tick →
-//     the doc becomes issued → the D5 gate opens.
+// (g) CS-3 S7-1 cutover — SEMANTIC REGRESSION (`legacy inventory-stable name`).
+//     The pre-cutover "transient → ERROR_RETRYABLE → tick ER-redrive → Sent → ungate" contract is
+//     RETIRED.  An online transient (`DpsError::Transport`) now classifies `SubmittedUnknown` and is
+//     HELD (`SENDING` + `PENDING_APPLY` + node `STOP_MODE`); R6 removed the convergence ER-redrive
+//     arm, so the tick makes NO new wire and does NOT advance the held doc.  The FN STAYS gated (the
+//     held doc keeps the D5 fence) — exit is probe/operator only (CS-8,
+//     `project_backlog_classify_send_outcome`).  This is a conscious loss of automatic liveness for
+//     P2 (at-most-one-wire), NOT a hidden regression.
 #[tokio::test]
 async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
     let pool = fresh_pool().await;
@@ -1087,10 +1093,10 @@ async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
 
     let (send_calls, last_calls) = seed_counters();
     let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    // Construction: the sell's send fails transiently → the doc lands in
-    // ErrorRetryable with a completed transport_trace(TransientRetry, 1).
+    // Construction: the sell's send fails transiently → SubmittedUnknown → the doc is HELD in
+    // SENDING (PENDING_APPLY) + node STOP_MODE.  (No ERROR_RETRYABLE — the ER edge is retired.)
     stub.push_send(Err(DpsError::Transport("transient-construction".into())));
-    // Tick redrive: stage_send re-sends → Ok → Sent (sfn stamped ⇒ issued).
+    // A spare Ok is queued but NEVER consumed: post-cutover the tick does NOT re-drive the held doc.
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
 
     let row = seed_inbox_sell(&pool).await;
@@ -1113,11 +1119,18 @@ async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
         .expect("inline::run with a transient send → Ok(InProgress)");
         assert_eq!(
             outcome.document_state,
-            DocState::ErrorRetryable,
-            "construction: transient send lands ErrorRetryable"
+            DocState::Sending,
+            "construction: transient send HOLDS the doc SENDING (SubmittedUnknown), not ErrorRetryable"
         );
     }
-    assert_eq!(read_doc_state(&pool, FN).await, "ERROR_RETRYABLE");
+    assert_eq!(read_doc_state(&pool, FN).await, "SENDING");
+    // The node is halted pending operator completion — this is what gates the tick below.
+    let mode: String = sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(mode, "STOP_MODE", "SubmittedUnknown halts the node");
 
     let view = RuntimeView {
         dps: &stub,
@@ -1128,13 +1141,13 @@ async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
 
     assert_eq!(
         read_doc_state(&pool, FN).await,
-        "SENT",
-        "resolver drives ER→Sent (issued) ⇒ the D5 gate opens"
+        "SENDING",
+        "post-cutover the tick does NOT re-drive the held doc — it stays SENDING (FN gated)"
     );
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
-        2,
-        "one construction fail + one redrive send"
+        1,
+        "only the construction wire happened — NO tick redrive (P2: at-most-one-wire)"
     );
 }
 

@@ -1188,19 +1188,30 @@ fn m3_map_send_reply_stays_wired_into_stage_send() {
     };
     scan.visit_file(&parsed);
 
-    assert!(
-        scan.any_calls >= 1,
-        "the live `map_send_reply` call was REMOVED from stage_send.rs — the CS-3 3.2 read-only \
-         shadow seam is the D/E tripwire and must stay wired until deliberately promoted. If this \
-         removal is intentional (the shadow is being promoted / retired), update this tripwire."
+    // CS-3 S7-1: the CS-3 3.2 read-only `map_send_reply` shadow (an inert `_shadow_response`
+    // that drove nothing) was DELIBERATELY PROMOTED into the live composed path. `stage_send::run`
+    // now wires the real single-RPC `send_chk_observed` (its EXACTLY-ONE-call-site sole-seam is
+    // guarded by `s7_p2_2_sole_seam`) and maps that transport-minted evidence into a `SendResponse`
+    // inside `submit_authorized` (guarded by the 32 AuthorityScan canaries in this file). So the
+    // read-only shadow seam is RETIRED from stage_send.rs — this pin is INVERTED to guard the
+    // post-promotion state: it fires if the shadow is ever RE-INTRODUCED (a regression to the
+    // pre-3.2 shape). The D/E authority-flow guarantee is now carried by `s7_p2_2_sole_seam` + the
+    // AuthorityScan gates, NOT by this shadow tripwire.
+    //
+    // (Test IDENTITY is kept stable — the additions-only `inventory_gate.sh` forbids removing a
+    // test name vs the merge base; the assertion is INVERTED, not renamed.)
+    assert_eq!(
+        scan.any_calls, 0,
+        "the CS-3 3.2 read-only `map_send_reply` shadow was RE-INTRODUCED into stage_send.rs \
+         ({} call-shape(s)) — it was promoted out at the S7-1 cutover and must NOT return; the live \
+         wire is `send_chk_observed` / `submit_authorized` (see `s7_p2_2_sole_seam`).",
+        scan.any_calls
     );
     assert_eq!(
-        scan.live_calls, 1,
-        "expected exactly ONE live `map_send_reply(wire_observation.evidence(), ..)` seam in \
-         stage_send.rs, found {} (any-shape count {}). The seam was rewired to a different \
-         evidence source — confirm it still forwards the single-RPC transport observation and \
-         update this pin.",
-        scan.live_calls, scan.any_calls
+        scan.live_calls, 0,
+        "no live `map_send_reply(evidence, ..)` seam may remain in stage_send.rs post-promotion \
+         (found {})",
+        scan.live_calls
     );
 }
 
