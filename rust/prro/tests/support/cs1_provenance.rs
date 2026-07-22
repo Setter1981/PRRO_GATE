@@ -65,6 +65,14 @@ use syn::{Expr, File, Type};
 pub const BASE_SHA: &str = "f2c17b1";
 /// head = CS-1 completion (immutable provenance endpoint).
 pub const HEAD_SHA: &str = "f2628ba";
+/// CS-3 S7-1 cutover re-baseline: the LIVE-drift leg's base/head endpoint. The immutable
+/// provenance leg (`BASE_SHA`->`HEAD_SHA`) is UNTOUCHED — the CS-1 refactor neutrality proof
+/// stays frozen at `f2c17b1..f2628ba` (historical). The cutover is an explicit, adjudicated
+/// contract change to the frozen test files (HELD/RMR/escalate), so ONLY the live-drift leg is
+/// re-anchored to the cutover commit: `git_show(LIVE_DRIFT_BASE_SHA, file) == worktree`, and it
+/// still fails RED on any FURTHER non-neutral drift vs this base. No carve-out, no weakening of
+/// the immutable proof. Re-anchor again (bump this) at the next adjudicated frozen-file change.
+pub const LIVE_DRIFT_BASE_SHA: &str = "bc186e6";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is

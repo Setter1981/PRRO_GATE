@@ -2282,6 +2282,7 @@ test-support	prro	prro::t3_auto_z_ticker	pin1c_auto_z_re_tick_is_idempotent	fals
 test-support	prro	prro::t3_auto_z_ticker	pin1d_online_auto_z_issues_normal_z_to_ack	false
 test-support	prro	prro::t3_auto_z_ticker	pin1e_null_driver_reject_escalates_durably_never_silent	false
 test-support	prro	prro::t3_auto_z_ticker	pin7_teeth_auto_z_ignores_enforcement_toggle	false
+test-support	prro	prro::t3_auto_z_ticker	pin_auto_z_quiescence_pending_does_not_poison_then_closes_after_clear	false
 test-support	prro	prro::t3_time_budgets	pin2_offline_session_36h_sell_refused_z_allowed	false
 test-support	prro	prro::t3_time_budgets	pin3_month_168h_accumulator_and_rollover	false
 test-support	prro	prro::t3_time_budgets	pin3b_rollover_does_not_reset_running_36h_session	false

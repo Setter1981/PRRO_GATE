@@ -13,7 +13,10 @@
 #
 # Format (tab-separated, one row per carve-out; `#` comments + blank lines ignored):
 #   <repo-relative-path>	<approved-git-blob-sha>	<provenance-note>
-rust/prro/tests/invariant_fuzzer/model.rs	c19654a4f1115cd500cef6bf67372a48ef7d197f	fuzzer oracle fix 32166cc (offline SHIFT_OPEN resets model cash_on_hand)
-rust/prro/tests/repo_fiscal_documents_state_cas.rs	098b80cdcc82435074062ef525d62d8c54ddc006	CS-3 Slice 5 operator-completion edge 86648df ((Sending,RequiresManualReconciliation) allowed; allowed_count 22->23, negative pin removed)
-rust/prro/tests/shift_state_whitelist_matrix.rs	1022ab351f4adf8f0a0e3b5676f8de550b4379f3	CS-3 gap 4a: whitelist edges 16 Opening->Closed (4a), 17 OLPD->Closed + 18 CLPD->OLPD (4b, offline rollback); count 15->18, 63 forbidden
-rust/prro/tests/repo_shifts.rs	488cefcf8b2baeb7002465f6c667736e66a39269	CS-3 gap 4b: repo_shifts allowed_transition matrix gains edges 15-18 (M2-N2a Opened->RMR, gap-4a Opening->Closed, gap-4b OLPD->Closed + CLPD->OLPD); OLPD->Closed moved allowed
+#
+# EMPTY after the CS-3 S7-1 cutover live-drift re-baseline (LIVE_DRIFT_BASE_SHA -> the cutover
+# commit): the live-drift leg's frozen endpoint is now the cutover itself, so every frozen file —
+# including the four former carve-outs (fuzzer oracle fix 32166cc, CS-3 Slice-5 operator-completion
+# 86648df, gap-4a/4b shift-whitelist edges) — is covered by the re-anchored AST-neutral leg (base
+# == worktree) directly; no per-file blob-pin needed. The immutable leg (f2c17b1..f2628ba) never
+# used carve-outs. A future post-cutover approved change re-pins here again with an artifact note.

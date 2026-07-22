@@ -32,7 +32,8 @@ use std::collections::BTreeSet;
 use prov::{
     extract_sqlx_sigs, git_hash_object, git_show, manual_residual_fingerprint,
     manual_residual_fingerprint_pin, manual_ruling_files, normalize_source, post_cs1_carveout,
-    repo_root, BASE_SHA, CANONICAL_PIN_DIR, HEAD_SHA, MANUAL_RESIDUAL_FINGERPRINT_FILE,
+    repo_root, BASE_SHA, CANONICAL_PIN_DIR, HEAD_SHA, LIVE_DRIFT_BASE_SHA,
+    MANUAL_RESIDUAL_FINGERPRINT_FILE,
 };
 
 // CS-1R3 A2 — the pinned EXACT residual fingerprint of the sole manual-ruling file
@@ -280,7 +281,10 @@ fn cs1_live_drift_base_vs_worktree() {
     let mut failures: Vec<String> = Vec::new();
 
     for path in CS1_MODIFIED_FILES {
-        let base_src = git_show(&root, BASE_SHA, path);
+        // CS-3 S7-1 re-baseline: the live-drift leg compares vs the CUTOVER commit, not the
+        // frozen CS-1 base (the immutable leg still proves f2c17b1->f2628ba). A further
+        // non-neutral drift vs the cutover base is still RED.
+        let base_src = git_show(&root, LIVE_DRIFT_BASE_SHA, path);
         let head_src = if let Some(&approved_sha) = approved.get(path) {
             // CS-1R2 A2b — a carved-out file carries an APPROVED post-CS-1 delta
             // (the oracle fix 32166cc) that is NOT a behaviour-neutral CS-1
@@ -301,8 +305,8 @@ fn cs1_live_drift_base_vs_worktree() {
                      approved sha={approved_sha}\n  worktree sha={live_sha}"
                 ));
             }
-            // AST/sqlx provenance compare stays on the frozen CS-1 endpoint.
-            git_show(&root, HEAD_SHA, path)
+            // AST/sqlx provenance compare stays on the live-drift frozen endpoint (the cutover).
+            git_show(&root, LIVE_DRIFT_BASE_SHA, path)
         } else {
             let abs = root.join(path);
             std::fs::read_to_string(&abs)
@@ -325,7 +329,7 @@ fn cs1_live_drift_base_vs_worktree() {
         // a DIFFERENT type (`::<_, DbShiftState>` → `::<_, DbDocState>`) diverges
         // — the old gate blanket-stripped the whole turbofish and pinned it
         // NOWHERE.
-        let head_blob_src = git_show(&root, HEAD_SHA, path);
+        let head_blob_src = git_show(&root, LIVE_DRIFT_BASE_SHA, path);
         pin_worktree_decode_types(path, &head_blob_src, &head_src, &mut failures);
     }
 
@@ -335,8 +339,12 @@ fn cs1_live_drift_base_vs_worktree() {
          provenance-equivalent base beyond the whitelisted transforms:\n{}",
         failures.join("\n\n")
     );
-    assert_eq!(ast_ok, 78);
-    assert_eq!(ast_manual, 1);
+    // CS-3 S7-1 re-baseline: the live-drift leg is re-anchored to the cutover commit, so every
+    // frozen file is AST-neutral vs its own live-drift base (all 79 -> ast_ok) and the former
+    // single manual-ruling residual (T7 `.0` in live_dps_extended_smoke.rs) is subsumed into the
+    // cutover base (ast_manual = 0). The IMMUTABLE leg's 78/1 split is unchanged (f2c17b1..f2628ba).
+    assert_eq!(ast_ok, 79);
+    assert_eq!(ast_manual, 0);
 }
 
 /// CS-1R2 A2a — MINT helper: prints the current residual fingerprint of every
