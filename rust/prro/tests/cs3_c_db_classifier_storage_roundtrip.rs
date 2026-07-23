@@ -663,15 +663,17 @@ fn normative_graph_rows() -> Vec<GraphRow> {
             node_effect: "NoNodeEffect",
         },
         // ── Started/Parsed(Indeterminate) ──────────────────────────────────────
-        // -4 UnknownStatus → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
+        // -4 UnknownStatus → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired (CS-3 Slice E Pin 3)
+        // (Stored via the CloseAmbiguous canonical leaf for this axes class — `ev_for` maps
+        // SUBMITTED_UNKNOWN/PARSED/ProbeRequired there; migration 038's matrix accepts it.)
         GraphRow {
-            label: "Indeterminate(Unknown/-4) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/TransientRetry",
+            label: "Indeterminate(Unknown/-4) → SUBMITTED_UNKNOWN/PARSED_DPS_ENVELOPE/ProbeRequired",
             evidence: parsed(RawStatus::Error(-4), DocType::Sell),
             doc_type: DocType::Sell,
             certainty: "SUBMITTED_UNKNOWN",
             provenance: "PARSED_DPS_ENVELOPE",
-            routing: Some("TransientRetry"),
-            node_effect: "NoNodeEffect",
+            routing: Some("ProbeRequired"),
+            node_effect: "ProbeRequired",
         },
         // -3 SaveError → SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / TransientRetry
         GraphRow {

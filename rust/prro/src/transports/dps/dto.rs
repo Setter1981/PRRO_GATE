@@ -322,9 +322,10 @@ pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAc
 /// so the digest is framed from live fields. `Status::try_from` fails only for a code outside the
 /// declared `-16..=1` enum (proto-unrecognized). §4.3 row-6 (auditor-adjudicated 2026-07-18): an
 /// unrecognized NON-ZERO code is still a server verdict code → `ServerCode` (the engine maps it to
-/// `UnknownStatus → TransientRetry`); ONLY proto `status == 0` (`Ok(Unknown)`) is `MissingStatus →
-/// ProbeRequired`. This preserves the §4.6 "unknown-non-zero" drift-delta (Live `Decode →
-/// ProbeRequired` vs Shadow `UnknownStatus → TransientRetry`).
+/// `UnknownStatus`, which CS-3 Slice E Pin 3 routes `→ ProbeRequired`); ONLY proto `status == 0`
+/// (`Ok(Unknown)`) is `MissingStatus → ProbeRequired`. Post-Pin-3 the §4.6 drift-delta is `-4` (Live
+/// `Indeterminate → TransientRetry` vs Shadow `UnknownStatus → ProbeRequired`); a proto-unrecognized
+/// `-17` is now an EQUAL row (Live tonic-decode fails → `Decode → ProbeRequired`, matching the shadow).
 pub(in crate::transports::dps) fn raw_reply_from_check_response(
     r: &gen::CheckResponse,
 ) -> RawSendReply {

@@ -267,10 +267,10 @@ pub enum ProbeReason {
     /// [`DecodeUnknown`]: that is a proto-default `status==0` (no envelope verdict at all), whereas
     /// this is a NON-zero code the server DID return but the contract does not name.
     ///
-    /// **Dormant until Pin 3.** At Pin 2 the classifier still routes `UnknownStatus → TransientRetry`
-    /// (`prro-domain` `mod.rs` `routing_for_indeterminate`), so [`wire_decision_from`] emits no probe
-    /// for this leaf. Pin 3 flips the classifier to `ProbeRequired`, which activates this reason via
-    /// the leaf's `ProbeRequired` arm — no projection change needed.
+    /// **Activated by Pin 3.** Pin 2 pre-wired this leaf's `ProbeRequired` arm in `wire_decision_from`
+    /// dormant; Pin 3 flipped `routing_for_indeterminate(UnknownStatus) → ProbeRequired` (`prro-domain`
+    /// `mod.rs`, atomic with migration 038), so the classifier now HOLDS this leaf and the projection
+    /// emits this probe reason — no `wire_decision_from` change was needed for the flip.
     SubmittedUnknown,
 }
 

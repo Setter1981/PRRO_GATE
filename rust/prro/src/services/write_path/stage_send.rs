@@ -2095,9 +2095,11 @@ mod tests {
             _ => panic!("returned outcome must be Routed"),
         }
 
-        // ── Divergent leaf B — UnknownStatus (-17) → TransientRetry (Pin 2; ProbeRequired at Pin 3) ──
-        // The total projection UNIFIES the two legacy sources for this leaf (`-17` decode→ProbeRequired
-        // and `-4` indeterminate→TransientRetry) under the single durable `UnknownStatus → TransientRetry`.
+        // ── Divergent leaf B — UnknownStatus (-17) → ProbeRequired/SubmittedUnknown (CS-3 Pin 3) ──
+        // The total projection UNIFIES the two legacy sources for this leaf (`-17` decode and `-4`
+        // indeterminate) under the single durable classifier verdict. Pin 3 flipped it TransientRetry →
+        // ProbeRequired, ACTIVATING the SubmittedUnknown probe that Pin 2 pre-wired dormant here (no
+        // `wire_decision_from` change — only the classifier's `routing_for_indeterminate` flipped).
         let ev_us = pin_started(SendResponse::parsed(SendOutcome::from_server_code(
             NonOkStatusCode::from_transport(-17).unwrap(),
             DocType::Sell,
@@ -2106,8 +2108,8 @@ mod tests {
         let cls_us = classify(&ev_us);
         assert_eq!(
             cls_us.routing(),
-            Some(ActiveRetryClass::TransientRetry),
-            "Pin 2: classifier still routes UnknownStatus → TransientRetry (Pin 3 flips it)"
+            Some(ActiveRetryClass::ProbeRequired),
+            "Pin 3: classifier now routes UnknownStatus → ProbeRequired"
         );
         let disc_us = EvidenceDiscriminant::from_evidence(&ev_us);
         let dec_us = wire_decision_from(&disc_us, &cls_us, None);
@@ -2116,13 +2118,14 @@ mod tests {
             WireDecision::Sent { .. } => panic!("UnknownStatus must be Routed"),
         };
         assert_eq!(d_us.target_state, DocState::ErrorRetryable);
-        assert_eq!(d_us.retry_class, RetryClass::TransientRetry);
-        assert_eq!(d_us.audit_event, AuditEvent::StageSendTransientRetry);
+        assert_eq!(d_us.retry_class, RetryClass::ProbeRequired);
+        assert_eq!(d_us.audit_event, AuditEvent::StageSendProbeRequired);
         assert_eq!(d_us.audit_severity, Severity::Warning);
         assert!(d_us.node_mode_flip.is_none());
-        assert!(
-            d_us.probe_hint.is_none(),
-            "Pin 2: UnknownStatus carries NO probe (TransientRetry); Pin 3 activates SubmittedUnknown"
+        assert_eq!(
+            d_us.probe_hint.as_ref().map(|h| h.reason),
+            Some(ProbeReason::SubmittedUnknown),
+            "Pin 3: UnknownStatus now carries the SubmittedUnknown probe (dormant since Pin 2)"
         );
         assert!(d_us.mac_recovery_hint.is_none());
         let fx_us = (None, "Decode", "status=-17 unknown non-zero".to_string());
@@ -2130,11 +2133,11 @@ mod tests {
             build_attempt_completion(&dec_us, Some(&fx_us), "t0".into(), "t1".into())
                 .retry_class
                 .as_deref(),
-            Some("TransientRetry")
+            Some("ProbeRequired")
         );
         match stage_send_outcome_from(dec_us, 1, Some(&fx_us)) {
             StageSendOutcome::Routed { decision, .. } => {
-                assert_eq!(decision.retry_class, RetryClass::TransientRetry)
+                assert_eq!(decision.retry_class, RetryClass::ProbeRequired)
             }
             _ => panic!("returned outcome must be Routed"),
         }
