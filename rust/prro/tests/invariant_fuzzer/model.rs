@@ -146,6 +146,19 @@ pub struct RefModel {
     //
     // **L3:** service-in/out terms wired (apply_service_io). EPZ stays 0 (fail-closed).
     pub cash_on_hand: i64,
+
+    // ── Cross-shift cash carry (mirrors prod `shifts.cash_balance_kop`) ────
+    // Prod carry semantics (operator decision 2026-07-10, `cash_ledger.rs:13-18`):
+    // a NEW shift's `opening_cash = prior shift's cash_balance_kop` (the last
+    // CLOSED shift's persisted CLOSING drawer), or 0 for the FN's first shift.
+    // A real SHIFT_CLOSE (Z_REPORT) OVERWRITES `cash_balance_kop` with the
+    // closing drawer; a force-close (`SellWithClosedShift`) NEVER persists, so
+    // the row keeps its OPENING value. This field is the model's mirror of that
+    // persisted anchor: it is written to `cash_on_hand` ONLY at a REAL close
+    // (online Z happy path + the offline drain finalize), applied as the opening
+    // at the NEXT shift-open, and left UNTOUCHED by a force-close (so the next
+    // open carries the force-closed shift's opening, exactly like prod).
+    pub carry_cash_kop: i64,
 }
 
 /// L0 — the cash amount used by every SELL/RETURN in the fuzzer fixture.
@@ -171,7 +184,8 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0, // L0: opening = 0 (first shift; carry is L3/L4)
+            cash_on_hand: 0,   // L0: opening = 0 (first shift; carry is L3/L4)
+            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
         }
     }
 
@@ -190,7 +204,8 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0, // L0: no open shift → no cash-on-hand
+            cash_on_hand: 0,   // L0: no open shift → no cash-on-hand
+            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
         }
     }
 
@@ -211,7 +226,8 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0, // L0: opening = 0 (first shift)
+            cash_on_hand: 0,   // L0: opening = 0 (first shift)
+            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
         }
     }
 
@@ -230,7 +246,8 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0, // L0: no open shift
+            cash_on_hand: 0,   // L0: no open shift
+            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
         }
     }
 
@@ -743,12 +760,15 @@ impl RefModel {
         if Self::online_origin_advances_seed(doc_state) {
             self.seed = Some(unsigned_hash);
             self.shift_state = ShiftState::Opened;
-            // W1 cash-on-hand reset (W1 coordination note, line 126):
-            // A new shift starts with opening balance = 0 (the fixture seeds shifts
-            // with cash_balance_kop = 0).  Reset the accumulator so the model's
-            // INV-21 guard mirrors prod's `derive_cash_on_hand(opening=0, ...)`.
-            // Carry across shifts is L3/L4 scope — not modelled here.
-            self.cash_on_hand = 0;
+            // Cross-shift cash carry (mirrors prod `cash_ledger.rs:14`
+            // `opening_cash = prior shift's cash_balance_kop`): a fresh shift opens
+            // with `cash_on_hand = <carry>`. The carry is the CLOSING drawer of the
+            // last REAL close (set in `carry_cash_kop`); 0 for the FN's first shift
+            // and after a non-persisting force-close. This replaces the old blanket
+            // reset-to-0, which was only sound under the single-open-shift-per-fixture
+            // assumption that the multi-shift alphabet (RAGE W1) broke — the
+            // `Sell → Z → ShiftOpen → EPZ` counterexample where prod carries 15000.
+            self.cash_on_hand = self.carry_cash_kop;
         } else if doc_state == DocState::Rejected {
             self.shift_state = ShiftState::RequiresManualReconciliation;
             return ExpectedOutcome::NoIssuanceRow;
@@ -758,6 +778,17 @@ impl RefModel {
             // not confirm and does not roll back a retryable send).  No seed
             // advance (D2 / advance-at-SEND), no RMR escalation.
             self.shift_state = ShiftState::Opening;
+            // Cross-shift carry also applies to a HELD open: prod stamps the new
+            // shift's opening `cash_balance_kop = <carry>` at ACQUIRE
+            // (`stage_acquire.rs:883-910`), BEFORE the send outcome, so an
+            // `Opening`-resting shift is read by `cash_on_hand_for_fn` (which
+            // excludes only CLOSED/RMR/ERROR/CREATED) at the CARRIED opening — NOT
+            // the stale prior-shift drawer. Counterexample (offline harness, seed
+            // 2026-07-23): `[OfflineServiceIn, GoOnline, SellWithClosedShift,
+            // OnlineShiftOpen([Superseded]), XReport]` → real 0 vs stale model
+            // 15000. The Rejected arm above escalates to RMR (excluded from the
+            // cash read), so it deliberately does NOT re-anchor.
+            self.cash_on_hand = self.carry_cash_kop;
         }
 
         ExpectedOutcome::Mutated(Mutation {
@@ -845,15 +876,13 @@ impl RefModel {
         self.codes_consumed += 1;
         self.seed = Some(unsigned_hash);
         self.shift_state = ShiftState::OpenedLocalPendingDrain;
-        // W1 cash-on-hand reset (mirrors the ONLINE twin `apply_online_shift_open`
-        // — line 727).  A freshly opened shift starts with opening balance = 0.
-        // HARD ZERO is sound under the CURRENT alphabet: the only closer,
-        // `force_shift_closed` (`SellWithClosedShift`), NEVER persists closing
-        // cash, so the CLOSED-shift carry is always 0 — prod's per-open-shift
-        // `cash_on_hand_for_fn` reads 0 for the fresh shift regardless.  A FUTURE
-        // alphabet with a real offline Z-close that persists `cash_balance_kop`
-        // before a reopen must RE-AUDIT this (switch to a derived opening carry).
-        self.cash_on_hand = 0;
+        // Cross-shift cash carry (offline twin of `apply_online_shift_open`): a fresh
+        // shift opens with `cash_on_hand = <carry>` (prod `cash_ledger.rs:14`). This
+        // is the RE-AUDIT the old HARD-ZERO comment demanded once a real Z-close that
+        // persists `cash_balance_kop` before a reopen entered the alphabet — the carry
+        // is set at the offline drain finalize (the real close) / online Z, and is 0
+        // for the FN's first shift or after a non-persisting force-close.
+        self.cash_on_hand = self.carry_cash_kop;
 
         ExpectedOutcome::Mutated(Mutation {
             lnd,
@@ -909,6 +938,11 @@ impl RefModel {
         if Self::online_origin_advances_seed(doc_state) {
             self.seed = Some(unsigned_hash);
             self.shift_state = ShiftState::Closed;
+            // Cross-shift carry: a real SHIFT_CLOSE persists the CLOSING drawer as
+            // `shifts.cash_balance_kop` (prod `cash_ledger.rs:16`), which becomes the
+            // NEXT shift's opening carry. Mirror it so a reopen after this Z sees the
+            // carried balance (the `Sell → Z → ShiftOpen → EPZ` counterexample).
+            self.carry_cash_kop = self.cash_on_hand;
         } else if doc_state == DocState::Rejected {
             // Current production escalates shift-class send rejects to RMR while
             // the document itself rests as non-issued Rejected.
@@ -1379,6 +1413,10 @@ impl RefModel {
                     }
                     ShiftState::ClosingLocalPendingDrain => {
                         self.shift_state = ShiftState::Closed;
+                        // Cross-shift carry (offline twin of the online Z-close): the drain
+                        // finalize is the REAL close that persists `cash_balance_kop`, so the
+                        // next shift-open carries this drawer (symmetry with online).
+                        self.carry_cash_kop = self.cash_on_hand;
                     }
                     _ => {}
                 }
