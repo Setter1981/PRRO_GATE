@@ -383,7 +383,12 @@ pub(in crate::transports::dps) fn observe_check_reply(
 /// runs the SAME `observe_check_reply` decode the live channel uses. Genuine transport / wrapper
 /// errors (`Transport`, `RemoteStatus`, `NotFound`, `Internal`, …) have NO faithful reply, so they
 /// fall back to `observe_from_legacy` (correctly `NoResponse`), matching production.
-#[cfg(any(test, feature = "test-support"))]
+//
+// `live-dps` is in the gate because the `#![cfg(feature = "live-dps")]` smoke harness
+// (`tests/live_dps_extended_smoke.rs`) builds scripted mocks via `scripted_observation`
+// on its compile-only path; that helper reuses this faithful decode, so both must be
+// present whenever the live-dps harness is compiled (CI `--features live-dps --no-run`).
+#[cfg(any(test, feature = "test-support", feature = "live-dps"))]
 pub fn observe_faithful_from_legacy(
     legacy: &Result<CheckAck, DpsError>,
 ) -> super::raw_reply::RawSendObservation {
@@ -435,7 +440,10 @@ pub fn observe_faithful_from_legacy(
 /// faithful observation ([`observe_faithful_from_legacy`]) from ONE call. A mock that specifically
 /// exercises the ABSENCE of a trusted reply must NOT use this — it returns an explicit `NoResponse`
 /// observation instead. Production `GrpcDpsChannel` overrides with the lossless single-decode body.
-#[cfg(any(test, feature = "test-support"))]
+//
+// `live-dps` gate: the live smoke harness's `StubAckDps` mock calls this on its compile-only
+// path (`cargo test --features live-dps --no-run`), so it must compile under live-dps too.
+#[cfg(any(test, feature = "test-support", feature = "live-dps"))]
 pub fn scripted_observation(
     legacy: Result<CheckAck, DpsError>,
 ) -> (
