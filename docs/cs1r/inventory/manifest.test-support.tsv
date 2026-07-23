@@ -579,7 +579,6 @@ test-support	prro	prro	services::write_path::error_routing::tests::mac_recovery_
 test-support	prro	prro	services::write_path::error_routing::tests::probe_required_class_carries_probe_hint	false
 test-support	prro	prro	services::write_path::error_routing::tests::route_send_result_err_arm_delegates_to_route_dps_error	false
 test-support	prro	prro	services::write_path::error_routing::tests::route_send_result_ok_arm_yields_sent_with_server_fiscal_no	false
-test-support	prro	prro	services::write_path::error_routing::tests::s7_target_wire_decision_maps_empty_sfn_to_held_not_sent	false
 test-support	prro	prro	services::write_path::error_routing::tests::terminal_reject_class_routes_to_rejected_state_only	false
 test-support	prro	prro	services::write_path::error_routing::tests::unknown_server_code_routes_to_wrapper_bug_fail_closed	false
 test-support	prro	prro	services::write_path::error_routing::tests::wrapper_bug_class_always_routes_to_error_retryable	false
@@ -643,12 +642,11 @@ test-support	prro	prro	services::write_path::stage_send::tests::envelope_hash_re
 test-support	prro	prro	services::write_path::stage_send::tests::envelope_hash_reflects_non_cms_field_drift	false
 test-support	prro	prro	services::write_path::stage_send::tests::extract_wire_forensics_carries_status_code_and_kind_per_variant	false
 test-support	prro	prro	services::write_path::stage_send::tests::extract_wire_forensics_remote_status_and_indeterminate_project_to_transport_ra	false
-test-support	prro	prro	services::write_path::stage_send::tests::f3_remote_status_projects_probe_required_from_evidence_not_legacy	false
-test-support	prro	prro	services::write_path::stage_send::tests::f3_unknown_nonzero_projects_transient_retry_from_evidence_not_legacy	false
 test-support	prro	prro	services::write_path::stage_send::tests::now_db_format_matches_sqlite_current_timestamp_shape	false
 test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_caps_at_512_bytes	false
 test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_passes_short_strings_unchanged	false
 test-support	prro	prro	services::write_path::stage_send::tests::truncate_msg_respects_utf8_boundaries	false
+test-support	prro	prro	services::write_path::stage_send::tests::wire_decision_from_locks_authority_tuple	false
 test-support	prro	prro	services::write_path::stage_send::tests::wire_decision_to_outcome_kind_maps_per_w10_table	false
 test-support	prro	prro	transports::dps::apply_plan_pin::s7_applyplan_missing_status_audit_is_decode_unknown_not_probe_required	false
 test-support	prro	prro	transports::dps::apply_plan_pin::s7_applyplan_ok_arms_route_to_sent	false
@@ -1170,6 +1168,8 @@ test-support	prro	prro::digest_mint_source_gate	services_call_of_mint_is_caught	
 test-support	prro	prro::digest_mint_source_gate	services_call_of_provenance_mint_is_caught	false
 test-support	prro	prro::digest_mint_source_gate	split_token_macro_ctor_is_caught	false
 test-support	prro	prro::digest_mint_source_gate	unrelated_ctor_name_not_flagged	false
+test-support	prro	prro::directed_unknown_status_probe	unknown_status_minus_17_holds_probe_required_single_wire	false
+test-support	prro	prro::directed_unknown_status_probe	unknown_status_minus_4_holds_probe_required_single_wire	false
 test-support	prro	prro::doctor_live_verdicts	cert_window_expired_when_past_not_after	false
 test-support	prro	prro::doctor_live_verdicts	cert_window_ok_when_more_than_30_days_remain	false
 test-support	prro	prro::doctor_live_verdicts	cert_window_warn_when_less_than_30_days_remain	false
@@ -1731,6 +1731,8 @@ test-support	prro	prro::migration_036_evidence_union	tg07_unknown_kind_rejected	
 test-support	prro	prro::migration_036_evidence_union	tg08_partial_evidence_no_kind_rejected	false
 test-support	prro	prro::migration_036_evidence_union	tg09_evidence_before_oo_rejected	false
 test-support	prro	prro::migration_036_evidence_union	tg10_remote_auth_missing_digest_rejected	false
+test-support	prro	prro::migration_038_unknown_status_probe	fresh_unknown_status_transition_requires_probe_required	false
+test-support	prro	prro::migration_038_unknown_status_probe	pre_038_legacy_oo_row_survives_revalidation_update	false
 test-support	prro	prro::migrations_007_008	doc_state_sending_round_trips_through_sqlx	false
 test-support	prro	prro::migrations_007_008	migration_007_unique_index_blocks_duplicate_fn_lnd	false
 test-support	prro	prro::migrations_007_008	migration_007_unique_index_listed_in_sqlite_master	false
@@ -2415,6 +2417,7 @@ test-support	prro	prro::write_path_dps_error_routing	fx18_server_minus_15_non_sh
 test-support	prro	prro::write_path_dps_error_routing	fx19_server_minus_15_close_shift_routes_to_probe_required	false
 test-support	prro	prro::write_path_dps_error_routing	fx20_server_minus_16_m3a_routes_to_rejected_alert	false
 test-support	prro	prro::write_path_dps_error_routing	fx21_pattern_b_retry_path_spy_observes_sending_marker_then_error_retryable	false
+test-support	prro	prro::write_path_dps_error_routing	slice_e_close_shift_probe_unifies_minus_2_and_minus_15	false
 test-support	prro	prro::write_path_inline	acquire_rejected_maps_only_no_double_terminalise	false
 test-support	prro	prro::write_path_inline	blocked_node_is_offline_refused_and_inbox_terminal	false
 test-support	prro	prro::write_path_inline	build_reject_terminalises_pre_acquire	false
