@@ -1880,7 +1880,14 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
         doc1_prev_before,
         "doc#1 previous_hash unchanged (no re-sign)"
     );
-    // No re-sign audit; one distinct refusal audit.
+    // ── CS-3 S7-1 (R3): the offline-origin -12 re-sign loop is DELETED, so there is no
+    //    explicit "refuse" step anymore. The -12 is a recorded HOLD (MacReseedPending): the
+    //    doc rests SENDING under a PENDING_APPLY reservation, the drain HALTS and escalates
+    //    the pending-drain shift to RequiresManualReconciliation. The offline-origin invariant
+    //    that motivated this pin SURVIVES verbatim — NO re-sign, so the seed never desyncs and
+    //    the chain stays intact (asserted above via invariant_scan + unchanged unsigned/prev).
+    //    The old MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED audit is retired; the escalation is now the
+    //    drain's own OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL (§16.7 universal EscalateManual, edges 6/14).
     let resigned: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_log WHERE event_type = 'MAC_RECOVERY_RESIGNED'",
     )
@@ -1891,14 +1898,61 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
         resigned, 0,
         "mac_recovery must NOT re-sign an offline-origin doc"
     );
-    let refused: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED'",
+
+    // The -12 is recorded HELD: doc#1 rests SENDING under a PENDING_APPLY MacReseedPending reservation.
+    let doc1_state: String = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND lnd = 1",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        doc1_state, "SENDING",
+        "offline-origin -12 → HELD (doc rests SENDING, no re-sign)"
+    );
+    let (res_apply, res_effect): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT apply_state, node_effect FROM delivery_reservation WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        res_apply.as_deref(),
+        Some("PENDING_APPLY"),
+        "held reservation"
+    );
+    assert_eq!(
+        res_effect.as_deref(),
+        Some("MacReseedPending"),
+        "-12 node-effect"
+    );
+
+    // M2-X1 UNIQUE (idempotent, no 2nd wire): the drain fires exactly ONE wire for doc#1, records
+    // the -12, then HALTS + escalates — it does NOT consume the 2nd queued -12 (no retry re-wire).
+    let mismatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'STAGE_SEND_MAC_HASH_MISMATCH'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(refused, 1, "one MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED audit");
-    // Shift escalated to manual-recon.
+    assert_eq!(
+        mismatches, 1,
+        "exactly one -12 wire attempt — the drain halts, no 2nd re-wire"
+    );
+
+    // The pending-drain shift escalates to manual-recon via the drain's halt audit + shift CAS.
+    let escalated: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        escalated, 1,
+        "one OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL audit"
+    );
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
         .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
@@ -2010,8 +2064,19 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
             .unwrap()
         }
     };
+    // ── FT pin (strict-sequential halt, post-cutover HELD semantics):
+    //    doc1 sends OK → ACK.  doc2's offline-origin DocumentReject during drain is now a
+    //    recorded HELD (SENDING under a PENDING_APPLY reservation) — a drain reject has crossed
+    //    the local-commit threshold, so rollback-to-terminal-Rejected does NOT apply (§6.3
+    //    universal EscalateManual); the drain HALTS and escalates the shift to
+    //    RequiresManualReconciliation.  doc3 is NEVER sent (strict-sequential halt at the
+    //    rejected predecessor — the M2-N1 unique value that survives the cutover).
     assert_eq!(state_at(1).await, "ACK", "doc1 → ACK");
-    assert_eq!(state_at(2).await, "REJECTED", "doc2 → REJECTED (terminal)");
+    assert_eq!(
+        state_at(2).await,
+        "SENDING",
+        "doc2 offline-origin drain reject → HELD (SENDING), NOT terminal REJECTED"
+    );
     assert_eq!(
         state_at(3).await,
         "OFFLINE_LOCAL_ACK",
@@ -2020,10 +2085,42 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
         2,
-        "only doc1 + doc2 reached the wire; doc3 never did"
+        "only doc1 + doc2 reached the wire; doc3 never did (strict halt)"
     );
 
-    // FN escalated to durable manual-recon via edge 15 (plain Opened, NOT wedged).
+    // doc2 rests OUTCOME_OBSERVED + PENDING_APPLY (held, not applied — the reject is unresolved).
+    let doc2_apply: Option<String> = sqlx::query_scalar(
+        "SELECT dr.apply_state FROM delivery_reservation dr JOIN fiscal_documents fd \
+         ON dr.document_id = fd.document_id WHERE dr.fiscal_number = ? AND fd.lnd = 2",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        doc2_apply.as_deref(),
+        Some("PENDING_APPLY"),
+        "doc2 held PENDING_APPLY"
+    );
+
+    // The drain recorded doc2's reject and escalated the shift to manual-recon (edge 15).
+    let rejected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'STAGE_SEND_REJECTED'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected, 1, "doc2's -1 DocumentReject was recorded");
+    let escalated: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        escalated, 1,
+        "one OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL audit"
+    );
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
         .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
@@ -2031,8 +2128,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
         .unwrap();
     assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
 
-    // Ledger clean over the REAL chain incl. the REJECTED offline-origin
-    // predecessor (M2-N2b).
+    // Ledger clean over the REAL chain incl. the HELD offline-origin doc2 (M2-N2b).
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
 
@@ -2180,7 +2276,11 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
         .expect("tick 1 strict drain returns Ok (escalates Manual)");
 
     assert_eq!(state_at(1).await, "ACK", "tick 1: doc1 → ACK");
-    assert_eq!(state_at(2).await, "REJECTED", "tick 1: doc2 → REJECTED");
+    assert_eq!(
+        state_at(2).await,
+        "SENDING",
+        "tick 1: doc2 offline-origin drain reject → HELD (SENDING), NOT terminal REJECTED"
+    );
     assert_eq!(state_at(3).await, "OFFLINE_LOCAL_ACK", "tick 1: doc3 held");
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
@@ -2219,7 +2319,11 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
         .expect("tick 2 re-tick drain returns Ok (idempotent no-op)");
 
     assert_eq!(state_at(1).await, "ACK", "re-tick: doc1 stable");
-    assert_eq!(state_at(2).await, "REJECTED", "re-tick: doc2 stable");
+    assert_eq!(
+        state_at(2).await,
+        "SENDING",
+        "re-tick: doc2 held-SENDING stable (idempotent — no re-send, no re-escalate)"
+    );
     assert_eq!(
         state_at(3).await,
         "OFFLINE_LOCAL_ACK",

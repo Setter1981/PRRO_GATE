@@ -9,9 +9,11 @@
 //!    (`NoResponse{CrashedBeforeObservation}` + `PENDING_APPLY` + node STOP), each in its own
 //!    `BEGIN IMMEDIATE`.  A reservation whose `node_state` row is missing (the NC-03 anomaly) is
 //!    DEFERRED, not converted;
-//! 2. **apply** every `OUTCOME_OBSERVED + PENDING_APPLY` reservation via the shared generation-CAS
-//!    `apply_outcome` orchestration.  A `HeldNotAutoRelease` (a `-12`/`-6`/SubmittedUnknown hold) is
-//!    EXPECTED — logged, never a boot error (frozen invariant #9).  `NodeStateMissing` DEFERS the FN;
+//! 2. **apply** every `OUTCOME_OBSERVED + PENDING_APPLY` reservation via the shared
+//!    `apply_orchestration::apply_recorded_outcome` (S7-1 B3 — fires the online shift edges 3/10 +
+//!    Z closing-cash in the apply tx, which the bare repo `apply_outcome` skipped).  A
+//!    `HeldNotAutoRelease` (a `-12`/`-6`/SubmittedUnknown hold) is EXPECTED — logged, never a boot
+//!    error (frozen invariant #9).  `NodeStateMissing` DEFERS the FN;
 //! 3. **reconstruct** the lost `node_state` for the deferred FNs (`boot_phase::reconstruct_lost_node_state`),
 //!    RESTORING the surviving reservation's authority (generation + active pointer) and setting node
 //!    STOP_MODE + CRITICAL audit — without this both `apply_outcome` and `complete_operator_pending`
@@ -40,6 +42,7 @@ use super::boot_phase;
 use crate::db::repositories::delivery_reservation::{self, ApplyError, ApplyResult, ReservationId};
 use crate::db::repositories::{audit_log, node_state};
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::services::write_path::apply_orchestration;
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 
 /// Counts emitted for the boot summary / observability (the S7-P4-BOOT tooth asserts DB *state*, not
@@ -81,18 +84,18 @@ enum ApplyClass {
 /// the `apply_outcome` error as an `anyhow::Error` so the transaction ROLLS BACK on any error (a
 /// partial effect-write is never committed); a `Held`/`NodeMissing` returns before any write in
 /// `apply_outcome`, so its rollback is a no-op.
+/// Apply one recorded outcome THROUGH the shared apply orchestration (S7-1 B3 fix, re-audit
+/// external-F1 / internal-B3). `apply_recorded_outcome` opens its own `BEGIN IMMEDIATE` and fires the
+/// online shift edges 3/10 (`Opening → Opened` / `Closing → Closed`) + Z closing-cash in the SAME tx
+/// as the doc-state CAS, returning the identical `HeldNotAutoRelease`/`NodeStateMissing`
+/// classification via the anyhow contract (FIX-C). The bare repo `apply_outcome` (the prior boot
+/// path) advanced the doc/SFN/seed but SKIPPED the shift edge, stranding an online SHIFT_OPEN/Z
+/// crash-resume in `Opening`/`Closing` (later destructively orphaned by boot branch e2).
 async fn apply_one(
     pool: &SqlitePool,
     reservation_id: delivery_reservation::ReservationId,
 ) -> ApplyClass {
-    let attempt: anyhow::Result<ApplyResult> = with_immediate(pool, move |tx| {
-        Box::pin(async move {
-            delivery_reservation::apply_outcome(tx, reservation_id)
-                .await
-                .map_err(anyhow::Error::from)
-        })
-    })
-    .await;
+    let attempt = apply_orchestration::apply_recorded_outcome(pool, reservation_id).await;
     match attempt {
         Ok(res) => ApplyClass::Resolved(res),
         Err(e) => match e.downcast_ref::<ApplyError>() {
@@ -192,7 +195,7 @@ async fn complete_crashed_trace(
 }
 
 /// The boot-first reservation pass (§7.2). Runs under the App recon mutex (`_guard` proves it).
-pub(crate) async fn run(
+pub async fn run(
     _guard: &super::ReconcileGuard<'_>,
     pool: &SqlitePool,
 ) -> anyhow::Result<ReservationBootSummary> {

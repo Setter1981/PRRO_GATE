@@ -28,11 +28,13 @@
 use sqlx::SqlitePool;
 use tokio::sync::OwnedMutexGuard;
 
-use crate::db::models::enums::{Protocol, ShiftState};
+use crate::db::models::enums::{Protocol, Severity, ShiftState};
+use crate::db::repositories::audit_log;
 use crate::db::repositories::ingress_inbox::{self, InboxInsertOutcome, NewInboxEntry};
 use crate::db::repositories::node_state;
 use crate::db::types::DbShiftId;
 use crate::runtime::ingress::seam::FiscalError;
+use crate::runtime::ingress::z_builder::{quiesce_shift_before_z, QuiescenceOutcome};
 use crate::services::time_budget::{self, Clock, EnforcementToggles, TimeBudgetGate};
 use crate::services::write_path::inline;
 use crate::services::write_path::stage_sign::SigningContext;
@@ -112,6 +114,67 @@ pub async fn run_auto_z_if_over_limit(
     if !budgets.shift_over_24h() {
         return Ok(AutoZOutcome::NotDue);
     }
+    let shift_hex = hex_encode_lower(shift_id.as_bytes());
+
+    // (2b) Z-QUIESCENCE GATE (poisoning fix).  The auto-Z reuses ONE deterministic
+    // inbox key per shift (`autoz-<fn>-<shift_hex>`), driven through `inline::run`.
+    // If the shift is NOT quiesced (a non-terminal in-flight receipt — e.g. a held
+    // `SENDING` — blocks Z aggregation), `inline::run`'s own C10 gate would
+    // TERMINALISE that inbox row to REJECTED (`terminalise_inbox_pre_acquire`);
+    // because the key is deterministic, EVERY later tick then `Replay`s that
+    // REJECTED row and `acquire` (status='NEW') can never re-drive it → the shift
+    // stays open FOREVER even after the operator clears the blocker (stuck-shift).
+    // So we run the SAME quiescence pass FIRST (short DB txs, no IO/crypto — it
+    // inline-finalizes the leading contiguous KVT2 run then reports): only mint
+    // when the shift is `Clear`.  On `Pending`, mint NOTHING (no inbox row → no
+    // poison), emit a best-effort forensic audit, and report NotDue so the NEXT
+    // tick retries cleanly once the blocker is resolved.
+    match quiesce_shift_before_z(pool, fiscal_number, shift_id).await {
+        Ok(QuiescenceOutcome::Clear) => {}
+        Ok(QuiescenceOutcome::Pending { blocking }) => {
+            let blockers: Vec<serde_json::Value> = blocking
+                .iter()
+                .map(|(id, st)| {
+                    serde_json::json!({
+                        "document_id": hex_encode_lower(id.as_bytes()),
+                        "state": st.as_str(),
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({ "blocking": blockers }).to_string();
+            // Best-effort: never let an audit write failure abort the tick.
+            let _ = audit_log::append(
+                pool,
+                "shift",
+                &shift_hex,
+                "AUTO_Z_QUIESCENCE_PENDING",
+                Severity::Warning,
+                None,
+                Some(&payload),
+            )
+            .await;
+            tracing::warn!(
+                fiscal_number,
+                shift = %shift_hex,
+                blocking = blocking.len(),
+                "auto_z: shift not quiesced for Z (non-terminal receipt in flight); \
+                 minting NO Z this tick — retry once the blocker resolves"
+            );
+            return Ok(AutoZOutcome::NotDue);
+        }
+        Err(e) => {
+            // A quiescence-pass error (short tx) is transient/structural; never
+            // panic the tick and never mint a poisonable row — report NotDue so a
+            // later tick retries.
+            tracing::error!(
+                fiscal_number,
+                shift = %shift_hex,
+                error = %format!("{e:?}"),
+                "auto_z: z-quiescence pass errored; minting NO Z this tick"
+            );
+            return Ok(AutoZOutcome::NotDue);
+        }
+    }
 
     // The synthetic Z must carry the shift's OWN recovery identity (driver_id +
     // signing cashier) — the Z build path requires both (z_builder). Recover them
@@ -147,7 +210,7 @@ pub async fn run_auto_z_if_over_limit(
     // (3) Mint (idempotently) the synthetic Z_REPORT inbox row for THIS shift and
     // drive it through the real write path. A deterministic key means a re-tick
     // after a crash mid-Z resolves the SAME row (INV-7), never a second Z.
-    let shift_hex = hex_encode_lower(shift_id.as_bytes());
+    // (`shift_hex` computed above at the quiescence gate.)
     let idem = auto_z_idempotency_key(fiscal_number, &shift_hex);
     let request_id = auto_z_request_id(&idem);
     // A Z carries no total; business_ts = the injected now (the close instant).

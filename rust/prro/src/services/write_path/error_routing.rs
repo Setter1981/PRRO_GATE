@@ -247,6 +247,16 @@ pub enum ProbeReason {
     Code2CloseShift,
     /// `-15` ERROR_NOT_OPEN_SHIFT + doc_type ∈ {SHIFT_CLOSE, Z_REPORT}.
     Code15CloseShift,
+    /// CS-3 S7-1 (dossier rev9): DPS returned OK (`status==1`) with an EMPTY fiscal id — no
+    /// issuance occurred, so the receipt is HELD for a `last_chk` probe rather than treated as a
+    /// `Sent{""}`. This is the target for the `OkButNoFiscalNumber` evidence leaf; the pre-cutover
+    /// early empty-id guard turned the same condition into a refusal.
+    OkButNoFiscalNumber,
+    /// CS-3 S7-1 (F3): a TLS-proven `Unauthenticated`/`PermissionDenied` (an authenticated non-DPS
+    /// peer, e.g. WAF/gateway) — the evidence classifier maps `RemoteAuthStatus → ProbeRequired`, so
+    /// the receipt is HELD for a `last_chk` probe rather than the legacy `TransientRetry` re-drive.
+    /// DISTINCT from [`OkButNoFiscalNumber`]: the cause is a remote status, not an empty fiscal id.
+    RemoteStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +280,51 @@ pub fn route_send_result(
             server_fiscal_no: ack.id,
         },
         Err(err) => WireDecision::Routed(route_dps_error(&err, doc_type, is_live_send)),
+    }
+}
+
+/// CS-3 S7-1 (design §4 + composition impl-design §6-B2): the `OkButNoFiscalNumber` HELD routing.
+///
+/// DPS returned OK (`status==1`) but with an EMPTY fiscal id → the receipt is NOT issued. The
+/// pre-cutover code caught this with an early empty-id guard (a refusal before the 4-b write tx);
+/// post-cutover it is the typed `OkButNoFiscalNumber` ApplyPlan row — a `ProbeRequired` HELD (dossier
+/// rev9), NEVER a `Sent{""}`. Driving trace/audit/return from a `Sent{""}` would write an empty
+/// `server_fiscal_no` into an OK `transport_trace` row and roll the whole record transaction back
+/// (the migration OK-CHECK), leaving the reservation stuck at `CALL_STARTED`.
+pub(crate) fn ok_but_no_fiscal_number_routing() -> RoutingDecision {
+    RoutingDecision {
+        target_state: DocState::ErrorRetryable,
+        retry_class: RetryClass::ProbeRequired,
+        audit_event: AuditEvent::StageSendProbeRequired,
+        audit_severity: Severity::Warning,
+        node_mode_flip: None,
+        probe_hint: Some(ProbeHint {
+            reason: ProbeReason::OkButNoFiscalNumber,
+        }),
+        mac_recovery_hint: None,
+    }
+}
+
+/// CS-3 S7-1 (composition impl-design §6-B2): project the legacy `WireDecision` (from
+/// `route_send_result`, the pinned incumbent) onto the post-wire TARGET authority that drives
+/// `record_outcome` / trace completion / audit / the returned `StageSendOutcome`.
+///
+/// The ONLY `Sent`↔held divergence at the route layer is the empty-id `Sent{""}` case (locked by
+/// `apply_plan_pin::s7_applyplan_ok_arms_route_to_sent`): a DPS-OK-with-no-fiscal-number is not an
+/// issuance, so it maps to the `OkButNoFiscalNumber` HELD ([`ok_but_no_fiscal_number_routing`]). Every
+/// other leaf routes IDENTICALLY in legacy and target (pinned per-code by `apply_plan_pin`), so it
+/// passes through unchanged — byte-equivalence for unchanged rows holds by target == legacy there. The
+/// caller keeps the legacy value ONLY for the drift-pin comparison, never as post-wire authority.
+///
+/// (The 2 remaining declared deltas — `UnknownStatus` / TLS `RemoteAuthStatus` — are non-`Sent` in
+/// BOTH legacy and target; only their trace retry-class refinement differs, tracked separately so a
+/// mis-transcription cannot introduce a 4th delta here.)
+pub(crate) fn target_wire_decision(legacy: WireDecision) -> WireDecision {
+    match legacy {
+        WireDecision::Sent { server_fiscal_no } if server_fiscal_no.is_empty() => {
+            WireDecision::Routed(ok_but_no_fiscal_number_routing())
+        }
+        other => other,
     }
 }
 
@@ -1161,6 +1216,49 @@ mod tests {
                 Some(expected_reason)
             );
         }
+    }
+
+    #[test]
+    fn s7_target_wire_decision_maps_empty_sfn_to_held_not_sent() {
+        // Acute B2 (composition impl-design §6): a route-layer `Sent{""}` (DPS OK, no fiscal number)
+        // must NOT stay `Sent` — that would write an empty server_fiscal_no into an OK trace row and
+        // roll the record tx back (migration OK-CHECK → stuck CALL_STARTED). It maps to the
+        // `OkButNoFiscalNumber` ProbeRequired HELD.
+        match target_wire_decision(WireDecision::Sent {
+            server_fiscal_no: String::new(),
+        }) {
+            WireDecision::Routed(rd) => {
+                assert_eq!(rd.target_state, DocState::ErrorRetryable);
+                assert_eq!(rd.retry_class, RetryClass::ProbeRequired);
+                assert_eq!(rd.audit_event, AuditEvent::StageSendProbeRequired);
+                assert_eq!(
+                    rd.probe_hint.as_ref().map(|h| h.reason),
+                    Some(ProbeReason::OkButNoFiscalNumber)
+                );
+            }
+            other => panic!("empty-SFN must map to a held Routed, got {other:?}"),
+        }
+        // Revert-canary: change `target_wire_decision`'s empty-SFN arm to `other => other` (pass the
+        // `Sent{""}` through unchanged) and this assertion REDs — proving the mapping is load-bearing
+        // (that a `Sent{""}` reaching the trace is the record-tx-rollback bug this fix removes).
+
+        // A real issuance (non-empty SFN) passes through as `Sent` (target == legacy).
+        assert!(matches!(
+            target_wire_decision(WireDecision::Sent {
+                server_fiscal_no: "4000123456".into(),
+            }),
+            WireDecision::Sent { server_fiscal_no } if server_fiscal_no == "4000123456"
+        ));
+
+        // A routed leaf passes through unchanged (target == legacy for every non-empty-SFN leaf).
+        assert!(matches!(
+            target_wire_decision(WireDecision::Routed(route_dps_error(
+                &DpsError::Transport("x".into()),
+                DocType::Sell,
+                true,
+            ))),
+            WireDecision::Routed(_)
+        ));
     }
 
     #[test]

@@ -304,7 +304,7 @@ async fn terminal_reject_routes_to_rejected_no_server_fiscal_no() {
 // ─── Fixture 3 — transport_retryable ─────────────────────────────────
 
 #[tokio::test]
-async fn transport_retryable_routes_to_error_retryable_preserves_attempt_at() {
+async fn transport_error_holds_stop_preserves_attempt_at() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_signed_doc_with_xml(&pool, 0x33, "SELL", 1, "SIGNED").await;
     let stub = StubDpsChannel::new(Err(DpsError::Transport("TLS reset".into())));
@@ -330,13 +330,45 @@ async fn transport_retryable_routes_to_error_retryable_preserves_attempt_at() {
     }
     assert_eq!(stub.call_count(), 1);
 
-    assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
+    // CS-3 S7-1: a Transport error is CLASSIFIED retryable (the trace records
+    // RETRYABLE_TRANSPORT below), but the composed path no longer RESTS it in
+    // ErrorRetryable for auto-redrive.  A wire failure after CALL_STARTED is
+    // AMBIGUOUS (the send may have reached DPS), so it is a recorded HOLD (the
+    // SubmittedUnknown treatment): the doc rests SENDING under a PENDING_APPLY
+    // reservation and the node halts to STOP_MODE — a conscious liveness trade for
+    // P2 double-issue safety.  Boot / operator resolves the hold; no auto re-wire.
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "SENDING",
+        "transport → HELD (SENDING), NOT auto-retryable ErrorRetryable"
+    );
+    let mode: String =
+        sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = '1234567890'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        mode, "STOP_MODE",
+        "transport-after-CALL_STARTED halts the node (ambiguous SubmittedUnknown)"
+    );
+    let apply_state: Option<String> = sqlx::query_scalar(
+        "SELECT apply_state FROM delivery_reservation WHERE fiscal_number = '1234567890'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        apply_state.as_deref(),
+        Some("PENDING_APPLY"),
+        "transport HELD reservation"
+    );
     assert!(
         read_submission_attempted_at(&pool, doc).await.is_some(),
-        "submission_attempted_at must persist on retryable path \
-         (forensics + W9 input)"
+        "submission_attempted_at must persist on the held path (forensics + boot input)"
     );
 
+    // The trace still records the transport CLASSIFICATION (RETRYABLE_TRANSPORT) — the
+    // wire outcome is retryable-typed even though the composed apply HOLDs it under STOP.
     let traces = transport_trace::list_for_document(&pool, doc)
         .await
         .unwrap();
@@ -510,7 +542,40 @@ async fn decode_status_zero_routes_to_probe_required_with_decode_unknown_hint() 
         }
         other => panic!("expected Routed ProbeRequired for Decode, got {other:?}"),
     }
-    assert_eq!(read_doc_state(&pool, doc).await, "ERROR_RETRYABLE");
+    // CS-3 S7-1: Decode status=0 is CLASSIFIED ProbeRequired (the routing echo above + the trace
+    // RETRYABLE_SERVER row below), but the composed path HOLDs it: the doc rests SENDING under a
+    // PENDING_APPLY reservation (node_effect ProbeRequired) and the node halts to STOP_MODE,
+    // awaiting a W9 last_chk probe / operator — NOT an auto-retryable ErrorRetryable.
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "SENDING",
+        "Decode → HELD (SENDING), NOT auto-retryable ErrorRetryable"
+    );
+    let mode: String =
+        sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = '1234567890'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        mode, "STOP_MODE",
+        "ProbeRequired halts the node pending the last_chk probe"
+    );
+    let (apply_state, node_effect): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT apply_state, node_effect FROM delivery_reservation WHERE fiscal_number = '1234567890'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        apply_state.as_deref(),
+        Some("PENDING_APPLY"),
+        "Decode HELD reservation"
+    );
+    assert_eq!(
+        node_effect.as_deref(),
+        Some("ProbeRequired"),
+        "Decode node-effect"
+    );
 
     let traces = transport_trace::list_for_document(&pool, doc)
         .await
@@ -658,15 +723,17 @@ async fn server_minus_11_routes_to_rejected_and_flips_node_to_blocked() {
     );
 }
 
-// ─── Fixture 3f — Server -11 with missing node_state row → typed error
+// ─── Fixture 3f — missing node_state row → pre-wire P3 refusal (zero wire)
 //
-// W10.3 structural-breach proof.  If `node_state` row is missing at
-// 4-b time (W5 acquire MUST upsert it before stage 1), the typed
-// `NodeStateMissingForBlock` surfaces and the entire 4-b tx rolls
-// back — doc stays in SENDING for W9 reconciliation.
+// W10.3 structural-breach proof, relocated by CS-3 S7-1 (§2.1). A missing
+// `node_state` row (W5 acquire MUST upsert it before stage 1) is now caught by
+// the PRE-WIRE P3 online-predecessor guard inside the authorize tx — it refuses
+// with a typed `Internal("P3: node_state row missing")` and ZERO wire, rolling
+// the whole authorize tx back atomically (nothing minted). The queued -11 is
+// never reached — the breach is caught before the wire, not at a post-wire 4-b.
 
 #[tokio::test]
-async fn server_minus_11_with_missing_node_state_surfaces_typed_error() {
+async fn missing_node_state_refused_pre_wire_p3_zero_wire() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_signed_doc_with_xml(&pool, 0xB5, "SELL", 1, "SIGNED").await;
     // **Intentionally NO `node_state::upsert_initial`** — simulate
@@ -686,62 +753,50 @@ async fn server_minus_11_with_missing_node_state_surfaces_typed_error() {
 
     let err = stage_send::run(&pool, &stub, doc, None)
         .await
-        .expect_err("missing node_state at 4-b must surface typed error");
+        .expect_err("a missing node_state row is refused pre-wire by the P3 guard");
     match err {
-        StageSendError::NodeStateMissingForBlock { fn_id, document_id } => {
-            assert_eq!(fn_id, "1234567890");
-            assert_eq!(document_id, doc);
-        }
-        other => panic!("expected NodeStateMissingForBlock, got {other:?}"),
+        StageSendError::Internal(e) => assert!(
+            e.to_string().contains("P3: node_state row missing"),
+            "expected the pre-wire P3 missing-node_state refusal, got: {e}"
+        ),
+        other => panic!("expected Internal(P3 node_state missing), got {other:?}"),
     }
 
-    // Doc state stays in SENDING (4-b tx rolled back).  W9 will pick
-    // it up on the next boot.
-    assert_eq!(read_doc_state(&pool, doc).await, "SENDING");
+    // KEY: the P3 guard runs PRE-WIRE inside the authorize tx (the SAME BEGIN IMMEDIATE as the
+    // reservation insert + CALL_STARTED marker), so its failure rolls the WHOLE authorize tx
+    // back BEFORE any send — send_chk NEVER fires (the queued -11 is never even reached).
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "pre-wire P3 refuses with ZERO wire (before the -11)"
+    );
 
-    // R-W10.3-review LOW 4 close: 4-pre commits SHOULD persist
-    // (CAS doc-state, trace alloc, intent-marker audit), but 4-b
-    // SHOULD roll back (trace.completed_at NULL, no result audit
-    // row).  This contract is what makes W9 reconciliation safe to
-    // pick up Sending docs without losing forensic continuity.
+    // The authorize rollback is atomic: NO CALL_STARTED marker, NO trace, NO intent audit — the
+    // doc simply stays in its SIGNED source state for boot to re-attempt once the FN is repaired.
+    // (Pre-cutover the post-wire 4-b guard left a SENDING marker + a 4-pre trace + intent audit;
+    // relocating the check pre-wire makes the refusal mint nothing.)
+    assert_eq!(read_doc_state(&pool, doc).await, "SIGNED");
     let traces = transport_trace::list_for_document(&pool, doc)
         .await
         .unwrap();
     assert_eq!(
         traces.len(),
-        1,
-        "trace allocated in 4-pre persists across 4-b rollback (1 row)"
+        0,
+        "authorize rolled back — no trace row minted"
     );
     assert!(
-        traces[0].completed_at.is_none(),
-        "4-b rolled back — trace.completed_at must remain NULL"
-    );
-    assert!(
-        traces[0].outcome_kind.is_none(),
-        "4-b rolled back — outcome_kind must not be set"
-    );
-    assert!(
-        traces[0].retry_class.is_none(),
-        "4-b rolled back — retry_class must not be set"
+        read_audit_event_types(&pool, doc).await.is_empty(),
+        "authorize rolled back — even the intent-marker audit is gone"
     );
 
-    // Audit: only the intent marker, no result/blocked entry (4-b
-    // rolled back swallowed it).
-    assert_eq!(
-        read_audit_event_types(&pool, doc).await,
-        vec!["STAGE_SEND_INTENT_MARKED"],
-        "4-b rollback must drop the result audit row"
-    );
-
-    // node_state row is genuinely missing (we never seeded it).  Pin
-    // that the failed flip didn't leave a half-applied row behind.
+    // node_state row is genuinely missing (we never seeded it) — the refused authorize left no
+    // half-applied row behind.
     let node_row = prro::db::repositories::node_state::get(&pool, "1234567890")
         .await
         .unwrap();
     assert!(
         node_row.is_none(),
-        "missing-FN scenario must NOT leave a partial node_state row \
-         after the 4-b rollback"
+        "the refused authorize must NOT leave a partial node_state row"
     );
 }
 
@@ -904,45 +959,6 @@ fn whitelist_4pre_source_states_regression_guard() {
     );
 }
 
-// ─── Fixture 6b — Pattern B retry-path: ErrorRetryable → Sending ─────
-
-#[tokio::test]
-async fn retry_path_error_retryable_to_sending_drives_through_4_pre() {
-    // W10.2 HIGH 3 §4.2: a doc previously routed to ErrorRetryable
-    // (e.g. Transport timeout on attempt #1) MUST be picked up by
-    // stage_send::run on the next worker tick via the 4-pre CAS
-    // (ErrorRetryable, Sending).  This fixture seeds in
-    // `ERROR_RETRYABLE`, runs stage_send::run, and asserts:
-    //   - attempt_no == 1 (fresh trace row, allocator counts attempts
-    //     per-document irrespective of source state)
-    //   - the 4-pre CAS Applied (no StateConflict)
-    //   - wire send_chk WAS called
-    //   - 4-b CAS Sending → Sent committed
-    let (_d, pool) = fresh_pool().await;
-    let doc = seed_signed_doc_with_xml(&pool, 0xC1, "SELL", 1, "ERROR_RETRYABLE").await;
-    let stub = StubDpsChannel::new(Ok(ack("DPS-FN-RETRY-OK")));
-
-    let outcome = stage_send::run(&pool, &stub, doc, None)
-        .await
-        .expect("retry from ErrorRetryable must succeed");
-
-    match outcome {
-        StageSendOutcome::Sent {
-            server_fiscal_no,
-            attempt_no: _,
-        } => {
-            assert_eq!(server_fiscal_no, "DPS-FN-RETRY-OK");
-        }
-        other => panic!("expected Sent on retry-path, got {other:?}"),
-    }
-    assert_eq!(
-        stub.call_count(),
-        1,
-        "retry-path must invoke send_chk exactly once"
-    );
-    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
-}
-
 // ─── M3b W9a helper: realistic W7a-acked offline state ──────────────
 
 /// Seeds a fiscal_documents row in `OFFLINE_LOCAL_ACK` state with all
@@ -1098,6 +1114,15 @@ impl DpsChannel for EnvelopeRecorder {
             Ok(a) => Ok(a.clone()),
             Err(_) => Err(DpsError::Transport("recorder: primed error".into())),
         }
+    }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
     }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         unreachable!("EnvelopeRecorder: last_chk not exercised")
@@ -1302,10 +1327,15 @@ async fn w9a_offline_local_ack_with_non_positive_offline_fiscal_no_surfaces_type
 
 #[tokio::test]
 async fn rerun_on_non_allowlisted_states_short_circuits_with_zero_wire_calls() {
-    // W10.2 HIGH 3 §4.2 + M3b W9a widening (2026-05-16): 4-pre CAS
-    // only accepts Signed | ErrorRetryable | OfflineLocalAck.  Any
-    // other source state (Prepared / Kvt1 / Kvt2 / Sending / Rejected
-    // / etc.) MUST yield StateConflict + zero wire calls.
+    // W10.2 HIGH 3 §4.2 + M3b W9a widening + CS-3 S7-1 (R2): the 4-pre
+    // source allowlist now accepts ONLY Signed | OfflineLocalAck.  R2
+    // DROPPED ErrorRetryable (an ErrorRetryable doc has already consumed
+    // one wire under an active CALL_STARTED reservation; re-seeding it
+    // would wire a SECOND time — R6 has the reconciliation layer escalate
+    // such a doc to RequiresManualReconciliation + STOP instead of
+    // re-wiring).  Any non-allowlisted source (Prepared / ErrorRetryable /
+    // Kvt1 / Kvt2 / Sending / Rejected / etc.) MUST yield StateConflict +
+    // zero wire calls.
     //
     // R-W10.2-review LOW 3 close: parametrise across the realistic ban
     // set rather than pin a single state.  Each (state_str, expected
@@ -1316,6 +1346,9 @@ async fn rerun_on_non_allowlisted_states_short_circuits_with_zero_wire_calls() {
     // States covered:
     //   - PREPARED: pre-stage-3 leakage scenario (worker bug bypassing
     //     stage 3).
+    //   - ERROR_RETRYABLE: R2 moved this OUT of the allowlist — stage_send
+    //     no longer re-wires a retried doc (the retired W10.2 retry path);
+    //     the reconciliation layer (R6) escalates it, never a 2nd wire.
     //   - SENDING: boot-recovery scenario — a crashed prior worker left
     //     the marker; W9 must own this case, NOT a fresh stage 4.
     //   - SENT, KVT1, KVT2: idempotent re-entry on already-fiscalised
@@ -1324,6 +1357,7 @@ async fn rerun_on_non_allowlisted_states_short_circuits_with_zero_wire_calls() {
     let (_d, pool) = fresh_pool().await;
     let cases: Vec<(u8, &'static str, DocState)> = vec![
         (0xC2, "PREPARED", DocState::Prepared),
+        (0xC1, "ERROR_RETRYABLE", DocState::ErrorRetryable),
         (0xC3, "SENDING", DocState::Sending),
         (0xC4, "KVT1", DocState::Kvt1),
         (0xC5, "KVT2", DocState::Kvt2),
@@ -1378,44 +1412,39 @@ async fn empty_server_fiscal_no_routes_to_typed_error_no_4b_persist() {
     // on the next boot.
     let stub = StubDpsChannel::new(Ok(ack("")));
 
-    let err = stage_send::run(&pool, &stub, doc, None)
+    // CS-3 S7-1 (FIX-B2) CONTRACT CHANGE: an empty CheckAck.id is no longer a typed
+    // `EmptyServerFiscalNo` error — it is the typed `OkButNoFiscalNumber` ApplyPlan leaf: a
+    // `ProbeRequired` HELD. `run` returns `Ok(Routed{ProbeRequired})`; the doc rests in SENDING under a
+    // PENDING_APPLY reservation (`apply_recorded_outcome` → `HeldNotAutoRelease`, swallowed), awaiting a
+    // last_chk probe / operator — NOT auto-redrive, NOT a typed error.
+    let outcome = stage_send::run(&pool, &stub, doc, None)
         .await
-        .expect_err("empty CheckAck.id must surface as typed error");
-    match err {
-        StageSendError::EmptyServerFiscalNo { document_id } => {
-            assert_eq!(document_id, doc);
-        }
-        other => panic!("expected EmptyServerFiscalNo, got {other:?}"),
+        .expect("empty CheckAck.id is now a HELD probe leaf, not an error");
+    match outcome {
+        StageSendOutcome::Routed { decision, .. } => assert_eq!(
+            decision.retry_class,
+            RetryClass::ProbeRequired,
+            "empty-SFN routes to the OkButNoFiscalNumber ProbeRequired HELD"
+        ),
+        other => panic!("expected Routed(ProbeRequired) for empty-SFN, got {other:?}"),
     }
-    assert_eq!(
-        stub.call_count(),
-        1,
-        "wire call DID happen — guard runs after"
-    );
+    assert_eq!(stub.call_count(), 1, "exactly one wire call");
 
-    // Doc state still SENDING (4-b never ran).
+    // Doc HELD in SENDING (apply returned HeldNotAutoRelease — no doc CAS), no server_fiscal_no.
     assert_eq!(read_doc_state(&pool, doc).await, "SENDING");
-    // server_fiscal_no NOT written (4-b skipped).
     assert!(read_server_fiscal_no(&pool, doc).await.is_none());
 
-    // Trace row WAS allocated in 4-pre — completed_at remains NULL
-    // (forensic crash-window shape).  W9 reconciliation will read
-    // this as an unfinished attempt.
+    // The record transaction COMPLETED the trace with the probe outcome (no longer a crash-window
+    // NULL): the composed path records + completes the attempt rather than early-erroring out of 4-pre.
     let traces = transport_trace::list_for_document(&pool, doc)
         .await
         .unwrap();
-    assert_eq!(traces.len(), 1, "trace allocated in 4-pre persists");
+    assert_eq!(traces.len(), 1, "trace allocated + completed");
     assert!(
-        traces[0].completed_at.is_none(),
-        "trace.completed_at NULL — crash-window forensic marker"
+        traces[0].completed_at.is_some(),
+        "trace.completed_at set — the record tx completed the attempt"
     );
-    assert!(traces[0].outcome_kind.is_none());
-
-    // Audit: only the intent marker, no result entry.
-    assert_eq!(
-        read_audit_event_types(&pool, doc).await,
-        vec!["STAGE_SEND_INTENT_MARKED"]
-    );
+    assert!(traces[0].outcome_kind.is_some());
 }
 
 // ─── Fixture 8 — bogus DocumentId surfaces DocumentMissing ───────────
@@ -1513,284 +1542,30 @@ async fn signed_xml_missing_surfaces_typed_error_no_state_mutation() {
     assert_eq!(traces.len(), 0);
 }
 
-// ─── W10.4 step 2d MED 1 close — MAC recovery dispatch smoke fixture ─
+// ─── CS-3 S7-1 (§2.1 / S7-P3-4) — pre-wire online predecessor equality ───────
 //
-// Crypto stub + signing context provided by `tests/common/mod.rs`
-// (R-W10.5-review MED 2 close — shared infra dedup).  `DetCrypto`
-// returns `RECOVERED-CMS` on every `sign_cms_detached` call.
+// `variant_p_mac_recovery_skips_drift_assert_and_advances_seed` (A.3 Variant P) was
+// RETIRED with the MAC orchestrator (R3). The old POST-wire drift-assert carried a
+// `mac_recovery_attempts < 1` skip so a re-anchored recovered doc would not false-fail.
+// With re-sign deleted there are NO recovered docs, so the skip is meaningless and the
+// P3 equality gate moved PRE-WIRE (authorize tx, §2.1): it enforces `node_state.seed ==
+// doc.previous_hash` for every online-origin doc BEFORE any wire, unconditionally — it
+// cannot false-fail because no doc's `previous_hash` is ever re-anchored anymore.
 
-/// Seed an `ERROR_RETRYABLE` doc with PAYLOAD_XML + SIGNED_XML
-/// pre-INSERTed (mirrors post-attempt-#1 4-b commit shape per freeze
-/// §4.4.1).  `previous_hash` set to `0xAA × 32` so the MAC_RECOVERY_RESIGNED
-/// audit's `old_previous_hash_hex` field is observable.
-async fn seed_error_retryable_doc_with_artifacts(pool: &SqlitePool, doc_byte: u8) -> DocumentId {
-    sqlx::query(
-        "INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) \
-         VALUES ('1234567890', '12345678', 'test')",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
-
-    // W14a-2b Commit 5: non-bypass SELL doc needs shift + signer
-    // attribution so signer_guard at stage_send 4-pre returns Ok.
-    let shift_byte = doc_byte ^ 0x80;
-    let shift_bytes = vec![shift_byte; 16];
-    sqlx::query(
-        "INSERT OR IGNORE INTO shifts(shift_id, fiscal_number, serial, state, open_mode, \
-            cash_balance_kop, opened_by_cashier_id) \
-         VALUES (?, '1234567890', 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
-    )
-    .bind(&shift_bytes)
-    .execute(pool)
-    .await
-    .expect("seed shift for SELL retry test");
-
-    let doc_bytes = vec![doc_byte; 16];
-    let req_bytes = vec![doc_byte ^ 0xFF; 16];
-    let sha = vec![0u8; 32];
-    let lnd = doc_byte as i64;
-    let prev_hash = [0xAAu8; 32];
-    sqlx::query(
-        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, shift_id, lnd, \
-            doc_type, state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
-            payload_json, payload_sha256_canonical, total_sum_kop, previous_hash, \
-            signed_by_cashier_id) \
-         VALUES (?, ?, '1234567890', ?, ?, 'SELL', 'ERROR_RETRYABLE', 'b1', 't1', 'ONLINE', \
-            '2026-05-09T12:34:56Z', \
-            '{\"items\":[{\"code\":\"p-1\",\"name\":\"Item A\",\"price_kop\":1500,\
-              \"quantity_thousandths\":1000,\"sum_kop\":1500}],\
-              \"payments\":[{\"name\":\"Cash\",\"sum_kop\":1500,\"type_code\":\"0\"}]}', \
-            ?, 1500, ?, 'test-cashier')",
-    )
-    .bind(&doc_bytes)
-    .bind(&req_bytes)
-    .bind(&shift_bytes)
-    .bind(lnd)
-    .bind(&sha)
-    .bind(&prev_hash[..])
-    .execute(pool)
-    .await
-    .expect("seed fiscal_documents (ERROR_RETRYABLE)");
-    // A.3: online-origin doc advances the chain seed at Sending→Sent, so
-    // stage_send reads node_state at 4-b.  This is a MAC-recovery doc
-    // (mac_recovery_attempts ends up >= 1 by the time it reaches Sent),
-    // so the pre-advance drift-assert is SKIPPED (Variant P) and the
-    // recovery orchestrator OVERWRITES unsigned_xml_sha256 — node_state
-    // only needs to EXIST.  Seed a genesis row (last_known NULL).
-    sqlx::query(
-        "INSERT OR IGNORE INTO node_state \
-            (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
-             backend_profile_id, transport_profile_id, last_known_unsigned_xml_sha256) \
-         VALUES ('1234567890', 'ONLINE', 'OPENED', ?, 1, 'b1', 't1', NULL)",
-    )
-    .bind(&shift_bytes)
-    .execute(pool)
-    .await
-    .expect("seed node_state (genesis) for mac-recovery send");
-    sqlx::query(
-        "INSERT INTO document_files(document_id, kind, content) \
-         VALUES (?, 'PAYLOAD_XML', ?), (?, 'SIGNED_XML', ?)",
-    )
-    .bind(&doc_bytes)
-    .bind(b"OLD-PAYLOAD-XML".to_vec())
-    .bind(&doc_bytes)
-    .bind(b"OLD-SIGNED-CMS".to_vec())
-    .execute(pool)
-    .await
-    .expect("seed document_files");
-    DocumentId::from_bytes(<[u8; 16]>::try_from(doc_bytes.as_slice()).unwrap())
-}
-
+/// S7-1 §2.1 (P3) — an online-origin doc whose node chain-seed has drifted off its
+/// `previous_hash` is a chain fork: the PRE-WIRE predecessor-equality gate refuses to
+/// authorize, so the whole `BEGIN IMMEDIATE` rolls back with ZERO wire (no reservation
+/// minted, no `CALL_STARTED` marker, seed NOT advanced). This is the migration of the
+/// former POST-wire `non_recovery_send_drift_fails_closed`: the refusal moved to the ONLY
+/// safe side of the wire, so the KEY new tooth is `call_count() == 0` (the incumbent
+/// fired the wire first, then rolled 4-b back). Revert-canary: delete the §2.1 `ensure!`
+/// (`stage_send.rs:1629`) and this drift reaches the wire + `Sent` → both `call_count`
+/// and the `expect_err` RED.
 #[tokio::test]
-async fn mac_recovery_resigned_drives_attempt_2_through_loop_to_sent() {
-    // R-W10.4-step2d-review MED 1 close — end-to-end smoke fixture
-    // for the loop wrap + sign_ctx propagation + attempt_no increment
-    // + trace/audit chain.  Pins the contract that:
-    //   1. Server -12 on attempt #1 → orchestrator runs → Resigned →
-    //      `continue 'attempt` re-enters 4-pre/4a/4b.
-    //   2. Attempt #2 reads the new SIGNED_XML (replaced by orchestrator's
-    //      MR-PERSIST), wire send returns OK, doc lands in `Sent` with
-    //      attempt_no = 2.
-    //   3. Two transport_trace rows materialise: attempt_no=1 with
-    //      outcome=RETRYABLE_MAC_HASH_MISMATCH, attempt_no=2 with
-    //      outcome=OK.
-    //   4. Audit chain documents the full forensic story:
-    //      STAGE_SEND_INTENT_MARKED (×2, one per attempt) +
-    //      STAGE_SEND_MAC_HASH_MISMATCH (attempt #1 4-b) +
-    //      MAC_RECOVERY_RESIGNED (orchestrator MR-PERSIST) +
-    //      STAGE_SEND_RESULT (attempt #2 4-b).
-    //   5. `mac_recovery_attempts` counter = 1 post-recovery.
-    //   6. Stub `send_chk` invoked exactly twice.
-    let (_d, pool) = fresh_pool().await;
-    let doc = seed_error_retryable_doc_with_artifacts(&pool, 0xC9).await;
-
-    // Stub: queue [Err(-12), Ok(CheckAck)] for attempts #1 and #2.
-    let stub = StubDpsChannel::with_queue(vec![
-        Err(prro::transports::dps::error::DpsError::Server {
-            code: -12,
-            message:
-                "ERROR_BAD_HASH_PREV: store deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567 server-side"
-                    .into(),
-        }),
-        Ok(CheckAck {
-            id: "DPS-FN-RECOVERED".into(),
-            id_sign: vec![],
-            data_sign: vec![],
-        }),
-    ]);
-
-    // SigningContext for the recovery orchestrator (shared common
-    // helper; `DetCrypto` returns `RECOVERED-CMS` on every call).
-    let sign_ctx = common::det_signing_ctx();
-
-    let outcome = stage_send::run(&pool, &stub, doc, Some(&sign_ctx))
-        .await
-        .expect("end-to-end Resigned-then-Sent must succeed");
-
-    // Outcome shape: Sent with attempt_no=2.
-    match outcome {
-        StageSendOutcome::Sent {
-            server_fiscal_no,
-            attempt_no,
-        } => {
-            assert_eq!(server_fiscal_no, "DPS-FN-RECOVERED");
-            assert_eq!(attempt_no, 2, "attempt_no must increment to 2 on re-entry");
-        }
-        other => panic!("expected Sent (recovered), got {other:?}"),
-    }
-
-    // Stub call count: exactly 2 wire sends.
-    assert_eq!(stub.call_count(), 2, "send_chk invoked once per attempt");
-
-    // Doc state: SENT.
-    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
-
-    // mac_recovery_attempts counter = 1.
-    let counter: i64 = sqlx::query_scalar(
-        "SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?",
-    )
-    .bind(DbDocumentId(doc))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(counter, 1, "single-bit budget burnt by orchestrator");
-
-    // Two trace rows: attempt #1 RETRYABLE_MAC_HASH_MISMATCH, #2 OK.
-    let traces = transport_trace::list_for_document(&pool, doc)
-        .await
-        .unwrap();
-    assert_eq!(traces.len(), 2, "one trace row per attempt");
-    assert_eq!(traces[0].attempt_no, 1);
-    assert_eq!(
-        traces[0].outcome_kind.as_deref(),
-        Some("RETRYABLE_MAC_HASH_MISMATCH")
-    );
-    assert_eq!(traces[0].retry_class.as_deref(), Some("MacRecovery"));
-    assert_eq!(traces[1].attempt_no, 2);
-    assert_eq!(traces[1].outcome_kind.as_deref(), Some("OK"));
-    assert_eq!(
-        traces[1].server_fiscal_no.as_deref(),
-        Some("DPS-FN-RECOVERED")
-    );
-
-    // Audit chain.
-    let events = read_audit_event_types(&pool, doc).await;
-    assert_eq!(
-        events,
-        vec![
-            "STAGE_SEND_INTENT_MARKED",     // attempt #1 4-pre
-            "STAGE_SEND_MAC_HASH_MISMATCH", // attempt #1 4-b (routed)
-            "MAC_RECOVERY_RESIGNED",        // orchestrator MR-PERSIST
-            "STAGE_SEND_INTENT_MARKED",     // attempt #2 4-pre
-            "STAGE_SEND_RESULT",            // attempt #2 4-b (Sent)
-        ],
-        "full forensic audit chain for Resigned end-to-end"
-    );
-
-    // SIGNED_XML replaced by orchestrator's MR-PERSIST.
-    let signed: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT content FROM document_files WHERE document_id = ? AND kind = 'SIGNED_XML'",
-    )
-    .bind(DbDocumentId(doc))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        signed.as_deref(),
-        Some(b"RECOVERED-CMS".as_slice()),
-        "SIGNED_XML must reflect the orchestrator's re-signed bytes"
-    );
-}
-
-// ─── A.3 Variant P (MAC-recovery) advance-at-SEND characterization ───────────
-
-/// A.3 Variant P (dossier §9.1) — a MAC-recovered doc SKIPS the pre-advance
-/// drift-assert AND still advances the seed. A recovered doc
-/// (`mac_recovery_attempts >= 1`) deliberately re-anchored its `previous_hash`
-/// onto the DPS-supplied tip, voiding the `node_state.seed == previous_hash`
-/// premise BY CONSTRUCTION — so the equality gate is skipped (else it would
-/// false-fail on every successful `-12` recovery). The seed still advances to
-/// THIS doc's own re-signed `unsigned_xml_sha256`, re-syncing the local chain
-/// onto DPS's tip. Isolated: pre-set attempts=1 + a deliberately mismatched node
-/// seed, then a plain OK send. If the `mac_recovery_attempts < 1` guard regressed
-/// (gate always live), this doc's drift would fail-closed → this pin catches it.
-#[tokio::test]
-async fn variant_p_mac_recovery_skips_drift_assert_and_advances_seed() {
-    let (_d, pool) = fresh_pool().await;
-    let doc = seed_signed_doc_with_xml(&pool, 0x5A, "SELL", 0x5A, "SIGNED").await;
-    // Recovery already burnt its single-bit budget; the node seed was re-anchored
-    // to a NON-matching DPS tip (doc.previous_hash stayed NULL / genesis).
-    sqlx::query("UPDATE fiscal_documents SET mac_recovery_attempts = 1 WHERE document_id = ?")
-        .bind(DbDocumentId(doc))
-        .execute(&pool)
-        .await
-        .unwrap();
-    let drifted = [0xD1u8; 32];
-    sqlx::query(
-        "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? \
-         WHERE fiscal_number = '1234567890'",
-    )
-    .bind(&drifted[..])
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let stub = StubDpsChannel::new(Ok(ack("DPS-FN-VARIANT-P")));
-    let outcome = stage_send::run(&pool, &stub, doc, None)
-        .await
-        .expect("Variant P must NOT trip the drift-assert (skipped for attempts>=1)");
-    assert!(
-        matches!(outcome, StageSendOutcome::Sent { .. }),
-        "recovered doc must reach Sent, got {outcome:?}"
-    );
-    assert_eq!(read_doc_state(&pool, doc).await, "SENT");
-    // Advance half: seed re-synced to THIS doc's own unsigned sha (0x5A×32),
-    // NOT left at the drifted value.
-    let seed: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = '1234567890'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        seed.as_deref(),
-        Some([0x5Au8; 32].as_slice()),
-        "Variant P must advance the seed to the recovered doc's own unsigned sha"
-    );
-}
-
-/// A.3 non-recovery drift FAILS CLOSED (the paired negative of Variant P): with
-/// `mac_recovery_attempts == 0` the equality gate is LIVE — a node seed that does
-/// NOT equal the doc's `previous_hash` is a chain fork, so the advance fails
-/// closed (`StageSendError::Internal` "chain-seed drift"), rolls the 4-b envelope
-/// back (doc stays `Sending` for reconciliation), and does NOT advance the seed.
-/// If the `ensure!` gate were removed, this drift would reach Sent → pin catches.
-#[tokio::test]
-async fn non_recovery_send_drift_fails_closed() {
+async fn online_predecessor_drift_refuses_authorize_zero_wire() {
     let (_d, pool) = fresh_pool().await;
     let doc = seed_signed_doc_with_xml(&pool, 0x5B, "SELL", 0x5B, "SIGNED").await;
-    // attempts stays 0 (gate LIVE); node seed drifted off doc.previous_hash (NULL).
+    // node seed drifted off doc.previous_hash (NULL / genesis) — a chain fork.
     let drifted = [0xD2u8; 32];
     sqlx::query(
         "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? \
@@ -1801,18 +1576,27 @@ async fn non_recovery_send_drift_fails_closed() {
     .await
     .unwrap();
 
-    let stub = StubDpsChannel::new(Ok(ack("DPS-FN-SHOULD-ROLL-BACK")));
+    let stub = StubDpsChannel::new(Ok(ack("DPS-FN-SHOULD-NEVER-WIRE")));
     let err = stage_send::run(&pool, &stub, doc, None)
         .await
-        .expect_err("chain-seed drift with attempts=0 must fail closed");
+        .expect_err("online predecessor drift must refuse authorize (fail closed)");
     match err {
         stage_send::StageSendError::Internal(e) => assert!(
-            e.to_string().contains("chain-seed drift"),
-            "expected chain-seed drift, got: {e}"
+            e.to_string().contains("predecessor drift"),
+            "expected pre-wire P3 predecessor-drift refusal, got: {e}"
         ),
-        other => panic!("expected Internal(chain-seed drift), got {other:?}"),
+        other => panic!("expected Internal(predecessor drift), got {other:?}"),
     }
-    // Fails closed: doc did NOT reach Sent (4-b rolled back), seed NOT advanced.
+
+    // KEY pre-wire tooth: the refusal is BEFORE the wire — the authorize tx rolls back,
+    // so send_chk is NEVER invoked (the retired POST-wire check fired the wire first).
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "pre-wire P3 refuses with ZERO wire (authorize tx rolled back before send)"
+    );
+
+    // Fails closed: no CALL_STARTED / issuance (doc NOT Sent), seed NOT advanced.
     assert_ne!(
         read_doc_state(&pool, doc).await,
         "SENT",
@@ -1827,6 +1611,125 @@ async fn non_recovery_send_drift_fails_closed() {
     assert_eq!(
         seed.as_deref(),
         Some(drifted.as_slice()),
-        "seed must NOT advance on a drift fork"
+        "seed must NOT advance on a refused authorize"
     );
+}
+
+// ─── CS-3 S7-1 (R3 / S7-P3-2) — `-12` divergence: recorded HELD, no 2nd wire ──
+//
+// The inline MAC-recovery orchestrator loop is DELETED (R3, `stage_send.rs:1232-1237`;
+// retires the live `-12 Resigned => continue` per CS3_REMEDIATION_DESIGN §hold-table
+// row 8). A DPS `-12` (ERROR_BAD_HASH_PREV) is now a recorded HOLD: the composed
+// `run()` fires exactly ONE wire, the RECORD tx writes `MacReseedPending` (which flips
+// the node to STOP_MODE), and `apply_recorded_outcome` returns the EXPECTED
+// `HeldNotAutoRelease` — the doc rests SENDING (no doc CAS, no issuance) under a
+// `PENDING_APPLY` reservation. NO re-sign, NO `continue`, NO second wire. Chain repair
+// + operator completion release the hold later. This composed-run pin is the twin of
+// the record-boundary pin `record_outcome::rc05_bad_hash_prev_held_stop_mode`.
+//
+// Revert-canary: if `record_outcome`'s `-12 → MacReseedPending` node-halt regressed to a
+// plain retryable (no STOP), the `STOP_MODE` assertion REDs; if R3 were reverted (loop
+// restored), `call_count() == 1` REDs (a 2nd wire would fire). Both are load-bearing.
+#[tokio::test]
+async fn minus_12_bad_hash_prev_records_held_stop_no_second_wire() {
+    let (_d, pool) = fresh_pool().await;
+    let doc = seed_signed_doc_with_xml(&pool, 0xC9, "SELL", 0xC9, "SIGNED").await;
+    let stub = StubDpsChannel::new(Err(DpsError::Server {
+        code: -12,
+        message: "ERROR_BAD_HASH_PREV: store \
+                  deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567 server-side"
+            .into(),
+    }));
+
+    let outcome = stage_send::run(&pool, &stub, doc, None)
+        .await
+        .expect("a -12 is a recorded HELD, not an error");
+
+    // The returned outcome echoes the ROUTING decision (ErrorRetryable / MacRecovery)
+    // with attempt_no == 1 — the raw routing echo, NOT the persisted state; the HELD is
+    // realized by record/apply. attempt_no == 1 proves there was NO second attempt.
+    match outcome {
+        StageSendOutcome::Routed {
+            decision,
+            attempt_no,
+            ..
+        } => {
+            assert_eq!(
+                decision.retry_class,
+                RetryClass::MacRecovery,
+                "-12 routes to the MacRecovery class"
+            );
+            assert_eq!(
+                decision.target_state,
+                DocState::ErrorRetryable,
+                "routing echo is ErrorRetryable; the HELD is realized by record+apply, not here"
+            );
+            assert_eq!(attempt_no, 1, "no re-sign, no second attempt");
+        }
+        other => panic!("expected Routed(MacRecovery) for -12, got {other:?}"),
+    }
+
+    // Exactly ONE wire call — the retired orchestrator would have fired a 2nd.
+    assert_eq!(
+        stub.call_count(),
+        1,
+        "exactly one wire send; the MAC re-sign retry is retired"
+    );
+
+    // Doc HELD in SENDING (apply returned HeldNotAutoRelease — no doc CAS, no issuance).
+    assert_eq!(read_doc_state(&pool, doc).await, "SENDING");
+    assert!(
+        read_server_fiscal_no(&pool, doc).await.is_none(),
+        "a HELD -12 issues nothing"
+    );
+
+    // Node halted: `MacReseedPending` flips the node to STOP_MODE in the record tx.
+    let mode: String =
+        sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = '1234567890'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        mode, "STOP_MODE",
+        "-12 halts the node pending MAC reseed / operator completion"
+    );
+
+    // Reservation rests OUTCOME_OBSERVED + PENDING_APPLY carrying the BadHashPrev evidence
+    // + MacReseedPending node-effect (the record-boundary contract, mirrors rc05).
+    let (apply_state, evidence_text, node_effect): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT apply_state, evidence_text, node_effect FROM delivery_reservation \
+         WHERE fiscal_number = '1234567890'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(apply_state.as_deref(), Some("PENDING_APPLY"));
+    assert_eq!(evidence_text.as_deref(), Some("BadHashPrev"));
+    assert_eq!(node_effect.as_deref(), Some("MacReseedPending"));
+
+    // The record tx allocated + COMPLETED the single attempt trace (no crash-window NULL),
+    // and NONE of the retired MAC-orchestrator audit events appear.
+    let traces = transport_trace::list_for_document(&pool, doc)
+        .await
+        .unwrap();
+    assert_eq!(traces.len(), 1, "exactly one attempt trace");
+    assert!(
+        traces[0].completed_at.is_some(),
+        "trace.completed_at set — the record tx completed the attempt"
+    );
+    let events = read_audit_event_types(&pool, doc).await;
+    for retired in [
+        "MAC_RECOVERY_RESIGNED",
+        "MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH",
+        "MAC_RECOVERY_HASH_NOT_EXTRACTABLE",
+    ] {
+        assert!(
+            !events.contains(&retired.to_string()),
+            "retired orchestrator event {retired} must NOT appear: {events:?}"
+        );
+    }
 }

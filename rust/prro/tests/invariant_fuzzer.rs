@@ -318,8 +318,10 @@ async fn teeth_d5_superseded_drain_predicts_error_retryable_rmr() {
 }
 
 /// U1 D5 (POS tooth) — a `[Ack, NotFound]` drain is differential-checked: the
-/// head doc → `SENT` (SentNotFoundDowngrade — held pending), shift unchanged,
-/// successors held.  (Pre-D5 both exotic scripts routed to Fault → resync.)
+/// head doc → `SENT` (SentFresh confirm → StructuralDrift, held pending), shift
+/// unchanged, successors held.  (Pre-D5 both exotic scripts routed to Fault →
+/// resync.)  NB: the cross-tick SentReplay-NotFound path now escalates to RMR +
+/// STOP (CS-3 S7-1 F2-kvt2); it is not driven by this single-tick script.
 #[tokio::test]
 async fn teeth_d5_send_ack_notfound_drain_predicts_sent_held() {
     let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
@@ -1000,8 +1002,9 @@ fn model_drain_reject_halts_and_escalates_manual() {
     assert!(matches!(out, ExpectedOutcome::Mutated(_)));
     assert_eq!(
         m.docs.get(&1),
-        Some(&DocState::Rejected),
-        "first backlog doc → REJECTED"
+        Some(&DocState::Sending),
+        "CS-3 S7-1: first backlog doc HELD at SENDING (a drain reject is a recorded HOLD under \
+         PENDING_APPLY, not a terminal Rejected)"
     );
     assert_eq!(
         m.docs.get(&2),
@@ -1891,9 +1894,16 @@ async fn mirrors_catch_seeded_mirror2_desync() {
 /// forced out.  Reject-halt legitimately rests at `GoingOnline + RMR`; the
 /// system must NOT auto-settle from there, so RMR is settled-for-scan.  Used by
 /// BOTH the per-op scan gate and the terminal settle.
+///
+/// CS-3 S7-1: a HELD send outcome (-12 / ambiguous / drain reject) flips the node to
+/// `StopMode` and rests the doc at SENDING under a PENDING_APPLY reservation — a legitimate
+/// operator-pending resting state (recovery is operator/boot-driven, not auto). So `StopMode`
+/// is a settled resting mode too; a held doc under STOP is NOT a liveness violation.
 fn is_settled(mode: NodeMode, shift: ShiftState) -> bool {
-    matches!(mode, NodeMode::Online | NodeMode::Offline)
-        || shift == ShiftState::RequiresManualReconciliation
+    matches!(
+        mode,
+        NodeMode::Online | NodeMode::Offline | NodeMode::StopMode
+    ) || shift == ShiftState::RequiresManualReconciliation
 }
 
 /// The shift states a real drain can make progress on (`backlog_drain.rs`
@@ -2959,14 +2969,15 @@ async fn teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call() {
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
     let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
 
-    // Drain (via GoOnline) with a leading reject → head doc REJECTED, shift →
-    // RequiresManualReconciliation, drain halts (the successor stays held).
+    // Drain (via GoOnline) with a leading reject → CS-3 S7-1: the head doc is a recorded HOLD
+    // (SENDING under PENDING_APPLY, not terminal Rejected), shift → RequiresManualReconciliation,
+    // drain halts (the successor stays held).
     let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
     let ledger = ctx.read_ledger().await;
     assert_eq!(
         ledger.get(&1),
-        Some(&DocState::Rejected),
-        "head backlog doc is REJECTED by the leading reject"
+        Some(&DocState::Sending),
+        "CS-3 S7-1: head backlog doc HELD at SENDING by the leading reject (recorded HOLD, not Rejected)"
     );
     assert_eq!(
         ledger.get(&2),
@@ -3838,6 +3849,59 @@ async fn teeth_epz_guard_3c_over_drawer_refused() {
     check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
         .await
         .expect("EPZ cash-out drops cash to 0 (− epz_out)");
+}
+
+/// ★TEETH — cross-shift cash carry (fuzzer capstone counterexample, CI seed
+/// 2026-07-23: `harness_online_seeded` shrank to `[OnlineSell, OnlineZReport,
+/// OnlineShiftOpen, OnlineEpz]`).  A SELL funds the drawer (15000), a real
+/// online Z closes the shift (prod persists `cash_balance_kop = 15000`), then a
+/// NEW shift opens — and prod carries the opening balance forward
+/// (`cash_ledger.rs:14` `opening_cash = prior shift's cash_balance_kop`).  So:
+///   - the X-report right after the reopen reports the CARRIED 15000 (NOT 0);
+///   - the follow-up EPZ is admitted by guard-3c on the carried drawer and
+///     MINTS a `CASH_ADVANCE_EPZ` row, dropping cash back to 0.
+///
+/// The pre-fix model reset `cash_on_hand = 0` at every shift-open (a stale
+/// "single open shift per fixture" assumption), so it predicted the reopen
+/// X-report = 0 and the EPZ = `ExpectedNoMutation` — while prod carried 15000
+/// and minted.  The differential harness catches BOTH divergences.
+///
+/// REVERT TARGET: change either shift-open carry back to `self.cash_on_hand = 0`
+/// (or drop the `carry_cash_kop = cash_on_hand` persist at the online Z-close) in
+/// `invariant_fuzzer/model.rs` → the X-report turnover check diverges (real 15000
+/// vs model 0) AND the EPZ `ExpectedNoMutation` arm fires (`minted a
+/// fiscal_documents row`) → this test REDs.
+#[tokio::test]
+async fn teeth_cross_shift_cash_carry_epz_after_z_reopen() {
+    use model::CASH_AMOUNT_KOP;
+    use oracle::check_cash_on_hand;
+
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+
+    // SELL funds the drawer → Z closes (persists carry) → reopen (carries 15000)
+    // → X-report sees the carry → EPZ mints on the carried drawer.  `run_harness`
+    // drives the differential model-vs-prod on every op; a carry divergence
+    // panics INSIDE it (X-report turnover mismatch + ExpectedNoMutation mint).
+    let ctx = run_harness(
+        &[
+            Op::OnlineSell(DpsScript::ack_path()),
+            Op::OnlineZReport(DpsScript::ack_path()),
+            Op::OnlineShiftOpen(DpsScript::ack_path()),
+            Op::XReport,
+            Op::OnlineEpz(DpsScript::ack_path()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+
+    // The EPZ drained the CARRIED opening balance: closing drawer == 0.
+    check_cash_on_hand(&ctx.pool, ctx.fn_id(), 0)
+        .await
+        .expect("EPZ cash-out drains the carried 15000 drawer back to 0");
+    // Sanity on the constant the fixture funds with.
+    assert_eq!(CASH_AMOUNT_KOP, 15_000);
 }
 
 /// ★TEETH — z-quiescence (#192/P1 class).  A non-terminal EPZ (an online EPZ

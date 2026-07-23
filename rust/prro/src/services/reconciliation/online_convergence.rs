@@ -309,6 +309,18 @@ async fn converge_one_doc(
                     }
                 }
             }
+            ConfirmDrainOutcome::SentNotFoundEscalated => {
+                // **CS-3 S7-1 F2-kvt2 (2026-07-22)**: structurally unreachable.
+                // SentNotFoundEscalated is SentReplay-exclusive (the classifier
+                // only emits SentNotFoundDowngrade for SentReplay); this online-
+                // convergence KVT1-handler confirms via Kvt1Reentry, whose NotFound
+                // routes to StructuralDrift.  Fail-loud on regression.
+                anyhow::bail!(
+                    "online-convergence: KVT1 doc {doc_id:?} produced \
+                     SentNotFoundEscalated, which is SentReplay-exclusive \
+                     (kvt2_confirm routing regression)"
+                );
+            }
             ConfirmDrainOutcome::ChainSeedMismatch { document_id } => {
                 // **AUD-L2-1b (2026-06-14)**: the Kvt2→Ack step hit a chain-seed
                 // breach (node_state seed != doc.previous_hash, online-origin).
@@ -516,7 +528,8 @@ const HOLD_INDETERMINATE_CRITICAL_TICKS: i64 = 3;
 
 const CONVERGE_ER_HOLD_INDETERMINATE: &str = "CONVERGE_ER_HOLD_INDETERMINATE";
 const CONVERGE_ER_PROBE_DEFERRED: &str = "CONVERGE_ER_PROBE_DEFERRED";
-const CONVERGE_ER_REDRIVE_ERROR: &str = "CONVERGE_ER_REDRIVE_ERROR";
+// CS-3 S7-1 (R6): `CONVERGE_ER_REDRIVE_ERROR` audit constant removed — the ER re-wire branch that
+// emitted it was deleted (transient ER now escalates to RMR, no re-wire, no redrive-error event).
 
 fn doc_hex(doc_id: DocumentId) -> String {
     use std::fmt::Write;
@@ -544,7 +557,10 @@ fn doc_hex(doc_id: DocumentId) -> String {
 /// escalate CAS own their own envelopes; audit appends are pool-bound.
 async fn converge_error_retryable_doc(
     pool: &SqlitePool,
-    view: &RuntimeView<'_>,
+    // CS-3 S7-1 (R6): escalation-only now — the transient re-wire arm (`stage_send::run`) was
+    // deleted, so the DPS view is intentionally unused. Kept for signature stability with the
+    // online convergence dispatch call-site; full param drop deferred to the R7 sweep.
+    _view: &RuntimeView<'_>,
     doc: &DocumentRow,
     summary: &mut TickSummary,
 ) -> anyhow::Result<()> {
@@ -557,37 +573,10 @@ async fn converge_error_retryable_doc(
     let entity = doc_hex(doc_id);
 
     match evaluate_er_redrive(pool, doc_id).await? {
-        ErRedriveDecision::Redrive => {
-            match crate::services::write_path::stage_send::run(
-                pool,
-                view.dps,
-                doc_id,
-                Some(view.signing_ctx),
-            )
-            .await
-            {
-                Ok(_) => summary.er_redriven += 1,
-                Err(e) => {
-                    // Per-doc isolation: record + count, do NOT abort the cohort.
-                    let payload = serde_json::json!({
-                        "document_id": entity,
-                        "branch": "converge-er-redrive",
-                        "error": e.to_string(),
-                    });
-                    audit_log::append(
-                        pool,
-                        "fiscal_document",
-                        &entity,
-                        CONVERGE_ER_REDRIVE_ERROR,
-                        Severity::Warning,
-                        None,
-                        Some(&payload.to_string()),
-                    )
-                    .await?;
-                    summary.errors += 1;
-                }
-            }
-        }
+        // CS-3 S7-1 (R6): the `Redrive` arm is DELETED — a transient ErrorRetryable no longer
+        // re-invokes `stage_send::run` (a second wire for an already CALL_STARTED doc =
+        // double-issue). `evaluate_er_redrive` now returns `EscalateManual { TransientRetry }`,
+        // handled by the EscalateManual arm below → RMR.
         ErRedriveDecision::BudgetExhausted { .. } => {
             boot_phase::cas_error_retryable_to_manual_reconciliation(
                 pool,

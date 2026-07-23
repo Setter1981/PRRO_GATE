@@ -239,6 +239,16 @@ pub fn scan_src_tree(manifest_dir: &str) -> Vec<LifecycleRef> {
             // empty-in-production) caller of `resume`/`apply`/`list_*`; its exact reference set is
             // positively pinned by `migration_032::boot_pass_references_only_the_sanctioned_read_apply_subset`.
             || rel.ends_with("reconciliation/reservation_boot_pass.rs")
+            // CS-3 S7-1 Q3: the shared apply-orchestration wrapper — SANCTIONED caller of
+            // `apply_outcome` (wraps it with shift edges 3/10).  Its exact reference set is positively
+            // pinned by `migration_032::apply_orchestration_references_only_the_apply_subset`.
+            || rel.ends_with("write_path/apply_orchestration.rs")
+            // CS-3 S7-1 Slice-4 CUTOVER: `stage_send::run_one_attempt` is now the SANCTIONED LIVE
+            // caller of `authorize_submission` (4-pre mint) + `record_outcome` (the record tx). The
+            // wire seam itself is positively pinned by `s7_p2_2_sole_seam`; this file's exact lifecycle
+            // reference set is positively pinned by
+            // `migration_032::stage_send_references_only_the_authorize_record_subset`.
+            || rel.ends_with("write_path/stage_send.rs")
         {
             continue;
         }

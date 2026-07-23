@@ -28,8 +28,12 @@ use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftStat
 /// `teeth_d3_forked_set_matches_prod_const`, so a prod-side boundary change turns
 /// the differential RED (a conscious model update) instead of silently
 /// propagating into the oracle (anti-shared-const).
-pub const MODEL_OFFLINE_ISSUED_STATES: [&str; 7] = [
+pub const MODEL_OFFLINE_ISSUED_STATES: [&str; 8] = [
     "OFFLINE_LOCAL_ACK",
+    // CS-3 S7-1: a HELD send outcome (ambiguous / transient / -12 / drain-reject) rests the
+    // offline-origin doc at SENDING under a PENDING_APPLY reservation — a legitimate issued
+    // (non-lost) state, mirroring prod `fiscal_documents::OFFLINE_ISSUED_STATES`.
+    "SENDING",
     "SENT",
     "KVT1",
     "ERROR_RETRYABLE",
@@ -142,6 +146,19 @@ pub struct RefModel {
     //
     // **L3:** service-in/out terms wired (apply_service_io). EPZ stays 0 (fail-closed).
     pub cash_on_hand: i64,
+
+    // ── Cross-shift cash carry (mirrors prod `shifts.cash_balance_kop`) ────
+    // Prod carry semantics (operator decision 2026-07-10, `cash_ledger.rs:13-18`):
+    // a NEW shift's `opening_cash = prior shift's cash_balance_kop` (the last
+    // CLOSED shift's persisted CLOSING drawer), or 0 for the FN's first shift.
+    // A real SHIFT_CLOSE (Z_REPORT) OVERWRITES `cash_balance_kop` with the
+    // closing drawer; a force-close (`SellWithClosedShift`) NEVER persists, so
+    // the row keeps its OPENING value. This field is the model's mirror of that
+    // persisted anchor: it is written to `cash_on_hand` ONLY at a REAL close
+    // (online Z happy path + the offline drain finalize), applied as the opening
+    // at the NEXT shift-open, and left UNTOUCHED by a force-close (so the next
+    // open carries the force-closed shift's opening, exactly like prod).
+    pub carry_cash_kop: i64,
 }
 
 /// L0 — the cash amount used by every SELL/RETURN in the fuzzer fixture.
@@ -167,7 +184,8 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0, // L0: opening = 0 (first shift; carry is L3/L4)
+            cash_on_hand: 0,   // L0: opening = 0 (first shift; carry is L3/L4)
+            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
         }
     }
 
@@ -186,7 +204,8 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0, // L0: no open shift → no cash-on-hand
+            cash_on_hand: 0,   // L0: no open shift → no cash-on-hand
+            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
         }
     }
 
@@ -207,7 +226,8 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0, // L0: opening = 0 (first shift)
+            cash_on_hand: 0,   // L0: opening = 0 (first shift)
+            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
         }
     }
 
@@ -226,7 +246,8 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0, // L0: no open shift
+            cash_on_hand: 0,   // L0: no open shift
+            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
         }
     }
 
@@ -366,7 +387,12 @@ impl RefModel {
             // interpreter: the ledger is unchanged) — so mirror only the forced
             // mode, no fiscal mutation / no row.
             Op::OfflineSellDuringGoingOnline => {
-                self.mode = NodeMode::GoingOnline;
+                // CS-3 S7-1: mirror the interp — this adversarial force must NOT un-halt an
+                // already-halted node (a held doc's STOP is only operator-cleared). When halted,
+                // leave the halt; the sell is refused on STOP/BLOCKED just the same.
+                if !matches!(self.mode, NodeMode::StopMode | NodeMode::Blocked) {
+                    self.mode = NodeMode::GoingOnline;
+                }
                 ExpectedOutcome::NoMutation
             }
             Op::SellWithClosedShift => {
@@ -503,6 +529,11 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
+        if doc_state == DocState::Sending {
+            // CS-3 S7-1: a HELD online outcome (ambiguous / Superseded / transient after
+            // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
+            self.mode = NodeMode::StopMode;
+        }
         self.docs.insert(lnd, doc_state);
         self.next_lnd += 1;
         if Self::online_origin_advances_seed(doc_state) {
@@ -648,6 +679,11 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
+        if doc_state == DocState::Sending {
+            // CS-3 S7-1: a HELD online outcome (ambiguous / Superseded / transient after
+            // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
+            self.mode = NodeMode::StopMode;
+        }
         self.docs.insert(lnd, doc_state);
         self.next_lnd += 1;
         if Self::online_origin_advances_seed(doc_state) {
@@ -712,6 +748,11 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
+        if doc_state == DocState::Sending {
+            // CS-3 S7-1: a HELD online outcome (ambiguous / Superseded / transient after
+            // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
+            self.mode = NodeMode::StopMode;
+        }
         self.docs.insert(lnd, doc_state);
         self.shift_lifecycle_lnds.insert(lnd);
         self.next_lnd += 1;
@@ -719,12 +760,15 @@ impl RefModel {
         if Self::online_origin_advances_seed(doc_state) {
             self.seed = Some(unsigned_hash);
             self.shift_state = ShiftState::Opened;
-            // W1 cash-on-hand reset (W1 coordination note, line 126):
-            // A new shift starts with opening balance = 0 (the fixture seeds shifts
-            // with cash_balance_kop = 0).  Reset the accumulator so the model's
-            // INV-21 guard mirrors prod's `derive_cash_on_hand(opening=0, ...)`.
-            // Carry across shifts is L3/L4 scope — not modelled here.
-            self.cash_on_hand = 0;
+            // Cross-shift cash carry (mirrors prod `cash_ledger.rs:14`
+            // `opening_cash = prior shift's cash_balance_kop`): a fresh shift opens
+            // with `cash_on_hand = <carry>`. The carry is the CLOSING drawer of the
+            // last REAL close (set in `carry_cash_kop`); 0 for the FN's first shift
+            // and after a non-persisting force-close. This replaces the old blanket
+            // reset-to-0, which was only sound under the single-open-shift-per-fixture
+            // assumption that the multi-shift alphabet (RAGE W1) broke — the
+            // `Sell → Z → ShiftOpen → EPZ` counterexample where prod carries 15000.
+            self.cash_on_hand = self.carry_cash_kop;
         } else if doc_state == DocState::Rejected {
             self.shift_state = ShiftState::RequiresManualReconciliation;
             return ExpectedOutcome::NoIssuanceRow;
@@ -734,6 +778,17 @@ impl RefModel {
             // not confirm and does not roll back a retryable send).  No seed
             // advance (D2 / advance-at-SEND), no RMR escalation.
             self.shift_state = ShiftState::Opening;
+            // Cross-shift carry also applies to a HELD open: prod stamps the new
+            // shift's opening `cash_balance_kop = <carry>` at ACQUIRE
+            // (`stage_acquire.rs:883-910`), BEFORE the send outcome, so an
+            // `Opening`-resting shift is read by `cash_on_hand_for_fn` (which
+            // excludes only CLOSED/RMR/ERROR/CREATED) at the CARRIED opening — NOT
+            // the stale prior-shift drawer. Counterexample (offline harness, seed
+            // 2026-07-23): `[OfflineServiceIn, GoOnline, SellWithClosedShift,
+            // OnlineShiftOpen([Superseded]), XReport]` → real 0 vs stale model
+            // 15000. The Rejected arm above escalates to RMR (excluded from the
+            // cash read), so it deliberately does NOT re-anchor.
+            self.cash_on_hand = self.carry_cash_kop;
         }
 
         ExpectedOutcome::Mutated(Mutation {
@@ -821,15 +876,13 @@ impl RefModel {
         self.codes_consumed += 1;
         self.seed = Some(unsigned_hash);
         self.shift_state = ShiftState::OpenedLocalPendingDrain;
-        // W1 cash-on-hand reset (mirrors the ONLINE twin `apply_online_shift_open`
-        // — line 727).  A freshly opened shift starts with opening balance = 0.
-        // HARD ZERO is sound under the CURRENT alphabet: the only closer,
-        // `force_shift_closed` (`SellWithClosedShift`), NEVER persists closing
-        // cash, so the CLOSED-shift carry is always 0 — prod's per-open-shift
-        // `cash_on_hand_for_fn` reads 0 for the fresh shift regardless.  A FUTURE
-        // alphabet with a real offline Z-close that persists `cash_balance_kop`
-        // before a reopen must RE-AUDIT this (switch to a derived opening carry).
-        self.cash_on_hand = 0;
+        // Cross-shift cash carry (offline twin of `apply_online_shift_open`): a fresh
+        // shift opens with `cash_on_hand = <carry>` (prod `cash_ledger.rs:14`). This
+        // is the RE-AUDIT the old HARD-ZERO comment demanded once a real Z-close that
+        // persists `cash_balance_kop` before a reopen entered the alphabet — the carry
+        // is set at the offline drain finalize (the real close) / online Z, and is 0
+        // for the FN's first shift or after a non-persisting force-close.
+        self.cash_on_hand = self.carry_cash_kop;
 
         ExpectedOutcome::Mutated(Mutation {
             lnd,
@@ -873,6 +926,11 @@ impl RefModel {
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
         let doc_state = online_outcome_state(script);
+        if doc_state == DocState::Sending {
+            // CS-3 S7-1: a HELD online outcome (ambiguous / Superseded / transient after
+            // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
+            self.mode = NodeMode::StopMode;
+        }
         self.docs.insert(lnd, doc_state);
         self.shift_lifecycle_lnds.insert(lnd);
         self.next_lnd += 1;
@@ -880,6 +938,11 @@ impl RefModel {
         if Self::online_origin_advances_seed(doc_state) {
             self.seed = Some(unsigned_hash);
             self.shift_state = ShiftState::Closed;
+            // Cross-shift carry: a real SHIFT_CLOSE persists the CLOSING drawer as
+            // `shifts.cash_balance_kop` (prod `cash_ledger.rs:16`), which becomes the
+            // NEXT shift's opening carry. Mirror it so a reopen after this Z sees the
+            // carried balance (the `Sell → Z → ShiftOpen → EPZ` counterexample).
+            self.carry_cash_kop = self.cash_on_hand;
         } else if doc_state == DocState::Rejected {
             // Current production escalates shift-class send rejects to RMR while
             // the document itself rests as non-issued Rejected.
@@ -1064,6 +1127,10 @@ impl RefModel {
                 let previous_hash = self.seed;
                 let unsigned_hash = synth_unsigned_hash(lnd);
                 let doc_state = online_outcome_state(script);
+                if doc_state == DocState::Sending {
+                    // CS-3 S7-1: a HELD online outcome flips the node to STOP_MODE.
+                    self.mode = NodeMode::StopMode;
+                }
                 self.docs.insert(lnd, doc_state); // the row IS minted (lnd allocated)
                 self.next_lnd += 1;
                 // A.3 / C6 — online-origin advances the seed at the SEND crossing
@@ -1346,6 +1413,10 @@ impl RefModel {
                     }
                     ShiftState::ClosingLocalPendingDrain => {
                         self.shift_state = ShiftState::Closed;
+                        // Cross-shift carry (offline twin of the online Z-close): the drain
+                        // finalize is the REAL close that persists `cash_balance_kop`, so the
+                        // next shift-open carries this drawer (symmetry with online).
+                        self.carry_cash_kop = self.cash_on_hand;
                     }
                     _ => {}
                 }
@@ -1408,41 +1479,53 @@ impl RefModel {
             }
             [WireResponse::Reject, ..] => {
                 let first = backlog[0];
-                self.docs.insert(first, DocState::Rejected);
+                // CS-3 S7-1: a drain reject of an OFFLINE_LOCAL_ACK backlog doc is a recorded HOLD
+                // — record_outcome commits PENDING_APPLY + STOP and the Sending→Rejected doc CAS is
+                // deferred to APPLY (never runs), so the HEAD doc rests SENDING, NOT terminal Rejected.
+                self.docs.insert(first, DocState::Sending);
                 self.shift_state = ShiftState::RequiresManualReconciliation;
-                // mode stays GoingOnline (drain halted); seed unchanged.
+                // CS-3 S7-1: the offline-origin reject-hold flips the node to STOP_MODE
+                // (record_outcome's `offline_reject_hold` early halt); seed unchanged; no 2nd wire
+                // (S7-2 fence). The STOP is cleared only by operator completion.
+                self.mode = NodeMode::StopMode;
                 ExpectedOutcome::Mutated(Mutation {
                     lnd: first,
-                    doc_state: DocState::Rejected,
+                    doc_state: DocState::Sending,
                     seed_after: self.seed,
                     previous_hash,
                     code_consumed: None,
                     shift_state_after: Some(self.shift_state),
                 })
             }
-            // U1 D5 — Superseded tip: the strict-sequential drain escalates to
-            // manual.  Empirically probe-derived (the `classify_check_result`
-            // Superseded arm, kvt2_confirm.rs:~357): the HEAD backlog doc →
-            // ERROR_RETRYABLE, the shift → RMR (EscalateManual, M3b §16.7); mode
-            // stays GoingOnline (set by `apply_go_online`); successors held at
-            // OFFLINE_LOCAL_ACK; the seed does NOT re-advance (offline-origin
-            // advanced it at issuance).
+            // U1 D5 — Superseded tip: the strict-sequential drain escalates to manual.
+            // CS-3 S7-1: a Superseded (ServerFiscalIdMismatch → WrapperBug) after CALL_STARTED is a
+            // recorded HOLD — the HEAD backlog doc rests SENDING under PENDING_APPLY (the doc CAS is
+            // deferred to APPLY, never runs), NOT ERROR_RETRYABLE; the shift → RMR (EscalateManual,
+            // M3b §16.7); mode stays GoingOnline; successors held at OFFLINE_LOCAL_ACK; the seed does
+            // NOT re-advance (offline-origin advanced it at issuance).
             [WireResponse::Superseded, ..] => {
                 let first = backlog[0];
-                self.docs.insert(first, DocState::ErrorRetryable);
+                self.docs.insert(first, DocState::Sending);
                 self.shift_state = ShiftState::RequiresManualReconciliation;
+                // CS-3 S7-1: the WrapperBug HOLD flips the node to STOP_MODE (record_outcome halt).
+                self.mode = NodeMode::StopMode;
                 ExpectedOutcome::Mutated(Mutation {
                     lnd: first,
-                    doc_state: DocState::ErrorRetryable,
+                    doc_state: DocState::Sending,
                     seed_after: self.seed,
                     previous_hash,
                     code_consumed: None,
                     shift_state_after: Some(self.shift_state),
                 })
             }
-            // U1 D5 — send Ack'd, last_chk NotFound: the HEAD doc is HELD at SENT
-            // (`SentNotFoundDowngrade`, kvt2_confirm.rs:~330); shift unchanged,
-            // mode stays GoingOnline, successors held, seed unchanged.
+            // U1 D5 — send Ack'd this tick, then last_chk NotFound: this is the
+            // SentFresh confirm path → StructuralDrift, so the freshly-sent HEAD
+            // doc is HELD at SENT (no CAS); shift unchanged, mode stays
+            // GoingOnline, successors held, seed unchanged.  NB (CS-3 S7-1
+            // F2-kvt2): a *cross-tick* SentReplay re-probe returning NotFound now
+            // ESCALATES the doc to RMR + node STOP (kvt2_confirm
+            // SentNotFoundEscalated); the current alphabet does not drive that
+            // cross-tick SentReplay drain, so this single-tick arm is unaffected.
             [WireResponse::Ack, WireResponse::NotFound, ..] => {
                 let first = backlog[0];
                 self.docs.insert(first, DocState::Sent);
@@ -1681,6 +1764,10 @@ fn online_outcome_state(script: &DpsScript) -> DocState {
         [WireResponse::Ack, WireResponse::Ack, ..] => DocState::Ack,
         [WireResponse::Reject, ..] => DocState::Rejected,
         [WireResponse::Ack, WireResponse::NotFound, ..] => DocState::Sent,
-        _ => DocState::ErrorRetryable,
+        // CS-3 S7-1: every other (ambiguous / transient / Superseded / escalate) online outcome
+        // after CALL_STARTED is a recorded HOLD — the doc rests SENDING under a PENDING_APPLY
+        // reservation (node → STOP_MODE), NOT auto-retryable ErrorRetryable. The doc-target CAS is
+        // deferred to the APPLY orchestration and never runs on a held outcome.
+        _ => DocState::Sending,
     }
 }

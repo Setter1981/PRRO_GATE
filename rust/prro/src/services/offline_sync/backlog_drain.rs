@@ -1392,6 +1392,19 @@ async fn process_via_stage_send(
                          (kvt2_confirm routing regression)"
                     )))
                 }
+                kvt2_confirm::ConfirmDrainOutcome::SentNotFoundEscalated => {
+                    // **CS-3 S7-1 F2-kvt2 (2026-07-22)**: structurally unreachable.
+                    // SentNotFoundEscalated is SentReplay-exclusive (the classifier
+                    // only emits SentNotFoundDowngrade for SentReplay); this is the
+                    // SentFresh confirm path, which routes a NotFound to
+                    // StructuralDrift, not SentNotFoundDowngrade.  Fail-loud on
+                    // regression.
+                    Err(BootError::Internal(format!(
+                        "process_via_stage_send({id_hex}): SentNotFoundEscalated is \
+                         SentReplay-exclusive; SentFresh cannot produce it \
+                         (kvt2_confirm routing regression)"
+                    )))
+                }
                 kvt2_confirm::ConfirmDrainOutcome::ChainSeedMismatch { .. } => {
                     // **AUD-L2-1b defense-in-depth**: structurally unreachable in
                     // the offline drain — offline-origin docs skip stage_finalize's
@@ -1525,7 +1538,10 @@ async fn process_via_stage_send(
 /// drives the outer pending-drain halt decision.
 async fn process_via_er_class_guard(
     pool: &SqlitePool,
-    deps: &RuntimeView<'_>,
+    // CS-3 S7-1 (R6): escalation-only now — the transient re-wire arm (`process_via_stage_send`)
+    // was deleted, so the DPS view is intentionally unused here. Kept for signature stability with
+    // the drain dispatch call-site; full param drop deferred to the R7 sweep.
+    _deps: &RuntimeView<'_>,
     fiscal_number: &str,
     doc: &fiscal_documents::DocumentRow,
     summary: &mut DrainSummary,
@@ -1541,13 +1557,10 @@ async fn process_via_er_class_guard(
         .map_err(BootError::Database)?;
 
     match decision {
-        ErRedriveDecision::Redrive => {
-            // TransientRetry + attempts < MAX_BOOT_ATTEMPTS — Pattern B
-            // retry path.  Reuse the OfflineLocalAck wire-send branch
-            // verbatim: stage_send::run handles the 4-pre CAS
-            // `ErrorRetryable → Sending` per W7 / W9a freeze §4.2.
-            process_via_stage_send(pool, deps, fiscal_number, doc, summary).await
-        }
+        // CS-3 S7-1 (R6): the `Redrive` arm is DELETED. A transient ErrorRetryable no longer
+        // re-invokes `process_via_stage_send` (that would be a SECOND wire for an already
+        // CALL_STARTED doc — double-issue). `evaluate_er_redrive` now returns
+        // `EscalateManual { TransientRetry }`, handled by the EscalateManual arm below → RMR.
         ErRedriveDecision::BudgetExhausted { attempts_used } => {
             cas_er_to_manual_via_drain(
                 pool,
@@ -1904,6 +1917,19 @@ async fn process_via_lastchk_replay(
             // successor off an unconfirmed predecessor / wedge.
             Ok(DocVerdict::SupersededHeld)
         }
+        kvt2_confirm::ConfirmDrainOutcome::SentNotFoundEscalated => {
+            // **CS-3 S7-1 re-audit F2-kvt2 (2026-07-22)**: the probed SENT doc's
+            // last_chk returned NotFound (issuance-ambiguous).  `confirm_drain_doc`
+            // has ALREADY escalated it atomically (Sent→RMR + node STOP_MODE +
+            // Critical SENT_NOT_FOUND_ESCALATED_MANUAL audit + trace retry_class
+            // NULL).  Map to a manual-recon Failed so the drain loop escalates the
+            // FN shift to Manual + HALTS — a blind re-send of an ambiguous doc is
+            // the double-issue hazard this campaign removes.
+            Ok(DocVerdict::Failed {
+                class: FailureClass::NotFound,
+                manual_recon: true,
+            })
+        }
         kvt2_confirm::ConfirmDrainOutcome::ChainSeedMismatch { .. } => {
             // **AUD-L2-1b defense-in-depth**: structurally unreachable — SentReplay
             // uses the bundled envelope path (NOT advance_to_ack), so it never
@@ -2019,6 +2045,18 @@ async fn process_via_w12_only(
             // site).  Distinct from the online-convergence tick, which has no
             // chain-head and HOLDS the same outcome (AUD-L5-1 EDIT-D).
             Ok(DocVerdict::SupersededHeld)
+        }
+        kvt2_confirm::ConfirmDrainOutcome::SentNotFoundEscalated => {
+            // **CS-3 S7-1 F2-kvt2 (2026-07-22)**: structurally unreachable.
+            // SentNotFoundEscalated is SentReplay-exclusive (the classifier only
+            // emits SentNotFoundDowngrade for SentReplay); this is the Kvt1Reentry
+            // path, whose NotFound routes to StructuralDrift.  Fail-loud on
+            // regression.
+            Err(BootError::Internal(format!(
+                "process_via_w12_only({id_hex}): SentNotFoundEscalated is \
+                 SentReplay-exclusive; Kvt1Reentry cannot produce it \
+                 (kvt2_confirm routing regression)"
+            )))
         }
         kvt2_confirm::ConfirmDrainOutcome::ChainSeedMismatch { .. } => {
             // **AUD-L2-1b defense-in-depth**: structurally unreachable in the
@@ -2993,9 +3031,42 @@ async fn drain_session_end_doc(
                 kvt2_confirm::ConfirmDrainOutcome::Advanced
             ))
         }
-        // Any non-Sent outcome (transient/route/refuse/error) → hold; the END
-        // is NOT Ack, session stays Draining, next tick re-drives (adopt).
-        _ => Ok(false),
+        // B2 re-audit (internal CRITICAL): any non-Sent outcome means the session-END is STUCK. A
+        // session-END MUST reach Sent to close the offline session, and under the HELD contract a
+        // non-Sent outcome does NOT auto-progress (no blind re-drive — R6 retired the ER redrive),
+        // so the old `_ => Ok(false)` spun the drain forever (session Draining, node GoingOnline, no
+        // RMR, no STOP, no CRITICAL audit) — the END is minted `fs_mode='ONLINE'` so it never enters
+        // the offline cohort R6 rewired to RMR. Escalate the FN to RequiresManualReconciliation
+        // (shift RMR + node mirror + Critical audit) so an operator resolves the ambiguous
+        // session-END; next tick the AUD-K8-1 entry guard refuses to re-drain the RMR shift.
+        other => {
+            let ns = node_state::get(pool, fiscal_number)
+                .await
+                .map_err(BootError::Database)?
+                .ok_or_else(|| {
+                    BootError::Internal(format!(
+                        "drain_session_end_doc({fiscal_number}): node_state row missing while \
+                         escalating a stuck session-END"
+                    ))
+                })?;
+            escalate_drain_to_manual(
+                pool,
+                fiscal_number,
+                &ns,
+                doc.document_id,
+                "session_end_not_sent",
+                // The session-END has no positional backlog index; use MAX as the terminal-END
+                // sentinel for the halt-position audit field.
+                usize::MAX,
+            )
+            .await?;
+            tracing::warn!(
+                fiscal_number,
+                outcome = ?other,
+                "B2: drain session-END did not reach Sent — escalated FN to RequiresManualReconciliation"
+            );
+            Ok(false)
+        }
     }
 }
 

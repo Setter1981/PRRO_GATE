@@ -32,7 +32,7 @@
 //! directly (sites that need supplementary writes ordered between
 //! CAS and audit — see `advance_sent_to_kvt1_from_probe`,
 //! `cas_sent_to_manual_reconciliation_from_probe`,
-//! `cas_sent_to_error_retryable_from_probe`).  Repository layer is
+//! `cas_sent_not_found_to_manual_from_probe`).  Repository layer is
 //! unchanged: no new pub fn on `fiscal_documents`.
 
 use sqlx::SqlitePool;
@@ -229,9 +229,12 @@ pub struct DispatchHistogram {
     /// Counts as an answered wire exchange (the probe got a Mismatch reply).
     pub sent_mismatch_superseded: usize,
     /// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
-    /// Doc transitioned Sent → ErrorRetryable; tick-2 of two-tick
-    /// retry path (ADR-M3-A9 step 3) re-drives via Pattern B.
-    pub sent_not_found_to_error_retryable: usize,
+    /// CS-3 S7-1 F2 (boot): a Sent doc DPS reports NotFound is issuance-
+    /// AMBIGUOUS → `cas_sent_not_found_to_manual_from_probe` escalates it
+    /// Sent → RequiresManualReconciliation + node STOP (NOT the retired
+    /// two-tick Sent → ErrorRetryable Pattern-B redrive — R6 killed the
+    /// blind re-drive of a `CALL_STARTED` doc).
+    pub sent_not_found_to_manual: usize,
     /// W11 PR-2b — SENT crash-recovery probe failure (TransportRetry
     /// / DecodeEscalate / Unexpected).  Doc state left at SENT; next
     /// boot tick re-attempts the probe.  Forensic audit
@@ -359,7 +362,7 @@ impl DispatchHistogram {
             + self.sent_match_to_kvt1
             + self.sent_mismatch_to_manual
             + self.sent_mismatch_superseded
-            + self.sent_not_found_to_error_retryable
+            + self.sent_not_found_to_manual
             + self.sent_probe_failure_deferred
             + self.prepared_dispatched
             + self.offline_local_ack_emitted
@@ -425,7 +428,7 @@ impl DispatchHistogram {
             || self.sent_match_to_kvt1 > 0
             || self.sent_mismatch_to_manual > 0
             || self.sent_mismatch_superseded > 0
-            || self.sent_not_found_to_error_retryable > 0
+            || self.sent_not_found_to_manual > 0
         // NOT counted (no answered DPS exchange):
         //   - sent_probe_failure_deferred — TransportRetry/Decode probe (no answer).
         //   - sending_resumed / encrypted_rerouted — Sending/Encrypted→ER, no DPS.
@@ -456,7 +459,7 @@ impl DispatchHistogram {
         self.sent_match_to_kvt1 += other.sent_match_to_kvt1;
         self.sent_mismatch_to_manual += other.sent_mismatch_to_manual;
         self.sent_mismatch_superseded += other.sent_mismatch_superseded;
-        self.sent_not_found_to_error_retryable += other.sent_not_found_to_error_retryable;
+        self.sent_not_found_to_manual += other.sent_not_found_to_manual;
         self.sent_probe_failure_deferred += other.sent_probe_failure_deferred;
         self.prepared_dispatched += other.prepared_dispatched;
         self.offline_local_ack_emitted += other.offline_local_ack_emitted;
@@ -935,54 +938,45 @@ pub async fn cas_sent_to_manual_reconciliation_from_probe(
     .await
 }
 
-/// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
+/// W11 PR-2b + S7-1 F2 re-audit — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
 ///
-/// CAS `Sent → ErrorRetryable` + complete the in-flight
-/// `transport_trace` row with `OutcomeKind::RetryableServer` (DPS
-/// has no record — server-side condition, retryable) + audit
-/// `BOOT_SENT_LAST_CHK_NOTFOUND`.
-///
-/// This is the first tick of the two-tick recovery path
-/// (operator-decided 2026-05-12 per W11 design doc §9 Q1).  Second
-/// tick: ERROR_RETRYABLE dispatch via `stage_send::run` re-drives
-/// via Pattern B `ErrorRetryable → Sending → wire send`.  ADR-M3-A9
-/// step 3 forbids the direct `Sent → Sending` edge.
-pub async fn cas_sent_to_error_retryable_from_probe(
+/// A `Sent` doc whose `last_chk` probe returns NotFound is issuance-AMBIGUOUS (DPS may have accepted
+/// it and lost the record, or never saw it), so it escalates ATOMICALLY to
+/// `RequiresManualReconciliation` + node `STOP_MODE` via `sent_not_found_to_manual` — NOT the old
+/// `Sent → ErrorRetryable` auto-redrive. The old path left a reachable window: between the
+/// `Sent → ErrorRetryable` CAS and R6's later escalation the node stayed `Online`, and an online ER
+/// doc with a stamped SFN counts as *issued*, so the sibling-gate let the NEXT document issue as a
+/// chain-fork head (re-audit external-F2 / internal-B4). R6 collapsed the redrive, so the old
+/// `retry_class = TransientRetry` two-tick contract is dead; the recovery trace is now completed with
+/// `retry_class = None`. All writes land in ONE `with_immediate` envelope.
+pub async fn cas_sent_not_found_to_manual_from_probe(
     pool: &SqlitePool,
     doc_id: DocumentId,
+    fiscal_number: &str,
     attempt_no: i32,
     wire_call_started_at: &str,
     wire_call_finished_at: &str,
 ) -> anyhow::Result<bool> {
+    let fscl = fiscal_number.to_string();
     let wire_started = wire_call_started_at.to_string();
     let wire_finished = wire_call_finished_at.to_string();
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            // (1) CAS Sent → ErrorRetryable (whitelisted at base;
-            // M3b W1 routes through repository `transition_state`).
-            // Supplementary writes (transport_trace completion +
-            // audit) land below — same envelope.
-            let cas = fiscal_documents::transition_state(
-                tx,
-                doc_id,
-                DocState::Sent,
-                DocState::ErrorRetryable,
-            )
-            .await?;
-            if !matches!(cas, TransitionOutcome::Applied) {
-                return Ok::<bool, anyhow::Error>(false);
+            // (1) Sent → RequiresManualReconciliation + node STOP_MODE + Critical operator-handoff
+            // audit — the fiscal-critical writes, atomic with the trace completion below.
+            match super::sent_not_found::sent_not_found_to_manual(tx, doc_id, &fscl).await {
+                Ok(()) => {}
+                Err(super::sent_not_found::SentNotFoundError::DocNotSent(_)) => {
+                    // Someone else already moved the doc out of Sent — benign, no partial trail.
+                    return Ok::<bool, anyhow::Error>(false);
+                }
+                Err(e) => return Err(anyhow::Error::new(e)),
             }
 
-            // (2) Complete transport_trace row with RetryableServer
-            // outcome.  M3a hardening pass 1 — `retry_class =
-            // TransientRetry` is the semantically correct durable
-            // label: probe `NotFound` means DPS has no record, so
-            // tick-2 of the ADR-M3-A9 retry path is the canonical
-            // transient retry path.  The new ER dispatcher
-            // (`dispatch_error_retryable_by_class`) routes
-            // TransientRetry rows through `stage_send::run`.  Writing
-            // `None` here would route the doc to the indeterminate-
-            // hold branch and break the two-tick contract.
+            // (2) Complete the recovery trace — server-side condition (DPS has no record). NOT a
+            // retry: `retry_class = None` so no dispatcher re-drives it. R6 retired the two-tick
+            // ErrorRetryable redrive; the doc is now terminal-manual (RMR), not an ER cohort member,
+            // and `sent_not_found_to_manual` already wrote the Critical operator-handoff audit above.
             let n = transport_trace::complete_tx(
                 tx,
                 doc_id,
@@ -995,13 +989,9 @@ pub async fn cas_sent_to_error_retryable_from_probe(
                     server_status_code: None,
                     error_kind: Some("LAST_CHK_NOTFOUND".to_string()),
                     error_message: Some(
-                        "DPS last_chk returned NotFound; tick-2 of two-tick retry path will re-drive via Pattern B".to_string()
+                        "DPS last_chk returned NotFound for a Sent doc; escalated to RequiresManualReconciliation + STOP (issuance-ambiguous, no blind re-drive)".to_string()
                     ),
-                    retry_class: Some(
-                        crate::services::write_path::error_routing::RetryClass::TransientRetry
-                            .as_str()
-                            .to_string(),
-                    ),
+                    retry_class: None,
                 },
             )
             .await?;
@@ -1010,25 +1000,6 @@ pub async fn cas_sent_to_error_retryable_from_probe(
                     "transport_trace notfound completion: rows_affected = {n} (expected 1; doc {doc_id:?}, attempt_no = {attempt_no})"
                 );
             }
-
-            // (3) Audit BOOT_SENT_LAST_CHK_NOTFOUND.
-            let payload = serde_json::json!({
-                "document_id": hex_lower(doc_id.as_bytes()),
-                "branch": "c-sent-notfound",
-                "attempt_no": attempt_no,
-                "rationale":
-                    "last_chk returned NotFound — DPS has no record of doc with this transport_request_id; tick-1 transition Sent → ErrorRetryable (ADR-M3-A9 step 3 two-tick retry path)",
-            });
-            audit_log::append_tx(
-                tx,
-                "fiscal_document",
-                &hex_lower(doc_id.as_bytes()),
-                "BOOT_SENT_LAST_CHK_NOTFOUND",
-                crate::db::models::enums::Severity::Warning,
-                None,
-                Some(&payload.to_string()),
-            )
-            .await?;
             Ok::<bool, anyhow::Error>(true)
         })
     })
@@ -2261,7 +2232,7 @@ pub async fn run_boot_reconciliation(
             "error_retryable_dispatched": histogram.error_retryable_dispatched,
             "sent_match_to_kvt1": histogram.sent_match_to_kvt1,
             "sent_mismatch_to_manual": histogram.sent_mismatch_to_manual,
-            "sent_not_found_to_error_retryable": histogram.sent_not_found_to_error_retryable,
+            "sent_not_found_to_manual": histogram.sent_not_found_to_manual,
             "sent_probe_failure_deferred": histogram.sent_probe_failure_deferred,
             "prepared_dispatched": histogram.prepared_dispatched,
             // M3b W7b — post-sign dispatcher outcomes (operator PR
@@ -2690,10 +2661,11 @@ async fn defer_probe(
 ///   state Sent → RequiresManualReconciliation (operator handoff per
 ///   W0-3 §6.4-b; whitelist edge from prep PR #35) + trace completion
 ///   with `Rejected` outcome.
-/// - **NotFound**: `cas_sent_to_error_retryable_from_probe` → state
-///   Sent → ErrorRetryable + trace completion with `RetryableServer`
-///   outcome.  Tick-2 of the two-tick retry path
-///   (operator-decided per W11 design doc §9 Q1).
+/// - **NotFound**: `cas_sent_not_found_to_manual_from_probe` → state
+///   Sent → RequiresManualReconciliation + node STOP + trace completion
+///   with `RetryableServer` (`retry_class = NULL`).  CS-3 S7-1 F2: a Sent
+///   doc DPS reports NotFound is issuance-AMBIGUOUS → escalate, NOT the
+///   retired two-tick Sent → ErrorRetryable redrive (R6 killed blind re-drive).
 /// - **TransportRetry / DecodeEscalate / Unexpected**:
 ///   `complete_probe_trace_no_state_change` → trace completion +
 ///   `BOOT_SENT_PROBE_DEFERRED` audit; doc stays in SENT for next
@@ -2867,16 +2839,17 @@ pub(crate) async fn dispatch_sent_via_probe(
             }
         }
         ProbeOutcome::NotFound => {
-            match cas_sent_to_error_retryable_from_probe(
+            match cas_sent_not_found_to_manual_from_probe(
                 pool,
                 doc_id,
+                &doc.fiscal_number,
                 attempt_no,
                 &wire_started,
                 &wire_finished,
             )
             .await
             {
-                Ok(_) => histogram.sent_not_found_to_error_retryable += 1,
+                Ok(_) => histogram.sent_not_found_to_manual += 1,
                 Err(e) => {
                     emit_dispatch_error(pool, doc_id, "c-sent-notfound", &e, histogram).await?
                 }
@@ -2994,10 +2967,38 @@ pub async fn cas_error_retryable_to_manual_reconciliation(
                 },
             )
             .await?;
-            Ok::<bool, anyhow::Error>(matches!(outcome, TransitionOutcome::Applied))
+            let applied = matches!(outcome, TransitionOutcome::Applied);
+            if applied {
+                stop_node_for_escalated_doc(tx, doc_id).await?;
+            }
+            Ok::<bool, anyhow::Error>(applied)
         })
     })
     .await
+}
+
+/// B4 re-audit (internal MAJOR — the '+STOP' half): halt the node in the SAME tx as an
+/// `ErrorRetryable → RequiresManualReconciliation` escalation, so a PERSISTENT doc-level failure
+/// (e.g. -13 FnConfigError) cannot mint an unbounded ER→RMR stream while the node stays `Online`
+/// (the cashier would get 202s forever, node never halts). Before this, only the offline-drain path
+/// set STOP; the online/boot ER→RMR sites escalated the doc but left the node `Online`.
+async fn stop_node_for_escalated_doc(
+    tx: &mut crate::db::tx::WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> anyhow::Result<()> {
+    let fscl: String =
+        sqlx::query_scalar("SELECT fiscal_number FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id.as_bytes().as_slice())
+            .fetch_one(&mut **tx)
+            .await?;
+    let ok = crate::db::repositories::node_state::set_mode_stop_mode_tx(tx, &fscl).await?;
+    if !ok {
+        anyhow::bail!(
+            "stop_node_for_escalated_doc: node_state row missing for escalated doc {doc_id:?} — \
+             cannot set STOP_MODE"
+        );
+    }
+    Ok(())
 }
 
 /// M3a hardening pass 1 — H2 closure: CAS `ErrorRetryable →
@@ -3042,7 +3043,13 @@ async fn cas_error_retryable_budget_exhausted(
                 },
             )
             .await?;
-            Ok::<bool, anyhow::Error>(matches!(outcome, TransitionOutcome::Applied))
+            let applied = matches!(outcome, TransitionOutcome::Applied);
+            if applied {
+                // B4 re-audit: halt the node atomically (budget-exhausted ER → RMR is the same
+                // manual-triage escalation as the per-class one; the node must not stay Online).
+                stop_node_for_escalated_doc(tx, doc_id).await?;
+            }
+            Ok::<bool, anyhow::Error>(applied)
         })
     })
     .await
@@ -3113,7 +3120,10 @@ async fn emit_error_retryable_hold_audit(
 /// design freeze flagged.
 async fn dispatch_error_retryable_by_class(
     pool: &SqlitePool,
-    deps: &super::RuntimeView<'_>,
+    // CS-3 S7-1 (R6): this dispatcher is escalation-only now — the transient re-wire arm was
+    // deleted, so the DPS view is intentionally unused. Kept in the signature for stability with
+    // the boot cohort loop's `Some(deps)` call-site; a full param drop is deferred to the R7 sweep.
+    _deps: &super::RuntimeView<'_>,
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
     histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
@@ -3132,38 +3142,10 @@ async fn dispatch_error_retryable_by_class(
     let decision = evaluate_er_redrive(pool, doc_id).await?;
 
     match decision {
-        ErRedriveDecision::Redrive => {
-            // TransientRetry + attempts < MAX_BOOT_ATTEMPTS — Pattern B
-            // retry path (existing W11 PR-2a wiring).
-            match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
-                // W14a-2b Commit 5 NIT-C5-2 + NIT-C5-5: split
-                // SignerRefused off the generic dispatched bucket
-                // AND split Mismatch (operator-actionable) from the
-                // structural caller-bug variants (engineering signal).
-                // M1-01 fix: exhaustive classification (no `Ok(_)` catch-all) so
-                // zero-wire StateConflict/DocumentMissing are NOT counted as an
-                // answered exchange (they'd falsely suppress the boot tip-guard).
-                Ok(outcome) => match classify_send_dispatch(&outcome) {
-                    SendDispatchClass::Dispatched => histogram.error_retryable_dispatched += 1,
-                    SendDispatchClass::StateConflict => histogram.dispatch_state_conflict += 1,
-                    SendDispatchClass::DocumentMissing => histogram.dispatch_document_missing += 1,
-                    SendDispatchClass::SignerRefusedMismatch => histogram.signer_refused_mismatch += 1,
-                    SendDispatchClass::SignerRefusedStructural => {
-                        histogram.signer_refused_structural_bug += 1
-                    }
-                },
-                Err(e) => {
-                    emit_dispatch_error(
-                        pool,
-                        doc_id,
-                        "c-error-retryable-transient",
-                        &anyhow::Error::new(e),
-                        histogram,
-                    )
-                    .await?
-                }
-            }
-        }
+        // CS-3 S7-1 (R6): the `Redrive` arm is DELETED. A transient ErrorRetryable no longer
+        // re-invokes `stage_send::run` at boot (that would be a SECOND wire for an already
+        // CALL_STARTED doc — double-issue). `evaluate_er_redrive` now returns
+        // `EscalateManual { TransientRetry }`, handled by the EscalateManual arm below → RMR.
         ErRedriveDecision::BudgetExhausted { attempts_used } => {
             // M3a hardening pass 1 — H2 closure: enforce the
             // boot-attempt budget cap.  `MAX_BOOT_ATTEMPTS = 5` is
@@ -4284,7 +4266,7 @@ mod tests {
         }
         .answered_wire_contact());
         assert!(DispatchHistogram {
-            sent_not_found_to_error_retryable: 1,
+            sent_not_found_to_manual: 1,
             ..Default::default()
         }
         .answered_wire_contact());

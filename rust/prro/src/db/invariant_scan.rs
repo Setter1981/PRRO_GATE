@@ -211,9 +211,30 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         });
     }
 
-    // 2. No quiescent SENDING (Pattern B intent marker must not rest).
+    // 2. No quiescent ORPHAN SENDING.  A `SENDING` doc is the Pattern-B intent marker; at a
+    // quiescent boundary it must not rest — UNLESS it is a PROVEN operator HOLD: a consistent
+    // (document, reservation) pair under a halted node.  CS-3 S7-1: the composed HOLD contract
+    // durably rests an offline-origin reject / submitted-unknown doc in `SENDING` + `PENDING_APPLY`
+    // pending operator completion.  Exempt ONLY the FULL relational witness — same document_id AND
+    // fiscal_number, reservation `OUTCOME_OBSERVED` + `PENDING_APPLY`, that reservation IS the
+    // node's ACTIVE, CURRENT-generation one, and the node is halted (STOP_MODE|BLOCKED).  This does
+    // NOT weaken the bug-#192 guard; it makes it PRECISE.  Everything else still reds, in particular:
+    // SENDING with no reservation; a `CALL_STARTED` (crash-mid-wire) reservation; a stale
+    // generation / non-active pointer; a clean `Accepted` stalled pre-apply without STOP; an
+    // arbitrary planted `PENDING_APPLY` not matching the active-generation witness.
     let sending: Vec<(String,)> = sqlx::query_as(
-        "SELECT lower(hex(document_id)) FROM fiscal_documents WHERE state = 'SENDING'",
+        "SELECT lower(hex(fd.document_id)) FROM fiscal_documents fd \
+         WHERE fd.state = 'SENDING' \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM delivery_reservation r \
+             JOIN node_state ns ON ns.fiscal_number = r.fiscal_number \
+             WHERE r.document_id = fd.document_id \
+               AND r.fiscal_number = fd.fiscal_number \
+               AND r.state = 'OUTCOME_OBSERVED' \
+               AND r.apply_state = 'PENDING_APPLY' \
+               AND r.reservation_id = ns.active_delivery_reservation_id \
+               AND r.authorized_generation = ns.delivery_generation \
+               AND ns.mode IN ('STOP_MODE', 'BLOCKED') )",
     )
     .fetch_all(pool)
     .await?;

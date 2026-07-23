@@ -60,7 +60,6 @@ use prro::runtime::ingress::handler::{handle_command, IngressBody};
 use prro::runtime::ingress::inline_binding::production_write_path;
 use prro::runtime::ingress::seam::WritePathEntry;
 use prro::services::reconciliation::runtime::RuntimeView;
-use prro::services::reconciliation::ReconciliationRuntime;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{
@@ -174,6 +173,16 @@ impl MatrixDps {
 
 #[async_trait]
 impl DpsChannel for MatrixDps {
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
+
     async fn send_chk(&self, e: CheckEnvelope) -> Result<CheckAck, DpsError> {
         // Per-FN fault dispatch: every injection is keyed by the sender's fiscal
         // number, so a fault armed on FN-A never fires for an interleaved FN-B send.
@@ -652,14 +661,10 @@ enum Action {
     GoOffline,
     /// Net restored: GO_ONLINE via the live door + one drain tick.
     GoOnlineDrain,
-    /// SELL while the net is DOWN but mode is STILL ONLINE → the doc must land
-    /// `ERROR_RETRYABLE` (stays online, retried by reconciliation), NOT OLA/lost.
+    /// SELL while the net is DOWN but mode is STILL ONLINE → CS-3 S7-1: the wire
+    /// failure after CALL_STARTED is a recorded HOLD (SENDING + STOP), online-origin,
+    /// NOT OLA/lost and NOT auto-retryable ErrorRetryable.
     SellRetryable(u64),
-    /// Reconciliation tick — re-drive pending `ERROR_RETRYABLE` docs to terminal.
-    Reconcile,
-    /// Online-convergence tick — actively finalise KVT1 → ACK (the mechanism
-    /// SEPARATE from `Reconcile`'s passive KVT1-hold; the supervisor drives both).
-    OnlineConverge,
     /// Службове внесення — cash INTO the drawer, `kop` kopecks.
     ServiceIn(i64),
     /// Службова видача — cash OUT of the drawer, `kop` kopecks. The drawer must
@@ -835,64 +840,32 @@ async fn apply_action(
             let (status, _resp) = drive_ingress(app, wp, fiscal_number, &body).await;
             let doc = last_doc_state(app.db(), fiscal_number).await;
             let mode = node_row(app.db(), fiscal_number).await.0;
+            // CS-3 S7-1: a net-drop mid-online SELL is a wire failure AFTER CALL_STARTED —
+            // ambiguous (the send may have reached DPS), so it is a recorded HOLD
+            // (SubmittedUnknown), NOT auto-retryable ErrorRetryable. The receipt rests SENDING
+            // (online-origin: NOT OLA, NOT lost) and the node halts to STOP_MODE (not OFFLINE)
+            // pending operator / boot resolution — a conscious liveness trade for P2.
             assert_eq!(
                 doc,
-                DocState::ErrorRetryable.as_str(),
-                "net-down online SELL step {i}: doc must rest ERROR_RETRYABLE \
-                 (stays online, retried — NOT OLA, NOT lost) (fn={fiscal_number})"
+                DocState::Sending.as_str(),
+                "net-down online SELL step {i}: doc HELD (SENDING), stays online-origin \
+                 — NOT OLA, NOT lost (fn={fiscal_number})"
             );
             assert_eq!(
-                mode, "ONLINE",
-                "net-down SELL must NOT flip mode to OFFLINE (fn={fiscal_number})"
+                mode, "STOP_MODE",
+                "net-down SELL after CALL_STARTED halts the node (ambiguous hold, NOT OFFLINE) \
+                 (fn={fiscal_number})"
             );
-            format!("SELL(seed={seed},total={total}) NET-DOWN → doc={doc} [{status}]")
+            format!(
+                "SELL(seed={seed},total={total}) NET-DOWN → HELD doc={doc} mode={mode} [{status}]"
+            )
         }
-        Action::Reconcile => {
-            let carriers = drain_carriers(dps.clone());
-            // Re-drive the ErrorRetryable doc (net restored). Several ticks,
-            // exactly as the supervisor loop does.
-            for _ in 0..8 {
-                let deps = ReconciliationRuntime::single_fn(drain_view(&carriers));
-                app.reconcile_pending_with(deps)
-                    .await
-                    .expect("reconcile_pending_with must run");
-            }
-            // PROVEN: reconcile forward-drives the doc OUT of ErrorRetryable
-            // (not lost, not stuck-retryable). NOTE (harness finding): the
-            // re-driven doc rests at KVT1 — the reconcile path does not
-            // finalise KVT1→KVT2→ACK from the same last_chk evidence the
-            // INLINE path finalises with. Asymmetry captured; full KVT2
-            // fidelity (or the real online-convergence tick) is a follow-up.
-            assert_eq!(
-                doc_count_in_state(app.db(), fiscal_number, "ERROR_RETRYABLE").await,
-                0,
-                "reconcile must re-drive the doc FORWARD out of ERROR_RETRYABLE (fn={fiscal_number})"
-            );
-            let st = last_doc_state(app.db(), fiscal_number).await;
-            format!("RECONCILE (re-drive) → ErrorRetryable cleared, doc now {st}")
-        }
-        Action::OnlineConverge => {
-            let carriers = drain_carriers(dps.clone());
-            // Active KVT1 → ACK finalisation (the M3b online-convergence tick,
-            // distinct from Reconcile's passive KVT1-hold). Tick to terminal.
-            let mut ticks = 0;
-            loop {
-                let view = drain_view(&carriers);
-                app.converge_online_for_fn(fiscal_number, &view)
-                    .await
-                    .expect("converge_online_for_fn must run");
-                ticks += 1;
-                if non_terminal_doc_count(app.db(), fiscal_number).await == 0 || ticks >= 8 {
-                    break;
-                }
-            }
-            assert_eq!(
-                non_terminal_doc_count(app.db(), fiscal_number).await,
-                0,
-                "online-convergence must finalise KVT1 → ACK ({ticks} ticks) (fn={fiscal_number})"
-            );
-            format!("ONLINE-CONVERGE ({ticks} ticks) → KVT1 finalised to ACK")
-        }
+        // CS-3 S7-1: `Action::Reconcile` (re-drive ErrorRetryable → KVT1) and
+        // `Action::OnlineConverge` (KVT1 → ACK) were RETIRED with the auto-recovery arc.
+        // R6 makes a stuck ErrorRetryable escalate to RequiresManualReconciliation (no
+        // re-drive), and transport failures are now a HOLD (SubmittedUnknown) resolved by
+        // the operator seam — so the old net-drop → re-drive → converge → ACK path no
+        // longer exists. Removed here (were used only by the pre-cutover S5).
         Action::ServiceIn(kop) => {
             let (status, state) = drive_ingress(
                 app,
@@ -1112,10 +1085,12 @@ async fn matrix_s3_dps_reject_corpus() {
             "ONLINE",
         ),
         (
+            // CS-3 S7-1: a transient reject after CALL_STARTED is a recorded HOLD
+            // (SubmittedUnknown), not an auto-retryable ErrorRetryable.
             -3,
-            "ERROR_SAVE (transient retry)",
-            DocState::ErrorRetryable,
-            "ONLINE",
+            "ERROR_SAVE (transient → HELD)",
+            DocState::Sending,
+            "STOP_MODE",
         ),
         (
             -5,
@@ -1124,10 +1099,11 @@ async fn matrix_s3_dps_reject_corpus() {
             "ONLINE",
         ),
         (
+            // CS-3 S7-1: the operator-escalation reject is now a recorded HOLD (node STOP).
             -6,
-            "ERROR_NOT_PREV_ZREPORT (escalate)",
-            DocState::ErrorRetryable,
-            "ONLINE",
+            "ERROR_NOT_PREV_ZREPORT (escalate → HELD)",
+            DocState::Sending,
+            "STOP_MODE",
         ),
         (
             -11,
@@ -1135,12 +1111,11 @@ async fn matrix_s3_dps_reject_corpus() {
             DocState::Rejected,
             "BLOCKED",
         ),
-        // NOTE: -12 (ERROR_BAD_HASH_PREV) is intentionally NOT in this simple-
-        // reject corpus. It triggers the multi-step W10.4 MAC-recovery subsystem
-        // (status_rro + re-seed + re-sign + re-send), NOT a terminal routing — a
-        // one-shot reject leaves the recovery unable to complete, so the doc
-        // terminalises to Rejected here. MAC recovery deserves a dedicated
-        // scenario (faithful re-seed modeling); tracked as a matrix follow-up.
+        // NOTE: -12 (ERROR_BAD_HASH_PREV) is intentionally NOT in this simple-reject
+        // corpus. CS-3 S7-1 (R3) retired the inline MAC-recovery loop: a -12 is now a
+        // recorded HOLD (MacReseedPending → SENDING + STOP), covered by the dedicated
+        // matrix_s14/s15 pins and write_path_stage4_send::minus_12_*. Including it here
+        // would just duplicate the transient→HELD row above.
         (
             -15,
             "ERROR_NOT_OPEN_SHIFT (reject)",
@@ -1154,10 +1129,11 @@ async fn matrix_s3_dps_reject_corpus() {
             "ONLINE",
         ),
         (
+            // CS-3 S7-1: an unknown code (byzantine fallback) is held, not auto-retried.
             -99,
-            "unknown code (byzantine fallback)",
-            DocState::ErrorRetryable,
-            "ONLINE",
+            "unknown code (byzantine → HELD)",
+            DocState::Sending,
+            "STOP_MODE",
         ),
     ];
     eprintln!("\n════════ DPS REJECT CORPUS ════════");
@@ -1247,32 +1223,30 @@ async fn matrix_s4_throughput_and_db() {
 }
 
 /// S5 — net-drop MID-ONLINE (the least-verified transition cell). The network
-/// drops while the node is STILL ONLINE (no operator GO_OFFLINE). A SELL must
-/// land `ERROR_RETRYABLE` — it stays online, is neither lost nor turned into an
-/// offline-local-ack, and rests on a CLEAN scan (crash-recovery state). When the
-/// net returns, reconciliation (the SAME entry the supervisor loop calls)
-/// re-drives it to terminal ACK. Whole path: real ingress → write-path →
-/// stage_send (send fails) → ErrorRetryable → real reconcile → send → ACK; only
-/// the network (MatrixDps) is faked.
+/// drops while the node is STILL ONLINE (no operator GO_OFFLINE). CS-3 S7-1: a
+/// wire failure AFTER CALL_STARTED is AMBIGUOUS (the send may have reached DPS),
+/// so the SELL is a recorded HOLD (SubmittedUnknown), NOT auto-retryable — the
+/// receipt rests SENDING (online-origin: neither lost nor turned into an
+/// offline-local-ack) and the node halts to STOP_MODE (NOT flipped to OFFLINE),
+/// on a CLEAN scan. Recovery is operator/boot-driven, not an auto re-drive — a
+/// conscious liveness trade for P2 double-issue safety, so the old
+/// reconcile→KVT1→converge→ACK→Z arc no longer applies to this cell. Whole path:
+/// real ingress → write-path → stage_send (wire fails) → composed record/apply →
+/// HELD (SENDING + STOP); only the network (MatrixDps) is faked.
 #[tokio::test]
-async fn matrix_s5_net_drop_mid_online_retry() {
+async fn matrix_s5_net_drop_mid_online_holds_stop() {
     let (app, dps, wp) = fresh_harness(&[FN]).await;
     let steps = vec![
         Action::Open,             // online SHIFT_OPEN → ACK
         Action::Sell(6),          // online SELL → ACK
-        Action::NetDown,          // physical net drop; mode STAYS online
-        Action::SellRetryable(8), // SELL → ERROR_RETRYABLE (retryable, not lost)
-        Action::NetUp,            // net restored
-        Action::Reconcile,        // reconcile re-drives ErrorRetryable → KVT1 (holds)
-        Action::OnlineConverge,   // online-convergence finalises KVT1 → ACK
-        Action::ZClose,           // now quiescent → shift closes cleanly
+        Action::NetDown,          // physical net drop; mode STAYS online until the wire fails
+        Action::SellRetryable(8), // SELL → transport HOLD (SENDING + STOP), online-origin
     ];
-    // Full net-drop-mid-online lifecycle: NET_DOWN online SELL → ERROR_RETRYABLE
-    // (stays online, not lost) → reconcile re-drives → KVT1 (passive hold) →
-    // online-convergence finalises → ACK → Z closes. The TWO-mechanism online
-    // convergence (reconcile re-drive + convergence KVT2-finalise) is exactly
-    // what the supervisor loop runs; a Z before quiescence is correctly blocked
-    // (Z_QUIESCENCE_PENDING/503, observed live).
+    // Net-drop-mid-online: NET_DOWN online SELL → HELD (SENDING, online-origin, NOT
+    // OLA, NOT lost) + node STOP_MODE, on a clean scan. The `SellRetryable` step
+    // asserts the HELD contract; `run` scans clean after each step (the held pair is
+    // exempt under STOP + PENDING_APPLY). Operator/boot resolution of the hold and
+    // shift closure are out of this cell's scope (they are separate operator seams).
     run("S5-net-drop-online", &steps, &app, &*wp, &dps).await;
 }
 
@@ -1663,92 +1637,165 @@ async fn matrix_b1_byzantine_garbage_server_fiscal_no() {
     );
 }
 
-/// S14 — MAC-RECOVERY happy path (DPS -12 ERROR_BAD_HASH_PREV → inline W10.4
-/// re-seed). The DPS rejects a SELL's send with `-12` carrying the REAL chain head
-/// (`store {64hex}`); the inline W10.4 recovery (`stage_send::run` → run_mac_recovery)
-/// re-signs the doc with the DPS-supplied previous_hash and re-sends — attempt #2
-/// succeeds. The whole choreography runs SYNCHRONOUSLY inside the one drive_ingress
-/// call (no reconcile / converge tick — corrects the earlier "status_rro" spec: the
-/// hash comes from the -12 MESSAGE, not a probe). Pins: the SELL still reaches ACK,
-/// `mac_recovery_attempts=1` (the single-bit budget was claimed), and the wire log
-/// shows the -12 then the clean re-send.
+/// S14 — MAC divergence, EXTRACTABLE-hash message (DPS -12 ERROR_BAD_HASH_PREV
+/// carrying the REAL chain head `store {64hex}`). CS-3 S7-1 (R3) RETIRED the inline
+/// W10.4 re-sign loop: a `-12` is now a recorded HOLD. The SELL fires exactly ONE
+/// wire and rests `SENDING` under a `PENDING_APPLY` reservation (`MacReseedPending`);
+/// the node halts to `STOP_MODE`; NO re-sign, NO 2nd wire, `mac_recovery_attempts`
+/// never claimed. S14-UNIQUE tooth: the HOLD does NOT advance the shift — it freezes
+/// exactly where SHIFT_OPEN left it (the halt gates the shift, not closes it). The
+/// extractable-hash message is now irrelevant to the outcome (S15 = plain-message twin).
 #[tokio::test]
-async fn matrix_s14_mac_recovery_minus12_resigns_to_ack() {
+async fn matrix_s14_mac_recovery_minus12_holds_shift_frozen() {
     let (app, dps, wp) = fresh_harness(&[FN]).await;
     let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s14-OPEN")).await;
     assert_eq!(os, 200, "S14 setup: SHIFT_OPEN must ACK");
+    let shift_before = shift_state(app.db(), FN).await;
 
     let recovered_hash = chain_seed_hex(app.db(), FN).await;
-    dps.inject_mac_recovery(FN, &recovered_hash);
+    dps.inject_mac_recovery(FN, &recovered_hash); // -12 WITH extractable store {hex}
     let _ = dps.drain_calls(); // clear the OPEN wire log
 
     let (body, total) = sell_body(FN, 2, "s14-SELL");
     let (status, _resp) = drive_ingress(&app, &*wp, FN, &body).await;
     let doc = last_doc_state(app.db(), FN).await;
+    let (mode, _) = node_row(app.db(), FN).await;
+    let shift_after = shift_state(app.db(), FN).await;
     let attempts = last_doc_mac_recovery_attempts(app.db(), FN).await;
     let wire = dps.drain_calls();
     eprintln!(
         "\n[S14] SELL(total={total}) with -12 injected → ingress[{status}] durable={doc} \
-         mac_recovery_attempts={attempts}\n  wire={wire:?}\n"
+         mode={mode} shift={shift_before}->{shift_after} attempts={attempts}\n  wire={wire:?}\n"
     );
 
+    // -12 → recorded HOLD (no inline re-sign): doc rests SENDING, node halted.
     assert_eq!(
         doc,
-        DocState::Ack.as_str(),
-        "S14: the recovered SELL must reach terminal ACK (durable={doc}, ingress {status})"
+        DocState::Sending.as_str(),
+        "S14: -12 → HELD, the SELL rests SENDING (durable={doc}, ingress {status})"
     );
     assert_eq!(
-        attempts, 1,
-        "S14: W10.4 recovery must have claimed its single-bit budget (attempts=1)"
+        mode, "STOP_MODE",
+        "S14: -12 halts the node pending MAC reseed"
     );
-    assert!(
-        wire.iter().any(|c| c.contains("-12")),
-        "S14: the wire must record the -12 reject, got {wire:?}"
-    );
-    assert!(
-        wire.iter().any(|c| c.contains("SENT(")),
-        "S14: the wire must record the successful re-send (attempt #2), got {wire:?}"
-    );
-    prro::db::invariant_scan::assert_clean(app.db()).await;
-    eprintln!(
-        "════════ S14-mac-recovery: PASS — -12 → inline W10.4 re-seed+re-sign → ACK (attempts=1) ════════"
-    );
-}
-
-/// S15 — MAC-RECOVERY failure (DPS -12 with NO extractable chain head). The DPS
-/// rejects with `-12` but a message LACKING the `store {64hex}` fragment → the
-/// recovery cannot extract a hash (HashNotExtractable) → the doc is overridden to a
-/// terminal `Rejected` (fail-closed: never a false ACK, never a stuck non-terminal,
-/// and the single-bit budget is NOT even claimed). Uses the plain `reject_next(-12)`
-/// whose scripted message has no `store {hex}`.
-#[tokio::test]
-async fn matrix_s15_mac_recovery_unextractable_hash_rejects() {
-    let (app, dps, wp) = fresh_harness(&[FN]).await;
-    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s15-OPEN")).await;
-    assert_eq!(os, 200, "S15 setup: SHIFT_OPEN must ACK");
-
-    dps.reject_next(FN, -12); // -12 with "matrix: scripted DPS reject" — NO store {hex}
-    let (body, _t) = sell_body(FN, 2, "s15-SELL");
-    let (status, _resp) = drive_ingress(&app, &*wp, FN, &body).await;
-    let doc = last_doc_state(app.db(), FN).await;
-    let attempts = last_doc_mac_recovery_attempts(app.db(), FN).await;
-    eprintln!(
-        "\n[S15] SELL with -12 (no extractable hash) → ingress[{status}] durable={doc} \
-         mac_recovery_attempts={attempts}\n"
-    );
-
+    // S14-UNIQUE: a held -12 must NOT advance the shift — it freezes where OPEN left it.
     assert_eq!(
-        doc,
-        DocState::Rejected.as_str(),
-        "S15: -12 with no extractable hash → terminal Rejected (durable={doc}, ingress {status})"
+        shift_after, shift_before,
+        "S14: a held -12 must NOT advance the shift ({shift_before} -> {shift_after})"
     );
     assert_eq!(
         attempts, 0,
-        "S15: HashNotExtractable happens BEFORE the counter CAS → attempts stays 0"
+        "S14: the re-sign loop is retired → the single-bit budget is NOT claimed"
+    );
+    // Exactly ONE wire (the -12) — the retired loop would have fired a 2nd re-send.
+    assert_eq!(
+        wire.len(),
+        1,
+        "S14: exactly one wire (the -12), no 2nd re-send: {wire:?}"
+    );
+    assert!(
+        wire[0].contains("-12"),
+        "S14: the one wire is the -12 reject, got {wire:?}"
+    );
+    assert!(
+        !wire.iter().any(|c| c.contains("SENT(")),
+        "S14: no successful re-send may appear, got {wire:?}"
+    );
+    // Reservation held: PENDING_APPLY carrying the MacReseedPending node-effect.
+    let (apply_state, node_effect): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT apply_state, node_effect FROM delivery_reservation \
+         WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        apply_state.as_deref(),
+        Some("PENDING_APPLY"),
+        "S14: SELL reservation held"
+    );
+    assert_eq!(
+        node_effect.as_deref(),
+        Some("MacReseedPending"),
+        "S14: -12 node-effect"
+    );
+    // The held SENDING is a LEGITIMATE quiescent hold (STOP_MODE + PENDING_APPLY witness).
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S14-mac-divergence: PASS — -12 → HELD (SENDING+STOP+PENDING_APPLY), shift frozen, 1 wire ════════"
+    );
+}
+
+/// S15 — MAC divergence, PLAIN message (DPS -12 with NO `store {64hex}` fragment).
+/// Under the retired W10.4 loop this was a distinct fail-closed leaf (HashNotExtractable
+/// → terminal `Rejected`). CS-3 S7-1 (R3) deleted the re-sign path, so there is no
+/// hash-extraction step anymore: a `-12` is a recorded HOLD REGARDLESS of the message.
+/// S15-UNIQUE tooth: the plain-message `-12` is IDENTICAL to S14's extractable one —
+/// the outcome is message-independent (HELD, node STOP_MODE, shift frozen, one wire),
+/// NOT the old terminal `Rejected`. Uses the plain `reject_next(-12)` (no `store {hex}`).
+#[tokio::test]
+async fn matrix_s15_mac_recovery_minus12_plain_message_still_holds() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s15-OPEN")).await;
+    assert_eq!(os, 200, "S15 setup: SHIFT_OPEN must ACK");
+    let shift_before = shift_state(app.db(), FN).await;
+
+    dps.reject_next(FN, -12); // -12 with a plain scripted message — NO store {hex}
+    let _ = dps.drain_calls(); // clear the OPEN wire log (so wire-count pins the SELL only)
+    let (body, _t) = sell_body(FN, 2, "s15-SELL");
+    let (status, _resp) = drive_ingress(&app, &*wp, FN, &body).await;
+    let doc = last_doc_state(app.db(), FN).await;
+    let (mode, _) = node_row(app.db(), FN).await;
+    let shift_after = shift_state(app.db(), FN).await;
+    let attempts = last_doc_mac_recovery_attempts(app.db(), FN).await;
+    let wire = dps.drain_calls();
+    eprintln!(
+        "\n[S15] SELL with plain -12 (no extractable hash) → ingress[{status}] durable={doc} \
+         mode={mode} shift={shift_before}->{shift_after} attempts={attempts}\n  wire={wire:?}\n"
+    );
+
+    // Message-independent: a plain -12 holds identically to the extractable-hash S14.
+    assert_eq!(
+        doc,
+        DocState::Sending.as_str(),
+        "S15: a plain -12 → HELD (SENDING), NOT the old terminal Rejected (durable={doc})"
+    );
+    assert_eq!(
+        mode, "STOP_MODE",
+        "S15: -12 halts the node regardless of message"
+    );
+    assert_eq!(
+        shift_after, shift_before,
+        "S15: a held -12 must NOT advance the shift ({shift_before} -> {shift_after})"
+    );
+    assert_eq!(attempts, 0, "S15: no re-sign path → budget never claimed");
+    assert_eq!(wire.len(), 1, "S15: exactly one wire (the -12): {wire:?}");
+    assert!(
+        wire[0].contains("-12"),
+        "S15: the one wire is the -12 reject, got {wire:?}"
+    );
+    let (apply_state, node_effect): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT apply_state, node_effect FROM delivery_reservation \
+         WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        apply_state.as_deref(),
+        Some("PENDING_APPLY"),
+        "S15: SELL reservation held"
+    );
+    assert_eq!(
+        node_effect.as_deref(),
+        Some("MacReseedPending"),
+        "S15: -12 node-effect"
     );
     prro::db::invariant_scan::assert_clean(app.db()).await;
     eprintln!(
-        "════════ S15-mac-recovery-fail: PASS — -12 unextractable → Rejected fail-closed (attempts=0, clean scan) ════════"
+        "════════ S15-mac-divergence: PASS — plain -12 → HELD (message-independent), NOT Rejected ════════"
     );
 }
 

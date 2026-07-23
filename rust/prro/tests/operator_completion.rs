@@ -354,6 +354,44 @@ async fn oc06_offline_not_accepted_refused_nothing_mutated() {
     assert_eq!(read_doc_state(&pool, 0x11).await, "SENDING");
 }
 
+// ───────── b1 reset-stop-mode refuses while a PENDING_APPLY reservation is unresolved ─────────
+
+/// B1 re-audit (CRITICAL): `reset_stop_mode` MUST refuse to flip `STOP_MODE → GOING_ONLINE` while an
+/// `OUTCOME_OBSERVED + PENDING_APPLY` reservation is unresolved. A blind flip would make
+/// `complete_operator_pending`'s `WHERE mode='STOP_MODE'` CAS match 0 rows forever → the FN is
+/// PERMANENTLY BRICKED (fence blocks all sells, seed never advances vs an accepted DPS receipt).
+/// The guard converts that silent brick into a loud, actionable refusal, preserving STOP_MODE so the
+/// completion path stays reachable.
+#[tokio::test]
+async fn b1_reset_stop_mode_refuses_while_pending_apply_unresolved() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5000000091";
+    let doc = seed_doc(&pool, fscl, 0x11, "SELL", Some(500)).await;
+    held_pending(&pool, 0x01, doc, fscl).await; // OUTCOME_OBSERVED + PENDING_APPLY + node STOP_MODE
+    assert_eq!(read_mode(&pool, fscl).await, "STOP_MODE");
+
+    // The guard refuses — NOT a blind flip.
+    let err = prro::admin::reset_stop_mode(&pool, fscl, "DPS restored, resuming")
+        .await
+        .expect_err(
+            "B1: reset-stop-mode must refuse while a PENDING_APPLY reservation is unresolved",
+        );
+    assert!(
+        matches!(
+            err,
+            prro::admin::AdminError::PendingResolutionRequired { .. }
+        ),
+        "B1: expected PendingResolutionRequired, got {err:?}"
+    );
+
+    // The node is STILL STOP_MODE — the flip was refused, so completion's precondition survives.
+    assert_eq!(
+        read_mode(&pool, fscl).await,
+        "STOP_MODE",
+        "B1: a refused reset must leave the node in STOP_MODE (completion precondition preserved)"
+    );
+}
+
 // ───────────────────── oc07 shift-family refused ─────────────────────────────
 
 #[tokio::test]
@@ -451,6 +489,169 @@ async fn oc09_completion_clears_pointer_and_next_doc_authorizes() {
     })
     .await
     .expect("next document authorizes after operator completion");
+}
+
+// ═══════════ B1 part 2 (§4.1) — the ADMIN resolution surface ═══════════
+//
+// The B1 guard makes `reset_stop_mode` REFUSE while a reservation is PENDING_APPLY (commit
+// `98a356f`), pointing the operator at `resolve-operator-pending`. Until now that command did not
+// exist, so an operator had NO path to clear a PENDING_APPLY brick. These teeth drive the admin
+// surface `prro::admin::resolve_operator_pending` end-to-end.
+
+#[tokio::test]
+async fn oc10_admin_resolve_operator_pending_accepted_releases_node() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5000000010";
+    let doc = seed_doc(&pool, fscl, 0x1A, "SELL", None).await;
+    held_pending(&pool, 0x0A, doc, fscl).await;
+    assert_eq!(read_mode(&pool, fscl).await, "STOP_MODE");
+    assert_eq!(
+        read_apply_state(&pool, 0x0A).await.as_deref(),
+        Some("PENDING_APPLY"),
+        "precondition: reservation held PENDING_APPLY"
+    );
+
+    // Drive the ADMIN surface end-to-end (this is what §4.1 adds).
+    let outcome = prro::admin::resolve_operator_pending(
+        &pool,
+        fscl,
+        [0x0A; 16],
+        OperatorResolution::Accepted {
+            fiscal_number: "4000222222".into(),
+        },
+    )
+    .await
+    .expect("admin resolve completes");
+
+    // The doc is issued, the reservation applied, the pointer cleared, the node released — the
+    // exact brick the B1 guard now blocks until this command runs.
+    assert!(outcome.applied, "resolution applied");
+    assert_eq!(
+        outcome.mode_target, "ONLINE",
+        "no active offline session → ONLINE"
+    );
+    assert_eq!(
+        read_doc_state(&pool, 0x1A).await,
+        "SENT",
+        "Accepted issues the doc"
+    );
+    assert_eq!(read_sfn(&pool, 0x1A).await.as_deref(), Some("4000222222"));
+    assert_eq!(
+        read_apply_state(&pool, 0x0A).await.as_deref(),
+        Some("APPLIED"),
+        "reservation APPLIED"
+    );
+    assert!(
+        read_pointer(&pool, fscl).await.is_none(),
+        "active pointer cleared"
+    );
+    assert_eq!(
+        read_mode(&pool, fscl).await,
+        "ONLINE",
+        "node released out of STOP_MODE"
+    );
+}
+
+#[tokio::test]
+async fn oc11_admin_resolve_rejects_reservation_of_a_different_fn_nothing_mutated() {
+    // Safety cross-check: the operator's --fn must own the reservation. A typo that names the
+    // WRONG FN (but a real reservation_id belonging to ANOTHER FN) must be refused — else the
+    // admin surface would silently resolve a reservation the operator did not intend.
+    let (_d, pool) = fresh_pool().await;
+    let fscl_a = "5000000011";
+    let fscl_b = "5000000012";
+    let doc = seed_doc(&pool, fscl_a, 0x1B, "SELL", None).await;
+    seed_doc(&pool, fscl_b, 0x2B, "SELL", None).await; // FN B exists but owns no held reservation
+    held_pending(&pool, 0x0B, doc, fscl_a).await;
+
+    // Operator names FN B but the reservation_id belongs to FN A → refuse.
+    let err = prro::admin::resolve_operator_pending(
+        &pool,
+        fscl_b,
+        [0x0B; 16],
+        OperatorResolution::Accepted {
+            fiscal_number: "4000333333".into(),
+        },
+    )
+    .await
+    .expect_err("mismatched FN must be refused");
+    assert_eq!(
+        err.exit_code(),
+        64,
+        "FN mismatch is operator command misuse (EX_USAGE)"
+    );
+
+    // Nothing mutated on FN A: still PENDING_APPLY, still STOP_MODE, pointer intact, doc SENDING.
+    assert_eq!(
+        read_apply_state(&pool, 0x0B).await.as_deref(),
+        Some("PENDING_APPLY")
+    );
+    assert_eq!(read_mode(&pool, fscl_a).await, "STOP_MODE");
+    assert!(read_pointer(&pool, fscl_a).await.is_some());
+    assert_eq!(read_doc_state(&pool, 0x1B).await, "SENDING");
+}
+
+// ═══════════ B5 (§4.2) — completion is reachable on a BLOCKED node, but stays BLOCKED ═══════════
+//
+// An OFFLINE-origin `-11` (ERROR_OFFLINE_168 — over the 168h offline ceiling) rests SENDING +
+// PENDING_APPLY with the node BLOCKED: `record_outcome`'s early halt sets BLOCKED (not STOP_MODE),
+// and `apply_outcome` returns HeldNotAutoRelease for an offline-origin reject. Two guarantees:
+//   (1) `resolve_operator_pending` must be REACHABLE — the completion mode-CAS was
+//       `WHERE mode='STOP_MODE'`, so a BLOCKED node returned NodeNotStopMode and the held doc could
+//       NEVER be cleared (the B5 brick);
+//   (2) completing it must NOT re-enable the over-ceiling node — it STAYS BLOCKED. Blindly flipping
+//       to ONLINE/GOING_ONLINE would let an over-ceiling FN issue offline again (INV-05 breach).
+
+#[tokio::test]
+async fn b5_resolve_on_blocked_node_completes_and_stays_blocked() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5000000024";
+    let doc = seed_doc(&pool, fscl, 0x24, "SELL", Some(700)).await; // offline-origin (offline_fiscal_no set)
+    held_pending(&pool, 0xA4, doc, fscl).await;
+    // Simulate the -11 early halt: the node is BLOCKED, NOT STOP_MODE.
+    sqlx::query("UPDATE node_state SET mode = 'BLOCKED' WHERE fiscal_number = ?")
+        .bind(fscl)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(read_mode(&pool, fscl).await, "BLOCKED");
+
+    let outcome = prro::admin::resolve_operator_pending(
+        &pool,
+        fscl,
+        [0xA4; 16],
+        OperatorResolution::Accepted {
+            fiscal_number: "4000444444".into(),
+        },
+    )
+    .await
+    .expect("resolve MUST be reachable on a BLOCKED node (B5)");
+
+    // The held doc is resolved and the fence pointer cleared...
+    assert!(outcome.applied, "reservation applied");
+    assert_eq!(
+        read_doc_state(&pool, 0x24).await,
+        "SENT",
+        "offline Accepted issues the doc"
+    );
+    assert_eq!(
+        read_apply_state(&pool, 0xA4).await.as_deref(),
+        Some("APPLIED")
+    );
+    assert!(
+        read_pointer(&pool, fscl).await.is_none(),
+        "fence pointer cleared"
+    );
+    // ...but the over-ceiling node STAYS BLOCKED (offline is still disabled — not re-enabled).
+    assert_eq!(
+        outcome.mode_target, "BLOCKED",
+        "B5: an over-ceiling node is NOT re-enabled by completion"
+    );
+    assert_eq!(
+        read_mode(&pool, fscl).await,
+        "BLOCKED",
+        "B5: node remains BLOCKED after completing the held doc"
+    );
 }
 
 // ═══════════ gap 4b — offline-cohort operator completion (P3 fork-safety) ═══════════
@@ -727,15 +928,17 @@ async fn oc22_mode_cas_failure_rolls_back_cohort_and_seed() {
     )
     .await;
     held_pending(&pool, 0x01, pred, fscl).await;
-    // Force the tail STOP_MODE->target CAS to match 0 rows by moving the node OUT of STOP_MODE.
-    sqlx::query("UPDATE node_state SET mode = 'BLOCKED' WHERE fiscal_number = ?")
+    // Force the completion's mode check to fail by moving the node to a NON-halt mode (a racing
+    // reset flipped it out of the held-halt). NB: BLOCKED is now a VALID completion mode (B5, §4.2),
+    // so this uses ONLINE — neither STOP_MODE nor BLOCKED → the `_` arm → NodeNotStopMode.
+    sqlx::query("UPDATE node_state SET mode = 'ONLINE' WHERE fiscal_number = ?")
         .bind(fscl)
         .execute(&pool)
         .await
         .unwrap();
     let err = complete(&pool, 0x01, OperatorResolution::NotAcceptedOffline)
         .await
-        .expect_err("mode CAS 0-rows fails the completion");
+        .expect_err("a non-halt mode fails the completion");
     assert!(is_err(&err, |e| matches!(
         e,
         CompletionError::NodeNotStopMode

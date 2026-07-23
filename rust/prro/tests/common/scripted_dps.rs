@@ -166,6 +166,16 @@ impl DpsChannel for ScriptedDps {
         })
     }
 
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
+
     async fn last_chk(&self, fn_sign: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_calls.fetch_add(1, Ordering::SeqCst);
         self.calls

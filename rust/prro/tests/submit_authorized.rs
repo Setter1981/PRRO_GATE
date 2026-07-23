@@ -23,7 +23,6 @@ use prro_domain::delivery::{
     DpsProtocolBinding, DpsProtocolId, ProtocolContractVersion, SubmissionEvidence,
 };
 use prro_domain::enums::DocType;
-use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -35,7 +34,10 @@ const TS: &str = "2026-07-20T00:00:00Z";
 const CHECK_SIGN: &[u8] = b"cms-signed-envelope-blob";
 
 fn envelope_hash() -> [u8; 32] {
-    <Sha256 as Digest>::digest(CHECK_SIGN).into()
+    // CS-3 S7-1 (B1): the token's `envelope_hash` is the FULL prost-`gen::Check` hash of the exact
+    // envelope that will be wired (every field), NOT `SHA256(check_sign)` — matching the
+    // `submit_authorized` rebind guard (`CheckEnvelope::wire_hash`).
+    wire_envelope().wire_hash()
 }
 
 fn wire_envelope() -> CheckEnvelope {
@@ -149,7 +151,8 @@ async fn sa01_valid_submit_fires_exactly_one_wire_and_returns_started_observatio
     let (channel, send_calls) = counting_channel();
     channel.push_send(Ok(ack("4000123456")));
 
-    let obs = submit_authorized(
+    // §Q2.1: submit_authorized now surfaces the byte-identical legacy result alongside the observation.
+    let (obs, _legacy) = submit_authorized(
         &channel,
         &port_binding(),
         auth,
@@ -239,5 +242,36 @@ async fn sa03_binding_mismatch_is_refused_with_zero_wire() {
         send_calls.load(Ordering::SeqCst),
         0,
         "a binding refusal performs ZERO wire I/O"
+    );
+}
+
+#[tokio::test]
+async fn sa04_non_check_sign_wire_field_tamper_is_refused_with_zero_wire() {
+    // CS-3 S7-1 (B1): a post-authorize tamper of a NON-`check_sign` wire field (here `rro_fn`) must
+    // ALSO be refused — the rebind guard now hashes the FULL `gen::Check`, not just `check_sign`.
+    // Under the pre-B1 `check_sign`-only guard this tamper slipped through to the wire. Revert
+    // `submit_authorized`'s rebind to `SHA256(check_sign)` and this test REDs (the wire fires),
+    // proving the full-envelope hash is load-bearing.
+    let (_d, pool) = fresh_pool().await;
+    let auth = seed_and_authorize(&pool).await;
+
+    let (channel, send_calls) = counting_channel();
+    channel.push_send(Ok(ack("4000123456")));
+
+    // IDENTICAL check_sign (a check_sign-only guard would PASS), but a different `rro_fn`.
+    let mut tampered = wire_envelope();
+    tampered.rro_fn = "4000000009".to_string();
+
+    let err = submit_authorized(&channel, &port_binding(), auth, tampered, DocType::Sell)
+        .await
+        .expect_err("a non-check_sign wire-field tamper must be refused");
+    assert!(
+        matches!(err, SubmitRefused::EnvelopeRebind),
+        "expected EnvelopeRebind on a full-envelope tamper; got {err:?}"
+    );
+    assert_eq!(
+        send_calls.load(Ordering::SeqCst),
+        0,
+        "a rebind refusal on a full-envelope tamper performs ZERO wire I/O"
     );
 }

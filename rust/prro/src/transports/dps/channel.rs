@@ -26,15 +26,17 @@ pub trait DpsChannel: Send + Sync {
 
     /// CS-3 3.2 PR2 pin3 — the single-RPC fan-out (spec §4.2): submit a receipt with EXACTLY ONE
     /// wire call and return BOTH the legacy `Result` AND the total transport-minted
-    /// `RawSendObservation` (the typed delivery evidence the Bridge/engine will map in PR4).
+    /// `RawSendObservation` (the typed delivery evidence the Bridge/engine maps at apply).
     ///
-    /// **DEGRADED default (mock/test channels only).** It calls `send_chk` once, then
-    /// back-projects the already-collapsed `Result<CheckAck, DpsError>` via `observe_from_legacy`
-    /// — which can only emit `Accepted`/`NoResponse` (no real digest survives the collapse), so a
-    /// default observation can never masquerade as full fidelity. Production `GrpcDpsChannel`
-    /// OVERRIDES this with the lossless single-decode body. The dependency is one-way
-    /// (`send_chk_observed` default → `send_chk`, which overrides nothing) — no mutual-default
-    /// recursion.
+    /// **REQUIRED — NO trait default (CS-3 S7-1).** The composed write-path apply derives the
+    /// terminal document state from `observation.evidence()`, so a degraded observation silently
+    /// collapses every outcome to `SubmittedUnknown`/HELD. A synthetic reverse-projection default
+    /// (from the already-collapsed `Result`) is REFUSED here: it would let a future production
+    /// adapter that forgets to override emit a FABRICATED digest/provenance as if transport-minted.
+    /// By carrying no default, every impl MUST choose its fidelity explicitly, compiler-enforced —
+    /// production `GrpcDpsChannel` overrides with the lossless single-decode body; scripted test
+    /// mocks use `dto::scripted_observation(self.send_chk(env).await)`; a mock exercising the
+    /// ABSENCE of a trusted reply returns an explicit `NoResponse` observation.
     ///
     /// **RETURN-TYPE PIN:** keep the tuple `(Result<…>, RawSendObservation)`. It MUST NOT be
     /// "simplified" to `Result<(CheckAck, RawSendObservation), DpsError>` — that would DROP the
@@ -43,11 +45,7 @@ pub trait DpsChannel: Send + Sync {
     async fn send_chk_observed(
         &self,
         envelope: CheckEnvelope,
-    ) -> (Result<CheckAck, DpsError>, RawSendObservation) {
-        let legacy = self.send_chk(envelope).await;
-        let observation = super::raw_reply::observe_from_legacy(&legacy);
-        (legacy, observation)
-    }
+    ) -> (Result<CheckAck, DpsError>, RawSendObservation);
 
     /// `lastChk` — fetch the last receipt the server has on file for
     /// the FN encoded in `fn_sign`.  Used by recovery and by the

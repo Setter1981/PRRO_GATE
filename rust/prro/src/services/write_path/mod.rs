@@ -10,6 +10,8 @@
 //!   - W10: DpsError routing dispatch
 //!   - W11: cross-stage deterministic-replay gate
 
+/// CS-3 S7-1 — shared apply orchestration: `apply_outcome` + online shift edges 3/10.
+pub mod apply_orchestration;
 pub mod auto_z;
 pub mod dispatch;
 pub mod error_routing;

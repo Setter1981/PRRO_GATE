@@ -669,6 +669,17 @@ impl DpsChannel for StubAckDps {
             data_sign: vec![],
         })
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        // CS-3 S7-1: required trait method (no default) — mirror the stub's send_chk into a
+        // scripted observation so the composed record/apply path sees faithful evidence.
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         unreachable!(
             "piece 4 stub: last_chk must not be invoked (PREPARED→SENT uses send_chk only)"
@@ -2085,6 +2096,20 @@ impl DpsChannel for StubOfflineAckDps {
     async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
         unreachable!(
             "smoke 9 offline reconcile: send_chk must NOT be invoked — node is OFFLINE \
+             so stage_send is not reached (drain uses the real channel, not this stub)"
+        )
+    }
+    async fn send_chk_observed(
+        &self,
+        _: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        // CS-3 S7-1: required trait method (no default). Same contract as send_chk — never
+        // invoked on this OFFLINE-reconcile stub (the live drain uses the real GrpcDpsChannel).
+        unreachable!(
+            "smoke 9 offline reconcile: send_chk_observed must NOT be invoked — node is OFFLINE \
              so stage_send is not reached (drain uses the real channel, not this stub)"
         )
     }

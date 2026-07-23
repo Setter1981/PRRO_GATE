@@ -73,8 +73,6 @@
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Europe::Kiev;
-use prost::Message as _;
-use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::db::models::enums::{DocState, DocType, Severity, ShiftState};
@@ -95,12 +93,11 @@ use crate::services::write_path::signer_guard::{self, SignerCashierMismatch};
 use crate::transports::dps::channel::DpsChannel;
 use crate::transports::dps::dto::{CheckEnvelope, DpsCheckType};
 use crate::transports::dps::error::DpsError;
-use crate::transports::dps::gen;
 
 use super::error_routing::{
-    route_send_result, AuditEvent, RetryClass, RoutingDecision, WireDecision,
+    route_send_result, target_wire_decision, AuditEvent, ProbeHint, ProbeReason, RetryClass,
+    RoutingDecision, WireDecision,
 };
-use super::mac_recovery::{self, MacRecoveryOutcome};
 use super::stage_sign::{derive_wire_artifact_kind, SignError, SigningContext, WireArtifactKind};
 
 // ─── Errors ──────────────────────────────────────────────────────────
@@ -617,27 +614,17 @@ enum PreOutcome {
     /// `fiscal_number` is propagated out so 4-b can call
     /// `node_state::set_mode_blocked_tx` for the W10.3 `-11` flip
     /// without a separate read.
+    ///
+    /// **CS-3 S7-1:** the authorize-tx ALSO minted the sealed [`Authorization`] (reservation insert +
+    /// generation advance + RN→CALL_STARTED) in the SAME tx, so `auth` is carried out to gate the
+    /// wire. Only the fields the wire/record/apply path needs survive — `shift_id` /
+    /// `offline_fiscal_no` / `previous_hash` / `unsigned_xml_sha256` / `mac_recovery_attempts` /
+    /// `fiscal_number` are re-read from durable state by the apply orchestration (Q3), not threaded.
     Marked {
+        auth: crate::db::repositories::delivery_reservation::Authorization,
         envelope: CheckEnvelope,
         attempt_no: i32,
         doc_type: DocType,
-        fiscal_number: String,
-        /// A′.1 piece 2 (D-15) — propagated out of the 4-pre closure (like
-        /// `doc_type`/`fiscal_number`) so the 4-b `WireDecision::Sent` block
-        /// can drive the shift confirm edges 3/10 WITHOUT a re-read.
-        /// `shift_id` = the confirm target; `offline_fiscal_no` = the
-        /// online-origin discriminator (`None` ⟺ online-origin; the drain
-        /// owns the offline shift edges).
-        shift_id: Option<ShiftId>,
-        offline_fiscal_no: Option<i64>,
-        /// A.3 (advance-at-SEND, §6 step 1) — chain fields from the PRE-CAS
-        /// `SendInputs` snapshot, propagated so the 4-b advance reads them
-        /// WITHOUT a post-CAS re-read (audit F7).  `previous_hash` feeds the
-        /// drift-assert; `unsigned_xml_sha256` is the advance target;
-        /// `mac_recovery_attempts` selects the C14 Variant P branch.
-        previous_hash: Option<Vec<u8>>,
-        unsigned_xml_sha256: Option<Vec<u8>>,
-        mac_recovery_attempts: i64,
     },
     /// `fetch_send_inputs_tx` returned `None` OR CAS returned
     /// `NotFound`.  No side effects.
@@ -793,11 +780,282 @@ async fn emit_signer_cashier_mismatch_audit_tx(
 }
 
 fn compute_envelope_hash(envelope: &CheckEnvelope) -> [u8; 32] {
-    let proto: gen::Check = envelope.clone().into();
-    let bytes = proto.encode_to_vec();
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    hasher.finalize().into()
+    // CS-3 S7-1 (B1): single source — delegate to the canonical `CheckEnvelope::wire_hash`
+    // (SHA-256 over the full prost `gen::Check`). The token/reservation `envelope_hash`, the
+    // `submit_authorized` rebind check and this trace `request_envelope_sha256` are now the SAME value.
+    envelope.wire_hash()
+}
+
+/// CS-3 S7-1 (composition impl-design §6-Q1): the FIXED production DPS protocol binding — the single
+/// source for BOTH the reservation/token binding (`build_new_reservation`) and the `submit_authorized`
+/// `port_binding` (AO-2 echoes them against each other, so the happy path always matches). `cpv`/`ecr`
+/// are provably always `None` and `protocol_id`/`contract` are fixed `FSCO_ZZD`/`1` today; this
+/// graduates to a per-FN config read only at CS-6 (`EvpzDps`), which has no live wire path yet.
+fn production_dps_binding() -> prro_domain::delivery::DpsProtocolBinding {
+    prro_domain::delivery::DpsProtocolBinding {
+        protocol_id: prro_domain::delivery::DpsProtocolId::FscoZzd,
+        contract_version: prro_domain::delivery::ProtocolContractVersion(1),
+        capability_profile_version: None,
+        endpoint_config_revision: None,
+    }
+}
+
+/// CS-3 S7-1 (composition impl-design §6-Q5): build the `NewReservation` the authorize-tx mints.
+/// `envelope_hash` is the FULL wire hash (B1 — `CheckEnvelope::wire_hash`), IDENTICAL to what
+/// `submit_authorized` rebind-checks and to the trace `request_envelope_sha256`. `reservation_id` is a
+/// fresh time-ordered UUID (unique per attempt; the DDL `UNIQUE(document_id, attempt_no)` + the
+/// `no_replace` trigger are the fail-closed backstop). The binding fields come from
+/// [`production_dps_binding`] so token == port by construction (AO-2 is a rebind/tamper guard).
+fn build_new_reservation(
+    doc: DocumentId,
+    inputs: &SendInputs,
+    envelope: &CheckEnvelope,
+) -> crate::db::repositories::delivery_reservation::NewReservation {
+    let b = production_dps_binding();
+    crate::db::repositories::delivery_reservation::NewReservation {
+        reservation_id: uuid::Uuid::now_v7().into_bytes(),
+        document_id: doc,
+        fiscal_number: inputs.fiscal_number.clone(),
+        dps_protocol_id: b.protocol_id.as_str().to_string(),
+        protocol_contract_version: i64::from(b.contract_version.0),
+        capability_profile_version: b.capability_profile_version.map(|v| i64::from(v.0)),
+        endpoint_config_revision: b.endpoint_config_revision.map(|v| i64::from(v.0)),
+        envelope_hash: envelope.wire_hash(),
+    }
+}
+
+/// CS-3 S7-1 (composition impl-design §6-Q2.2): build the two record arguments from the post-wire
+/// evidence — the TARGET authority (`classify` + `EvidenceDiscriminant`) that `record_outcome`
+/// persists. Post-wire the reservation has crossed `CALL_STARTED` (a `Started` generation witness); a
+/// `NotSubmitted` certainty (a pre-wire refusal) never reaches record, so the `Started` pairing is
+/// total here. `remote_correlation_id` is `None` for the live path (matches legacy 4-b).
+fn build_record_args(
+    obs: &crate::db::repositories::delivery_reservation::AttemptObservation,
+) -> anyhow::Result<(
+    prro_domain::delivery::evidence::EvidenceDiscriminant,
+    prro_domain::delivery::ObservedOutcomeV1,
+    prro_domain::delivery::ClassifiedOutcome,
+)> {
+    let classified = prro_domain::delivery::classify(obs.evidence());
+    let disc = prro_domain::delivery::evidence::EvidenceDiscriminant::from_evidence(obs.evidence());
+    // migration-036 evidence matrix (arm 5): a clean `Accepted` REQUIRES
+    // `remote_correlation_id == evidence_text` (the accepted fiscal number F); a NULL correlation on
+    // an `Accepted` trips the matrix trigger and rolls the record tx back. Every other outcome carries
+    // a NULL correlation. Derive it from the discriminant's own columns so it can never drift from
+    // `evidence_text`.
+    let cols = disc.to_columns();
+    let correlation = if cols.kind == "Accepted" {
+        cols.text
+            .as_deref()
+            .map(prro_domain::delivery::BoundedText::from_truncating)
+    } else {
+        None
+    };
+    let generation = prro_domain::delivery::PositiveGeneration::new(obs.authorized_generation())
+        .ok_or_else(|| {
+            anyhow::anyhow!("build_record_args: authorized_generation must be >= 1 post-wire")
+        })?;
+    let outcome = prro_domain::delivery::ObservedOutcomeV1::record(
+        &classified,
+        correlation,
+        prro_domain::delivery::AuthorizedGeneration::Started(generation),
+    )
+    .map_err(|e| anyhow::anyhow!("build_record_args: ObservedOutcomeV1::record: {e:?}"))?;
+    // F3: return `classified` too — the projection of the durable authority onto the WireDecision
+    // (trace/audit/return/drain) is built from this SAME classifier, so they cannot drift.
+    Ok((disc, outcome, classified))
+}
+
+/// CS-3 S7-1 (F3): project the durable evidence classifier's verdict onto the `WireDecision` that
+/// drives trace + audit + the returned outcome + drain failure-class, so those observations can
+/// never disagree with the durable record (which `build_record_args` builds from the SAME
+/// `classify`). The `legacy` wire routing is a COMPAT projection retained for wire-forensics + the
+/// drift-pin; where the classifier diverges from it, the classifier is authoritative. TWO retry-class
+/// divergences are reconciled (both targeted — full "slice E" is a later slice). (1) `RemoteAuthStatus`:
+/// legacy `RemoteStatus → TransientRetry`, durable `classify → ProbeRequired` → project ProbeRequired
+/// (reuses `StageSendProbeRequired` audit, `ProbeReason::RemoteStatus`). (2) unknown NON-ZERO code
+/// (CS-3 S7-1 re-audit MAJOR): legacy tonic-decode fails → `Decode → ProbeRequired`, durable
+/// `classify → UnknownStatus → TransientRetry` (the §4.6 raw drift-delta) → project TransientRetry
+/// (`StageSendTransientRetry`, no probe_hint) — else the durable `routing_class=TransientRetry` splits
+/// from trace/audit/return/drain=ProbeRequired.
+///
+/// Every OTHER leaf already agrees (Decode `-2/-15`, etc. route ProbeRequired on both sides), so it
+/// falls through `_ => legacy`. The Sent SFN arm is unaffected (the fiscal number comes from the
+/// legacy `CheckAck`). The RAW legacy-vs-classifier drift-pin (grpc) is untouched — it compares the
+/// raw routings; only the PROJECTED wire decision is reconciled here.
+fn project_decision_from_evidence(
+    legacy: WireDecision,
+    classified: &prro_domain::delivery::ClassifiedOutcome,
+) -> WireDecision {
+    match (&legacy, classified.routing()) {
+        // The classifier says ProbeRequired but the legacy wire routing did not — the RemoteAuthStatus
+        // delta (the only such divergence today; Decode / -2 / -15 already route ProbeRequired, so they
+        // agree and fall through). Rebuild as the evidence-correct ProbeRequired routing, reusing the
+        // existing STAGE_SEND_PROBE_REQUIRED audit distinguished by `ProbeReason::RemoteStatus`.
+        (WireDecision::Routed(d), Some(prro_domain::delivery::ActiveRetryClass::ProbeRequired))
+            if d.retry_class != RetryClass::ProbeRequired =>
+        {
+            WireDecision::Routed(RoutingDecision {
+                target_state: DocState::ErrorRetryable,
+                retry_class: RetryClass::ProbeRequired,
+                audit_event: AuditEvent::StageSendProbeRequired,
+                audit_severity: Severity::Warning,
+                node_mode_flip: None,
+                probe_hint: Some(ProbeHint {
+                    reason: ProbeReason::RemoteStatus,
+                }),
+                mac_recovery_hint: None,
+            })
+        }
+        // CS-3 S7-1 (F3 re-audit MAJOR): the REVERSE direction — the classifier says TransientRetry
+        // but the legacy wire routing said ProbeRequired. The ONLY reachable such leaf is an unknown
+        // NON-ZERO DPS status code (outside the proto enum -16..=1): the legacy tonic-decode fails →
+        // `Decode → ProbeRequired`, while the durable classifier maps it `UnknownStatus →
+        // TransientRetry` (the §4.6 preserved RAW drift-delta, pinned by the grpc drift-check). The
+        // durable record is built from the classifier (TransientRetry), so without this arm
+        // trace/audit/return/drain would report the legacy ProbeRequired while
+        // `delivery_reservation.routing_class` records TransientRetry — a durable-vs-observable split.
+        // Rebuild as the evidence-correct TransientRetry routing (STAGE_SEND_TRANSIENT_RETRY, NO
+        // probe_hint — matching `route_dps_error`'s Transport/Server-3 transient arm).
+        //
+        // **Guarded to `legacy == ProbeRequired`, NOT the broad `legacy != TransientRetry`:** a
+        // wrapper-bug DpsError (NotFound / ServerFiscalIdMismatch / QueryNotSupported / Internal) is
+        // also `classified==TransientRetry` (NoResponse) but `legacy==WrapperBug`; that WrapperBug
+        // routing is DELIBERATELY preserved (routing-driven CRITICAL audit = operator visibility) and
+        // must NOT be reconciled here. The raw legacy-vs-classifier drift-pin is untouched.
+        (
+            WireDecision::Routed(d),
+            Some(prro_domain::delivery::ActiveRetryClass::TransientRetry),
+        ) if d.retry_class == RetryClass::ProbeRequired => WireDecision::Routed(RoutingDecision {
+            target_state: DocState::ErrorRetryable,
+            retry_class: RetryClass::TransientRetry,
+            audit_event: AuditEvent::StageSendTransientRetry,
+            audit_severity: Severity::Warning,
+            node_mode_flip: None,
+            probe_hint: None,
+            mac_recovery_hint: None,
+        }),
+        _ => legacy,
+    }
+}
+
+/// CS-3 S7-1 (composition impl-design §6-Q4): build the public `StageSendOutcome` from the TARGET
+/// `WireDecision` (`target_wire_decision(route_send_result(...))`) — RELOCATED verbatim from the legacy
+/// 4-b return block. Driving the return from the TARGET (not the raw legacy) is FIX-B2: an empty-SFN
+/// `Sent{""}` has already been mapped to a `Routed(OkButNoFiscalNumber)` HELD upstream.
+fn stage_send_outcome_from(
+    decision: WireDecision,
+    attempt_no: i32,
+    forensics: Option<&(Option<i32>, &'static str, String)>,
+) -> StageSendOutcome {
+    match decision {
+        WireDecision::Sent { server_fiscal_no } => StageSendOutcome::Sent {
+            server_fiscal_no,
+            attempt_no,
+        },
+        WireDecision::Routed(decision) => {
+            let (wire_status_code, wire_error_message) = match forensics {
+                Some((code, _kind, msg)) if !msg.is_empty() => (*code, Some(truncate_msg(msg))),
+                Some((code, _kind, _empty)) => (*code, None),
+                None => (None, None),
+            };
+            StageSendOutcome::Routed {
+                decision,
+                attempt_no,
+                wire_status_code,
+                wire_error_message,
+            }
+        }
+    }
+}
+
+/// CS-3 S7-1 (composition impl-design §6-Q2.3): the outcome audit — RELOCATED verbatim from the legacy
+/// 4-b audit block (`STAGE_SEND_RESULT` on the `Sent` arm, `decision.audit_event` on the routed arm,
+/// same payload). Driven by the TARGET `WireDecision` (FIX-B2). Emitted inside the record transaction.
+async fn append_stage_send_result_audit(
+    tx: &mut crate::db::tx::WriteTxConn<'_>,
+    doc: DocumentId,
+    decision: &WireDecision,
+    attempt_no: i32,
+    outcome_kind_str: &str,
+) -> anyhow::Result<()> {
+    let (event_type, severity) = match decision {
+        WireDecision::Sent { .. } => ("STAGE_SEND_RESULT", Severity::Info),
+        WireDecision::Routed(d) => (d.audit_event.as_str(), d.audit_severity),
+    };
+    let mut payload_obj = serde_json::json!({
+        "attempt_no": attempt_no,
+        "outcome_kind": outcome_kind_str,
+    });
+    if let WireDecision::Routed(d) = decision {
+        payload_obj["retry_class"] = serde_json::Value::String(d.retry_class.as_str().to_string());
+        if let Some(mode) = d.node_mode_flip {
+            payload_obj["node_mode_flipped"] = serde_json::Value::String(format!("{mode:?}"));
+        }
+        if let Some(hint) = &d.probe_hint {
+            payload_obj["probe_hint"] = serde_json::Value::String(format!("{:?}", hint.reason));
+        }
+    }
+    let payload = payload_obj.to_string();
+    audit_log::append_tx(
+        tx,
+        "fiscal_document",
+        &format!("{doc:?}"),
+        event_type,
+        severity,
+        None,
+        Some(&payload),
+    )
+    .await?;
+    Ok(())
+}
+
+/// CS-3 S7-1 (composition impl-design §6-Q2.3): the RECORD transaction — one `BEGIN IMMEDIATE` that
+/// atomically (1) commits the TARGET record via the repo `record_outcome` (axes + `PENDING_APPLY` +
+/// early STOP/BLOCKED), (2) completes the `transport_trace`, (3) appends the outcome audit. The doc
+/// target CAS / SFN / seed / shift edges MOVE to the APPLY orchestration (Q3); record owns
+/// evidence + trace + audit + safety-halt. Consumes `obs` by value (moved into the closure so
+/// `record_outcome` can borrow it); the caller captures `reservation_id` before the move.
+#[allow(clippy::too_many_arguments)]
+async fn record_transaction(
+    pool: &SqlitePool,
+    obs: crate::db::repositories::delivery_reservation::AttemptObservation,
+    outcome: prro_domain::delivery::ObservedOutcomeV1,
+    disc: prro_domain::delivery::evidence::EvidenceDiscriminant,
+    decision: WireDecision,
+    forensics: Option<(Option<i32>, &'static str, String)>,
+    started: String,
+    finished: String,
+    doc: DocumentId,
+    attempt_no: i32,
+) -> Result<(), StageSendError> {
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            // 1. TARGET record: authority CAS + axes + PENDING_APPLY + early STOP/BLOCKED (repo).
+            crate::db::repositories::delivery_reservation::record_outcome(
+                tx, &obs, &outcome, &disc,
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+            // 2. complete the existing transport_trace (verbatim relocation from legacy 4-b).
+            let completion =
+                build_attempt_completion(&decision, forensics.as_ref(), started, finished);
+            let outcome_kind_str = completion.outcome_kind.as_str().to_string();
+            let rows = transport_trace::complete_tx(tx, doc, attempt_no, completion).await?;
+            if rows == 0 {
+                return Err(anyhow::Error::new(StageSendError::TraceMissingAtComplete {
+                    document_id: doc,
+                    attempt_no,
+                }));
+            }
+            // 3. outcome audit — TARGET decision (verbatim relocation from legacy 4-b).
+            append_stage_send_result_audit(tx, doc, &decision, attempt_no, &outcome_kind_str)
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    })
+    .await
+    .map_err(bridge_anyhow)
 }
 
 /// Local-private wall-clock helper for `wire_call_*` strings, which
@@ -921,6 +1179,18 @@ fn build_attempt_completion(
         WireDecision::Sent { server_fiscal_no } => Some(server_fiscal_no.clone()),
         _ => None,
     };
+    // CS-3 S7-1 (FIX-B2): the empty-SFN case maps a wire-OK `Sent{""}` to `Routed(OkButNoFiscalNumber)`
+    // — a LEGITIMATE Routed WITHOUT forensics (the wire returned OK, so there is no error to extract).
+    // Detect it so the trace records clean (no-error) fields and the "Routed ⟺ forensics" invariant is
+    // not violated for this one non-error routed leaf.
+    let is_ok_no_fiscal = matches!(
+        decision,
+        WireDecision::Routed(d)
+            if matches!(
+                d.probe_hint.as_ref().map(|h| h.reason),
+                Some(ProbeReason::OkButNoFiscalNumber)
+            )
+    );
     let (server_status_code, error_kind, error_message) = match (decision, forensics) {
         (WireDecision::Sent { .. }, _) => (None, None, None),
         (WireDecision::Routed(_), Some((code, kind, message))) => {
@@ -931,9 +1201,10 @@ fn build_attempt_completion(
             };
             (*code, Some((*kind).to_string()), message_opt)
         }
-        // Routed without forensics is a programming bug — every
-        // Routed arm comes from a DpsError.  Surface defensively
-        // rather than panic in case of unforeseen path.
+        // FIX-B2: the mapped-OK `OkButNoFiscalNumber` routed leaf — no wire error, clean forensic fields.
+        (WireDecision::Routed(_), None) if is_ok_no_fiscal => (None, None, None),
+        // Any OTHER Routed without forensics is a programming bug — every real routed arm comes from a
+        // DpsError.  Surface defensively rather than panic in case of an unforeseen path.
         (WireDecision::Routed(_), None) => (None, Some("UnknownRouted".to_string()), None),
     };
     // W10.2 review fix-up + migration 012: durable encoding of
@@ -950,9 +1221,12 @@ fn build_attempt_completion(
             // which extract_wire_forensics handles exhaustively.  Fail
             // fast in dev/CI; defensive fallback in release.
             debug_assert!(
-                matches!(decision, WireDecision::Sent { .. }),
-                "WireDecision::Routed reached build_attempt_completion without forensics"
+                matches!(decision, WireDecision::Sent { .. }) || is_ok_no_fiscal,
+                "WireDecision::Routed (non-OkButNoFiscalNumber) reached build_attempt_completion \
+                 without forensics"
             );
+            // Unused by `wire_decision_to_outcome_kind` except on `TransientRetry`; the
+            // `OkButNoFiscalNumber` leaf is `ProbeRequired`, so this fallback never affects it.
             "Transport"
         }
     };
@@ -1032,88 +1306,14 @@ pub async fn run(
     pool: &SqlitePool,
     dps_channel: &dyn DpsChannel,
     doc: DocumentId,
-    sign_ctx: Option<&SigningContext>,
+    _sign_ctx: Option<&SigningContext>,
 ) -> Result<StageSendOutcome, StageSendError> {
-    // W10.4 step 2d — MAC recovery dispatch loop bound.  At most ONE
-    // re-entry per `run()` invocation; combined with the DDL
-    // `mac_recovery_attempts CHECK IN (0, 1)` budget, infinite-loop
-    // is unreachable.  Flag is reset on each fresh `run()` call.
-    //
-    // Architecture (R-W10.4-senior-review MED 3 + LOW 3 close):
-    // `run` is now a thin loop wrapper; the 4-pre/4a/4b body lives
-    // in `run_one_attempt` so loop body indentation stays canonical
-    // and each attempt is independently reasoned about.
-    let mut mac_recovery_invoked = false;
-
-    loop {
-        let outcome = run_one_attempt(pool, dps_channel, doc).await?;
-
-        // MAC recovery dispatch only fires on the routed-MacRecovery
-        // arm; everything else returns directly.
-        let (decision, attempt_no, wire_msg) = match &outcome {
-            StageSendOutcome::Routed {
-                decision,
-                attempt_no,
-                wire_error_message,
-                ..
-            } if decision.retry_class == RetryClass::MacRecovery => {
-                (decision.clone(), *attempt_no, wire_error_message.clone())
-            }
-            _ => return Ok(outcome),
-        };
-
-        if mac_recovery_invoked {
-            // Second `-12` after a successful Resigned in the same
-            // run() call.  Budget burnt by the first orchestrator
-            // invocation; short-circuit with FAILED_REPEAT audit.
-            return override_to_rejected_with_failed_repeat_audit(pool, doc, attempt_no, wire_msg)
-                .await;
-        }
-        mac_recovery_invoked = true;
-
-        let ctx = sign_ctx.ok_or(StageSendError::MacRecoveryContextMissing { document_id: doc })?;
-        let hint = decision.mac_recovery_hint.clone().ok_or_else(|| {
-            StageSendError::Internal(anyhow::anyhow!(
-                "MacRecovery decision missing mac_recovery_hint for doc {doc:?}"
-            ))
-        })?;
-
-        match mac_recovery::run_mac_recovery(pool, ctx, doc, &hint).await? {
-            MacRecoveryOutcome::Resigned => continue,
-            MacRecoveryOutcome::HashNotExtractable => {
-                // Orchestrator already emitted MAC_RECOVERY_HASH_NOT_EXTRACTABLE.
-                // Caller's job: CAS to Rejected without duplicate audit.
-                return override_to_rejected_no_additional_audit(
-                    pool,
-                    doc,
-                    attempt_no,
-                    AuditEvent::MacRecoveryHashNotExtractable,
-                    wire_msg,
-                )
-                .await;
-            }
-            MacRecoveryOutcome::CounterExhausted => {
-                return override_to_rejected_with_failed_repeat_audit(
-                    pool, doc, attempt_no, wire_msg,
-                )
-                .await;
-            }
-            MacRecoveryOutcome::OfflineOriginRefused => {
-                // M2-X1 (external-critic HIGH, 2026-06-12): the orchestrator
-                // refused to re-sign an offline-origin doc (it already emitted
-                // MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED; counter NOT claimed, chain
-                // untouched).  Return the original `Routed{MacRecovery}` outcome
-                // unchanged — `RetryClass::MacRecovery` is a manual-recon class
-                // (`is_manual_recon_retry_class`), so the drain's
-                // `process_via_stage_send` maps it to `DocVerdict::Failed{
-                // manual_recon: true}` and a pending-drain shift escalates to
-                // RequiresManualReconciliation (§16.7), mirroring the M2-04 seam.
-                // No online-path change: online docs have NULL offline_fiscal_no
-                // and never reach this arm.
-                return Ok(outcome);
-            }
-        }
-    }
+    // CS-3 S7-1 (R3): the MAC-recovery loop is DELETED. A `-12` routed leaf is now a recorded HOLD —
+    // `run_one_attempt` records `MacReseedPending` (which sets STOP in `record_outcome`) and
+    // `apply_recorded_outcome` returns the EXPECTED `HeldNotAutoRelease`; there is NO re-sign, NO
+    // `continue`, and NO second wire. `_sign_ctx` is unused (the envelope is pre-signed at stage_sign);
+    // the parameter is kept for zero caller edits — all 7 callers pass it (S7-3 cleanup removes it).
+    run_one_attempt(pool, dps_channel, doc).await
 }
 
 /// A′.1 piece 2 — POST-WIRE shift confirm edge (3: `Opening → Opened`, 10:
@@ -1131,7 +1331,7 @@ pub async fn run(
 /// to persist in `shifts.cash_balance_kop` (L0 carry anchor for the next shift).
 /// For all other transitions this value is ignored (`None` is fine; `Some(0)` also safe).
 #[allow(clippy::too_many_arguments)]
-async fn confirm_shift_edge(
+pub(crate) async fn confirm_shift_edge(
     tx: &mut crate::db::tx::WriteTxConn<'_>,
     fiscal_number: &str,
     shift_id: Option<ShiftId>,
@@ -1264,9 +1464,14 @@ async fn run_one_attempt(
             //
             // CAS itself still fires later (after envelope build), but
             // the allowlist filter here is the structural gate.
+            // CS-3 S7-1 (R2): `ErrorRetryable` is DROPPED from the source allowlist. Only a fresh
+            // `Signed` / `OfflineLocalAck` may seed a `Sending` — an `ErrorRetryable` doc has already
+            // consumed exactly one wire (all ER producers are post-wire routes), so re-seeding it here
+            // would be a SECOND wire for an already-`CALL_STARTED` doc. It now surfaces as
+            // `StateConflict`; the R6 convergence retires the redrive callers so it never bricks.
             if !matches!(
                 inputs.state,
-                DocState::Signed | DocState::ErrorRetryable | DocState::OfflineLocalAck,
+                DocState::Signed | DocState::OfflineLocalAck,
             ) {
                 return Ok(PreOutcome::StateConflict {
                     observed: inputs.state,
@@ -1417,12 +1622,12 @@ async fn run_one_attempt(
             // is one of the 3 allowed values by construction; the
             // `unreachable!()` arm guards against future filter drift.
             let source_state = match inputs.state {
-                DocState::Signed | DocState::ErrorRetryable | DocState::OfflineLocalAck => {
-                    inputs.state
-                }
+                // CS-3 S7-1 (R2): ErrorRetryable dropped — kept in sync with the top allowlist so the
+                // `unreachable!` stays honest (an ER doc surfaced as `StateConflict` above).
+                DocState::Signed | DocState::OfflineLocalAck => inputs.state,
                 other => unreachable!(
-                    "MED-C5-1 invariant: top-of-4-pre allowlist already filtered \
-                     non-{{Signed,ErrorRetryable,OfflineLocalAck}}; got {other:?}"
+                    "S7-1 R2 invariant: top-of-4-pre allowlist already filtered \
+                     non-{{Signed,OfflineLocalAck}}; got {other:?}"
                 ),
             };
             match fd::transition_state(tx, doc, source_state, DocState::Sending).await? {
@@ -1485,54 +1690,59 @@ async fn run_one_attempt(
             )
             .await?;
 
+            // ── S7-1 §2.1 (P3): online-origin pre-wire predecessor equality ──
+            // The FN chain seed MUST equal this doc's `previous_hash` BEFORE we mint the reservation —
+            // moving the incumbent post-wire drift check to the ONLY safe side of the wire, in the
+            // SAME `BEGIN IMMEDIATE` as the reservation insert + CALL_STARTED marker. Online-origin
+            // only (offline follows the offline chain/cohort rules). A mismatch refuses with ZERO wire
+            // (the whole authorize tx rolls back, so no reservation is minted).
+            if inputs.offline_fiscal_no.is_none() {
+                let ns = node_state::get_tx(tx, &inputs.fiscal_number)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "stage_send P3: node_state row missing for FN {} (doc {doc:?})",
+                            inputs.fiscal_number
+                        )
+                    })?;
+                anyhow::ensure!(
+                    ns.last_known_unsigned_xml_sha256.as_ref().map(|h| h.as_slice())
+                        == inputs.previous_hash.as_deref(),
+                    "stage_send P3: online predecessor drift for doc {doc:?} — node seed != \
+                     doc.previous_hash; refusing authorize (zero wire)"
+                );
+            }
+
+            // ── S7-1: mint the delivery reservation in THIS tx (P2 Layer 2/3) ──
+            // `authorize_submission` does the call-once `NOT EXISTS` + `RESERVED_NOT_STARTED` insert +
+            // generation advance + `RN→CALL_STARTED` CAS, and returns the sealed non-`Clone`
+            // `Authorization` that gates the sole wire. `envelope_hash` = the FULL wire hash (B1).
+            let auth = crate::db::repositories::delivery_reservation::authorize_submission(
+                tx,
+                build_new_reservation(doc, &inputs, &envelope),
+                &now_db_format(),
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+
             Ok(PreOutcome::Marked {
+                auth,
                 envelope,
                 attempt_no,
                 doc_type: inputs.doc_type,
-                shift_id: inputs.shift_id,
-                offline_fiscal_no: inputs.offline_fiscal_no,
-                previous_hash: inputs.previous_hash,
-                unsigned_xml_sha256: inputs.unsigned_xml_sha256,
-                mac_recovery_attempts: inputs.mac_recovery_attempts,
-                fiscal_number: inputs.fiscal_number,
             })
         })
     })
     .await
     .map_err(bridge_anyhow)?;
 
-    let (
-        envelope,
-        attempt_no,
-        doc_type,
-        fiscal_number,
-        shift_id,
-        offline_fiscal_no,
-        previous_hash,
-        unsigned_xml_sha256,
-        mac_recovery_attempts,
-    ) = match pre {
+    let (auth, envelope, attempt_no, doc_type) = match pre {
         PreOutcome::Marked {
+            auth,
             envelope,
             attempt_no,
             doc_type,
-            fiscal_number,
-            shift_id,
-            offline_fiscal_no,
-            previous_hash,
-            unsigned_xml_sha256,
-            mac_recovery_attempts,
-        } => (
-            envelope,
-            attempt_no,
-            doc_type,
-            fiscal_number,
-            shift_id,
-            offline_fiscal_no,
-            previous_hash,
-            unsigned_xml_sha256,
-            mac_recovery_attempts,
-        ),
+        } => (auth, envelope, attempt_no, doc_type),
         PreOutcome::DocumentMissing => return Ok(StageSendOutcome::DocumentMissing),
         PreOutcome::SignedArtifactMissing => {
             return Err(StageSendError::SignedArtifactMissing { document_id: doc })
@@ -1550,574 +1760,90 @@ async fn run_one_attempt(
         }
     };
 
-    // ── 4a — wire send OUTSIDE any lock ──────────────────────────────
-    //
-    // W3 static scanner enforces that `send_chk` / `send_chk_observed`
-    // are not reachable from inside any `with_immediate` closure body;
-    // the runtime
-    // task_local guard panics in debug if a foreign-IO call happens
-    // inside a BEGIN IMMEDIATE scope.  This call site is at module
-    // top level, between the two `with_immediate` blocks above and
-    // below.
+    // ── PHASE 2 — WIRE (outside any lock): `submit_authorized` is the SOLE `send_chk_observed` ──
+    // The wire RELOCATES here from the deleted legacy 4a: `submit_authorized` consumes the sealed
+    // non-`Clone` `Authorization` by value, echoes the full binding + envelope hash (AO-2 + rebind),
+    // fires EXACTLY ONE `send_chk_observed`, and surfaces the byte-identical legacy `Result` for the
+    // drift-pin + trace/audit routing. P2 Layer 3: no wire-capable value survives the call.
+    let port_binding = production_dps_binding();
     let wire_call_started_at = now_db_format();
-    // CS-3 3.2 PR2 pin3: the single-RPC fan-out. `wire_result` (the tuple `.0`) is byte-identical
-    // to the former `send_chk(...)` — for `GrpcDpsChannel` it is the SAME decode on the SAME single
-    // `send_chk_v2` reply, so routing/audit/CAS are unchanged. `wire_observation` is the total
-    // transport-minted shadow; in 3.2 it is bound READ-ONLY and drives NOTHING (no record, no
-    // second wire, no `-12` change) — it is wired live in PR4/Bridge.
-    let (wire_result, wire_observation) = dps_channel.send_chk_observed(envelope.clone()).await;
-    // CS-3 3.2 PR4 pin B: project the transport-minted shadow into the typed delivery contract
-    // (`RawSendReply` + store `doc_type` → `SendResponse`, spec §4.3). READ-ONLY in 3.2 — the mapped
-    // response drives NOTHING (no classify-record, no state, no second wire); the §4.6 drift-pin
-    // proves it agrees with the live `route_send_result` outcome below, and D/E wires it live.
-    let _shadow_response = super::shadow_map::map_send_reply(wire_observation.evidence(), doc_type);
+    let (obs, legacy) = match super::submit::submit_authorized(
+        dps_channel,
+        &port_binding,
+        auth,
+        envelope,
+        doc_type,
+    )
+    .await
+    {
+        Ok(v) => v,
+        // Unreachable by construction (fixed binding + the SAME envelope moved to the wire). Fail
+        // closed if it ever fires — the reservation is already `CALL_STARTED`, so boot normalizes it
+        // (`resume_crashed_reservation`) without a re-wire (D-FIX-D; the STOP hardening is a follow-up).
+        Err(refused) => {
+            return Err(StageSendError::Internal(anyhow::anyhow!(
+            "submit_authorized refused for doc {doc:?} (unreachable, fixed binding): {refused:?}"
+        )))
+        }
+    };
     let wire_call_finished_at = now_db_format();
 
-    // W10.2: dispatch on the typed routing surface.  `is_live_send=true`
-    // — production stage 4 send (freeze §3.5; W9 reconciliation will
-    // pass `false`).  Forensics (status_code / error_kind /
-    // error_message) are extracted ONCE here so they're available BOTH
-    // for the 4-b `transport_trace::complete_tx` row AND for the
-    // public `StageSendOutcome::Routed { wire_status_code,
-    // wire_error_message, .. }` surface tests rely on.
-    let wire_forensics: Option<(Option<i32>, &'static str, String)> = match &wire_result {
+    // ── PHASE 3 setup — the TARGET authority (FIX-B2) ──
+    // Forensics from the byte-identical legacy result (for the trace row + the public Routed surface).
+    let wire_forensics: Option<(Option<i32>, &'static str, String)> = match &legacy {
         Ok(_) => None,
         Err(e) => Some(extract_wire_forensics(e)),
     };
-    let wire_decision = route_send_result(wire_result, doc_type, true);
+    // Build the TARGET record arguments (classify axes + the lossless evidence discriminant + the
+    // classifier). `record_outcome` persists these — the DURABLE authority.
+    let (disc, outcome, classified) = build_record_args(&obs).map_err(StageSendError::Internal)?;
+    // The legacy wire routing maps the raw `Result` onto a `WireDecision`; `target_wire_decision`
+    // already reconciles the empty-SFN `Sent{""}` → `OkButNoFiscalNumber` HELD leaf. It is retained
+    // for wire-forensics + the drift-pin only. F3: the `decision` that drives trace + audit + the
+    // returned outcome + drain failure-class is PROJECTED from the SAME classifier that built the
+    // durable record, so those observations can never disagree with durable (today the sole
+    // retry-class divergence is `RemoteAuthStatus` → ProbeRequired vs the legacy TransientRetry).
+    let legacy_decision = target_wire_decision(route_send_result(legacy, doc_type, true));
+    let decision = project_decision_from_evidence(legacy_decision, &classified);
+    // Capture the reservation id BEFORE `obs` is moved into the record transaction.
+    let reservation_id = obs.reservation_id();
 
-    // EmptyServerFiscalNo guard (LOW risk close from W7.3 review).
-    // The transport_trace OK-CHECK would otherwise reject 4-b commit
-    // and roll back the entire 4-b tx (losing the audit and
-    // CAS-Sending->Sent in the process); catching here lets the
-    // doc stay cleanly in `Sending` for W9 reconciliation.
-    if let WireDecision::Sent { server_fiscal_no } = &wire_decision {
-        if server_fiscal_no.is_empty() {
-            return Err(StageSendError::EmptyServerFiscalNo { document_id: doc });
-        }
-    }
+    // ── PHASE 3 — RECORD tx: record_outcome (axes + PENDING_APPLY + early STOP/BLOCKED) + trace + audit.
+    record_transaction(
+        pool,
+        obs,
+        outcome,
+        disc,
+        decision.clone(),
+        wire_forensics.clone(),
+        wire_call_started_at,
+        wire_call_finished_at,
+        doc,
+        attempt_no,
+    )
+    .await?;
 
-    // ── 4b ───────────────────────────────────────────────────────────
-    //
-    // W10.2 dispatch:
-    //   - `WireDecision::Sent`            → CAS Sending → Sent +
-    //                                        set_server_fiscal_no_tx +
-    //                                        audit STAGE_SEND_RESULT.
-    //   - `WireDecision::Routed(decision)` → CAS Sending →
-    //                                        decision.target_state +
-    //                                        audit decision.audit_event.
-    //
-    // **W10.3 honoured.**  `decision.node_mode_flip == Some(Blocked)`
-    // is invoked inside this same 4-b `with_immediate` envelope —
-    // `node_state.mode → BLOCKED` is atomic with the CAS
-    // `Sending → Rejected` and the audit row.  Server-11 cannot leave
-    // the FN unblocked.
-    //
-    // **W10.2 deferred:**
-    //   - `decision.mac_recovery_hint` (Server-12) → W10.4 will
-    //     orchestrate MAC re-sign + re-send BEFORE this 4-b commit.
-    //   - `decision.probe_hint` → W9 reconciliation territory; never
-    //     actioned in stage 4 (only surfaced in audit payload for
-    //     forensic grep, per W10.2 review LOW/MED 3).
-
-    // L0 — derive closing cash BEFORE the 4-b write-tx (invariant #1: no
-    // DB reads are forbidden inside write-tx, but the derive call is a
-    // SELECT-only pool read that must happen OUTSIDE the IMMEDIATE lock).
-    // Only computed for the CLOSE edge (ZReport/ShiftClose, online-origin).
-    // Opening stored in cash_balance_kop at create-time; re-read here so
-    // the derive is self-contained (no extra state threaded from acquire).
-    let closing_cash_kop_for_4b: Option<i64> = if offline_fiscal_no.is_none()
-        && matches!(doc_type, DocType::ZReport | DocType::ShiftClose)
-    {
-        if let Some(sid) = shift_id {
-            // Re-read the opening anchor from shifts.cash_balance_kop
-            // (written at shift-open acquire, this is the opening value
-            // before the close overwrites it).
-            let opening_kop: i64 = sqlx::query_scalar::<_, i64>(
-                "SELECT cash_balance_kop FROM shifts WHERE shift_id = ?",
-            )
-            .bind(sid.as_bytes().to_vec())
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None)
-            .unwrap_or(0);
-            Some(
-                crate::services::cash_ledger::derive_closing_cash(
-                    pool,
-                    &fiscal_number,
-                    sid,
-                    opening_kop,
-                )
-                .await
-                .unwrap_or_else(|e| {
-                    // HOLE 3 — HOLE 3 fix: audit the derive-cash fallback so it is
-                    // observable.  The fallback is safe (shift commit proceeds with
-                    // the opening anchor), but silently swallowing the error meant
-                    // `cash_balance_kop` on the closed shift would be wrong without
-                    // any trace.  `audit_log::append` is pool-based (outside any
-                    // write-tx — invariant #1 honoured) so this fires synchronously
-                    // before the 4-b envelope.
-                    let doc_hex = format!("{doc:?}");
-                    let fn_str = fiscal_number.clone();
-                    let payload = serde_json::json!({
-                        "doc": doc_hex,
-                        "fiscal_number": fn_str,
-                        "doc_type": format!("{doc_type:?}"),
-                        "error": e.to_string(),
-                        "fallback_kop": opening_kop,
-                    })
-                    .to_string();
-                    // Fire the audit in a blocking-on-pool call.  This fn is async
-                    // but `unwrap_or_else` is sync — use tokio::task::block_in_place
-                    // to await; this branch fires only on a rare derive failure
-                    // (DB error reading issued receipts) and is off the hot path.
-                    let pool_ref = pool.clone();
-                    // We can't call `.await` in a closure, so spawn a task and block
-                    // on it.  This is safe here because we are already in a Tokio
-                    // async context (stage_send is always called from an async fn).
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let _ = audit_log::append(
-                                &pool_ref,
-                                "fiscal_document",
-                                &doc_hex,
-                                "l0_derive_closing_cash_fallback",
-                                Severity::Warning,
-                                None,
-                                Some(&payload),
-                            )
-                            .await;
-                        })
-                    });
-                    opening_kop
-                }), // safe fallback: don't lose shift commit
-            )
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let decision_for_closure = wire_decision.clone();
-    let forensics_for_closure = wire_forensics.clone();
-    let started_for_closure = wire_call_started_at;
-    let finished_for_closure = wire_call_finished_at;
-    // R-W10.3-review LOW 2 close: `fiscal_number` is moved directly
-    // (single owner — the closure).  `wire_decision` and
-    // `wire_forensics` are cloned because the post-closure return
-    // block reads them; `fiscal_number` is not.
-    with_immediate(pool, move |tx| {
-        let decision = decision_for_closure;
-        let forensics = forensics_for_closure;
-        let started = started_for_closure;
-        let finished = finished_for_closure;
-        let closing_cash_kop = closing_cash_kop_for_4b;
-        // `fiscal_number` captured directly via `move`; no rebind
-        // (R-W10.3-review LOW 3 close — the previous self-rebind
-        // `let fiscal_number = fiscal_number;` was a no-op).
-        Box::pin(async move {
-            let target = match &decision {
-                WireDecision::Sent { .. } => DocState::Sent,
-                WireDecision::Routed(d) => d.target_state,
-            };
-
-            // Post-wire CAS Sending -> target.  Single-writer +
-            // 4-pre-committed marker: any non-Applied outcome here is
-            // a structural breach (no other writer can mutate the
-            // doc, the marker is durable).
-            match fd::transition_state(tx, doc, DocState::Sending, target).await? {
-                TransitionOutcome::Applied => {}
-                observed => {
-                    return Err(anyhow::Error::new(StageSendError::PostWireCasFailed {
-                        document_id: doc,
-                        target,
-                        observed,
-                    }));
-                }
+    // ── PHASE 4 — APPLY orchestration (shared live + boot): doc CAS / SFN / seed / shift + APPLIED.
+    // A `HeldNotAutoRelease` is the EXPECTED result for a `-12`/`-6`/SubmittedUnknown routed leaf: the
+    // doc rests `PENDING_APPLY` under STOP (set in record), and the outcome is surfaced below — it is
+    // NOT an error (FIX-C). Real structural / DB errors propagate.
+    match super::apply_orchestration::apply_recorded_outcome(pool, reservation_id).await {
+        Ok(_) => {}
+        Err(e) => match e
+            .downcast_ref::<crate::db::repositories::delivery_reservation::ApplyError>()
+        {
+            Some(crate::db::repositories::delivery_reservation::ApplyError::HeldNotAutoRelease) => {
             }
-
-            // server_fiscal_no UPDATE on success branch (Empty guard
-            // ran before this closure; we know it's non-empty here).
-            //
-            // A.3 sfn-lockstep pin (§6 step 3): the ONLY live online
-            // issued-forward edge today is this `WireDecision::Sent` arm, so
-            // `set_server_fiscal_no_tx` + the seed advance below stay in
-            // lockstep (sfn set ⟺ seed advanced — the D3 discriminator). The
-            // dormant sfn-less edges (`(Sending,Kvt1)` inline fast-path,
-            // `(ErrorRetryable,Sent/Kvt1)` re-sends) are removed in PR-B; when
-            // the inline fast-path returns it MUST stamp sfn + advance here too.
-            if let WireDecision::Sent { server_fiscal_no } = &decision {
-                if !fd::set_server_fiscal_no_tx(tx, doc, server_fiscal_no).await? {
-                    return Err(anyhow::Error::new(
-                        StageSendError::SetServerFiscalNoMissing { document_id: doc },
-                    ));
-                }
-
-                // ── A.3 ADVANCE-AT-SEND (design v3 §6 step 2; dossier §9.1
-                //    Variant P) — the online issuance moment IS this fresh
-                //    `WireDecision::Sent` Applied CAS.  Advance the FN chain
-                //    seed (`node_state.last_known_unsigned_xml_sha256`) to THIS
-                //    doc's `unsigned_xml_sha256`, atomic with the CAS + sfn
-                //    stamp above (so `server_fiscal_no` set ⟺ seed advanced —
-                //    the D3 discriminator).  Online-origin ONLY (offline
-                //    advances at offline-ack, M2-01).  Chain fields come from
-                //    the PRE-CAS `SendInputs` snapshot (audit F7 — NO post-CAS
-                //    re-read).  The pre-advance drift-assert mirrors
-                //    `stage_offline_ack`: on a chain fork it FAILS CLOSED and
-                //    rolls the whole envelope back (doc stays `Sending` for
-                //    reconciliation); the D5 gate (A.3 PR-C) prevents the
-                //    interleave that could trip it after the wire call.
-                if offline_fiscal_no.is_none() {
-                    let ns = node_state::get_tx(tx, &fiscal_number).await?.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "stage_send: node_state row missing for FN {fiscal_number} at online \
-                             seed advance (doc {doc:?})"
-                        )
-                    })?;
-                    let unsigned_arr: [u8; 32] = unsigned_xml_sha256
-                        .as_deref()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "stage_send: online SENT doc {doc:?} missing unsigned_xml_sha256"
-                            )
-                        })?
-                        .try_into()
-                        .map_err(|_| {
-                            anyhow::anyhow!(
-                                "stage_send: doc {doc:?} unsigned_xml_sha256 is not 32 bytes"
-                            )
-                        })?;
-                    // C14 Variant P (dossier §9.1): a recovered doc
-                    // (`mac_recovery_attempts >= 1`) deliberately re-anchored
-                    // `previous_hash` onto the DPS-supplied hash, voiding the
-                    // `local-seed == previous_hash` premise BY CONSTRUCTION — so
-                    // SKIP the equality gate (else it would false-fail on every
-                    // successful `-12` recovery).  The advance target (this
-                    // doc's own re-signed sha) is unchanged, re-syncing the
-                    // local chain onto DPS's tip.  Safe: the mac-recovery loop
-                    // runs in-run under the FN single-writer lease.
-                    if mac_recovery_attempts < 1 {
-                        anyhow::ensure!(
-                            ns.last_known_unsigned_xml_sha256.as_ref().map(|h| h.as_slice())
-                                == previous_hash.as_deref(),
-                            "stage_send: chain-seed drift for doc {doc:?} — node_state seed != \
-                             doc.previous_hash (online issuance must extend the chain from the last \
-                             issued doc); refusing to advance"
-                        );
-                    }
-                    if !node_state::update_last_known_xml_sha_tx(tx, &fiscal_number, &unsigned_arr)
-                        .await?
-                    {
-                        anyhow::bail!(
-                            "stage_send: node_state row vanished mid-envelope for FN \
-                             {fiscal_number} (doc {doc:?}) at online seed advance"
-                        );
-                    }
-                }
-
-                // A′.1 piece 2 — shift confirm edges 3/10.  "DPS Ack" for the
-                // shift ladder = SENT + `server_fiscal_no` (this fresh
-                // `WireDecision::Sent` Applied CAS), NOT terminal Ack — a
-                // finalize hook would stall SELLs for the whole reconciliation
-                // window (plan §2).  Online-origin ONLY (`offline_fiscal_no IS
-                // NULL`): the drain owns the offline pending-drain shift edges
-                // (backlog_drain.rs:2460), so an offline-origin doc must not
-                // double-fire here.  POST-WIRE: a non-Applied shift-CAS does
-                // NOT roll back the Sent commit (wire-truth wins) — see
-                // `confirm_shift_edge`.
-                if offline_fiscal_no.is_none() {
-                    match doc_type {
-                        DocType::ShiftOpen => {
-                            confirm_shift_edge(
-                                tx,
-                                &fiscal_number,
-                                shift_id,
-                                doc,
-                                ShiftState::Opening,
-                                ShiftState::Opened,
-                                "edge3_open",
-                                None, // opening edge: no closing cash to persist
-                            )
-                            .await?;
-                        }
-                        DocType::ZReport | DocType::ShiftClose => {
-                            confirm_shift_edge(
-                                tx,
-                                &fiscal_number,
-                                shift_id,
-                                doc,
-                                ShiftState::Closing,
-                                ShiftState::Closed,
-                                "edge10_close",
-                                closing_cash_kop, // L0 closing anchor
-                            )
-                            .await?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // W10.3 — node_state.mode flip atomic with the CAS above.
-            // Only Server-11 currently emits this flip; future routes
-            // may emit it for additional NodeMode targets.  We restrict
-            // to BLOCKED here (the only target the routing fn ever
-            // emits per freeze §3); if `node_mode_flip` ever carries
-            // a different NodeMode, the match falls through to a
-            // skip — surfaced via debug_assert! so dev/CI catches it.
-            if let WireDecision::Routed(d) = &decision {
-                if let Some(target_mode) = d.node_mode_flip {
-                    debug_assert_eq!(
-                        target_mode,
-                        crate::db::models::enums::NodeMode::Blocked,
-                        "W10.3 only honours NodeMode::Blocked; routing fn must \
-                         not emit other NodeMode targets without extending stage_send"
-                    );
-                    if target_mode == crate::db::models::enums::NodeMode::Blocked
-                        && !node_state::set_mode_blocked_tx(tx, &fiscal_number).await?
-                    {
-                        return Err(anyhow::Error::new(
-                            StageSendError::NodeStateMissingForBlock {
-                                fn_id: fiscal_number.clone(),
-                                document_id: doc,
-                            },
-                        ));
-                    }
-                }
-            }
-
-            // Complete trace row.  rows_affected == 0 ⇒ typed error
-            // (W7.1 append-then-complete contract).
-            let completion =
-                build_attempt_completion(&decision, forensics.as_ref(), started, finished);
-            let outcome_kind_str = completion.outcome_kind.as_str();
-            let rows = transport_trace::complete_tx(tx, doc, attempt_no, completion).await?;
-            if rows == 0 {
-                return Err(anyhow::Error::new(StageSendError::TraceMissingAtComplete {
-                    document_id: doc,
-                    attempt_no,
-                }));
-            }
-
-            // Audit event: success arm uses STAGE_SEND_RESULT (W7
-            // contract); routed arm uses `decision.audit_event` per
-            // freeze §3.4 closed enum.
-            //
-            // Payload composition (W10.2 LOW 1 + LOW/MED 3 + W10.3 LOW 1):
-            //   - `attempt_no`, `outcome_kind` always present (W7).
-            //   - `retry_class` on the routed arm — forensic grep
-            //     dimension orthogonal to event_type.
-            //   - `node_mode_flipped: "Blocked"` on Server-11 — durable
-            //     evidence of the W10.3 flip; redundant with the
-            //     `node_state.mode = 'BLOCKED'` row (DDL keeps SHOUTING
-            //     case) but cheap, and lets audit-log forensics work
-            //     without a join.
-            //   - `probe_hint` reason on Decode/-2/-15 close-shift —
-            //     surfaces the W9 last_chk-probe target without
-            //     re-decoding the routing fn.
-            let (event_type, severity) = match &decision {
-                WireDecision::Sent { .. } => ("STAGE_SEND_RESULT", Severity::Info),
-                WireDecision::Routed(d) => (d.audit_event.as_str(), d.audit_severity),
-            };
-            let mut payload_obj = serde_json::json!({
-                "attempt_no": attempt_no,
-                "outcome_kind": outcome_kind_str,
-            });
-            if let WireDecision::Routed(d) = &decision {
-                // R-W10.3-review LOW 1 close: all three payload
-                // discriminators use PascalCase consistently — matches
-                // `RetryClass::as_str()` migration-012 wire form and the
-                // Rust `Debug` form of `NodeMode` / `ProbeReason`.
-                // Earlier draft uppercased `node_mode_flipped`; that
-                // mirrored the DDL form ('BLOCKED') but broke
-                // forensic-grep consistency across audit_log JSON
-                // payloads.
-                //
-                // R-W10.3-review LOW 3 doc note: `node_mode_flipped`
-                // encodes ROUTING INTENT (the `-11` decision asked
-                // for BLOCKED), NOT a state transition observation.
-                // SQLite UPDATE semantics report rows_affected=1 for
-                // a matching row even when the value is unchanged, so
-                // the second `-11` for the same already-BLOCKED FN
-                // emits the same payload — by design, no CAS guard
-                // (avoids a read-then-write race on a hot path).
-                payload_obj["retry_class"] =
-                    serde_json::Value::String(d.retry_class.as_str().to_string());
-                if let Some(mode) = d.node_mode_flip {
-                    payload_obj["node_mode_flipped"] =
-                        serde_json::Value::String(format!("{mode:?}"));
-                }
-                if let Some(hint) = &d.probe_hint {
-                    payload_obj["probe_hint"] =
-                        serde_json::Value::String(format!("{:?}", hint.reason));
-                }
-            }
-            let payload = payload_obj.to_string();
-            audit_log::append_tx(
-                tx,
-                "fiscal_document",
-                &format!("{doc:?}"),
-                event_type,
-                severity,
-                None,
-                Some(&payload),
-            )
-            .await?;
-
-            Ok::<_, anyhow::Error>(())
-        })
-    })
-    .await
-    .map_err(bridge_anyhow)?;
-
-    Ok(match wire_decision {
-        WireDecision::Sent { server_fiscal_no } => StageSendOutcome::Sent {
-            server_fiscal_no,
-            attempt_no,
+            _ => return Err(StageSendError::Internal(e)),
         },
-        WireDecision::Routed(decision) => {
-            let (wire_status_code, wire_error_message) = match &wire_forensics {
-                Some((code, _kind, msg)) if !msg.is_empty() => (*code, Some(truncate_msg(msg))),
-                Some((code, _kind, _empty)) => (*code, None),
-                // Routed arm without source forensics is a programming
-                // bug — Routed only reaches here from `Err(_)`.
-                None => (None, None),
-            };
-            StageSendOutcome::Routed {
-                decision,
-                attempt_no,
-                wire_status_code,
-                wire_error_message,
-            }
-        }
-    })
-}
-
-// ─── W10.4 step 2d — recovery-failure override helpers ───────────────
-
-/// Synthetic `RoutingDecision` for the post-recovery override paths
-/// (HashNotExtractable / CounterExhausted): doc transitions
-/// `ErrorRetryable → Rejected`; the carried `audit_event` discriminates
-/// which recovery-failure mode caused the override.
-fn synthetic_rejected_decision(audit_event: AuditEvent) -> RoutingDecision {
-    RoutingDecision {
-        target_state: DocState::Rejected,
-        retry_class: RetryClass::TerminalReject,
-        audit_event,
-        audit_severity: Severity::Error,
-        node_mode_flip: None,
-        probe_hint: None,
-        mac_recovery_hint: None,
     }
-}
 
-/// Override path for `HashNotExtractable`: orchestrator already emitted
-/// `MAC_RECOVERY_HASH_NOT_EXTRACTABLE`.  Caller's job is just to CAS
-/// the doc out of `ErrorRetryable` into `Rejected`.  No audit row
-/// (recovery layer + final state suffice for forensics).
-///
-/// `synthetic_decision_event` populates the surfaced
-/// `StageSendOutcome::Routed.decision.audit_event`.  The helper does
-/// NOT emit an audit row — naming reflects "which event the synthetic
-/// decision will carry", not "what we'll write to audit_log"
-/// (R-W10.4-step2d-review LOW 2 close — earlier `audit_event_for_outcome`
-/// suggested writing).
-///
-/// `wire_error_message` carries the original `-12` wire message
-/// through to the public `StageSendOutcome` surface so caller-side
-/// forensics don't lose context (R-W10.4-step2d-review LOW 1 close).
-async fn override_to_rejected_no_additional_audit(
-    pool: &SqlitePool,
-    doc: DocumentId,
-    attempt_no: i32,
-    synthetic_decision_event: AuditEvent,
-    wire_error_message: Option<String>,
-) -> Result<StageSendOutcome, StageSendError> {
-    with_immediate(pool, move |tx| {
-        Box::pin(async move {
-            match fd::transition_state(tx, doc, DocState::ErrorRetryable, DocState::Rejected)
-                .await?
-            {
-                TransitionOutcome::Applied => Ok::<_, anyhow::Error>(()),
-                observed => Err(anyhow::Error::new(StageSendError::PostWireCasFailed {
-                    document_id: doc,
-                    target: DocState::Rejected,
-                    observed,
-                })),
-            }
-        })
-    })
-    .await
-    .map_err(bridge_anyhow)?;
-    Ok(StageSendOutcome::Routed {
-        decision: synthetic_rejected_decision(synthetic_decision_event),
+    // The returned outcome is derived from the TARGET decision (FIX-B2), not the raw legacy.
+    Ok(stage_send_outcome_from(
+        decision,
         attempt_no,
-        // `-12` is the only Server status code that maps to
-        // `RetryClass::MacRecovery` (W10.1 routing fn §2.1 row -12);
-        // hardcoded value matches the contract.
-        wire_status_code: Some(-12),
-        wire_error_message,
-    })
-}
-
-/// Override path for `CounterExhausted` AND for second `-12` after a
-/// successful Resigned in the same `run()` call.  Both signal that the
-/// recovery budget is spent; emit `MAC_RECOVERY_FAILED_REPEAT_HASH_MISMATCH`
-/// audit + CAS to `Rejected` atomically.
-///
-/// `wire_error_message` (R-W10.4-step2d-review LOW 1 close) preserves
-/// the wire `-12` message through to the public `StageSendOutcome`.
-async fn override_to_rejected_with_failed_repeat_audit(
-    pool: &SqlitePool,
-    doc: DocumentId,
-    attempt_no: i32,
-    wire_error_message: Option<String>,
-) -> Result<StageSendOutcome, StageSendError> {
-    let payload = serde_json::json!({
-        "attempt_no": attempt_no,
-        "outcome_kind": "REJECTED",
-        "retry_class": RetryClass::TerminalReject.as_str(),
-    })
-    .to_string();
-    with_immediate(pool, move |tx| {
-        let payload = payload.clone();
-        Box::pin(async move {
-            match fd::transition_state(tx, doc, DocState::ErrorRetryable, DocState::Rejected)
-                .await?
-            {
-                TransitionOutcome::Applied => {}
-                observed => {
-                    return Err(anyhow::Error::new(StageSendError::PostWireCasFailed {
-                        document_id: doc,
-                        target: DocState::Rejected,
-                        observed,
-                    }));
-                }
-            }
-            audit_log::append_tx(
-                tx,
-                "fiscal_document",
-                &format!("{doc:?}"),
-                AuditEvent::MacRecoveryFailedRepeatHashMismatch.as_str(),
-                Severity::Error,
-                None,
-                Some(&payload),
-            )
-            .await?;
-            Ok::<_, anyhow::Error>(())
-        })
-    })
-    .await
-    .map_err(bridge_anyhow)?;
-    Ok(StageSendOutcome::Routed {
-        decision: synthetic_rejected_decision(AuditEvent::MacRecoveryFailedRepeatHashMismatch),
-        attempt_no,
-        // See note in `override_to_rejected_no_additional_audit`:
-        // `-12` is the only MacRecovery wire code.
-        wire_status_code: Some(-12),
-        wire_error_message,
-    })
+        wire_forensics.as_ref(),
+    ))
 }
 
 // ─── Unit tests for the pure surface ─────────────────────────────────
@@ -2126,6 +1852,201 @@ async fn override_to_rejected_with_failed_repeat_audit(
 mod tests {
     use super::*;
     use crate::db::models::enums::{DocState, DocType};
+
+    // ─── F3 — projection agrees with the durable evidence classifier ───
+    //
+    // In prod a TLS-proven Unauthenticated/PermissionDenied couples a FAITHFUL `RemoteAuthStatus`
+    // observation (→ `classify` = ProbeRequired, the DURABLE record) with a `DpsError::RemoteStatus`
+    // legacy (→ the compat wire routing = TransientRetry). Before F3 the projection (trace / audit /
+    // returned outcome / drain) was driven by the legacy TransientRetry and thus DISAGREED with the
+    // durable ProbeRequired. `project_decision_from_evidence` projects the classifier onto the wire
+    // decision so they cannot diverge. (Tests cannot mint a faithful `RawSendObservation` —
+    // `RawSendReply::remote_auth_status` is `pub(in crate::transports::dps)` by design — so this
+    // exercises the projection seam directly against a real `classify(RemoteAuthStatus)`.)
+    #[test]
+    fn f3_remote_status_projects_probe_required_from_evidence_not_legacy() {
+        use prro_domain::delivery::{
+            classify, ActiveRetryClass, DpsProtocolBinding, DpsProtocolId, EnvelopeHash,
+            GrpcStatusDigest, ProtocolContractVersion, RemoteStatusEvidence, SendResponse,
+            SubmissionEvidence,
+        };
+
+        let evidence = SubmissionEvidence::Started {
+            response: SendResponse::remote_status(RemoteStatusEvidence::RemoteAuthStatus(
+                GrpcStatusDigest::from_transport_digest([0xCD; 32]),
+            )),
+            binding: DpsProtocolBinding {
+                protocol_id: DpsProtocolId::FscoZzd,
+                contract_version: ProtocolContractVersion(1),
+                capability_profile_version: None,
+                endpoint_config_revision: None,
+            },
+            envelope_hash: EnvelopeHash([0u8; 32]),
+        };
+        let classified = classify(&evidence);
+        // DURABLE authority: RemoteAuthStatus classifies ProbeRequired.
+        assert_eq!(
+            classified.routing(),
+            Some(ActiveRetryClass::ProbeRequired),
+            "durable authority: RemoteAuthStatus → ProbeRequired"
+        );
+
+        // The coupled legacy DPS-error routing is the compat TransientRetry (the F3 delta).
+        let legacy = target_wire_decision(route_send_result(
+            Err(DpsError::RemoteStatus {
+                code: "Unauthenticated".into(),
+                message: "gateway".into(),
+                digest: GrpcStatusDigest::from_transport_digest([0xCD; 32]),
+            }),
+            DocType::Sell,
+            true,
+        ));
+        match &legacy {
+            WireDecision::Routed(d) => assert_eq!(
+                d.retry_class,
+                RetryClass::TransientRetry,
+                "legacy compat routing = TransientRetry (the delta)"
+            ),
+            WireDecision::Sent { .. } => panic!("RemoteStatus legacy must be Routed"),
+        }
+
+        // F3: project the durable authority onto the wire decision.
+        let decision = project_decision_from_evidence(legacy, &classified);
+        let d = match &decision {
+            WireDecision::Routed(d) => d,
+            WireDecision::Sent { .. } => panic!("projected decision must be Routed"),
+        };
+        assert_eq!(
+            d.retry_class,
+            RetryClass::ProbeRequired,
+            "F3: projection reflects DURABLE ProbeRequired, NOT legacy TransientRetry"
+        );
+        assert_eq!(
+            d.audit_event,
+            AuditEvent::StageSendProbeRequired,
+            "F3: audit event is the (reused) probe-required event"
+        );
+        assert_eq!(
+            d.probe_hint.as_ref().map(|h| h.reason),
+            Some(ProbeReason::RemoteStatus),
+            "F3: distinct RemoteStatus probe reason (NOT OkButNoFiscalNumber)"
+        );
+
+        // End-to-end projection consistency: the transport_trace retry_class column + the returned
+        // outcome (→ drain failure-class) both agree with durable ProbeRequired, not TransientRetry.
+        let forensics = (None, "Transport", "gateway".to_string());
+        let completion =
+            build_attempt_completion(&decision, Some(&forensics), "t0".into(), "t1".into());
+        assert_eq!(
+            completion.retry_class.as_deref(),
+            Some("ProbeRequired"),
+            "F3: transport_trace.retry_class == durable ProbeRequired"
+        );
+        match stage_send_outcome_from(decision, 1, Some(&forensics)) {
+            StageSendOutcome::Routed { decision, .. } => assert_eq!(
+                decision.retry_class,
+                RetryClass::ProbeRequired,
+                "F3: returned StageSendOutcome (→ drain failure-class) == durable ProbeRequired"
+            ),
+            _ => panic!("returned outcome must be Routed"),
+        }
+    }
+
+    /// CS-3 S7-1 (F3 re-audit MAJOR fix): the REVERSE projection direction. An unknown non-zero DPS
+    /// status code (e.g. `-17`, outside the proto enum `-16..=1`) is the §4.6 preserved raw drift-delta
+    /// — the durable classifier maps it `UnknownStatus → TransientRetry`, while the legacy tonic-decode
+    /// fails → `Decode → ProbeRequired`. Before this fix `project_decision_from_evidence` reconciled
+    /// ONLY the `classifier == ProbeRequired` direction, so for this reachable reply the observable
+    /// (trace / audit / returned outcome / drain failure-class) stayed the legacy `ProbeRequired` while
+    /// the durable `delivery_reservation.routing_class` recorded `TransientRetry` — a durable-vs-
+    /// observable split. The symmetric arm projects the durable `TransientRetry` onto the observable.
+    #[test]
+    fn f3_unknown_nonzero_projects_transient_retry_from_evidence_not_legacy() {
+        use prro_domain::delivery::{
+            classify, ActiveRetryClass, DecodedResponseDigest, DpsProtocolBinding, DpsProtocolId,
+            EnvelopeHash, NonOkStatusCode, ProtocolContractVersion, SendOutcome, SendResponse,
+            SubmissionEvidence,
+        };
+
+        // DURABLE authority: an unknown non-zero code classifies UnknownStatus → TransientRetry.
+        let evidence = SubmissionEvidence::Started {
+            response: SendResponse::parsed(SendOutcome::from_server_code(
+                NonOkStatusCode::from_transport(-17).unwrap(),
+                DocType::Sell,
+                DecodedResponseDigest::from_transport_digest([0xAB; 32]),
+            )),
+            binding: DpsProtocolBinding {
+                protocol_id: DpsProtocolId::FscoZzd,
+                contract_version: ProtocolContractVersion(1),
+                capability_profile_version: None,
+                endpoint_config_revision: None,
+            },
+            envelope_hash: EnvelopeHash([0u8; 32]),
+        };
+        let classified = classify(&evidence);
+        assert_eq!(
+            classified.routing(),
+            Some(ActiveRetryClass::TransientRetry),
+            "durable authority: unknown non-zero → UnknownStatus → TransientRetry"
+        );
+
+        // The coupled legacy wire routing for the same reply is Decode → ProbeRequired (a
+        // proto-unrecognized code fails tonic decode — the §4.6 raw drift-delta).
+        let legacy = target_wire_decision(route_send_result(
+            Err(DpsError::Decode("status=-17 unknown non-zero".into())),
+            DocType::Sell,
+            true,
+        ));
+        match &legacy {
+            WireDecision::Routed(d) => assert_eq!(
+                d.retry_class,
+                RetryClass::ProbeRequired,
+                "legacy Decode routing = ProbeRequired (the delta)"
+            ),
+            WireDecision::Sent { .. } => panic!("Decode legacy must be Routed"),
+        }
+
+        // F3 symmetric fix: project the DURABLE authority (TransientRetry) onto the wire decision.
+        let decision = project_decision_from_evidence(legacy, &classified);
+        let d = match &decision {
+            WireDecision::Routed(d) => d,
+            WireDecision::Sent { .. } => panic!("projected decision must be Routed"),
+        };
+        assert_eq!(
+            d.retry_class,
+            RetryClass::TransientRetry,
+            "F3: projection reflects DURABLE TransientRetry, NOT legacy ProbeRequired"
+        );
+        assert_eq!(d.target_state, DocState::ErrorRetryable);
+        assert_eq!(
+            d.audit_event,
+            AuditEvent::StageSendTransientRetry,
+            "F3: audit event is the transient-retry event, NOT decode-unknown"
+        );
+        assert!(
+            d.probe_hint.is_none(),
+            "F3: transient retry carries NO probe_hint"
+        );
+
+        // End-to-end projection consistency: transport_trace.retry_class + the returned outcome
+        // (→ drain failure-class) both agree with durable TransientRetry, NOT the legacy ProbeRequired.
+        let forensics = (None, "Decode", "status=-17 unknown non-zero".to_string());
+        let completion =
+            build_attempt_completion(&decision, Some(&forensics), "t0".into(), "t1".into());
+        assert_eq!(
+            completion.retry_class.as_deref(),
+            Some("TransientRetry"),
+            "F3: transport_trace.retry_class == durable TransientRetry"
+        );
+        match stage_send_outcome_from(decision, 1, Some(&forensics)) {
+            StageSendOutcome::Routed { decision, .. } => assert_eq!(
+                decision.retry_class,
+                RetryClass::TransientRetry,
+                "F3: returned StageSendOutcome (→ drain failure-class) == durable TransientRetry"
+            ),
+            _ => panic!("returned outcome must be Routed"),
+        }
+    }
 
     fn inputs(doc_type: DocType, lnd: i64, business_ts: &str) -> SendInputs {
         SendInputs {

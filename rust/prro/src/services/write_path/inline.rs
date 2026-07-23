@@ -953,16 +953,30 @@ async fn run_staged(
                         Err(fe)
                     }
                 }
-                SendDisposition::InProgress => Ok(FiscalOutcome {
-                    // Transient wire failure: the doc is persisted at
-                    // `ErrorRetryable`; the ledger re-drives it via drain/B1.
-                    // 202 IN_PROGRESS — NOT a terminal failure. No DPS id yet.
-                    document_id: doc_id,
-                    fiscal_id: None,
-                    fiscal_ts: None,
-                    document_state: DocState::ErrorRetryable,
-                    report_xml: None,
-                }),
+                SendDisposition::InProgress => {
+                    // CS-3 S7-1: report the ACTUAL persisted state, NOT the routing target.  Post
+                    // cutover the composed apply HOLDS a transient (`SubmittedUnknown`) in `SENDING`
+                    // (`PENDING_APPLY` + STOP) — there is NO auto-redrive (R1/R2 retired the ER edge;
+                    // resolution is probe/operator, see `project_backlog_classify_send_outcome`).  The
+                    // FnConfigError (`-13`/`-14`) path instead persists `ErrorRetryable`.  Both
+                    // classify to `InProgress` (the client sees the SAME `202 IN_PROGRESS`), but the
+                    // reported `document_state` string MUST be truthful — first-pass ↔ replay parity
+                    // (`replay.rs` reads `fd.state`).  A read miss/error defaults to the held
+                    // `SENDING` (the near-certain in-flight state) rather than downgrading a
+                    // successful 202 to a 500.
+                    let document_state = fiscal_documents::state_by_document_id(pool, doc_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or(DocState::Sending);
+                    Ok(FiscalOutcome {
+                        document_id: doc_id,
+                        fiscal_id: None,
+                        fiscal_ts: None,
+                        document_state,
+                        report_xml: None,
+                    })
+                }
                 SendDisposition::ResolveReplay { observed } => {
                     // No-wire idempotent re-entry / race (stage_send StateConflict
                     // / DocumentMissing): resolve the durable truth from the
@@ -1966,6 +1980,15 @@ mod tests {
     impl DpsChannel for StubLastChk {
         async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
             unreachable!("online_confirm never sends");
+        }
+        async fn send_chk_observed(
+            &self,
+            envelope: CheckEnvelope,
+        ) -> (
+            Result<CheckAck, DpsError>,
+            crate::transports::dps::raw_reply::RawSendObservation,
+        ) {
+            crate::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
         }
         async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
             self.0

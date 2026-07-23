@@ -1,0 +1,33 @@
+# CS-1R R1.2 — SUPERSESSION registry (adjudicated retire-and-replace).
+#
+# The forward inventory gate (scripts/cs1r/inventory_gate.sh, control 2) forbids
+# ANY test-identity removal vs the PR base. The SOLE exception is an adjudicated
+# retire-and-replace recorded here, EXACTLY (no glob):
+#   * every removal vs base MUST appear here as (removed_module, removed_test);
+#   * every row's replacement test MUST exist in the current manifest;
+#   * the registry MUST NOT be stale (a row with no real removal vs base is RED);
+#   * any UNregistered future removal is RED.
+#
+# TAB-separated columns:
+#   removed_module <TAB> removed_test <TAB> repl_module <TAB> repl_test <TAB> reason
+# (module in manifest form, e.g. `prro::write_path_dps_error_routing`).
+#
+# ── CS-3 S7-1 double-issue cutover (PR #336): 15 contracts retired-and-replaced ──
+# The HELD/RMR contract + F2/F3 error-routing + advance-at-SEND + the MAC-recovery
+# orchestrator changed the asserted behaviour, so the old-contract tests were
+# renamed/moved. Rows below are populated from the verified supersession map.
+prro::backlog_drain_state_dispatch	c5b2_sent_replay_lastchk_not_found_holds_fn_drain_er_redrive_queued	prro::backlog_drain_state_dispatch	c5b2_sent_replay_lastchk_not_found_escalates_manual_with_stop	SENT+NotFound drain: old ER-downgrade+redrive retired; post-CALL_STARTED ambiguity now EscalateManual+STOP (HELD/RMR)
+prro::shift_life_matrix	matrix_s14_mac_recovery_minus12_resigns_to_ack	prro::shift_life_matrix	matrix_s14_mac_recovery_minus12_holds_shift_frozen	-12: inline resign-loop->ACK retired; now -12 HELD (SENDING+STOP+PENDING_APPLY, no re-sign) — F3/HELD
+prro::shift_life_matrix	matrix_s15_mac_recovery_unextractable_hash_rejects	prro::shift_life_matrix	matrix_s15_mac_recovery_minus12_plain_message_still_holds	-12 no-hash->Rejected retired; -12 is message-independent HOLD (no extraction step) — F3/HELD
+prro::shift_life_matrix	matrix_s5_net_drop_mid_online_retry	prro::shift_life_matrix	matrix_s5_net_drop_mid_online_holds_stop	transport-retryable->ER->redrive->ACK retired; ambiguous post-CALL_STARTED transport now HELD (SENDING+STOP)
+prro::write_path_deterministic_replay	fixture_6_sent_last_chk_notfound_two_tick_retry_path	prro::write_path_deterministic_replay	fixture_6_sent_last_chk_notfound_escalates_manual_with_stop	SENT+NotFound two-tick ER redrive retired; now EscalateManual+STOP (F2-kvt2 cross-tick escalation)
+prro::write_path_dps_error_routing	fx17_server_minus_12_routes_to_mac_recovery_decision	prro::write_path_stage4_send	minus_12_bad_hash_prev_records_held_stop_no_second_wire	-12->MAC-recovery routing decision retired; -12 now recorded HOLD (one wire, no second wire, PENDING_APPLY) — R3
+prro::write_path_dps_error_routing	mac_fx01_hash_not_extractable_overrides_to_rejected	prro::mac_recovery_orchestrator	run_mac_recovery_hash_not_extractable_emits_audit_no_state_change	HashNotExtractable->caller-overrides-Rejected retired; contract moved to orchestrator unit (audit, no state change)
+prro::write_path_dps_error_routing	mac_fx02_counter_exhausted_overrides_to_rejected_with_failed_repeat_audit	prro::mac_recovery_orchestrator	run_mac_recovery_counter_already_burnt_returns_counter_exhausted	counter-exhausted->caller FAILED_REPEAT+Rejected retired; moved to orchestrator CAS-fail->CounterExhausted typed
+prro::write_path_dps_error_routing	mac_fx03_second_minus_12_after_resigned_emits_failed_repeat	prro::mac_recovery_orchestrator	run_mac_recovery_happy_resigned_persists_atomic_four_write	second -12 in stage_send loop retired (loop deleted R3); orchestrator resigned path covered in isolation
+prro::write_path_stage4_send	mac_recovery_resigned_drives_attempt_2_through_loop_to_sent	prro::write_path_stage4_send	minus_12_bad_hash_prev_records_held_stop_no_second_wire	resign+loop-reentry->attempt#2->SENT retired; -12 HELD, no reentry/attempt#2 (inline resign-loop deleted R3)
+prro::write_path_stage4_send	non_recovery_send_drift_fails_closed	prro::write_path_stage4_send	online_predecessor_drift_refuses_authorize_zero_wire	post-wire non-recovery drift fail-closed retired; predecessor-drift now refused in authorize tx pre-wire (P3), zero wire
+prro::write_path_stage4_send	retry_path_error_retryable_to_sending_drives_through_4_pre	prro::write_path_stage4_send	transport_error_holds_stop_preserves_attempt_at	ER->4-pre CAS auto-redrive->SENT retired; transport error now HELD (SENDING+STOP+PENDING_APPLY), not auto-retriable
+prro::write_path_stage4_send	server_minus_11_with_missing_node_state_surfaces_typed_error	prro::write_path_stage4_send	server_minus_11_routes_to_rejected_and_flips_node_to_blocked	-11+missing-node_state typed-error retired; -11->Rejected+node BLOCKED (missing-row breach covered by pre-wire P3 twin)
+prro::write_path_stage4_send	transport_retryable_routes_to_error_retryable_preserves_attempt_at	prro::write_path_stage4_send	transport_error_holds_stop_preserves_attempt_at	Transport->ER+attempt_at retired; Transport now HELD (SENDING+STOP); submission_attempted_at tooth retained
+prro::write_path_stage4_send	variant_p_mac_recovery_skips_drift_assert_and_advances_seed	prro::write_path_stage4_send	online_predecessor_drift_refuses_authorize_zero_wire	Variant-P drift-skip+seed-advance retired; drift refused at authorize pre-wire (P3), Variant-P bypass moot
