@@ -495,7 +495,10 @@ async fn slice_e_close_shift_probe_unifies_minus_2_and_minus_15() {
         code: -15,
         message: "ERROR_NOT_OPEN_SHIFT".into(),
     }));
-    let r15 = match stage_send::run(&pool15, &stub15, doc15, None).await.unwrap() {
+    let r15 = match stage_send::run(&pool15, &stub15, doc15, None)
+        .await
+        .unwrap()
+    {
         StageSendOutcome::Routed { decision, .. } => {
             assert_eq!(decision.retry_class, RetryClass::ProbeRequired);
             decision.probe_hint.as_ref().map(|h| h.reason)

@@ -95,8 +95,7 @@ use crate::transports::dps::dto::{CheckEnvelope, DpsCheckType};
 use crate::transports::dps::error::DpsError;
 
 use super::error_routing::{
-    route_send_result, target_wire_decision, AuditEvent, ProbeHint, ProbeReason, RetryClass,
-    RoutingDecision, WireDecision,
+    route_dps_error, AuditEvent, ProbeHint, ProbeReason, RetryClass, RoutingDecision, WireDecision,
 };
 use super::stage_sign::{derive_wire_artifact_kind, SignError, SigningContext, WireArtifactKind};
 
@@ -866,77 +865,231 @@ fn build_record_args(
     Ok((disc, outcome, classified))
 }
 
-/// CS-3 S7-1 (F3): project the durable evidence classifier's verdict onto the `WireDecision` that
-/// drives trace + audit + the returned outcome + drain failure-class, so those observations can
-/// never disagree with the durable record (which `build_record_args` builds from the SAME
-/// `classify`). The `legacy` wire routing is a COMPAT projection retained for wire-forensics + the
-/// drift-pin; where the classifier diverges from it, the classifier is authoritative. TWO retry-class
-/// divergences are reconciled (both targeted — full "slice E" is a later slice). (1) `RemoteAuthStatus`:
-/// legacy `RemoteStatus → TransientRetry`, durable `classify → ProbeRequired` → project ProbeRequired
-/// (reuses `StageSendProbeRequired` audit, `ProbeReason::RemoteStatus`). (2) unknown NON-ZERO code
-/// (CS-3 S7-1 re-audit MAJOR): legacy tonic-decode fails → `Decode → ProbeRequired`, durable
-/// `classify → UnknownStatus → TransientRetry` (the §4.6 raw drift-delta) → project TransientRetry
-/// (`StageSendTransientRetry`, no probe_hint) — else the durable `routing_class=TransientRetry` splits
-/// from trace/audit/return/drain=ProbeRequired.
+/// CS-3 Slice E (Pin 2 / Track A — the SINGLE routing authority). Project the sealed evidence leaf +
+/// the classifier onto the `WireDecision` that drives trace + audit + the returned outcome + drain
+/// failure-class. **TOTAL** over `EvidenceDiscriminantKind` — a new leaf breaks the build (no `_`
+/// catch-all). Replaces the former `project_decision_from_evidence`, which special-cased the two
+/// leaves whose projection diverged from a naive legacy pass-through; those are now STRUCTURAL leaves.
 ///
-/// Every OTHER leaf already agrees (Decode `-2/-15`, etc. route ProbeRequired on both sides), so it
-/// falls through `_ => legacy`. The Sent SFN arm is unaffected (the fiscal number comes from the
-/// legacy `CheckAck`). The RAW legacy-vs-classifier drift-pin (grpc) is untouched — it compares the
-/// raw routings; only the PROJECTED wire decision is reconciled here.
-fn project_decision_from_evidence(
-    legacy: WireDecision,
+/// **Boundary (rev4 §3.1, `docs/CS3_SLICE_E_PIN2_LEAF_TUPLE_TABLE.md`):** `target_state`,
+/// `retry_class`, `node_mode_flip`, `probe_hint.reason`, and the happy `Sent{server_fiscal_no}` (SFN
+/// from `disc::Accepted`, NOT the legacy `CheckAck`) come from `classified` + `disc` ONLY — never the
+/// collapsed legacy `DpsError`. `route_dps_error` is thereby demoted to the raw legacy-vs-classifier
+/// drift-pin (`grpc.rs`) + the forensic overlay (`extract_wire_forensics`); it no longer authors the
+/// wire decision.
+///
+/// **Diagnostic overlay (`route_dps_error` demoted) — `wrapper_overlay`.** The message / DPS
+/// status-code reach the trace via the SEPARATE, untouched `wire_forensics`
+/// (`extract_wire_forensics(&legacy)`) path. `mac_recovery_hint` is `None` on every leaf: the
+/// projected decision's hint is DEAD (the W10.4 MAC orchestrator sources the `-12` hash from the
+/// durable evidence — `mac_recovery.rs`, not this projection). ONE diagnostic CANNOT be rebuilt from
+/// classifier+disc: a WRAPPER-side bug (`Internal` / `NotFound` / `QueryNotSupported` /
+/// `ServerFiscalIdMismatch`) collapses into the `NoResponse` leaf (evidence carries no wrapper shape)
+/// AND mints an empty `WireDiagnostics::default()` (the absence path), yet the S7-1 contract keeps it
+/// SENDING-held with a CRITICAL `WrapperBug` audit for operator visibility
+/// (`write_path_dps_error_routing.rs` fx06–fx09). Its ONLY witness is the legacy `route_dps_error`
+/// result — passed as `wrapper_overlay` (the demoted `route_dps_error`) and consulted EXCLUSIVELY on
+/// the `NoResponse` leaf to preserve that `WrapperBug` decision verbatim (behaviour-neutral). Every
+/// other leaf ignores the overlay — routing is classifier+disc-authoritative.
+fn wire_decision_from(
+    disc: &prro_domain::delivery::evidence::EvidenceDiscriminant,
     classified: &prro_domain::delivery::ClassifiedOutcome,
+    wrapper_overlay: Option<&RoutingDecision>,
 ) -> WireDecision {
-    match (&legacy, classified.routing()) {
-        // The classifier says ProbeRequired but the legacy wire routing did not — the RemoteAuthStatus
-        // delta (the only such divergence today; Decode / -2 / -15 already route ProbeRequired, so they
-        // agree and fall through). Rebuild as the evidence-correct ProbeRequired routing, reusing the
-        // existing STAGE_SEND_PROBE_REQUIRED audit distinguished by `ProbeReason::RemoteStatus`.
-        (WireDecision::Routed(d), Some(prro_domain::delivery::ActiveRetryClass::ProbeRequired))
-            if d.retry_class != RetryClass::ProbeRequired =>
-        {
-            WireDecision::Routed(RoutingDecision {
-                target_state: DocState::ErrorRetryable,
-                retry_class: RetryClass::ProbeRequired,
-                audit_event: AuditEvent::StageSendProbeRequired,
-                audit_severity: Severity::Warning,
-                node_mode_flip: None,
-                probe_hint: Some(ProbeHint {
-                    reason: ProbeReason::RemoteStatus,
-                }),
-                mac_recovery_hint: None,
-            })
-        }
-        // CS-3 S7-1 (F3 re-audit MAJOR): the REVERSE direction — the classifier says TransientRetry
-        // but the legacy wire routing said ProbeRequired. The ONLY reachable such leaf is an unknown
-        // NON-ZERO DPS status code (outside the proto enum -16..=1): the legacy tonic-decode fails →
-        // `Decode → ProbeRequired`, while the durable classifier maps it `UnknownStatus →
-        // TransientRetry` (the §4.6 preserved RAW drift-delta, pinned by the grpc drift-check). The
-        // durable record is built from the classifier (TransientRetry), so without this arm
-        // trace/audit/return/drain would report the legacy ProbeRequired while
-        // `delivery_reservation.routing_class` records TransientRetry — a durable-vs-observable split.
-        // Rebuild as the evidence-correct TransientRetry routing (STAGE_SEND_TRANSIENT_RETRY, NO
-        // probe_hint — matching `route_dps_error`'s Transport/Server-3 transient arm).
-        //
-        // **Guarded to `legacy == ProbeRequired`, NOT the broad `legacy != TransientRetry`:** a
-        // wrapper-bug DpsError (NotFound / ServerFiscalIdMismatch / QueryNotSupported / Internal) is
-        // also `classified==TransientRetry` (NoResponse) but `legacy==WrapperBug`; that WrapperBug
-        // routing is DELIBERATELY preserved (routing-driven CRITICAL audit = operator visibility) and
-        // must NOT be reconciled here. The raw legacy-vs-classifier drift-pin is untouched.
-        (
-            WireDecision::Routed(d),
-            Some(prro_domain::delivery::ActiveRetryClass::TransientRetry),
-        ) if d.retry_class == RetryClass::ProbeRequired => WireDecision::Routed(RoutingDecision {
-            target_state: DocState::ErrorRetryable,
-            retry_class: RetryClass::TransientRetry,
-            audit_event: AuditEvent::StageSendTransientRetry,
-            audit_severity: Severity::Warning,
-            node_mode_flip: None,
-            probe_hint: None,
-            mac_recovery_hint: None,
-        }),
-        _ => legacy,
-    }
+    use prro_domain::delivery::evidence::EvidenceDiscriminantKind as K;
+    use prro_domain::delivery::{ActiveRetryClass, DpsReject, NodeEffect};
+
+    // node_mode_flip is a pure function of the classifier's node_effect (only Offline168 → Blocked).
+    let node_mode_flip = match classified.node_effect() {
+        NodeEffect::NodeBlocked => Some(crate::db::models::enums::NodeMode::Blocked),
+        _ => None,
+    };
+
+    // Per-leaf authority tuple: (target_state, retry_class, audit_event, audit_severity, probe_reason).
+    // The happy `Accepted` arm early-returns `Sent{sfn}` (routing() is None there). Every other leaf is
+    // `Routed`. See the leaf→tuple table doc for the full derivation + behaviour-neutrality proof.
+    type Tuple = (
+        DocState,
+        RetryClass,
+        AuditEvent,
+        Severity,
+        Option<ProbeReason>,
+    );
+    let (target_state, retry_class, audit_event, audit_severity, probe_reason): Tuple =
+        match disc.kind() {
+            K::Accepted(fiscal_no) => {
+                return WireDecision::Sent {
+                    server_fiscal_no: fiscal_no.to_string(),
+                }
+            }
+            // Definitive DPS verdict — audit_event + severity per verdict (authority-side, from disc).
+            K::Rejected(verdict, _digest) => match verdict {
+                // -1 ERROR_VEREFY — document-level reject, ERROR severity (operator-visible, not a bug).
+                DpsReject::Verify => (
+                    DocState::Rejected,
+                    RetryClass::TerminalReject,
+                    AuditEvent::StageSendRejected,
+                    Severity::Error,
+                    None,
+                ),
+                // -11 ERROR_OFFLINE_168 — terminal + node BLOCKED flip (via node_effect above).
+                DpsReject::Offline168 => (
+                    DocState::Rejected,
+                    RetryClass::TerminalReject,
+                    AuditEvent::StageSendNodeBlocked,
+                    Severity::Critical,
+                    None,
+                ),
+                // -12 ERROR_BAD_HASH_PREV — MAC recovery class.
+                DpsReject::BadHashPrev => (
+                    DocState::ErrorRetryable,
+                    RetryClass::MacRecovery,
+                    AuditEvent::StageSendMacHashMismatch,
+                    Severity::Warning,
+                    None,
+                ),
+                // -6 ERROR_NOT_PREV_ZREPORT — operator-recoverable.
+                DpsReject::NotPrevZReport => (
+                    DocState::ErrorRetryable,
+                    RetryClass::OperatorEscalation,
+                    AuditEvent::StageSendOperatorEscalation,
+                    Severity::Error,
+                    None,
+                ),
+                // -13/-14 ERROR_NOT_REGISTERED_* — FN-config error.
+                DpsReject::NotRegisteredRro | DpsReject::NotRegisteredSigner => (
+                    DocState::ErrorRetryable,
+                    RetryClass::FnConfigError,
+                    AuditEvent::StageSendFnNotRegistered,
+                    Severity::Error,
+                    None,
+                ),
+                // -5/-7..-10 XML-class, -16 OfflineId, `Close` (=-2/-15 on non-close) — terminal, CRITICAL
+                // (builder/adapter/ingress bug worth an operator alert).
+                DpsReject::Type
+                | DpsReject::Xml
+                | DpsReject::XmlDate
+                | DpsReject::XmlChk
+                | DpsReject::XmlZReport
+                | DpsReject::OfflineId
+                | DpsReject::Close => (
+                    DocState::Rejected,
+                    RetryClass::TerminalReject,
+                    AuditEvent::StageSendRejected,
+                    Severity::Critical,
+                    None,
+                ),
+            },
+            // -2/-15 on a close/Z doc — close-shift ambiguity, HELD for a probe.
+            K::CloseAmbiguous(_digest) => (
+                DocState::ErrorRetryable,
+                RetryClass::ProbeRequired,
+                AuditEvent::StageSendProbeRequired,
+                Severity::Warning,
+                Some(ProbeReason::CloseShiftProbe),
+            ),
+            // status==0 proto-default decode — HELD for a probe.
+            K::MissingStatus(_digest) => (
+                DocState::ErrorRetryable,
+                RetryClass::ProbeRequired,
+                AuditEvent::StageSendDecodeUnknown,
+                Severity::Warning,
+                Some(ProbeReason::DecodeUnknown),
+            ),
+            // DPS OK with an empty fiscal id — no issuance, HELD for a probe.
+            K::OkButNoFiscalNumber(_digest) => (
+                DocState::ErrorRetryable,
+                RetryClass::ProbeRequired,
+                AuditEvent::StageSendProbeRequired,
+                Severity::Warning,
+                Some(ProbeReason::OkButNoFiscalNumber),
+            ),
+            // TLS-proven authenticated non-DPS peer — HELD for a probe. (Former F3 forward divergence:
+            // legacy `RemoteStatus → TransientRetry`, durable `classify → ProbeRequired`; now structural.)
+            K::RemoteAuthStatus(_digest) => (
+                DocState::ErrorRetryable,
+                RetryClass::ProbeRequired,
+                AuditEvent::StageSendProbeRequired,
+                Severity::Warning,
+                Some(ProbeReason::RemoteStatus),
+            ),
+            // Parsed envelope, unnamed non-zero status code (`-4`/`-17`/`-99`). Pin 2: classifier routes
+            // TransientRetry (unifying the two legacy sources — the former F3 reverse divergence). Pin 3
+            // flips `routing_for_indeterminate(UnknownStatus) → ProbeRequired`, activating the dormant
+            // SubmittedUnknown probe here with NO projection change.
+            K::UnknownStatus(_code, _digest) => match classified.routing() {
+                Some(ActiveRetryClass::ProbeRequired) => (
+                    DocState::ErrorRetryable,
+                    RetryClass::ProbeRequired,
+                    AuditEvent::StageSendProbeRequired,
+                    Severity::Warning,
+                    Some(ProbeReason::SubmittedUnknown),
+                ),
+                _ => (
+                    DocState::ErrorRetryable,
+                    RetryClass::TransientRetry,
+                    AuditEvent::StageSendTransientRetry,
+                    Severity::Warning,
+                    None,
+                ),
+            },
+            // -3 ERROR_SAVE — transient retry.
+            K::SaveError(_digest) => (
+                DocState::ErrorRetryable,
+                RetryClass::TransientRetry,
+                AuditEvent::StageSendTransientRetry,
+                Severity::Warning,
+                None,
+            ),
+            // Genuine local absence / transport failure — the classifier collapses EVERY wire failure
+            // (incl. wrapper-side bugs) to NoResponse → TransientRetry. A wrapper-bug's CRITICAL
+            // WrapperBug diagnostic cannot be rebuilt from the classifier (evidence lost the shape), so
+            // it rides the demoted `route_dps_error` overlay — preserved VERBATIM (S7-1 SENDING-held
+            // wrapper contract; `write_path_dps_error_routing.rs` fx06–fx09, incl. the distinct
+            // FiscalIdMismatch audit). Transport (the reachable case) has a non-WrapperBug overlay and
+            // falls through to the classifier's TransientRetry.
+            K::NoResponse(_cause) => {
+                if let Some(ov) = wrapper_overlay {
+                    if ov.retry_class == RetryClass::WrapperBug {
+                        return WireDecision::Routed(ov.clone());
+                    }
+                }
+                (
+                    DocState::ErrorRetryable,
+                    RetryClass::TransientRetry,
+                    AuditEvent::StageSendTransientRetry,
+                    Severity::Warning,
+                    None,
+                )
+            }
+            // NotStarted preflight leaves — UNREACHABLE post-wire (`submit_authorized` returns only
+            // `Started`); handled for totality. SigningFailed classifies WrapperBug (CRITICAL — this is
+            // where the classifier's WrapperBug class is authored); PreconditionFailed → TransientRetry.
+            K::SigningFailed => (
+                DocState::ErrorRetryable,
+                RetryClass::WrapperBug,
+                AuditEvent::StageSendWrapperBug,
+                Severity::Critical,
+                None,
+            ),
+            K::PreconditionFailed => (
+                DocState::ErrorRetryable,
+                RetryClass::TransientRetry,
+                AuditEvent::StageSendTransientRetry,
+                Severity::Warning,
+                None,
+            ),
+        };
+
+    WireDecision::Routed(RoutingDecision {
+        target_state,
+        retry_class,
+        audit_event,
+        audit_severity,
+        node_mode_flip,
+        probe_hint: probe_reason.map(|reason| ProbeHint { reason }),
+        mac_recovery_hint: None,
+    })
 }
 
 /// CS-3 S7-1 (composition impl-design §6-Q4): build the public `StageSendOutcome` from the TARGET
@@ -1797,14 +1950,23 @@ async fn run_one_attempt(
     // Build the TARGET record arguments (classify axes + the lossless evidence discriminant + the
     // classifier). `record_outcome` persists these — the DURABLE authority.
     let (disc, outcome, classified) = build_record_args(&obs).map_err(StageSendError::Internal)?;
-    // The legacy wire routing maps the raw `Result` onto a `WireDecision`; `target_wire_decision`
-    // already reconciles the empty-SFN `Sent{""}` → `OkButNoFiscalNumber` HELD leaf. It is retained
-    // for wire-forensics + the drift-pin only. F3: the `decision` that drives trace + audit + the
-    // returned outcome + drain failure-class is PROJECTED from the SAME classifier that built the
-    // durable record, so those observations can never disagree with durable (today the sole
-    // retry-class divergence is `RemoteAuthStatus` → ProbeRequired vs the legacy TransientRetry).
-    let legacy_decision = target_wire_decision(route_send_result(legacy, doc_type, true));
-    let decision = project_decision_from_evidence(legacy_decision, &classified);
+    // The demoted `route_dps_error` — the diagnostic overlay. Consulted by `wire_decision_from` ONLY to
+    // preserve a wrapper-side bug's CRITICAL WrapperBug decision on the collapsed `NoResponse` leaf
+    // (evidence + `WireDiagnostics` cannot rebuild `Internal`/`NotFound`/`QueryNotSupported`/
+    // `ServerFiscalIdMismatch`). Derived from the byte-identical legacy result; NOT the wire authority.
+    let wrapper_overlay = match &legacy {
+        Err(e) => Some(route_dps_error(e, doc_type, true)),
+        Ok(_) => None,
+    };
+    // CS-3 Slice E (Pin 2 — Track A): the `decision` that drives trace + audit + the returned outcome +
+    // drain failure-class is the TOTAL projection of the DURABLE authority (the sealed evidence leaf +
+    // the SAME classifier that built the record), so those observations can never disagree with the
+    // durable record. The legacy `Result` remains ONLY for the forensic overlay (`wire_forensics`,
+    // above), the wrapper-bug diagnostic overlay (above), and the raw legacy-vs-classifier drift-pin
+    // (`grpc.rs`); it no longer AUTHORS the decision (`route_dps_error` / `target_wire_decision`
+    // demoted — the empty-SFN `Sent{""}` → `OkButNoFiscalNumber` HELD leaf that `target_wire_decision`
+    // used to reconcile is now the structural `OkButNoFiscalNumber` evidence leaf).
+    let decision = wire_decision_from(&disc, &classified, wrapper_overlay.as_ref());
     // Capture the reservation id BEFORE `obs` is moved into the record transaction.
     let reservation_id = obs.reservation_id();
 
@@ -1853,28 +2015,25 @@ mod tests {
     use super::*;
     use crate::db::models::enums::{DocState, DocType};
 
-    // ─── F3 — projection agrees with the durable evidence classifier ───
+    // ─── Pin 2 (Track A total projection) — the wire_decision_from authority tuple ───
     //
-    // In prod a TLS-proven Unauthenticated/PermissionDenied couples a FAITHFUL `RemoteAuthStatus`
-    // observation (→ `classify` = ProbeRequired, the DURABLE record) with a `DpsError::RemoteStatus`
-    // legacy (→ the compat wire routing = TransientRetry). Before F3 the projection (trace / audit /
-    // returned outcome / drain) was driven by the legacy TransientRetry and thus DISAGREED with the
-    // durable ProbeRequired. `project_decision_from_evidence` projects the classifier onto the wire
-    // decision so they cannot diverge. (Tests cannot mint a faithful `RawSendObservation` —
-    // `RawSendReply::remote_auth_status` is `pub(in crate::transports::dps)` by design — so this
-    // exercises the projection seam directly against a real `classify(RemoteAuthStatus)`.)
-    #[test]
-    fn f3_remote_status_projects_probe_required_from_evidence_not_legacy() {
+    // The single central-change guard (rev4 §4-step-2): `wire_decision_from` derives the wire
+    // `WireDecision` from the sealed evidence leaf + the classifier — NEVER from the collapsed legacy
+    // `DpsError`. This SUBSUMES the two former F3 pins
+    // (`f3_remote_status_*` / `f3_unknown_nonzero_*`), which special-cased the two leaves whose
+    // projection diverges from a naive legacy pass-through; here they are STRUCTURAL leaves of the
+    // total function. Full-tuple asserts lock every `RoutingDecision` field so a silent drift in the
+    // otherwise-unguarded central change reds. See `docs/CS3_SLICE_E_PIN2_LEAF_TUPLE_TABLE.md`.
+    #[cfg(test)]
+    fn pin_started(
+        response: prro_domain::delivery::SendResponse,
+    ) -> prro_domain::delivery::SubmissionEvidence {
         use prro_domain::delivery::{
-            classify, ActiveRetryClass, DpsProtocolBinding, DpsProtocolId, EnvelopeHash,
-            GrpcStatusDigest, ProtocolContractVersion, RemoteStatusEvidence, SendResponse,
+            DpsProtocolBinding, DpsProtocolId, EnvelopeHash, ProtocolContractVersion,
             SubmissionEvidence,
         };
-
-        let evidence = SubmissionEvidence::Started {
-            response: SendResponse::remote_status(RemoteStatusEvidence::RemoteAuthStatus(
-                GrpcStatusDigest::from_transport_digest([0xCD; 32]),
-            )),
+        SubmissionEvidence::Started {
+            response,
             binding: DpsProtocolBinding {
                 protocol_id: DpsProtocolId::FscoZzd,
                 contract_version: ProtocolContractVersion(1),
@@ -1882,170 +2041,186 @@ mod tests {
                 endpoint_config_revision: None,
             },
             envelope_hash: EnvelopeHash([0u8; 32]),
-        };
-        let classified = classify(&evidence);
-        // DURABLE authority: RemoteAuthStatus classifies ProbeRequired.
-        assert_eq!(
-            classified.routing(),
-            Some(ActiveRetryClass::ProbeRequired),
-            "durable authority: RemoteAuthStatus → ProbeRequired"
-        );
-
-        // The coupled legacy DPS-error routing is the compat TransientRetry (the F3 delta).
-        let legacy = target_wire_decision(route_send_result(
-            Err(DpsError::RemoteStatus {
-                code: "Unauthenticated".into(),
-                message: "gateway".into(),
-                digest: GrpcStatusDigest::from_transport_digest([0xCD; 32]),
-            }),
-            DocType::Sell,
-            true,
-        ));
-        match &legacy {
-            WireDecision::Routed(d) => assert_eq!(
-                d.retry_class,
-                RetryClass::TransientRetry,
-                "legacy compat routing = TransientRetry (the delta)"
-            ),
-            WireDecision::Sent { .. } => panic!("RemoteStatus legacy must be Routed"),
-        }
-
-        // F3: project the durable authority onto the wire decision.
-        let decision = project_decision_from_evidence(legacy, &classified);
-        let d = match &decision {
-            WireDecision::Routed(d) => d,
-            WireDecision::Sent { .. } => panic!("projected decision must be Routed"),
-        };
-        assert_eq!(
-            d.retry_class,
-            RetryClass::ProbeRequired,
-            "F3: projection reflects DURABLE ProbeRequired, NOT legacy TransientRetry"
-        );
-        assert_eq!(
-            d.audit_event,
-            AuditEvent::StageSendProbeRequired,
-            "F3: audit event is the (reused) probe-required event"
-        );
-        assert_eq!(
-            d.probe_hint.as_ref().map(|h| h.reason),
-            Some(ProbeReason::RemoteStatus),
-            "F3: distinct RemoteStatus probe reason (NOT OkButNoFiscalNumber)"
-        );
-
-        // End-to-end projection consistency: the transport_trace retry_class column + the returned
-        // outcome (→ drain failure-class) both agree with durable ProbeRequired, not TransientRetry.
-        let forensics = (None, "Transport", "gateway".to_string());
-        let completion =
-            build_attempt_completion(&decision, Some(&forensics), "t0".into(), "t1".into());
-        assert_eq!(
-            completion.retry_class.as_deref(),
-            Some("ProbeRequired"),
-            "F3: transport_trace.retry_class == durable ProbeRequired"
-        );
-        match stage_send_outcome_from(decision, 1, Some(&forensics)) {
-            StageSendOutcome::Routed { decision, .. } => assert_eq!(
-                decision.retry_class,
-                RetryClass::ProbeRequired,
-                "F3: returned StageSendOutcome (→ drain failure-class) == durable ProbeRequired"
-            ),
-            _ => panic!("returned outcome must be Routed"),
         }
     }
 
-    /// CS-3 S7-1 (F3 re-audit MAJOR fix): the REVERSE projection direction. An unknown non-zero DPS
-    /// status code (e.g. `-17`, outside the proto enum `-16..=1`) is the §4.6 preserved raw drift-delta
-    /// — the durable classifier maps it `UnknownStatus → TransientRetry`, while the legacy tonic-decode
-    /// fails → `Decode → ProbeRequired`. Before this fix `project_decision_from_evidence` reconciled
-    /// ONLY the `classifier == ProbeRequired` direction, so for this reachable reply the observable
-    /// (trace / audit / returned outcome / drain failure-class) stayed the legacy `ProbeRequired` while
-    /// the durable `delivery_reservation.routing_class` recorded `TransientRetry` — a durable-vs-
-    /// observable split. The symmetric arm projects the durable `TransientRetry` onto the observable.
     #[test]
-    fn f3_unknown_nonzero_projects_transient_retry_from_evidence_not_legacy() {
+    fn wire_decision_from_locks_authority_tuple() {
+        use crate::transports::dps::error::DpsError;
+        use prro_domain::delivery::evidence::EvidenceDiscriminant;
         use prro_domain::delivery::{
-            classify, ActiveRetryClass, DecodedResponseDigest, DpsProtocolBinding, DpsProtocolId,
-            EnvelopeHash, NonOkStatusCode, ProtocolContractVersion, SendOutcome, SendResponse,
-            SubmissionEvidence,
+            classify, ActiveRetryClass, DecodedResponseDigest, GrpcStatusDigest, NoResponseCause,
+            NonOkStatusCode, RemoteStatusEvidence, SendOutcome, SendResponse,
         };
 
-        // DURABLE authority: an unknown non-zero code classifies UnknownStatus → TransientRetry.
-        let evidence = SubmissionEvidence::Started {
-            response: SendResponse::parsed(SendOutcome::from_server_code(
-                NonOkStatusCode::from_transport(-17).unwrap(),
-                DocType::Sell,
-                DecodedResponseDigest::from_transport_digest([0xAB; 32]),
+        // ── Divergent leaf A — RemoteAuthStatus → ProbeRequired/RemoteStatus ──
+        // Durable authority: classify(RemoteAuthStatus) = ProbeRequired. Legacy `DpsError::RemoteStatus`
+        // routes the COMPAT TransientRetry; the projection must reflect the DURABLE ProbeRequired.
+        let ev_ra = pin_started(SendResponse::remote_status(
+            RemoteStatusEvidence::RemoteAuthStatus(GrpcStatusDigest::from_transport_digest(
+                [0xCD; 32],
             )),
-            binding: DpsProtocolBinding {
-                protocol_id: DpsProtocolId::FscoZzd,
-                contract_version: ProtocolContractVersion(1),
-                capability_profile_version: None,
-                endpoint_config_revision: None,
-            },
-            envelope_hash: EnvelopeHash([0u8; 32]),
-        };
-        let classified = classify(&evidence);
-        assert_eq!(
-            classified.routing(),
-            Some(ActiveRetryClass::TransientRetry),
-            "durable authority: unknown non-zero → UnknownStatus → TransientRetry"
-        );
-
-        // The coupled legacy wire routing for the same reply is Decode → ProbeRequired (a
-        // proto-unrecognized code fails tonic decode — the §4.6 raw drift-delta).
-        let legacy = target_wire_decision(route_send_result(
-            Err(DpsError::Decode("status=-17 unknown non-zero".into())),
-            DocType::Sell,
-            true,
         ));
-        match &legacy {
-            WireDecision::Routed(d) => assert_eq!(
-                d.retry_class,
-                RetryClass::ProbeRequired,
-                "legacy Decode routing = ProbeRequired (the delta)"
-            ),
-            WireDecision::Sent { .. } => panic!("Decode legacy must be Routed"),
-        }
-
-        // F3 symmetric fix: project the DURABLE authority (TransientRetry) onto the wire decision.
-        let decision = project_decision_from_evidence(legacy, &classified);
-        let d = match &decision {
+        let cls_ra = classify(&ev_ra);
+        assert_eq!(cls_ra.routing(), Some(ActiveRetryClass::ProbeRequired));
+        let disc_ra = EvidenceDiscriminant::from_evidence(&ev_ra);
+        let dec_ra = wire_decision_from(&disc_ra, &cls_ra, None);
+        let d_ra = match &dec_ra {
             WireDecision::Routed(d) => d,
-            WireDecision::Sent { .. } => panic!("projected decision must be Routed"),
+            WireDecision::Sent { .. } => panic!("RemoteAuthStatus must be Routed"),
         };
+        assert_eq!(d_ra.target_state, DocState::ErrorRetryable);
+        assert_eq!(d_ra.retry_class, RetryClass::ProbeRequired);
+        assert_eq!(d_ra.audit_event, AuditEvent::StageSendProbeRequired);
+        assert_eq!(d_ra.audit_severity, Severity::Warning);
+        assert!(d_ra.node_mode_flip.is_none());
         assert_eq!(
-            d.retry_class,
-            RetryClass::TransientRetry,
-            "F3: projection reflects DURABLE TransientRetry, NOT legacy ProbeRequired"
+            d_ra.probe_hint.as_ref().map(|h| h.reason),
+            Some(ProbeReason::RemoteStatus),
+            "RemoteAuthStatus carries the distinct RemoteStatus probe reason"
         );
-        assert_eq!(d.target_state, DocState::ErrorRetryable);
+        assert!(d_ra.mac_recovery_hint.is_none());
+        // End-to-end: trace retry_class + returned outcome both agree with the DURABLE ProbeRequired.
+        let fx_ra = (None, "Transport", "gateway".to_string());
         assert_eq!(
-            d.audit_event,
-            AuditEvent::StageSendTransientRetry,
-            "F3: audit event is the transient-retry event, NOT decode-unknown"
+            build_attempt_completion(&dec_ra, Some(&fx_ra), "t0".into(), "t1".into())
+                .retry_class
+                .as_deref(),
+            Some("ProbeRequired")
         );
-        assert!(
-            d.probe_hint.is_none(),
-            "F3: transient retry carries NO probe_hint"
-        );
-
-        // End-to-end projection consistency: transport_trace.retry_class + the returned outcome
-        // (→ drain failure-class) both agree with durable TransientRetry, NOT the legacy ProbeRequired.
-        let forensics = (None, "Decode", "status=-17 unknown non-zero".to_string());
-        let completion =
-            build_attempt_completion(&decision, Some(&forensics), "t0".into(), "t1".into());
-        assert_eq!(
-            completion.retry_class.as_deref(),
-            Some("TransientRetry"),
-            "F3: transport_trace.retry_class == durable TransientRetry"
-        );
-        match stage_send_outcome_from(decision, 1, Some(&forensics)) {
-            StageSendOutcome::Routed { decision, .. } => assert_eq!(
-                decision.retry_class,
-                RetryClass::TransientRetry,
-                "F3: returned StageSendOutcome (→ drain failure-class) == durable TransientRetry"
-            ),
+        match stage_send_outcome_from(dec_ra, 1, Some(&fx_ra)) {
+            StageSendOutcome::Routed { decision, .. } => {
+                assert_eq!(decision.retry_class, RetryClass::ProbeRequired)
+            }
             _ => panic!("returned outcome must be Routed"),
         }
+
+        // ── Divergent leaf B — UnknownStatus (-17) → TransientRetry (Pin 2; ProbeRequired at Pin 3) ──
+        // The total projection UNIFIES the two legacy sources for this leaf (`-17` decode→ProbeRequired
+        // and `-4` indeterminate→TransientRetry) under the single durable `UnknownStatus → TransientRetry`.
+        let ev_us = pin_started(SendResponse::parsed(SendOutcome::from_server_code(
+            NonOkStatusCode::from_transport(-17).unwrap(),
+            DocType::Sell,
+            DecodedResponseDigest::from_transport_digest([0xAB; 32]),
+        )));
+        let cls_us = classify(&ev_us);
+        assert_eq!(
+            cls_us.routing(),
+            Some(ActiveRetryClass::TransientRetry),
+            "Pin 2: classifier still routes UnknownStatus → TransientRetry (Pin 3 flips it)"
+        );
+        let disc_us = EvidenceDiscriminant::from_evidence(&ev_us);
+        let dec_us = wire_decision_from(&disc_us, &cls_us, None);
+        let d_us = match &dec_us {
+            WireDecision::Routed(d) => d,
+            WireDecision::Sent { .. } => panic!("UnknownStatus must be Routed"),
+        };
+        assert_eq!(d_us.target_state, DocState::ErrorRetryable);
+        assert_eq!(d_us.retry_class, RetryClass::TransientRetry);
+        assert_eq!(d_us.audit_event, AuditEvent::StageSendTransientRetry);
+        assert_eq!(d_us.audit_severity, Severity::Warning);
+        assert!(d_us.node_mode_flip.is_none());
+        assert!(
+            d_us.probe_hint.is_none(),
+            "Pin 2: UnknownStatus carries NO probe (TransientRetry); Pin 3 activates SubmittedUnknown"
+        );
+        assert!(d_us.mac_recovery_hint.is_none());
+        let fx_us = (None, "Decode", "status=-17 unknown non-zero".to_string());
+        assert_eq!(
+            build_attempt_completion(&dec_us, Some(&fx_us), "t0".into(), "t1".into())
+                .retry_class
+                .as_deref(),
+            Some("TransientRetry")
+        );
+        match stage_send_outcome_from(dec_us, 1, Some(&fx_us)) {
+            StageSendOutcome::Routed { decision, .. } => {
+                assert_eq!(decision.retry_class, RetryClass::TransientRetry)
+            }
+            _ => panic!("returned outcome must be Routed"),
+        }
+
+        // ── Reject with a node-mode flip — Offline168 (-11) → TerminalReject + Blocked ──
+        // Locks the node_mode_flip source (classifier `node_effect==NodeBlocked → Some(Blocked)`) and
+        // the per-verdict Critical severity (a TerminalReject leaf), both authority-side (disc+cls).
+        let ev_ob = pin_started(SendResponse::parsed(SendOutcome::from_server_code(
+            NonOkStatusCode::from_transport(-11).unwrap(),
+            DocType::Sell,
+            DecodedResponseDigest::from_transport_digest([0x11; 32]),
+        )));
+        let cls_ob = classify(&ev_ob);
+        let disc_ob = EvidenceDiscriminant::from_evidence(&ev_ob);
+        let d_ob = match wire_decision_from(&disc_ob, &cls_ob, None) {
+            WireDecision::Routed(d) => d,
+            WireDecision::Sent { .. } => panic!("Offline168 must be Routed"),
+        };
+        assert_eq!(d_ob.target_state, DocState::Rejected);
+        assert_eq!(d_ob.retry_class, RetryClass::TerminalReject);
+        assert_eq!(d_ob.audit_event, AuditEvent::StageSendNodeBlocked);
+        assert_eq!(d_ob.audit_severity, Severity::Critical);
+        assert_eq!(
+            d_ob.node_mode_flip,
+            Some(crate::db::models::enums::NodeMode::Blocked)
+        );
+        assert!(d_ob.probe_hint.is_none());
+
+        // ── NoResponse leaf + WrapperBug overlay — the demoted route_dps_error is preserved VERBATIM ──
+        // The classifier collapses a wrapper-side bug (`Internal`/…) into NoResponse → TransientRetry;
+        // its CRITICAL WrapperBug diagnostic cannot be rebuilt from evidence, so it rides the overlay
+        // (S7-1 SENDING-held wrapper contract; integration fx06–fx09). A NON-wrapper overlay (Transport)
+        // does NOT apply — the leaf keeps the classifier's TransientRetry.
+        let ev_nr = pin_started(SendResponse::no_response(
+            NoResponseCause::CallFailedWithoutTrustedDpsEnvelope,
+        ));
+        let cls_nr = classify(&ev_nr);
+        assert_eq!(cls_nr.routing(), Some(ActiveRetryClass::TransientRetry));
+        let disc_nr = EvidenceDiscriminant::from_evidence(&ev_nr);
+        let wrapper = route_dps_error(
+            &DpsError::Internal("wrapper bug".into()),
+            DocType::Sell,
+            true,
+        );
+        assert_eq!(wrapper.retry_class, RetryClass::WrapperBug);
+        let d_nr = match wire_decision_from(&disc_nr, &cls_nr, Some(&wrapper)) {
+            WireDecision::Routed(d) => d,
+            WireDecision::Sent { .. } => panic!("NoResponse must be Routed"),
+        };
+        assert_eq!(
+            d_nr.retry_class,
+            RetryClass::WrapperBug,
+            "wrapper-bug overlay preserved VERBATIM on the collapsed NoResponse leaf"
+        );
+        assert_eq!(d_nr.audit_event, AuditEvent::StageSendWrapperBug);
+        assert_eq!(d_nr.audit_severity, Severity::Critical);
+        // A ServerFiscalIdMismatch overlay preserves its DISTINCT forensic audit event.
+        let mismatch = route_dps_error(
+            &DpsError::ServerFiscalIdMismatch {
+                expected_id: "A".into(),
+                actual_id: "B".into(),
+            },
+            DocType::Sell,
+            true,
+        );
+        match wire_decision_from(&disc_nr, &cls_nr, Some(&mismatch)) {
+            WireDecision::Routed(d) => {
+                assert_eq!(d.retry_class, RetryClass::WrapperBug);
+                assert_eq!(d.audit_event, AuditEvent::StageSendFiscalIdMismatch);
+            }
+            WireDecision::Sent { .. } => panic!("must be Routed"),
+        }
+        // Transport overlay → NOT preserved; the leaf keeps the classifier's TransientRetry.
+        let transport = route_dps_error(&DpsError::Transport("reset".into()), DocType::Sell, true);
+        match wire_decision_from(&disc_nr, &cls_nr, Some(&transport)) {
+            WireDecision::Routed(d) => assert_eq!(
+                d.retry_class,
+                RetryClass::TransientRetry,
+                "Transport overlay is non-WrapperBug → classifier TransientRetry"
+            ),
+            WireDecision::Sent { .. } => panic!("must be Routed"),
+        }
+
+        // (The happy `Accepted → Sent{fiscal_no}` arm — SFN threaded from `disc::Accepted`, not the
+        // legacy `CheckAck` — is covered by `route_send_result_ok_arm_yields_sent` +
+        // `s7_target_wire_decision_maps_empty_sfn_to_held_not_sent`.)
     }
 
     fn inputs(doc_type: DocType, lnd: i64, business_ts: &str) -> SendInputs {
