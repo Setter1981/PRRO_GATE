@@ -455,6 +455,26 @@ pub fn scripted_observation(
     (legacy, observation)
 }
 
+/// CS-3 Slice E Pin 5 (directed teeth §6): the SAME `(legacy, observation)` pair the production
+/// `GrpcDpsChannel` mints from a RAW `gen::CheckResponse`, via the REAL [`observe_check_reply`] decode.
+///
+/// A mock built on [`scripted_observation`] cannot exercise the `UnknownStatus` leaf: an unnamed
+/// non-zero status code (`-4`/`-17`) collapses to `DpsError::Indeterminate`/`Decode`, which
+/// [`observe_faithful_from_legacy`] cannot rebuild (it falls back to `NoResponse`). This helper feeds
+/// the raw `CheckResponse` straight through the production single-decode, so a directed test drives the
+/// real `UnknownStatus → ProbeRequired` leaf end-to-end (NOT a `Mutation`/fuzzer op — `wire_to_result`
+/// collapses those).
+#[cfg(any(test, feature = "test-support"))]
+pub fn scripted_raw_observation(
+    resp: gen::CheckResponse,
+) -> (
+    Result<CheckAck, DpsError>,
+    super::raw_reply::RawSendObservation,
+) {
+    let (legacy, raw, diag) = observe_check_reply(resp);
+    (legacy, super::raw_reply::RawSendObservation::new(raw, diag))
+}
+
 /// Same dispatch shape for `StatusResponse` — the proto's status enum
 /// is a strict subset of `CheckResponse`'s, so the routing rules
 /// match one-to-one.
