@@ -243,10 +243,13 @@ pub struct ProbeHint {
 pub enum ProbeReason {
     /// status=0 UNKNOWN — proto-default, server contract drift suspected.
     DecodeUnknown,
-    /// `-2` ERROR_CHECK + doc_type ∈ {SHIFT_CLOSE, Z_REPORT}.
-    Code2CloseShift,
-    /// `-15` ERROR_NOT_OPEN_SHIFT + doc_type ∈ {SHIFT_CLOSE, Z_REPORT}.
-    Code15CloseShift,
+    /// CS-3 Slice E: `-2` (ERROR_CHECK) or `-15` (ERROR_NOT_OPEN_SHIFT) on a
+    /// {SHIFT_CLOSE, Z_REPORT} doc — both are close-shift ambiguity that HOLDS for a probe with
+    /// zero second wire. The raw code is already discarded in the sealed `CloseAmbiguous` evidence
+    /// leaf (`prro-domain` `evidence.rs`), and both arms produced an identical `ProbeRequired`/HELD
+    /// `RoutingDecision`, so they unify to ONE reason — an accepted observable audit-label merge
+    /// (2→1). No downstream distinguishes `-2` from `-15`; the probe reads `routing_class`, not this.
+    CloseShiftProbe,
     /// CS-3 S7-1 (dossier rev9): DPS returned OK (`status==1`) with an EMPTY fiscal id — no
     /// issuance occurred, so the receipt is HELD for a `last_chk` probe rather than treated as a
     /// `Sent{""}`. This is the target for the `OkButNoFiscalNumber` evidence leaf; the pre-cutover
@@ -505,7 +508,7 @@ fn route_server_code(
                     audit_severity: Severity::Warning,
                     node_mode_flip: None,
                     probe_hint: Some(ProbeHint {
-                        reason: ProbeReason::Code2CloseShift,
+                        reason: ProbeReason::CloseShiftProbe,
                     }),
                     mac_recovery_hint: None,
                 }
@@ -599,7 +602,7 @@ fn route_server_code(
                     audit_severity: Severity::Warning,
                     node_mode_flip: None,
                     probe_hint: Some(ProbeHint {
-                        reason: ProbeReason::Code15CloseShift,
+                        reason: ProbeReason::CloseShiftProbe,
                     }),
                     mac_recovery_hint: None,
                 }
@@ -850,7 +853,7 @@ mod tests {
             assert_eq!(
                 d.probe_hint,
                 Some(ProbeHint {
-                    reason: ProbeReason::Code2CloseShift
+                    reason: ProbeReason::CloseShiftProbe
                 })
             );
         }
@@ -931,7 +934,7 @@ mod tests {
             assert_eq!(
                 d.probe_hint,
                 Some(ProbeHint {
-                    reason: ProbeReason::Code15CloseShift
+                    reason: ProbeReason::CloseShiftProbe
                 })
             );
         }
@@ -1201,11 +1204,11 @@ mod tests {
             ),
             (
                 route_server_code(-2, "open shift", DocType::ShiftClose, true),
-                ProbeReason::Code2CloseShift,
+                ProbeReason::CloseShiftProbe,
             ),
             (
                 route_server_code(-15, "x", DocType::ZReport, true),
-                ProbeReason::Code15CloseShift,
+                ProbeReason::CloseShiftProbe,
             ),
         ];
         for (d, expected_reason) in cases {

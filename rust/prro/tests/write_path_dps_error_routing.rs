@@ -457,8 +457,8 @@ async fn fx11_server_minus_2_close_shift_routes_to_probe_required() {
             assert_eq!(decision.retry_class, RetryClass::ProbeRequired);
             assert_eq!(
                 decision.probe_hint.as_ref().map(|h| h.reason),
-                Some(ProbeReason::Code2CloseShift),
-                "close-shift -2 must carry Code2CloseShift probe hint"
+                Some(ProbeReason::CloseShiftProbe),
+                "close-shift -2 must carry CloseShiftProbe probe hint"
             );
         }
         other => panic!("expected Routed probe, got {other:?}"),
@@ -467,7 +467,46 @@ async fn fx11_server_minus_2_close_shift_routes_to_probe_required() {
     assert_eq!(read_state(&pool, doc).await, "SENDING");
     let chain = read_audit_chain(&pool, doc).await;
     let payload = assert_audit_event(&chain, "STAGE_SEND_PROBE_REQUIRED", "WARNING");
-    assert!(payload.contains("\"probe_hint\":\"Code2CloseShift\""));
+    assert!(payload.contains("\"probe_hint\":\"CloseShiftProbe\""));
+}
+
+// CS-3 Slice E (Pin 1) — RED-first: -2 and -15 close-shift collapse to ONE probe reason
+// (CloseShiftProbe). Before the merge they carry distinct CloseShiftProbe / CloseShiftProbe;
+// after, both must be EQUAL. Rename-agnostic — compares the two reasons, names no variant.
+#[tokio::test]
+async fn slice_e_close_shift_probe_unifies_minus_2_and_minus_15() {
+    let (_d2, pool2) = fresh_pool().await;
+    let doc2 = seed_signed_zreport(&pool2, 0xE2).await;
+    let stub2 = StubDpsChannel::new(Err(DpsError::Server {
+        code: -2,
+        message: "ERROR_CHECK".into(),
+    }));
+    let r2 = match stage_send::run(&pool2, &stub2, doc2, None).await.unwrap() {
+        StageSendOutcome::Routed { decision, .. } => {
+            assert_eq!(decision.retry_class, RetryClass::ProbeRequired);
+            decision.probe_hint.as_ref().map(|h| h.reason)
+        }
+        other => panic!("expected Routed probe for -2, got {other:?}"),
+    };
+
+    let (_d15, pool15) = fresh_pool().await;
+    let doc15 = seed_signed_zreport(&pool15, 0xE5).await;
+    let stub15 = StubDpsChannel::new(Err(DpsError::Server {
+        code: -15,
+        message: "ERROR_NOT_OPEN_SHIFT".into(),
+    }));
+    let r15 = match stage_send::run(&pool15, &stub15, doc15, None).await.unwrap() {
+        StageSendOutcome::Routed { decision, .. } => {
+            assert_eq!(decision.retry_class, RetryClass::ProbeRequired);
+            decision.probe_hint.as_ref().map(|h| h.reason)
+        }
+        other => panic!("expected Routed probe for -15, got {other:?}"),
+    };
+
+    assert!(
+        r2.is_some() && r2 == r15,
+        "Slice E: -2 and -15 close-shift must collapse to one CloseShiftProbe reason; got {r2:?} vs {r15:?}"
+    );
 }
 
 // Fixture 12 — Server{-3} → transient retry
@@ -635,7 +674,7 @@ async fn fx19_server_minus_15_close_shift_routes_to_probe_required() {
             assert_eq!(decision.retry_class, RetryClass::ProbeRequired);
             assert_eq!(
                 decision.probe_hint.as_ref().map(|h| h.reason),
-                Some(ProbeReason::Code15CloseShift),
+                Some(ProbeReason::CloseShiftProbe),
             );
         }
         other => panic!("expected Routed probe, got {other:?}"),
@@ -644,7 +683,7 @@ async fn fx19_server_minus_15_close_shift_routes_to_probe_required() {
     assert_eq!(read_state(&pool, doc).await, "SENDING");
     let chain = read_audit_chain(&pool, doc).await;
     let payload = assert_audit_event(&chain, "STAGE_SEND_PROBE_REQUIRED", "WARNING");
-    assert!(payload.contains("\"probe_hint\":\"Code15CloseShift\""));
+    assert!(payload.contains("\"probe_hint\":\"CloseShiftProbe\""));
 }
 
 // Fixture 20 — Server{-16} M3a → terminal Rejected + alert

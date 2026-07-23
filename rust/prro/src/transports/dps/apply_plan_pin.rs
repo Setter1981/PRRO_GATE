@@ -224,12 +224,12 @@ fn s7_applyplan_routing_projection_is_locked() {
     );
     assert_eq!(
         routed(-2, Z),
-        close_probe_required(ProbeReason::Code2CloseShift),
+        close_probe_required(ProbeReason::CloseShiftProbe),
         "-2 on close/Z"
     );
     assert_eq!(
         routed(-15, Z),
-        close_probe_required(ProbeReason::Code15CloseShift),
+        close_probe_required(ProbeReason::CloseShiftProbe),
         "-15 on close/Z"
     );
 
