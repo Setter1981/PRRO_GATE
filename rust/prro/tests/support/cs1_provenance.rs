@@ -72,7 +72,7 @@ pub const HEAD_SHA: &str = "f2628ba";
 /// re-anchored to the cutover commit: `git_show(LIVE_DRIFT_BASE_SHA, file) == worktree`, and it
 /// still fails RED on any FURTHER non-neutral drift vs this base. No carve-out, no weakening of
 /// the immutable proof. Re-anchor again (bump this) at the next adjudicated frozen-file change.
-pub const LIVE_DRIFT_BASE_SHA: &str = "bc186e6";
+pub const LIVE_DRIFT_BASE_SHA: &str = "97c16eb";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is

@@ -1388,6 +1388,7 @@ test-support	prro	prro::invariant_fuzzer	scan_skips_mid_crash_sending_transient	
 test-support	prro	prro::invariant_fuzzer	shrinking_reduces_a_forced_failure_to_minimal	false
 test-support	prro	prro::invariant_fuzzer	teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call	false
 test-support	prro	prro::invariant_fuzzer	teeth_b10_reverted_begin_chain_reddens_ledger_delta	false
+test-support	prro	prro::invariant_fuzzer	teeth_cross_shift_cash_carry_epz_after_z_reopen	false
 test-support	prro	prro::invariant_fuzzer	teeth_d1_gapless_reissue_not_flagged	false
 test-support	prro	prro::invariant_fuzzer	teeth_d1_next_lnd_predicts_db	false
 test-support	prro	prro::invariant_fuzzer	teeth_d2_mid_transition_deferral_not_flagged	false
