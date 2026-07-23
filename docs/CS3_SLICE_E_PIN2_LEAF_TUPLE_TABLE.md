@@ -31,10 +31,12 @@ anyway (it is dropped inside `submit_authorized`), so no sole-wire plumbing was 
 
 ## Grounding notes
 
-1. **`mac_recovery_hint` on the projected decision is DEAD** → `None` on every leaf. Field reads exist
-   only in `error_routing.rs` unit tests; the W10.4 MAC orchestrator (`mac_recovery.rs`) reads its own
-   `hint` param sourced from the durable `-12` evidence, not this projection. Emitting `None` is
-   observably identical (the field never reaches audit/trace/return).
+1. **`mac_recovery_hint` on the projected decision has NO live consumer** → `None` on every leaf. Field
+   reads exist only in `error_routing.rs` unit tests; the W10.4 MAC orchestrator (`mac_recovery.rs`) reads
+   its own `hint` param sourced from the durable `-12` evidence, not this projection. The `None` DOES ride
+   into the returned `StageSendOutcome::Routed`'s `RoutingDecision` (`stage_send.rs` ~`stage_send_outcome_from`),
+   but neither the audit nor the trace nor any production reader references it — so emitting `None` is
+   observably inert (not "unreachable").
 2. **Wrapper-bugs ARE reachable — via the observed evidence collapse.** `Internal` / `NotFound` /
    `QueryNotSupported` / `ServerFiscalIdMismatch` collapse to the ONE `NoResponse{CallFailed…}` leaf
    (`observe_faithful_from_legacy` → `observe_from_legacy`); `classify(NoResponse)` is always

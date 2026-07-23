@@ -31,8 +31,13 @@
 --     terminal state without tripping the matrix. This lenient branch is defensive backward-compat;
 --     no fresh writer ever exercises it (INSERT pins RESERVED_NOT_STARTED → 032, so the only route
 --     into OO is the CALL_STARTED transition, and the live writer emits ProbeRequired).
--- The `evidence_immutable` trigger (036) freezes only the four evidence columns after OO — NOT
--- `routing_class`/`node_effect` — so a re-validation UPDATE re-fires this matrix and is checked here.
+-- ANY UPDATE on a row already at OUTCOME_OBSERVED re-fires this BEFORE UPDATE matrix trigger (its
+-- WHEN keys on NEW.state='OUTCOME_OBSERVED'), so the row's axes are re-checked here even on a benign
+-- `apply_state` change. `routing_class`/`node_effect` are themselves frozen after OO (migrations
+-- 032/033), so a re-validation UPDATE cannot MUTATE them into the legacy combo — it can only carry
+-- the row's UNCHANGED axes, which for a pre-038 UnknownStatus row are `(TransientRetry, NoNodeEffect)`;
+-- the lenient branch accepts exactly that. (The `evidence_immutable` trigger (036) independently freezes
+-- the four evidence columns.)
 
 DROP TRIGGER IF EXISTS delivery_reservation_evidence_matrix_update;
 
