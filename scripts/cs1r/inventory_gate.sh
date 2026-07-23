@@ -3,7 +3,9 @@
 #
 # Enforces ALL THREE (spec §4 R1.2), profile in identity:
 #   (1) live `nextest list` == committed manifest (no drift), per profile;
-#   (2) the PR's manifest diff vs base may ONLY ADD identity rows;
+#   (2) the PR's manifest diff vs base may ONLY ADD identity rows — the sole
+#       exception is an adjudicated retire-and-replace recorded EXACTLY in the
+#       supersession registry (docs/cs1r/inventory/superseded_removals.tsv);
 #   (3) every new source test file appears in the committed source inventory in
 #       THIS PR (a new test can't be added-then-silently-deleted).
 #
@@ -75,25 +77,78 @@ ok "source inventory: no drift, every source test file recorded"
 # evaporated with the detector. `scripts/cs1r/manifest_detector_paths.py` and
 # `scripts/cs1r/rust_change_paths.py` were deleted in the same change.
 
-# ── control (2): additions-only vs base (PR mode) ────────────────────────────
+# ── control (2): additions-only vs base, with a recorded SUPERSESSION registry ──
+# A removal (a test identity present in base but ABSENT in the PR) stays FORBIDDEN
+# by default. The ONLY escape is an adjudicated retire-and-replace recorded EXACTLY
+# in the supersession registry (docs/cs1r/inventory/superseded_removals.tsv):
+#   * every removal MUST be registered (module,test) — no glob, no wildcard;
+#   * the registry MUST NOT be stale — every registered removal must ACTUALLY be
+#     absent vs base;
+#   * every registered REPLACEMENT test MUST exist in the current manifest (retired
+#     coverage moved, it did not vanish).
+# So the set of real removals == the set of registered supersessions, exactly. Any
+# UNregistered future removal (or a stale/false registry row, or a missing
+# replacement) is RED. Controls (1) live==committed and (3) source-inventory are
+# UNCHANGED.
 if [ "${1:-}" = "--pr" ]; then
   BASE_REF="${2:?--pr requires a base ref}"
+  REGISTRY="$INV_DIR/superseded_removals.tsv"
+
+  # Approved (removed_module, removed_test) identities from the registry.
+  # Columns (TAB): removed_module  removed_test  repl_module  repl_test  reason
+  if [ -f "$REGISTRY" ]; then
+    grep -vE '^[[:space:]]*(#|$)' "$REGISTRY" | cut -f1,2 | sort -u > "$TMP/approved_ident.tsv"
+  else
+    : > "$TMP/approved_ident.tsv"
+  fi
+
+  : > "$TMP/removed_ident_all.tsv"
   for profile in test-support live-dps; do
     committed="$INV_DIR/manifest.$profile.tsv"
     git show "$BASE_REF:$committed" > "$TMP/base.$profile.tsv" 2>/dev/null \
       || { echo "base has no $committed (new file) — treated as empty"; : > "$TMP/base.$profile.tsv"; }
-    # rows present in base but ABSENT in the PR manifest = a REMOVAL (forbidden).
-    removed="$(comm -23 <(sort "$TMP/base.$profile.tsv") <(sort "$committed") || true)"
-    if [ -n "$removed" ]; then
-      echo "----- forbidden REMOVALS from $profile manifest -----" >&2
-      echo "$removed" >&2
-      fail "manifest diff vs base REMOVED identity rows ($profile) — additions-only \
-(delete/rename/#[ignore] of an existing test is forbidden without an explicit \
-architecture decision)"
+    comm -23 <(sort "$TMP/base.$profile.tsv") <(sort "$committed") > "$TMP/removed.$profile.tsv" || true
+    # (module f3, test f4) of each removed identity row.
+    cut -f3,4 "$TMP/removed.$profile.tsv" | sort -u > "$TMP/removed_ident.$profile.tsv"
+    cat "$TMP/removed_ident.$profile.tsv" >> "$TMP/removed_ident_all.tsv"
+    # (a) every removal must be a REGISTERED supersession — else forbidden.
+    unapproved="$(comm -23 "$TMP/removed_ident.$profile.tsv" "$TMP/approved_ident.tsv" || true)"
+    if [ -n "$unapproved" ]; then
+      echo "----- REMOVED identities NOT in supersession registry ($profile) -----" >&2
+      echo "$unapproved" >&2
+      fail "manifest REMOVED test identities not recorded in $REGISTRY ($profile) — additions-only \
+unless an adjudicated retire-and-replace is registered (delete/rename/#[ignore] is otherwise forbidden)"
     fi
-    added="$(comm -13 <(sort "$TMP/base.$profile.tsv") <(sort "$committed") | wc -l)"
-    ok "profile '$profile': additions-only vs $BASE_REF ($added added, 0 removed)"
+    added="$(comm -13 <(sort "$TMP/base.$profile.tsv") <(sort "$committed") | wc -l | tr -d ' ')"
+    superseded="$(wc -l < "$TMP/removed_ident.$profile.tsv" | tr -d ' ')"
+    ok "profile '$profile': additions-only + registered-supersession vs $BASE_REF ($added added, $superseded superseded)"
   done
+
+  # (b) NO stale registry rows: every approved supersession must ACTUALLY be absent
+  # vs base in some profile (a registry row with no real removal is RED).
+  sort -u "$TMP/removed_ident_all.tsv" > "$TMP/removed_ident_u.tsv"
+  stale="$(comm -23 "$TMP/approved_ident.tsv" "$TMP/removed_ident_u.tsv" || true)"
+  if [ -n "$stale" ]; then
+    echo "----- STALE supersession registry rows (no matching removal vs base) -----" >&2
+    echo "$stale" >&2
+    fail "supersession registry has rows with no actual removal vs base — prune $REGISTRY (exact, no stale)"
+  fi
+
+  # (c) every registered REPLACEMENT must EXIST in the current committed manifest
+  # (test-support OR live-dps). Read via process-substitution (NOT a pipe) so a
+  # `fail` inside the loop exits the script instead of a subshell.
+  if [ -f "$REGISTRY" ]; then
+    while IFS=$'\t' read -r rmod rtest repl_mod repl_test reason; do
+      case "$rmod" in ''|\#*) continue ;; esac
+      hit="$(awk -F'\t' -v m="$repl_mod" -v t="$repl_test" '$3==m && $4==t {print; exit}' \
+             "$INV_DIR/manifest.test-support.tsv" "$INV_DIR/manifest.live-dps.tsv")"
+      if [ -z "$hit" ]; then
+        fail "supersession replacement '$repl_mod::$repl_test' (retiring '$rmod::$rtest') \
+not found in the committed manifests — the replacement test must exist"
+      fi
+    done < <(grep -vE '^[[:space:]]*(#|$)' "$REGISTRY")
+    ok "supersession registry: all replacements exist in the current manifest"
+  fi
 
   # control (3) additions-only for the SOURCE inventory: a committed source test
   # file path may not VANISH from the manifest vs base (a delete is an explicit
