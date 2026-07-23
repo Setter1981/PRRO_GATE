@@ -196,6 +196,24 @@ async fn read_reservation_axes(pool: &SqlitePool, doc: DocumentId) -> Axes {
     .unwrap()
 }
 
+/// The durable HOLD markers: (reservation `apply_state`, `node_state.mode`, whether the FN fence
+/// pointer `active_delivery_reservation_id` is still SET). `1234567890` is the seed FN.
+async fn read_hold_markers(pool: &SqlitePool, doc: DocumentId) -> (String, String, bool) {
+    let apply_state: String =
+        sqlx::query_scalar("SELECT apply_state FROM delivery_reservation WHERE document_id = ?")
+            .bind(DbDocumentId(doc))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let (mode, fence): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT mode, active_delivery_reservation_id FROM node_state WHERE fiscal_number = '1234567890'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (apply_state, mode, fence.is_some())
+}
+
 /// The shared body: a raw `status` (`-4` or `-17`) drives the `UnknownStatus → ProbeRequired` leaf.
 async fn assert_unknown_status_holds_probe(status: i32, doc_byte: u8) {
     let (_d, pool) = fresh_pool().await;
@@ -232,11 +250,28 @@ async fn assert_unknown_status_holds_probe(status: i32, doc_byte: u8) {
         "status={status}: raw code preserved"
     );
 
-    // STOP/fence held: the doc rests SENDING (NOT ErrorRetryable re-drive, NOT Rejected).
+    // STOP/fence held — the doc rests SENDING (NOT ErrorRetryable re-drive, NOT Rejected) AND the
+    // three durable hold markers are set: the reservation stays PENDING_APPLY (apply did NOT release
+    // it — `record_outcome`/`apply_recorded_outcome` HeldNotAutoRelease), the node is halted STOP_MODE
+    // (record owns the SubmittedUnknown halt, `delivery_reservation.rs` set_mode_stop_mode_tx), and the
+    // FN fence pointer is NOT cleared (the held reservation is still the node's active one).
     assert_eq!(
         read_state(&pool, doc).await,
         "SENDING",
         "status={status}: held SENDING under STOP"
+    );
+    let (apply_state, node_mode, fence_set) = read_hold_markers(&pool, doc).await;
+    assert_eq!(
+        apply_state, "PENDING_APPLY",
+        "status={status}: reservation HELD PENDING_APPLY (apply did not auto-release)"
+    );
+    assert_eq!(
+        node_mode, "STOP_MODE",
+        "status={status}: node halted STOP_MODE (SubmittedUnknown hold)"
+    );
+    assert!(
+        fence_set,
+        "status={status}: the FN fence pointer (active_delivery_reservation_id) is NOT cleared"
     );
 
     // The returned outcome carries the ProbeRequired routing + the SubmittedUnknown probe reason.
