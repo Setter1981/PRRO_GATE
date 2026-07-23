@@ -1021,7 +1021,13 @@ fn routing_for_reject(verdict: &DpsReject) -> (ActiveRetryClass, NodeEffect) {
 
 fn routing_for_indeterminate(ind: &SendIndeterminate) -> ActiveRetryClass {
     match ind.kind() {
-        SendIndeterminateKind::UnknownStatus { .. } => ActiveRetryClass::TransientRetry,
+        // CS-3 Slice E Pin 3 (Track B): a parsed envelope carrying an unnamed non-zero status code
+        // (`-4`/`-17`/`-99`) is HELD for a `last_chk` probe, NOT blind-retried — the wire crossed and a
+        // real envelope returned, but its verdict is unresolvable. Flipped TransientRetry → ProbeRequired
+        // (node_effect follows via `node_effect_for_active` → ProbeRequired). ATOMIC with migration 038
+        // (the un-flipped classifier would take SQL rejects from 038's matrix, and vice-versa).
+        SendIndeterminateKind::UnknownStatus { .. } => ActiveRetryClass::ProbeRequired,
+        // SaveError (`-3`) stays TransientRetry — a distinct leaf; DPS advises a bounded re-send.
         SendIndeterminateKind::SaveError { .. } => ActiveRetryClass::TransientRetry,
         SendIndeterminateKind::CloseAmbiguous { .. } => ActiveRetryClass::ProbeRequired,
         // D-2: proto status==0 is a decode-indeterminate — probe, don't blind-retry (§4.6).

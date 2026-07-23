@@ -208,7 +208,11 @@ fn s7_applyplan_routing_projection_is_locked() {
     assert_eq!(
         routed(-4, SELL),
         transient_retry(),
-        "-4 ErrorUnknown (Indeterminate) — NOT a delta"
+        // The LEGACY (incumbent) `route_dps_error` routing of a parsed `-4` stays TransientRetry.
+        // CS-3 Slice E Pin 3 flipped the SHADOW classifier (UnknownStatus → ProbeRequired), so `-4`
+        // is now the §4.6 drift-delta (Live TransientRetry / Shadow ProbeRequired), pinned by the
+        // grpc drift-check — this incumbent-forensics assertion is unaffected.
+        "-4 ErrorUnknown (Indeterminate) — incumbent route stays TransientRetry"
     );
 
     // ── close/non-close split (-2 / -15) ──
@@ -224,12 +228,12 @@ fn s7_applyplan_routing_projection_is_locked() {
     );
     assert_eq!(
         routed(-2, Z),
-        close_probe_required(ProbeReason::Code2CloseShift),
+        close_probe_required(ProbeReason::CloseShiftProbe),
         "-2 on close/Z"
     );
     assert_eq!(
         routed(-15, Z),
-        close_probe_required(ProbeReason::Code15CloseShift),
+        close_probe_required(ProbeReason::CloseShiftProbe),
         "-15 on close/Z"
     );
 

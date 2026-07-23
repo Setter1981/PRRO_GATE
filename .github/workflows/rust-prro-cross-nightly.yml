@@ -56,7 +56,12 @@ jobs:
             apt: ''
 
     steps:
+      # fetch-depth: 0 — this job runs the full `cargo nextest run -p prro` which includes
+      # `cs1_test_provenance`; that test `git show`s pinned CS-1 base/head SHAs (f2c17b1/f2628ba +
+      # the live-drift base), unreachable on a shallow checkout. Mirrors rust-prro.yml.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
 
       - name: Install apt deps (Linux musl)
         if: matrix.apt != ''

@@ -735,7 +735,10 @@ mod tests {
             (-2, "", z), // close/Z → ProbeRequired
             (-15, "", z),
             (-3, "", sell),
-            (-4, "", sell),
+            // CS-3 Slice E Pin 3: `-17` (unknown non-zero) is now an EQUAL row — Live tonic-decode
+            // fails → Decode → ProbeRequired, Shadow UnknownStatus → ProbeRequired (flipped). `-4`
+            // moved OUT to Delta 2 below (Live Indeterminate → TransientRetry stays, Shadow flipped).
+            (-17, "", sell),
             (0, "", sell), // status==0 → both ProbeRequired (Live Decode, Shadow MissingStatus)
         ];
         for &(status, id, dt) in equal_rows {
@@ -768,23 +771,28 @@ mod tests {
             },
             "delta empty-id shadow"
         );
-        // Delta 2 — unknown non-zero: Live Decode→ProbeRequired, Shadow UnknownStatus→TransientRetry.
-        let (live, shadow) = drift_check(-17, "", sell);
+        // Delta 2 — parsed `-4`: Live Indeterminate→TransientRetry, Shadow UnknownStatus→ProbeRequired.
+        // CS-3 Slice E Pin 3 flipped the shadow (UnknownStatus TransientRetry → ProbeRequired), so the
+        // §4.6 delta DIRECTION reversed vs the pre-flip `-17` delta: the persisted classifier now HOLDS
+        // (`ProbeRequired`) while the legacy wire routing still re-drives (`TransientRetry`). `-17` is an
+        // EQUAL row above (Live tonic-decode fails → ProbeRequired, matching the flipped shadow); `-4`
+        // is the parsed-Indeterminate leaf whose legacy compat routing stayed TransientRetry.
+        let (live, shadow) = drift_check(-4, "", sell);
         assert_eq!(
             live,
-            Norm::Retry {
-                class: Nc::ProbeRequired,
-                blocked: false
-            },
-            "delta unknown-non-zero live"
-        );
-        assert_eq!(
-            shadow,
             Norm::Retry {
                 class: Nc::TransientRetry,
                 blocked: false
             },
-            "delta unknown-non-zero shadow"
+            "delta parsed-minus-4 live"
+        );
+        assert_eq!(
+            shadow,
+            Norm::Retry {
+                class: Nc::ProbeRequired,
+                blocked: false
+            },
+            "delta parsed-minus-4 shadow"
         );
         // Delta 3 — TLS RemoteStatus: Live TransientRetry (compat projection), Shadow ProbeRequired.
         let (live, shadow) = drift_status(Status::unauthenticated("x"), PeerAuth::TlsProven, sell);

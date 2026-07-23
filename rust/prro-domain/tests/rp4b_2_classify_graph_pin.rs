@@ -9,9 +9,10 @@
 //! **Normative graph source:** #4B §2 table (quoted verbatim in NORMATIVE_GRAPH below).
 //! Encoded INDEPENDENTLY from `classify` — not by calling `classify`.
 //!
-//! **Also covers RP4B-3:** `-4` ⇒ `{SubmittedUnknown, Parsed, TransientRetry}`;
-//! `-3` same row; bare timeout ⇒ `{SubmittedUnknown, NoResponse, TransientRetry}`;
-//! `-1` ⇒ `{Submitted, Parsed, TerminalReject}` — all distinct.
+//! **Also covers RP4B-3:** `-4` ⇒ `{SubmittedUnknown, Parsed, ProbeRequired}` (CS-3 Slice E Pin 3
+//! flipped UnknownStatus TransientRetry → ProbeRequired); `-3` (SaveError) ⇒
+//! `{SubmittedUnknown, Parsed, TransientRetry}`; bare timeout ⇒ `{SubmittedUnknown, NoResponse,
+//! TransientRetry}`; `-1` ⇒ `{Submitted, Parsed, TerminalReject}` — all distinct.
 //!
 //! RED-first: this test is written BEFORE the types/classifier exist; it must compile
 //! and FAIL (type-not-found or classification mismatch) before the implementation lands.
@@ -159,7 +160,7 @@ use SubmissionCertainty as SC;
 //   Started{Parsed(Rejected(-14 NotSignReg))} → Submitted / ParsedDpsEnvelope / FnConfigError
 //   Started{Parsed(Rejected(-16 OffId))}   → Submitted / ParsedDpsEnvelope / TerminalReject
 //   Started{Parsed(Rejected(Close on SELL))} → Submitted / ParsedDpsEnvelope / TerminalReject
-//   Started{Parsed(Indeterminate(Unknown))} → SubmittedUnknown / ParsedDpsEnvelope / TransientRetry
+//   Started{Parsed(Indeterminate(Unknown))} → SubmittedUnknown / ParsedDpsEnvelope / ProbeRequired
 //   Started{Parsed(Indeterminate(SaveError))} → SubmittedUnknown / ParsedDpsEnvelope / TransientRetry
 //   Started{Parsed(Indeterminate(CloseAmbig on Z_REPORT))} → SubmittedUnknown / ParsedDpsEnvelope / ProbeRequired
 //   Started{Parsed(Indeterminate(OkNoFn))} → SubmittedUnknown / ParsedDpsEnvelope / ProbeRequired
@@ -316,10 +317,13 @@ fn normative_graph() -> Vec<GraphRow> {
 
         // ── Started{Parsed(Indeterminate)} ──────────────────────────────────
         GraphRow {
-            label: "Started/Parsed(Indeterminate(Unknown/-4)) → SubmittedUnknown/Parsed/TransientRetry (RP4B-3)",
+            // CS-3 Slice E Pin 3 (Track B): UnknownStatus flips TransientRetry → ProbeRequired (and
+            // node_effect NoNodeEffect → ProbeRequired). A parsed envelope carrying an unnamed non-zero
+            // code is HELD for a `last_chk` probe, not blind-retried. Atomic with migration 038.
+            label: "Started/Parsed(Indeterminate(Unknown/-4)) → SubmittedUnknown/Parsed/ProbeRequired (CS-3 Slice E Pin 3)",
             evidence: parsed(RawDpsStatus::Error(-4), DocType::Sell),
             doc_type: DocType::Sell,
-            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::TransientRetry), NE::NoNodeEffect),
+            expected: expected(SC::SubmittedUnknown, RP::ParsedDpsEnvelope, Some(ARC::ProbeRequired), NE::ProbeRequired),
         },
         GraphRow {
             label: "Started/Parsed(Indeterminate(SaveError/-3)) → SubmittedUnknown/Parsed/TransientRetry (RP4B-3)",

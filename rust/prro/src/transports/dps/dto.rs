@@ -322,9 +322,10 @@ pub(crate) fn try_decode_check_response(r: gen::CheckResponse) -> Result<CheckAc
 /// so the digest is framed from live fields. `Status::try_from` fails only for a code outside the
 /// declared `-16..=1` enum (proto-unrecognized). §4.3 row-6 (auditor-adjudicated 2026-07-18): an
 /// unrecognized NON-ZERO code is still a server verdict code → `ServerCode` (the engine maps it to
-/// `UnknownStatus → TransientRetry`); ONLY proto `status == 0` (`Ok(Unknown)`) is `MissingStatus →
-/// ProbeRequired`. This preserves the §4.6 "unknown-non-zero" drift-delta (Live `Decode →
-/// ProbeRequired` vs Shadow `UnknownStatus → TransientRetry`).
+/// `UnknownStatus`, which CS-3 Slice E Pin 3 routes `→ ProbeRequired`); ONLY proto `status == 0`
+/// (`Ok(Unknown)`) is `MissingStatus → ProbeRequired`. Post-Pin-3 the §4.6 drift-delta is `-4` (Live
+/// `Indeterminate → TransientRetry` vs Shadow `UnknownStatus → ProbeRequired`); a proto-unrecognized
+/// `-17` is now an EQUAL row (Live tonic-decode fails → `Decode → ProbeRequired`, matching the shadow).
 pub(in crate::transports::dps) fn raw_reply_from_check_response(
     r: &gen::CheckResponse,
 ) -> RawSendReply {
@@ -452,6 +453,26 @@ pub fn scripted_observation(
 ) {
     let observation = observe_faithful_from_legacy(&legacy);
     (legacy, observation)
+}
+
+/// CS-3 Slice E Pin 5 (directed teeth §6): the SAME `(legacy, observation)` pair the production
+/// `GrpcDpsChannel` mints from a RAW `gen::CheckResponse`, via the REAL [`observe_check_reply`] decode.
+///
+/// A mock built on [`scripted_observation`] cannot exercise the `UnknownStatus` leaf: an unnamed
+/// non-zero status code (`-4`/`-17`) collapses to `DpsError::Indeterminate`/`Decode`, which
+/// [`observe_faithful_from_legacy`] cannot rebuild (it falls back to `NoResponse`). This helper feeds
+/// the raw `CheckResponse` straight through the production single-decode, so a directed test drives the
+/// real `UnknownStatus → ProbeRequired` leaf end-to-end (NOT a `Mutation`/fuzzer op — `wire_to_result`
+/// collapses those).
+#[cfg(any(test, feature = "test-support"))]
+pub fn scripted_raw_observation(
+    resp: gen::CheckResponse,
+) -> (
+    Result<CheckAck, DpsError>,
+    super::raw_reply::RawSendObservation,
+) {
+    let (legacy, raw, diag) = observe_check_reply(resp);
+    (legacy, super::raw_reply::RawSendObservation::new(raw, diag))
 }
 
 /// Same dispatch shape for `StatusResponse` — the proto's status enum
