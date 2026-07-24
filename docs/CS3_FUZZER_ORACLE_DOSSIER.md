@@ -197,8 +197,11 @@ op Reboot changed the held reservation (before=Some(...) after=None)`.
    origins) — see "(C-i) offline origin-keyed held witnesses" below; (ii) drain-produced HELD witness
    (the held-witness oracle firing GENERATIVELY after a drain, not just a direct send — map MINOR-2);
    (iii) `NotAcceptedOffline` cohort-cancel + chain rewind — LAST (the hard one).
-3. **Increment 2 part (b)** — fence-IDENTITY strengthening (P3): the fence pointer NAMES this doc's
-   reservation at the CURRENT `delivery_generation`, not merely non-NULL (columns confirmed, mig 034).
+3. **Increment 2 part (b)** — fence-IDENTITY strengthening (P3): ✅ **DONE for the held-witness
+   surface** (external-audit MAJOR fix — the `fence_held` axis + `active_held_reservation` now assert
+   the fence NAMES this doc's reservation at the CURRENT `delivery_generation`, prod predicate
+   `invariant_scan.rs:228-237`; 2 canaries). Any REMAINING fence-identity gaps outside the held-witness
+   read (e.g. a standalone fence-pointer invariant on every op) are the residual of this item.
 4. **RETURN idempotent replay** (P2) — a held RETURN re-driven / crash+reboot re-issue.
 5. **THEN** CS-1 re-baseline + re-mint + PR-ready gate (batched at the TRUE tip — do NOT re-baseline
    early; every increment above touches the same files, so an early re-baseline = double churn).
@@ -349,3 +352,36 @@ in the model (no prod `classify()` import). The probe was removed after; the val
   (no test exercises it; the 5 teeth only pass `[Reject]`/`[Ack,NotFound]`). When C-ii wires the
   drain-produced held-witness oracle into the GENERATIVE `run_harness`, route the OFFLINE ops through
   `offline_held_witness` (not `online_held_witness`) so the delegation branch gets real coverage.
+
+### ✅ (C-i) external cross-model audit — NO_GO → RESOLVED (fence authority + [Ack,NotFound] honesty)
+
+An external decorrelated auditor returned **NO_GO** (production confirmed SOUND — A–G all
+confirmed-sound, no model-vs-prod defect; the encoded `[Reject]` values are right). Two oracle-side
+findings, both **model/oracle-should-tighten, NOT a prod defect**, both fixed:
+
+- **MAJOR — the `fence_held` witness axis checked pointer PRESENCE, not AUTHORITY.** `read_held_witness`
+  computed `fence_held = active_delivery_reservation_id IS NOT NULL`, and `active_held_reservation`
+  selected any `PENDING_APPLY` row — neither verified the reservation IS the node's active,
+  current-generation held one. **Empirical bypass (reproduced):** after a genuine offline reject holds,
+  overwrite `node_state.active_delivery_reservation_id` with a foreign `[0xA5;16]` →
+  `directed_offline_reject_held_witness_matches_real_reservation` PASSED (blessing a forked/P3 fence).
+  **Fix:** both `read_held_witness.fence_held` and `active_held_reservation` now use the FULL prod
+  exemption predicate (`src/db/invariant_scan.rs:228-237`): `state='OUTCOME_OBSERVED' AND
+  apply_state='PENDING_APPLY' AND reservation_id = ns.active_delivery_reservation_id AND
+  authorized_generation = ns.delivery_generation`. Tightening `active_held_reservation` is
+  behavior-preserving by Increment 2 (≤1 active reservation ⇒ the `PENDING_APPLY` row IS the active
+  one). Two negative canaries added — `offline_reject_held_witness_reds_on_foreign_fence_pointer` and
+  `..._reds_on_stale_generation` — **both personally canary-proven**: reverting `fence_held` to
+  presence-only makes both RED (the exact bypass), the full predicate makes both GREEN. All prior
+  held-witness teeth (UnknownStatus/Superseded/BadHashPrev) + both generative capstones stay GREEN (a
+  faithful hold's fence IS authoritative), so the generative oracle now asserts fence AUTHORITY on
+  every generated hold. **This lands dossier follow-up #3 (fence-IDENTITY strengthening, P3) for the
+  held-witness surface.**
+- **MINOR — the `[Ack,NotFound]` leaf's `NotFound` is the EMPTY-QUITTANCE (K4) form**, not a real
+  `DpsError::NotFound` (`interp::wire_to_result` maps it to send→Ack + empty-`data_sign` lastChk). The
+  encoded `None` is right (either way the doc issued at SEND), but the "real NotFound" framing
+  over-promised. Fixed: honest comment + `directed_offline_ack_notfound_releases_at_send_not_held` now
+  POSITIVELY asserts `apply_state=APPLIED` / `doc=SENT` / fence pointer NULL (not just "no held row").
+- **Verification:** fuzzer **154/154** (was 152; +2 fence canaries); fmt + clippy `-D` clean; prod
+  FROZEN (0 src diff). Large-N (`FUZZ_CASES=4096`) generative capstones re-run to re-validate the
+  touched generative fence path.

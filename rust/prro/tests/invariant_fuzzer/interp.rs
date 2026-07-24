@@ -379,6 +379,36 @@ impl FuzzCtx {
         .unwrap();
     }
 
+    /// Adversarial-audit canary support: repoint the FN fence to a FOREIGN reservation id — a
+    /// non-NULL pointer that does NOT name the held reservation (an open P3 / forked fence). A
+    /// presence-only `fence_held = active_delivery_reservation_id IS NOT NULL` check would
+    /// false-green; the authority predicate must compute `fence_held = false` and RED.
+    pub async fn corrupt_active_fence_to_foreign(&self) {
+        sqlx::query(
+            "UPDATE node_state SET active_delivery_reservation_id = ? WHERE fiscal_number = ?",
+        )
+        .bind(&[0xA5u8; 16][..])
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Adversarial-audit canary support: advance `node_state.delivery_generation` past the held
+    /// reservation's `authorized_generation` (a monotonic +1 — the schema permits an increase). The
+    /// fence pointer still names the reservation, but at a STALE generation → the authority predicate
+    /// must compute `fence_held = false` and RED (an ABA-style generation drift).
+    pub async fn bump_delivery_generation(&self) {
+        sqlx::query(
+            "UPDATE node_state SET delivery_generation = delivery_generation + 1 \
+             WHERE fiscal_number = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
     /// Test corruption (O3): overwrite an ACK doc's stored `unsigned_xml_sha256`
     /// with a value that no longer matches its persisted `PAYLOAD_XML` — a
     /// stored-hash / stored-payload divergence the REFERENTIAL chain oracle
@@ -692,9 +722,13 @@ impl FuzzCtx {
             String,
             Option<i64>,
             String,
+            String,
+            Vec<u8>,
+            Option<i64>,
         )> = sqlx::query_as(
             "SELECT dr.submission_certainty, dr.response_provenance, dr.routing_class, \
-                        dr.node_effect, dr.evidence_kind, dr.evidence_code, dr.apply_state \
+                        dr.node_effect, dr.evidence_kind, dr.evidence_code, dr.apply_state, \
+                        dr.state, dr.reservation_id, dr.authorized_generation \
                  FROM delivery_reservation dr \
                  JOIN fiscal_documents fd \
                    ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
@@ -714,14 +748,29 @@ impl FuzzCtx {
             evidence_kind,
             evidence_code,
             apply_state,
+            res_state,
+            reservation_id,
+            authorized_generation,
         ) = row?;
-        let (mode, fence): (String, Option<Vec<u8>>) = sqlx::query_as(
-            "SELECT mode, active_delivery_reservation_id FROM node_state WHERE fiscal_number = ?",
-        )
-        .bind(self.fn_id.as_str())
-        .fetch_one(&self.pool)
-        .await
-        .unwrap();
+        let (mode, active_ptr, delivery_generation): (String, Option<Vec<u8>>, i64) =
+            sqlx::query_as(
+                "SELECT mode, active_delivery_reservation_id, delivery_generation \
+                 FROM node_state WHERE fiscal_number = ?",
+            )
+            .bind(self.fn_id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        // `fence_held` is the FENCE AUTHORITY, not mere pointer presence: this doc's reservation IS
+        // the node's ACTIVE, CURRENT-generation held one — the exact prod exemption predicate the
+        // referential scan walks (`src/db/invariant_scan.rs:228-237`, the StuckSending HOLD carve-out).
+        // A foreign pointer, a stale `delivery_generation`, or a non-`OUTCOME_OBSERVED` reservation
+        // makes this FALSE → the held-witness oracle REDs on a broken/forked fence (a `fence.is_some()`
+        // presence check would false-green there — adversarial-audit MAJOR fix).
+        let fence_held = res_state == "OUTCOME_OBSERVED"
+            && apply_state == "PENDING_APPLY"
+            && active_ptr.as_deref() == Some(reservation_id.as_slice())
+            && authorized_generation == Some(delivery_generation);
         Some(ObservedHeld {
             submission_certainty: certainty,
             response_provenance: provenance,
@@ -731,7 +780,7 @@ impl FuzzCtx {
             evidence_code,
             apply_state,
             node_mode: mode,
-            fence_held: fence.is_some(),
+            fence_held,
         })
     }
 
@@ -764,12 +813,22 @@ impl FuzzCtx {
     /// this targets THE held reservation blocking the FN — independent of which doc was the last wire
     /// op (a drain can hold a doc that is not the most-recent sell).
     pub async fn active_held_reservation(&self) -> Option<([u8; 16], [u8; 16])> {
+        // The FULL fence-authority predicate (prod `invariant_scan.rs:228-237`), not merely "any
+        // PENDING_APPLY": the reservation must BE the node's active, current-generation held one.
+        // Sound by Increment 2 (≤1 active reservation — a PENDING_APPLY reservation is exactly the
+        // single active one), so this is behavior-preserving in every sound state; under a corrupted
+        // / forked fence it fail-closes to None instead of blessing a stray PENDING_APPLY row.
         let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "SELECT dr.reservation_id, fd.request_id \
              FROM delivery_reservation dr \
              JOIN fiscal_documents fd \
                ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
-             WHERE dr.fiscal_number = ? AND dr.apply_state = 'PENDING_APPLY' LIMIT 1",
+             JOIN node_state ns ON ns.fiscal_number = dr.fiscal_number \
+             WHERE dr.fiscal_number = ? \
+               AND dr.state = 'OUTCOME_OBSERVED' \
+               AND dr.apply_state = 'PENDING_APPLY' \
+               AND dr.reservation_id = ns.active_delivery_reservation_id \
+               AND dr.authorized_generation = ns.delivery_generation LIMIT 1",
         )
         .bind(self.fn_id.as_str())
         .fetch_optional(&self.pool)

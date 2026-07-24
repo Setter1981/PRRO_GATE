@@ -1700,7 +1700,10 @@ fn offline_reject_held_witness_reds_on_prod_apply_regression() {
 /// held under `PENDING_APPLY` / `STOP_MODE` / fence) MATCHES real prod. Drives the real
 /// `backlog_drain::drain` (via `GoOnline`), then probes the held reservation directly (the harness
 /// held-witness check is direct-send-gated; drain-produced holds are wired generatively in C-ii).
-/// CANARY: flip the model's offline `[Reject]` `routing_class` (or `apply_state`) → this REDs.
+/// CANARY: flip the model's offline `[Reject]` `routing_class` (or `apply_state`) → this REDs. The
+/// `fence_held` axis is the FENCE AUTHORITY (this reservation IS the node's active current-generation
+/// held one), not mere pointer presence — see the two `..._reds_on_foreign_fence_pointer` /
+/// `..._reds_on_stale_generation` canaries below.
 #[tokio::test]
 async fn directed_offline_reject_held_witness_matches_real_reservation() {
     let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
@@ -1716,6 +1719,64 @@ async fn directed_offline_reject_held_witness_matches_real_reservation() {
     oracle::check_held_witness(observed.as_ref(), &expected).unwrap_or_else(|d| {
         panic!("offline reject held-witness must match the real reservation: {d:?}")
     });
+}
+
+/// CS-3 (C-i) [fence-authority negative canary] — a FOREIGN fence pointer must RED. The held-witness
+/// `fence_held` axis verifies fence AUTHORITY (this doc's reservation IS the node's active,
+/// current-generation held one — prod's `invariant_scan.rs:228-237` exemption predicate), NOT mere
+/// `active_delivery_reservation_id IS NOT NULL` presence. After a genuine offline reject holds (the
+/// witness MATCHES — the non-vacuous baseline), repointing the fence to a foreign reservation id (a
+/// P3 / forked fence) must make the oracle RED. A presence-only check would false-green here
+/// (adversarial-audit MAJOR). The reservation itself is untouched, so `read_held_witness` still
+/// returns a row; only the `fence_held` authority flips.
+#[tokio::test]
+async fn offline_reject_held_witness_reds_on_foreign_fence_pointer() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+    let (_res_id, rid) = ctx
+        .active_held_reservation()
+        .await
+        .expect("an offline-drain reject HOLDS a PENDING_APPLY reservation");
+    let expected = model::offline_held_witness(&DpsScript::send_then_reject())
+        .expect("the offline [Reject] leaf holds");
+    // Baseline: with an INTACT fence the witness matches (proves the canary flips on corruption, not
+    // on a broken test).
+    oracle::check_held_witness(ctx.read_held_witness(&rid).await.as_ref(), &expected)
+        .expect("an intact fence must MATCH the held witness");
+    // Corrupt: repoint the fence to a foreign reservation id.
+    ctx.corrupt_active_fence_to_foreign().await;
+    assert!(
+        oracle::check_held_witness(ctx.read_held_witness(&rid).await.as_ref(), &expected).is_err(),
+        "a FOREIGN fence pointer (present but not naming this reservation) MUST RED — fence_held is \
+         AUTHORITY, not presence"
+    );
+}
+
+/// CS-3 (C-i) [fence-authority negative canary] — a STALE `delivery_generation` must RED. Same
+/// authority contract as the foreign-pointer canary, on the generation axis: after a genuine hold
+/// (witness matches), advancing `node_state.delivery_generation` past the reservation's
+/// `authorized_generation` (a monotonic +1, an ABA-style drift) leaves the pointer naming the
+/// reservation but at the WRONG generation → the oracle must RED.
+#[tokio::test]
+async fn offline_reject_held_witness_reds_on_stale_generation() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+    let (_res_id, rid) = ctx
+        .active_held_reservation()
+        .await
+        .expect("an offline-drain reject HOLDS a PENDING_APPLY reservation");
+    let expected = model::offline_held_witness(&DpsScript::send_then_reject())
+        .expect("the offline [Reject] leaf holds");
+    oracle::check_held_witness(ctx.read_held_witness(&rid).await.as_ref(), &expected)
+        .expect("an intact fence must MATCH the held witness");
+    ctx.bump_delivery_generation().await;
+    assert!(
+        oracle::check_held_witness(ctx.read_held_witness(&rid).await.as_ref(), &expected).is_err(),
+        "a STALE delivery_generation (pointer names the reservation but at the wrong generation) \
+         MUST RED — fence_held checks the CURRENT-generation authority"
+    );
 }
 
 /// CS-3 (C-i) [end-to-end] — the ORIGIN counterpart: an ONLINE `[Reject]` RELEASES. The doc rests
@@ -1750,11 +1811,15 @@ async fn directed_online_reject_releases_to_rejected_no_hold() {
 }
 
 /// CS-3 (C-i) [end-to-end] — `[Ack, NotFound]` is a VERIFIED non-divergence: it RELEASES at SEND on
-/// BOTH origins. The send Ack is the issuance moment (advance-at-SEND) → the drained doc rests `SENT`
-/// with an APPLIED reservation and a CLEAR fence; the `NotFound` lastChk merely defers the KVT
-/// quittance (a converging `SENT`, not a fenced halt). So there is NO held reservation offline, and
-/// the model correctly returns `None` for the leaf — an honest coverage boundary, not a gap. Guards
-/// against a future editor inventing a false offline hold for `[Ack, NotFound]`.
+/// BOTH origins. NB the leaf's `NotFound` is the EMPTY-QUITTANCE (K4 hold) form —
+/// `send_ack_then_last_not_found` maps to send→Ack + a `last_chk` with empty `data_sign` (interp
+/// `wire_to_result`), NOT a real `DpsError::NotFound` transport error; either way the doc has ALREADY
+/// issued at the send Ack, so the distinction is immaterial to the delivery reservation. The send Ack
+/// is the issuance moment (advance-at-SEND) → the drained doc rests `SENT` with an APPLIED reservation
+/// and a CLEAR fence; the empty quittance merely defers the KVT confirmation (a converging `SENT`, not
+/// a fenced halt). This tooth POSITIVELY reads apply_state=APPLIED / doc=SENT / fence=NULL, so the
+/// `None` model prediction is empirically grounded (not just "no held reservation"). Guards against a
+/// future editor inventing a false offline hold for `[Ack, NotFound]`.
 #[tokio::test]
 async fn directed_offline_ack_notfound_releases_at_send_not_held() {
     let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
@@ -1764,6 +1829,37 @@ async fn directed_offline_ack_notfound_releases_at_send_not_held() {
         &Op::GoOnline(DpsScript::send_ack_then_last_not_found()),
     )
     .await;
+    // POSITIVE release-at-SEND witness (not merely "no held reservation"): the drained doc's
+    // reservation is APPLIED and the doc rests SENT — read straight from the ledger.
+    let (apply_state, doc_state): (String, String) = sqlx::query_as(
+        "SELECT dr.apply_state, fd.state FROM delivery_reservation dr \
+         JOIN fiscal_documents fd \
+           ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+         WHERE dr.fiscal_number = ? ORDER BY dr.attempt_no DESC LIMIT 1",
+    )
+    .bind(ctx.fn_id())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        apply_state, "APPLIED",
+        "the send-Ack is APPLIED at SEND (released, not held)"
+    );
+    assert_eq!(
+        doc_state, "SENT",
+        "the doc rests SENT awaiting KVT convergence"
+    );
+    let fence: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT active_delivery_reservation_id FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(ctx.fn_id())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert!(
+        fence.is_none(),
+        "the fence pointer is CLEAR after release-at-SEND"
+    );
     assert!(
         ctx.active_held_reservation().await.is_none(),
         "offline [Ack,NotFound] releases at SEND (APPLIED, doc SENT); it must NOT hold"
