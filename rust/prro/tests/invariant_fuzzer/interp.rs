@@ -726,6 +726,23 @@ impl FuzzCtx {
         self.last_row.as_ref().map(|r| r.request_id)
     }
 
+    /// CS-3 Increment 2 — the count of ACTIVE delivery reservations for this FN, using the SAME
+    /// predicate as the prod `ux_reservation_active` UNIQUE index (migration 035:53-55), spec-COPIED
+    /// not imported.  Prod already enforces `<= 1` via that partial unique index; the fuzzer asserts
+    /// the same structurally after every op, so a `> 1` (a double-issue — two in-flight reservations
+    /// for one FN) or a dropped index REDs.
+    pub async fn active_reservation_count(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_reservation WHERE fiscal_number = ? \
+             AND (state IN ('RESERVED_NOT_STARTED','CALL_STARTED') \
+                  OR (state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY'))",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
     /// CS-3 operator-completion — the `reservation_id` of the latest reservation attempt for a doc
     /// (keyed by `request_id`), the handle `resolve_operator_pending` completes.  `None` if the doc
     /// has no reservation row.
