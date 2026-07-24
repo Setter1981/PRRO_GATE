@@ -1830,6 +1830,38 @@ pub fn online_held_witness(script: &DpsScript) -> Option<HeldWitness> {
             node_mode: "STOP_MODE",
             fence_held: true,
         }),
+        // Superseded (server fiscal-id mismatch): the faithful adapter DEGRADES it to a NoResponse
+        // record, so the DURABLE class is `TransientRetry` / `NoNodeEffect` (NOT the `WrapperBug`
+        // diagnostic OVERLAY that `error_routing`/the strategy comment mention — the overlay never
+        // reaches the persisted reservation). It still HOLDS: SENDING under PENDING_APPLY + STOP_MODE
+        // + fence. `node_effect == NoNodeEffect` while `node_mode == STOP_MODE` is REAL prod — the
+        // halt comes from the HELD record, not the classifier's node-effect axis.
+        [WireResponse::Superseded, ..] => Some(HeldWitness {
+            submission_certainty: "SUBMITTED_UNKNOWN",
+            response_provenance: "NO_RESPONSE",
+            routing_class: "TransientRetry",
+            node_effect: "NoNodeEffect",
+            evidence_kind: "NoResponse",
+            evidence_code: None,
+            apply_state: "PENDING_APPLY",
+            node_mode: "STOP_MODE",
+            fence_held: true,
+        }),
+        // BadHashPrev (a bad previous-hash chain link): a PARSED DPS reject routed to the MAC-recovery
+        // class — `MacRecovery` / `MacReseedPending` (the operator supplies a corrected seed, `-12`).
+        // Held: SENDING under PENDING_APPLY + STOP_MODE + fence. `evidence_code` is a verdict/digest,
+        // not a raw integer → None.
+        [WireResponse::BadHashPrev, ..] => Some(HeldWitness {
+            submission_certainty: "SUBMITTED",
+            response_provenance: "PARSED_DPS_ENVELOPE",
+            routing_class: "MacRecovery",
+            node_effect: "MacReseedPending",
+            evidence_kind: "Rejected",
+            evidence_code: None,
+            apply_state: "PENDING_APPLY",
+            node_mode: "STOP_MODE",
+            fence_held: true,
+        }),
         _ => None,
     }
 }

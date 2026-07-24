@@ -1316,6 +1316,47 @@ async fn operator_complete_fn_mismatch_refused_hold_intact() {
     assert!(held.fence_held, "the FN fence stays held");
 }
 
+// ── CS-3 held-leaf expansion: Superseded + BadHashPrev (Increment 3) ─────────
+
+/// CS-3 Increment 3 [pure] — the Superseded leaf's DURABLE routing class is `TransientRetry` (the
+/// NoResponse-degrade record), NOT the `WrapperBug` diagnostic OVERLAY. Encodes the overlay-vs-durable
+/// distinction so a future editor cannot silently adopt the overlay label into the persisted record.
+#[test]
+fn superseded_durable_class_is_transient_retry_not_wrapperbug() {
+    let w = model::online_held_witness(&DpsScript::superseded_tip())
+        .expect("the Superseded leaf holds");
+    assert_eq!(
+        w.routing_class, "TransientRetry",
+        "the DURABLE class is TransientRetry, NOT the WrapperBug diagnostic overlay"
+    );
+    assert_eq!(w.node_effect, "NoNodeEffect");
+    assert_eq!(w.evidence_kind, "NoResponse");
+    assert_eq!(w.response_provenance, "NO_RESPONSE");
+}
+
+/// CS-3 Increment 3 [end-to-end] — the fuzzer's held-witness oracle asserts the REAL persisted
+/// delivery axes for an online Superseded sell; the model's INDEPENDENT durable-class contract
+/// (TransientRetry / NoNodeEffect / NoResponse, held under STOP_MODE) MATCHES real prod.
+/// `run_harness` panics on ANY held-witness divergence, so a clean run IS the pass.  CANARY: flip
+/// the model's Superseded `routing_class` to `"WrapperBug"` (the overlay trap) → this REDs.
+#[tokio::test]
+async fn directed_superseded_held_witness_matches_real_reservation() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::superseded_tip())], ctx, model).await;
+}
+
+/// CS-3 Increment 3 [end-to-end] — the held-witness oracle asserts the REAL persisted axes for an
+/// online BadHashPrev sell; the model's INDEPENDENT contract (MacRecovery / MacReseedPending,
+/// evidence Rejected, held under STOP_MODE) MATCHES real prod.  CANARY: flip the model's BadHashPrev
+/// `routing_class` to `"TransientRetry"` → this REDs.
+#[tokio::test]
+async fn directed_bad_hash_prev_held_witness_matches_real_reservation() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::bad_hash_prev())], ctx, model).await;
+}
+
 /// Tier-1 slice 1 — online Z_REPORT is a genuine fuzzer op, not a side test:
 /// model predicts the Z doc and the shift transition, interpreter drives the
 /// production inline Z dispatcher, and the differential checks both.
