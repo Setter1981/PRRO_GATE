@@ -134,7 +134,10 @@ mod tests {
         let pan = Llv::new("411111******1111").unwrap();
         let rrn = Llv::new("234567890123").unwrap();
         let composed = format!("{merchant}{terminal}{pan}{rrn}");
-        assert_eq!(composed, "10MERCHANT4207TERM00116411111******111112234567890123");
+        assert_eq!(
+            composed,
+            "10MERCHANT4207TERM00116411111******111112234567890123"
+        );
     }
 
     #[test]
@@ -164,10 +167,10 @@ mod tests {
     #[test]
     fn len_2_digit_is_padded_for_all_lengths_1_to_9() {
         for (raw, expected_prefix) in [
-            ("a",     "01"),
-            ("ab",    "02"),
-            ("abc",   "03"),
-            ("abcd",  "04"),
+            ("a", "01"),
+            ("ab", "02"),
+            ("abc", "03"),
+            ("abcd", "04"),
             ("abcde", "05"),
             ("abcdef", "06"),
             ("abcdefg", "07"),

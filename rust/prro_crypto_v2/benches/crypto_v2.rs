@@ -15,13 +15,14 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use prro_crypto_v2::{
-    batch_verify, batch_verify_fast, BatchItem,
+    batch_verify, batch_verify_fast,
     core::{
         curve::Curve,
         field::FieldEl,
         point::Point,
         sign::{sign, verify, Signature},
     },
+    BatchItem,
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -85,7 +86,9 @@ fn bench_field(c: &mut Criterion) {
     let b = Fe::from_hex("2A29EF207D0E9B6C55CD260B306C7E007AC491CA1B10C62334A9E8DCD8D20FB7");
 
     let mut g = c.benchmark_group("field");
-    g.bench_function("mul_257", |b_| b_.iter(|| black_box(a).mod_mul(&black_box(b))));
+    g.bench_function("mul_257", |b_| {
+        b_.iter(|| black_box(a).mod_mul(&black_box(b)))
+    });
     g.bench_function("sqr_257", |b_| b_.iter(|| black_box(a).mod_sqr()));
     g.bench_function("inv_257", |b_| b_.iter(|| black_box(a).invert()));
     g.finish();
@@ -96,14 +99,21 @@ fn bench_field(c: &mut Criterion) {
 fn bench_sign(c: &mut Criterion) {
     let curve = Curve::dstu_pb_257();
     let mw = curve.mod_words;
-    let d    = make_fe(0xDEAD_BEEF, mw);
+    let d = make_fe(0xDEAD_BEEF, mw);
     let hash = make_fe(0xCAFE_1234, mw);
-    let e    = make_fe(0xABCD_1234, mw);
+    let e = make_fe(0xABCD_1234, mw);
 
     c.benchmark_group("sign")
         .throughput(Throughput::Elements(1))
         .bench_function("dstu_pb_257", |b| {
-            b.iter(|| sign(black_box(&curve), black_box(&d), black_box(&hash), black_box(&e)))
+            b.iter(|| {
+                sign(
+                    black_box(&curve),
+                    black_box(&d),
+                    black_box(&hash),
+                    black_box(&e),
+                )
+            })
         });
 }
 
@@ -115,7 +125,14 @@ fn bench_verify(c: &mut Criterion) {
     // Pre-generate 64 distinct fixtures with different keys so cold-cache bench
     // can cycle through them without recomputing inside the hot loop.
     let cold_fixtures: Vec<Fixture> = (0u32..64)
-        .map(|i| make_fixture(&curve, 0xABCD_0000 + i * 31, 0xCAFE_0000 + i, 0xDEAD_0000 + i))
+        .map(|i| {
+            make_fixture(
+                &curve,
+                0xABCD_0000 + i * 31,
+                0xCAFE_0000 + i,
+                0xDEAD_0000 + i,
+            )
+        })
         .collect();
 
     // One fixture for warm-cache (same pubkey every call → Q_CACHE always warm).
@@ -131,13 +148,23 @@ fn bench_verify(c: &mut Criterion) {
         b.iter(|| {
             let f = &cold_fixtures[idx % cold_fixtures.len()];
             idx = idx.wrapping_add(1);
-            verify(black_box(&curve), black_box(&f.pubkey), black_box(&f.hash), black_box(&f.sig))
+            verify(
+                black_box(&curve),
+                black_box(&f.pubkey),
+                black_box(&f.hash),
+                black_box(&f.sig),
+            )
         })
     });
 
     g.bench_function("warm_key", |b| {
         b.iter(|| {
-            verify(black_box(&curve), black_box(&warm.pubkey), black_box(&warm.hash), black_box(&warm.sig))
+            verify(
+                black_box(&curve),
+                black_box(&warm.pubkey),
+                black_box(&warm.hash),
+                black_box(&warm.sig),
+            )
         })
     });
 
@@ -152,7 +179,14 @@ fn bench_batch_same_key(c: &mut Criterion) {
 
     // All from the same device (same private key d=0xDEAD_BEEF).
     let fixtures: Vec<Fixture> = (0u32..64)
-        .map(|i| make_fixture(&curve, 0xDEAD_BEEF, 0xCAFE_0000 + i, 0xABCD_0000 + i * 7 + 1))
+        .map(|i| {
+            make_fixture(
+                &curve,
+                0xDEAD_BEEF,
+                0xCAFE_0000 + i,
+                0xABCD_0000 + i * 7 + 1,
+            )
+        })
         .collect();
 
     let mut g = c.benchmark_group("batch_verify/same_key");
@@ -161,7 +195,11 @@ fn bench_batch_same_key(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             let items: Vec<BatchItem<'_>> = fixtures[..n]
                 .iter()
-                .map(|f| BatchItem { pub_q: &f.pubkey, hash: &f.hash, sig: &f.sig })
+                .map(|f| BatchItem {
+                    pub_q: &f.pubkey,
+                    hash: &f.hash,
+                    sig: &f.sig,
+                })
                 .collect();
             b.iter(|| batch_verify(black_box(&items), black_box(&curve)))
         });
@@ -177,7 +215,14 @@ fn bench_batch_mixed_keys(c: &mut Criterion) {
 
     // Each fixture uses a different private key.
     let fixtures: Vec<Fixture> = (0u32..32)
-        .map(|i| make_fixture(&curve, 0xDEAD_0000 + i * 37 + 1, 0xCAFE_0000 + i, 0xABCD_0000 + i * 13 + 1))
+        .map(|i| {
+            make_fixture(
+                &curve,
+                0xDEAD_0000 + i * 37 + 1,
+                0xCAFE_0000 + i,
+                0xABCD_0000 + i * 13 + 1,
+            )
+        })
         .collect();
 
     let mut g = c.benchmark_group("batch_verify/mixed_keys");
@@ -186,7 +231,11 @@ fn bench_batch_mixed_keys(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             let items: Vec<BatchItem<'_>> = fixtures[..n]
                 .iter()
-                .map(|f| BatchItem { pub_q: &f.pubkey, hash: &f.hash, sig: &f.sig })
+                .map(|f| BatchItem {
+                    pub_q: &f.pubkey,
+                    hash: &f.hash,
+                    sig: &f.sig,
+                })
                 .collect();
             b.iter(|| batch_verify(black_box(&items), black_box(&curve)))
         });
@@ -201,7 +250,14 @@ fn bench_batch_fast(c: &mut Criterion) {
     const SIZES: &[usize] = &[4, 16, 64];
 
     let fixtures: Vec<Fixture> = (0u32..64)
-        .map(|i| make_fixture(&curve, 0xDEAD_BEEF, 0xCAFE_0000 + i, 0xABCD_0000 + i * 7 + 1))
+        .map(|i| {
+            make_fixture(
+                &curve,
+                0xDEAD_BEEF,
+                0xCAFE_0000 + i,
+                0xABCD_0000 + i * 7 + 1,
+            )
+        })
         .collect();
 
     let mut g = c.benchmark_group("batch_fast/same_key");
@@ -210,7 +266,11 @@ fn bench_batch_fast(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             let items: Vec<BatchItem<'_>> = fixtures[..n]
                 .iter()
-                .map(|f| BatchItem { pub_q: &f.pubkey, hash: &f.hash, sig: &f.sig })
+                .map(|f| BatchItem {
+                    pub_q: &f.pubkey,
+                    hash: &f.hash,
+                    sig: &f.sig,
+                })
                 .collect();
             b.iter(|| batch_verify_fast(black_box(&items), black_box(&curve)))
         });

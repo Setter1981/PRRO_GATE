@@ -1027,6 +1027,15 @@ pub async fn drain<'a>(
             } => {
                 // Terminal / non-self-resolving (REJECTED / doc-level manual):
                 // halt + escalate the FN to RequiresManualReconciliation.
+                // This applies for ALL identifiable shift states — OLPD/CLPD
+                // (§16.7 family-1) AND plain Opened (edge 15).  The AUD-K8-1
+                // re-entry guard at step 1b and the fuzzer reference model both
+                // depend on shift→RMR being the durable operator surface.
+                //
+                // The only degrade path is inside `escalate_drain_to_manual`
+                // itself: if `current_shift_id` is None (unidentifiable shift),
+                // it emits a Critical doc-keyed audit + returns Ok instead of
+                // hard-Erring the drain.
                 escalate_drain_to_manual(
                     pool,
                     fiscal_number,
@@ -1214,6 +1223,47 @@ fn is_manual_recon_retry_class(retry: RetryClass) -> bool {
         | RetryClass::OperatorEscalation => true,
         RetryClass::TransientRetry | RetryClass::ProbeRequired => false,
     }
+}
+
+/// Emit a Critical `OFFLINE_DRAIN_REJECT_MANUAL_REQUIRED` audit row keyed on
+/// the failed doc (entity_type = `fiscal_document`).
+///
+/// Used ONLY in the `escalate_drain_to_manual` degrade path: when
+/// `current_shift_id` is `None` (or the shift state is non-whitelisted), the
+/// shift cannot be escalated to RMR.  Instead of hard-Erring the drain
+/// (which caused the production crash), we emit this Critical audit keyed on
+/// the doc and return `Ok(())`.  The normal path (identifiable shift in
+/// Opened/OLPD/CLPD) still CAS-es the shift to RMR via `escalate_drain_to_manual`.
+async fn emit_drain_reject_opened_shift_critical(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    failed_doc_id: DocumentId,
+    failure_class: &str,
+    shift_state: ShiftState,
+    halt_position: usize,
+) -> Result<(), BootError> {
+    let payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "document_id": hex_lower(failed_doc_id.as_bytes()),
+        "failure_class": failure_class,
+        "shift_state": shift_state.as_str(),
+        "halt_position": halt_position,
+        "rationale": "escalate_drain_to_manual: current_shift_id=None or \
+                      non-whitelisted shift state; cannot CAS shift to RMR; \
+                      doc-level Critical audit emitted as degrade surface",
+    });
+    audit_log::append(
+        pool,
+        AUDIT_ENTITY_DOC,
+        &hex_lower(failed_doc_id.as_bytes()),
+        "OFFLINE_DRAIN_REJECT_MANUAL_REQUIRED",
+        Severity::Critical,
+        None,
+        Some(&payload.to_string()),
+    )
+    .await
+    .map(|_| ())
+    .map_err(BootError::Database)
 }
 
 /// Dispatch one doc by its persisted `state` (spec amendment
@@ -1463,18 +1513,21 @@ async fn process_via_stage_send(
         }
         Err(send_err) => {
             let class = failure_class_for_send_err(&send_err);
+            // Re-ruling 2026-07-08: Db errors (transport-class) are retryable;
+            // all other StageSendError variants are structural terminal.
+            let manual_recon = !is_send_err_retryable(class);
             let class_str = failure_class_for(class);
             summary.record_doc_failure(doc.document_id, class_str.to_string());
             let payload = serde_json::json!({
                 "document_id": id_hex,
                 "failure_class": class_str,
                 "send_error_detail": send_err.to_string(),
-                "manual_recon_class": true,
+                "manual_recon_class": manual_recon,
             });
             emit_doc_failed(pool, &id_hex, &payload).await?;
             Ok(DocVerdict::Failed {
                 class,
-                manual_recon: true,
+                manual_recon,
             })
         }
     }
@@ -2537,12 +2590,24 @@ async fn escalate_drain_to_manual(
         // Silent-Ok would busy-loop: the drain "halts" but the shift never reached
         // RMR → the AUD-K8-1 entry guard never fires next tick → re-drain →
         // re-SupersededHeld forever.
-        EscalationOutcome::NoEscalatableShift => Err(BootError::Internal(format!(
-            "escalate_drain_to_manual({fiscal_number}): drain escalation found NO \
-             RMR-escalatable shift (shift_state={state}) — structural drift; the \
-             drain only runs on active Opened/pending-drain shifts",
-            state = ns.shift_state.as_str(),
-        ))),
+        // Re-ruling 2026-07-08: `NoEscalatableShift` (current_shift_id=None
+        // or non-whitelisted from-state) MUST NOT hard-Err the drain — the
+        // original BootError::Internal caused the production crash.  Degrade to
+        // the OPENED-branch Critical-audit path; the no-shift audit was already
+        // emitted by escalate_fn_to_manual_recon, so add the doc-keyed audit
+        // here for operator cross-reference, then return Ok.
+        EscalationOutcome::NoEscalatableShift => {
+            emit_drain_reject_opened_shift_critical(
+                pool,
+                fiscal_number,
+                failed_doc_id,
+                failure_class,
+                ns.shift_state,
+                halt_position,
+            )
+            .await?;
+            Ok(())
+        }
     }
 }
 
@@ -3009,11 +3074,19 @@ fn failure_class_for_retry(retry: RetryClass) -> FailureClass {
     }
 }
 
-/// Map `StageSendError` (per-doc Err result) → `FailureClass`.  All
-/// `StageSendError` variants are treated as per-doc failures —
-/// sibling continues per spec §2.5 try-and-audit shim.
+/// Map `StageSendError` (per-doc Err result) → `FailureClass`.
+///
+/// **Re-ruling 2026-07-08**: `StageSendError::Db` is a transport /
+/// infrastructure error (local DB failure before or after the wire),
+/// NOT a structural invariant breach.  It maps to `FailureClass::Transport`
+/// (retryable) so the drain loop does NOT escalate manual-recon on a
+/// transient DB hiccup.  All other `StageSendError` variants remain
+/// structural-terminal → `manual_recon: true` in the drain loop.
 fn failure_class_for_send_err(err: &StageSendError) -> FailureClass {
     match err {
+        // Infrastructure / transient: local DB error before or after wire.
+        // Retryable — next drain tick re-attempts the doc.
+        StageSendError::Db(_) => FailureClass::Transport,
         // Both producer-side offline_fiscal_no defects (NULL vs <= 0) are the
         // same DRAIN disposition; the forensic split lives at the
         // StageSendError + audit layer (m3b W9a Round-2 LOW #1).
@@ -3039,7 +3112,6 @@ fn failure_class_for_send_err(err: &StageSendError) -> FailureClass {
         | StageSendError::MacRecoverySnapshotReloadFailed(_)
         | StageSendError::SetServerFiscalNoMissing { .. }
         | StageSendError::TraceMissingAtComplete { .. }
-        | StageSendError::Db(_)
         // STOP-O3-1 fix (v7): unreachable on the drain path — the drain sends
         // `OfflineLocalAck` docs (offline_fiscal_no=Some), while (v7) is scoped
         // to {Signed, ErrorRetryable} with offline_fiscal_no NULL.  Classified
@@ -3048,6 +3120,16 @@ fn failure_class_for_send_err(err: &StageSendError) -> FailureClass {
         | StageSendError::OfflineDocRoutedOnline { .. }
         | StageSendError::Internal(_) => FailureClass::Internal,
     }
+}
+
+/// True if `class` from [`failure_class_for_send_err`] is transport-class
+/// retryable (no manual escalation, no shift touch).
+///
+/// Re-ruling 2026-07-08: `FailureClass::Transport` (from `StageSendError::Db`)
+/// is the only retryable class from the `Err(send_err)` arm; all others are
+/// structural terminal.
+fn is_send_err_retryable(class: FailureClass) -> bool {
+    matches!(class, FailureClass::Transport)
 }
 
 // ─── C6 amend2 (MED-C6-3): Eligible-arm integration tests ────────────

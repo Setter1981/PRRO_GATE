@@ -70,7 +70,10 @@ mod tests {
     #[test]
     fn decode_invalid_hex_returns_err() {
         let err = decode_password("not!!hex", "2026-12-31", "Тест").unwrap_err();
-        assert!(err.contains("hex decode"), "expected 'hex decode' in: {err}");
+        assert!(
+            err.contains("hex decode"),
+            "expected 'hex decode' in: {err}"
+        );
     }
 
     #[test]
@@ -101,8 +104,11 @@ mod tests {
         let pw = "secret";
         let vt = "2026-12-31";
         let empty = encode_password(pw, vt, "");
-        let one   = encode_password(pw, vt, "А");
-        assert_eq!(empty, one, "both use '?' fallback → identical key → identical ciphertext");
+        let one = encode_password(pw, vt, "А");
+        assert_eq!(
+            empty, one,
+            "both use '?' fallback → identical key → identical ciphertext"
+        );
 
         // Two-char name uses the actual second char → different key.
         let two = encode_password(pw, vt, "АБ");
@@ -115,7 +121,10 @@ mod tests {
         let name = "Сідоренко";
         let a = encode_password(pw, "2026-01-01", name);
         let b = encode_password(pw, "2027-06-30", name);
-        assert_ne!(a, b, "different cert expiry → different key → different ciphertext");
+        assert_ne!(
+            a, b,
+            "different cert expiry → different key → different ciphertext"
+        );
     }
 
     #[test]
@@ -124,10 +133,7 @@ mod tests {
         let pw = "MyPass";
         let vt = "2026-12-31";
         let name = "Іваненко";
-        assert_eq!(
-            encode_password(pw, vt, name),
-            encode_password(pw, vt, name),
-        );
+        assert_eq!(encode_password(pw, vt, name), encode_password(pw, vt, name),);
     }
 
     #[test]
@@ -164,22 +170,25 @@ mod tests {
     fn decode_hex_uppercase_accepted() {
         // hex crate decodes both upper and lowercase hex. Verify we accept uppercase output
         // from external tools (e.g. if stored in DB as uppercase).
-        let pw   = "TestPass";
-        let vt   = "2026-12-31";
+        let pw = "TestPass";
+        let vt = "2026-12-31";
         let name = "Тестовий";
         let encoded_lower = encode_password(pw, vt, name); // returns lowercase hex
-        let encoded_upper = encoded_lower.to_uppercase();  // simulate DB storing uppercase
-        let decoded = decode_password(&encoded_upper, vt, name)
-            .expect("uppercase hex must decode correctly");
-        assert_eq!(decoded, pw, "uppercase hex must roundtrip to original password");
+        let encoded_upper = encoded_lower.to_uppercase(); // simulate DB storing uppercase
+        let decoded =
+            decode_password(&encoded_upper, vt, name).expect("uppercase hex must decode correctly");
+        assert_eq!(
+            decoded, pw,
+            "uppercase hex must roundtrip to original password"
+        );
     }
 
     #[test]
     fn encode_password_single_unicode_char() {
         // Single-char operator name: nth(1) returns None → '?' used as fallback.
         // Single UTF-8 multi-byte char: "А" is 2 bytes but 1 char — nth(1) returns None.
-        let pw   = "secret";
-        let vt   = "2026-12-31";
+        let pw = "secret";
+        let vt = "2026-12-31";
         let name = "А"; // 1 char, 2 UTF-8 bytes
 
         let encoded = encode_password(pw, vt, name);
@@ -197,24 +206,27 @@ mod tests {
     #[test]
     fn encode_with_null_byte_in_password_roundtrips() {
         // Rust strings allow null bytes — verify XOR handles them correctly.
-        let pw   = "pass\x00word"; // contains null byte
-        let vt   = "2026-12-31";
+        let pw = "pass\x00word"; // contains null byte
+        let vt = "2026-12-31";
         let name = "Тест";
         let encoded = encode_password(pw, vt, name);
-        let decoded = decode_password(&encoded, vt, name)
-            .expect("null byte in password must roundtrip");
-        assert_eq!(decoded, pw, "null byte in password must survive encode/decode");
+        let decoded =
+            decode_password(&encoded, vt, name).expect("null byte in password must roundtrip");
+        assert_eq!(
+            decoded, pw,
+            "null byte in password must survive encode/decode"
+        );
     }
 
     #[test]
     fn encode_all_ascii_printable_characters_roundtrip() {
         // Stress-test with full printable ASCII range
         let pw: String = (0x20u8..=0x7E).map(|b| b as char).collect();
-        let vt   = "2026-12-31";
+        let vt = "2026-12-31";
         let name = "Оператор";
         let encoded = encode_password(&pw, vt, name);
-        let decoded = decode_password(&encoded, vt, name)
-            .expect("full printable ASCII must roundtrip");
+        let decoded =
+            decode_password(&encoded, vt, name).expect("full printable ASCII must roundtrip");
         assert_eq!(decoded, pw);
     }
 

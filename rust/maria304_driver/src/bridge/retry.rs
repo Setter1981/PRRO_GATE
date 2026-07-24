@@ -78,13 +78,21 @@ pub struct RetryBridge<B: Bridge + Send + Sync> {
 impl<B: Bridge + Send + Sync> RetryBridge<B> {
     #[must_use]
     pub fn new(inner: B, policy: RetryPolicy) -> Self {
-        Self { inner, policy, sleeper: Box::new(ThreadSleeper) }
+        Self {
+            inner,
+            policy,
+            sleeper: Box::new(ThreadSleeper),
+        }
     }
 
     /// Plug in a custom sleeper — mainly for tests.
     #[must_use]
     pub fn with_sleeper(inner: B, policy: RetryPolicy, sleeper: Box<dyn Sleeper>) -> Self {
-        Self { inner, policy, sleeper }
+        Self {
+            inner,
+            policy,
+            sleeper,
+        }
     }
 }
 
@@ -136,7 +144,10 @@ mod tests {
     }
     impl ScriptedBridge {
         fn new(script: Vec<Result<CanonicalResponse, BridgeError>>) -> Self {
-            Self { script: Mutex::new(script), calls: Mutex::new(0) }
+            Self {
+                script: Mutex::new(script),
+                calls: Mutex::new(0),
+            }
         }
     }
     impl Bridge for ScriptedBridge {
@@ -296,8 +307,14 @@ mod tests {
             Err(BridgeError::Transport("once".to_string())),
             Ok(sample_ok()), // never reached
         ]);
-        let policy = RetryPolicy { max_attempts: 1, ..RetryPolicy::default() };
+        let policy = RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        };
         let bridge = RetryBridge::with_sleeper(inner, policy, sleeper);
-        assert!(matches!(bridge.submit(&sample_cmd()), Err(BridgeError::Transport(_))));
+        assert!(matches!(
+            bridge.submit(&sample_cmd()),
+            Err(BridgeError::Transport(_))
+        ));
     }
 }

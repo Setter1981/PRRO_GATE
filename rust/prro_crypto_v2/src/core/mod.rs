@@ -17,23 +17,23 @@
 //! for ДПС certs, PDF/XML packaging, HTTP transport — lives in sibling
 //! modules if/when added.
 
+pub mod backend;
+pub(crate) mod batch;
+pub(crate) mod comb;
+pub mod curve;
+pub mod fe;
+pub mod field;
+pub(crate) mod fixed_base;
 pub mod gf2m;
 pub mod gf2m_257;
-pub mod field;
-pub mod fe;
-pub mod scalar;
-pub mod curve;
+pub mod hash;
+pub(crate) mod mladder;
 pub mod point;
 pub mod proj;
-pub(crate) mod wnaf;
-pub(crate) mod fixed_base;
-pub(crate) mod mladder;
-pub(crate) mod comb;
+pub mod scalar;
 pub mod sign;
-pub(crate) mod batch;
-pub mod hash;
-pub mod backend;
 pub(crate) mod tau_naf;
+pub(crate) mod wnaf;
 
 // ─── τ-NAF policy types ──────────────────────────────────────────────────────
 

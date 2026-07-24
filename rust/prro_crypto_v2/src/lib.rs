@@ -29,16 +29,15 @@ pub mod core;
 
 // ─── Top-level re-exports ────────────────────────────────────────────────────
 
+pub use crate::core::batch::{batch_verify, batch_verify_fast, BatchItem, BatchResult};
 pub use core::curve::Curve;
 pub use core::field::FieldEl;
 pub use core::point::Point;
 pub use core::sign::{
-    set_verify_cache_capacity, sign, truncate, verify,
-    sign_with_policy, verify_with_policy,
+    set_verify_cache_capacity, sign, sign_with_policy, truncate, verify, verify_with_policy,
     Signature,
 };
 pub use core::{TauNafMode, TauNafPolicy};
-pub use crate::core::batch::{batch_verify, batch_verify_fast, BatchItem, BatchResult};
 
 /// Prime the backend dispatch so the first `sign()` call in a process does
 /// not pay the one-time `CPUID` probing cost.

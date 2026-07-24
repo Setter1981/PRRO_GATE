@@ -54,36 +54,90 @@ fn encode_char(ch: char) -> u8 {
     }
     match ch {
         // IBM-866 upper half: Russian capitals А..П at 0x80..0x8F
-        'А' => 0x80, 'Б' => 0x81, 'В' => 0x82, 'Г' => 0x83,
-        'Д' => 0x84, 'Е' => 0x85, 'Ж' => 0x86, 'З' => 0x87,
-        'И' => 0x88, 'Й' => 0x89, 'К' => 0x8A, 'Л' => 0x8B,
-        'М' => 0x8C, 'Н' => 0x8D, 'О' => 0x8E, 'П' => 0x8F,
+        'А' => 0x80,
+        'Б' => 0x81,
+        'В' => 0x82,
+        'Г' => 0x83,
+        'Д' => 0x84,
+        'Е' => 0x85,
+        'Ж' => 0x86,
+        'З' => 0x87,
+        'И' => 0x88,
+        'Й' => 0x89,
+        'К' => 0x8A,
+        'Л' => 0x8B,
+        'М' => 0x8C,
+        'Н' => 0x8D,
+        'О' => 0x8E,
+        'П' => 0x8F,
         // 0x90..0x9F = Р..Я
-        'Р' => 0x90, 'С' => 0x91, 'Т' => 0x92, 'У' => 0x93,
-        'Ф' => 0x94, 'Х' => 0x95, 'Ц' => 0x96, 'Ч' => 0x97,
-        'Ш' => 0x98, 'Щ' => 0x99, 'Ъ' => 0x9A, 'Ы' => 0x9B,
-        'Ь' => 0x9C, 'Э' => 0x9D, 'Ю' => 0x9E, 'Я' => 0x9F,
+        'Р' => 0x90,
+        'С' => 0x91,
+        'Т' => 0x92,
+        'У' => 0x93,
+        'Ф' => 0x94,
+        'Х' => 0x95,
+        'Ц' => 0x96,
+        'Ч' => 0x97,
+        'Ш' => 0x98,
+        'Щ' => 0x99,
+        'Ъ' => 0x9A,
+        'Ы' => 0x9B,
+        'Ь' => 0x9C,
+        'Э' => 0x9D,
+        'Ю' => 0x9E,
+        'Я' => 0x9F,
         // 0xA0..0xAF = а..п
-        'а' => 0xA0, 'б' => 0xA1, 'в' => 0xA2, 'г' => 0xA3,
-        'д' => 0xA4, 'е' => 0xA5, 'ж' => 0xA6, 'з' => 0xA7,
-        'и' => 0xA8, 'й' => 0xA9, 'к' => 0xAA, 'л' => 0xAB,
-        'м' => 0xAC, 'н' => 0xAD, 'о' => 0xAE, 'п' => 0xAF,
+        'а' => 0xA0,
+        'б' => 0xA1,
+        'в' => 0xA2,
+        'г' => 0xA3,
+        'д' => 0xA4,
+        'е' => 0xA5,
+        'ж' => 0xA6,
+        'з' => 0xA7,
+        'и' => 0xA8,
+        'й' => 0xA9,
+        'к' => 0xAA,
+        'л' => 0xAB,
+        'м' => 0xAC,
+        'н' => 0xAD,
+        'о' => 0xAE,
+        'п' => 0xAF,
         // 0xE0..0xEF = р..я
-        'р' => 0xE0, 'с' => 0xE1, 'т' => 0xE2, 'у' => 0xE3,
-        'ф' => 0xE4, 'х' => 0xE5, 'ц' => 0xE6, 'ч' => 0xE7,
-        'ш' => 0xE8, 'щ' => 0xE9, 'ъ' => 0xEA, 'ы' => 0xEB,
-        'ь' => 0xEC, 'э' => 0xED, 'ю' => 0xEE, 'я' => 0xEF,
+        'р' => 0xE0,
+        'с' => 0xE1,
+        'т' => 0xE2,
+        'у' => 0xE3,
+        'ф' => 0xE4,
+        'х' => 0xE5,
+        'ц' => 0xE6,
+        'ч' => 0xE7,
+        'ш' => 0xE8,
+        'щ' => 0xE9,
+        'ъ' => 0xEA,
+        'ы' => 0xEB,
+        'ь' => 0xEC,
+        'э' => 0xED,
+        'ю' => 0xEE,
+        'я' => 0xEF,
         // Russian Ё / ё
-        'Ё' => 0xF0, 'ё' => 0xF1,
+        'Ё' => 0xF0,
+        'ё' => 0xF1,
         // Ukrainian-specific (positions match IBM-866 "Cyrillic+" layout
         // used by the Resonance firmware).
-        'Є' => 0xF2, 'є' => 0xF3,
-        'Ї' => 0xF4, 'ї' => 0xF5,
-        'Ў' => 0xF6, 'ў' => 0xF7,
+        'Є' => 0xF2,
+        'є' => 0xF3,
+        'Ї' => 0xF4,
+        'ї' => 0xF5,
+        'Ў' => 0xF6,
+        'ў' => 0xF7,
         '°' => 0xF8,
         '·' => 0xFA,
-        'І' => 0xB8, 'і' => 0xB9,
-        'Ґ' => 0xBA, 'ґ' => 0xBB,
+        'І' => 0xB8,
+        'і' => 0xB9,
+        'Ґ' => 0xBA,
+        'ґ' => 0xBB,
         // Numeric / punctuation pass-through is ASCII already; anything
         // unhandled becomes '?' so downstream lengths stay predictable.
         _ => b'?',
@@ -95,10 +149,18 @@ fn decode_byte(b: u8) -> char {
         return b as char;
     }
     match b {
-        0x80..=0x8F => ['А','Б','В','Г','Д','Е','Ж','З','И','Й','К','Л','М','Н','О','П'][(b - 0x80) as usize],
-        0x90..=0x9F => ['Р','С','Т','У','Ф','Х','Ц','Ч','Ш','Щ','Ъ','Ы','Ь','Э','Ю','Я'][(b - 0x90) as usize],
-        0xA0..=0xAF => ['а','б','в','г','д','е','ж','з','и','й','к','л','м','н','о','п'][(b - 0xA0) as usize],
-        0xE0..=0xEF => ['р','с','т','у','ф','х','ц','ч','ш','щ','ъ','ы','ь','э','ю','я'][(b - 0xE0) as usize],
+        0x80..=0x8F => [
+            'А', 'Б', 'В', 'Г', 'Д', 'Е', 'Ж', 'З', 'И', 'Й', 'К', 'Л', 'М', 'Н', 'О', 'П',
+        ][(b - 0x80) as usize],
+        0x90..=0x9F => [
+            'Р', 'С', 'Т', 'У', 'Ф', 'Х', 'Ц', 'Ч', 'Ш', 'Щ', 'Ъ', 'Ы', 'Ь', 'Э', 'Ю', 'Я',
+        ][(b - 0x90) as usize],
+        0xA0..=0xAF => [
+            'а', 'б', 'в', 'г', 'д', 'е', 'ж', 'з', 'и', 'й', 'к', 'л', 'м', 'н', 'о', 'п',
+        ][(b - 0xA0) as usize],
+        0xE0..=0xEF => [
+            'р', 'с', 'т', 'у', 'ф', 'х', 'ц', 'ч', 'ш', 'щ', 'ъ', 'ы', 'ь', 'э', 'ю', 'я',
+        ][(b - 0xE0) as usize],
         0xF0 => 'Ё',
         0xF1 => 'ё',
         0xF2 => 'Є',
@@ -140,15 +202,23 @@ mod tests {
         // Byte-level table — if any of these change, downstream firmware
         // will mis-render the chars on the receipt.  Pin to concrete values.
         let cases: &[(char, u8)] = &[
-            ('І', 0xB8), ('і', 0xB9),
-            ('Ґ', 0xBA), ('ґ', 0xBB),
-            ('Є', 0xF2), ('є', 0xF3),
-            ('Ї', 0xF4), ('ї', 0xF5),
+            ('І', 0xB8),
+            ('і', 0xB9),
+            ('Ґ', 0xBA),
+            ('ґ', 0xBB),
+            ('Є', 0xF2),
+            ('є', 0xF3),
+            ('Ї', 0xF4),
+            ('ї', 0xF5),
         ];
         for &(ch, expected) in cases {
             let s = ch.to_string();
             let bytes = encode(&s);
-            assert_eq!(bytes, vec![expected], "{ch} → expected 0x{expected:02X}, got {bytes:02X?}");
+            assert_eq!(
+                bytes,
+                vec![expected],
+                "{ch} → expected 0x{expected:02X}, got {bytes:02X?}"
+            );
             assert_eq!(decode(&bytes), s, "decode({expected:02X}) != {ch}");
         }
     }
@@ -174,16 +244,16 @@ mod tests {
         assert_eq!(
             encoded,
             vec![
-                0xBA,           // Ґ
-                0xE0,           // р
-                0xAE,           // о
-                0xAD,           // н
-                0xAE,           // о
-                0x20,           // space
-                0xEF,           // я
-                0xA3,           // г
-                0xB9,           // і
-                0xA4,           // д
+                0xBA, // Ґ
+                0xE0, // р
+                0xAE, // о
+                0xAD, // н
+                0xAE, // о
+                0x20, // space
+                0xEF, // я
+                0xA3, // г
+                0xB9, // і
+                0xA4, // д
             ],
             "byte-level reference drift",
         );
@@ -222,7 +292,10 @@ mod tests {
         // should never need to emit those bytes for any Ukrainian letter.
         let chars = "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯЁЄЇІабвгдежзийклмнопрстуфхцчшщъыьэюяёєїі";
         for b in encode(chars) {
-            assert!(b != 0xFD && b != 0xFE, "byte {b:02X} collides with frame markers");
+            assert!(
+                b != 0xFD && b != 0xFE,
+                "byte {b:02X} collides with frame markers"
+            );
         }
     }
 }

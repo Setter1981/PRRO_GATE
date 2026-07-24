@@ -271,7 +271,10 @@ impl Command {
             "CSIN" => match body.chars().next() {
                 Some('0') => Self::Csin(false),
                 Some('1') => Self::Csin(true),
-                _ => Self::Unknown { opcode: opcode.into(), body: body_owned },
+                _ => Self::Unknown {
+                    opcode: opcode.into(),
+                    body: body_owned,
+                },
             },
             "SYNC" => Self::Sync,
             "UPAS" => {
@@ -296,8 +299,8 @@ impl Command {
                     Some(mode) => {
                         // Remaining body after the mode char — safe char-based offset.
                         let after_mode = chars.as_str();
-                        let password = split_at_nth_char(after_mode, 4)
-                            .map(|(pwd, _)| pwd.to_string());
+                        let password =
+                            split_at_nth_char(after_mode, 4).map(|(pwd, _)| pwd.to_string());
                         Self::Svsl { mode, password }
                     }
                     None => Self::InvalidParams {
@@ -326,11 +329,23 @@ impl Command {
                 // byte-slice here.
                 match split_at_nth_char(body, 22) {
                     Some((discount, upcount)) => Self::Gren {
-                        discount_name: if discount.is_empty() { None } else { Some(discount.to_string()) },
-                        upcount_name: if upcount.is_empty() { None } else { Some(upcount.to_string()) },
+                        discount_name: if discount.is_empty() {
+                            None
+                        } else {
+                            Some(discount.to_string())
+                        },
+                        upcount_name: if upcount.is_empty() {
+                            None
+                        } else {
+                            Some(upcount.to_string())
+                        },
                     },
                     None => Self::Gren {
-                        discount_name: if body.is_empty() { None } else { Some(body_owned.clone()) },
+                        discount_name: if body.is_empty() {
+                            None
+                        } else {
+                            Some(body_owned.clone())
+                        },
                         upcount_name: None,
                     },
                 }
@@ -379,13 +394,27 @@ impl Command {
                 let sum_str: String = prefix_chars.collect();
                 let sum: u64 = match sum_str.parse::<u64>() {
                     Ok(v) if v > 0 => v,
-                    _ => return Self::InvalidParams { opcode: opcode.into(), body: body_owned },
+                    _ => {
+                        return Self::InvalidParams {
+                            opcode: opcode.into(),
+                            body: body_owned,
+                        }
+                    }
                 };
                 let desc = description.to_string();
                 match dir {
-                    'I' => Self::Caioi { sum_kopecks: sum, description: desc },
-                    'O' => Self::Caioo { sum_kopecks: sum, description: desc },
-                    _ => Self::InvalidParams { opcode: opcode.into(), body: body_owned },
+                    'I' => Self::Caioi {
+                        sum_kopecks: sum,
+                        description: desc,
+                    },
+                    'O' => Self::Caioo {
+                        sum_kopecks: sum,
+                        description: desc,
+                    },
+                    _ => Self::InvalidParams {
+                        opcode: opcode.into(),
+                        body: body_owned,
+                    },
                 }
             }
             "ZREP" => Self::Zrep,
@@ -405,7 +434,10 @@ impl Command {
                             Self::Iren { first, last }
                         }
                     }
-                    None => Self::InvalidParams { opcode: opcode.into(), body: body_owned },
+                    None => Self::InvalidParams {
+                        opcode: opcode.into(),
+                        body: body_owned,
+                    },
                 }
             }
             "FIRP" | "IREP" => {
@@ -415,12 +447,21 @@ impl Command {
                 {
                     Some((from, to)) => {
                         if opcode == "FIRP" {
-                            Self::Firp { from: from.to_string(), to: to.to_string() }
+                            Self::Firp {
+                                from: from.to_string(),
+                                to: to.to_string(),
+                            }
                         } else {
-                            Self::Irep { from: from.to_string(), to: to.to_string() }
+                            Self::Irep {
+                                from: from.to_string(),
+                                to: to.to_string(),
+                            }
                         }
                     }
-                    None => Self::InvalidParams { opcode: opcode.into(), body: body_owned },
+                    None => Self::InvalidParams {
+                        opcode: opcode.into(),
+                        body: body_owned,
+                    },
                 }
             }
             "ARTZ" => Self::Artz,
@@ -431,7 +472,9 @@ impl Command {
             "PRTX" => Self::Prtx,
 
             "ARMO" if !body.is_empty() => {
-                let mode = u8::try_from(body.chars().next().unwrap_or('0').to_digit(10).unwrap_or(0)).unwrap_or(0);
+                let mode =
+                    u8::try_from(body.chars().next().unwrap_or('0').to_digit(10).unwrap_or(0))
+                        .unwrap_or(0);
                 Self::Armo(mode)
             }
             "DEPT" => Self::Dept(body_owned),
@@ -439,13 +482,17 @@ impl Command {
             "BOTM" => Self::Botm(body_owned),
             "BOTm" => Self::BotmIdx(body_owned),
             "NPDI" if !body.is_empty() => {
-                let mode = u8::try_from(body.chars().next().unwrap_or('0').to_digit(10).unwrap_or(0)).unwrap_or(0);
+                let mode =
+                    u8::try_from(body.chars().next().unwrap_or('0').to_digit(10).unwrap_or(0))
+                        .unwrap_or(0);
                 Self::Npdi(mode)
             }
             "ZDNM" => Self::Zdnm(body_owned),
             "CTIM" => Self::Ctim(body_owned),
             "SZKR" if !body.is_empty() => {
-                let mode = u8::try_from(body.chars().next().unwrap_or('0').to_digit(10).unwrap_or(0)).unwrap_or(0);
+                let mode =
+                    u8::try_from(body.chars().next().unwrap_or('0').to_digit(10).unwrap_or(0))
+                        .unwrap_or(0);
                 Self::Szkr(mode)
             }
             "PZKR" => Self::Pzkr(body.parse().unwrap_or(0)),
@@ -463,7 +510,10 @@ impl Command {
             "MDMD" => Self::Mdmd(body_owned),
             "TSES" => Self::Tses,
 
-            _ => Self::Unknown { opcode: opcode.to_string(), body: body_owned },
+            _ => Self::Unknown {
+                opcode: opcode.to_string(),
+                body: body_owned,
+            },
         }
     }
 }
@@ -474,7 +524,10 @@ mod tests {
     use crate::wire::Frame;
 
     fn parse(s: &str) -> Command {
-        Command::parse(&Frame { text: s.to_string(), had_crc: false })
+        Command::parse(&Frame {
+            text: s.to_string(),
+            had_crc: false,
+        })
     }
 
     #[test]
@@ -487,7 +540,10 @@ mod tests {
     fn upas_splits_password_and_cashier() {
         let c = parse("UPAS1111111111Cashier");
         match c {
-            Command::Upas { password, cashier_id } => {
+            Command::Upas {
+                password,
+                cashier_id,
+            } => {
                 assert_eq!(password, "1111111111");
                 assert_eq!(cashier_id, "Cashier");
             }
@@ -526,7 +582,10 @@ mod tests {
     fn nlpr_splits_two_cyrillic_tax_chars() {
         let c = parse("NLPRГА"); // Г + А (cigarettes + regular)
         match c {
-            Command::Nlpr { tax1_char, tax2_char } => {
+            Command::Nlpr {
+                tax1_char,
+                tax2_char,
+            } => {
                 assert_eq!(tax1_char, 'Г');
                 assert_eq!(tax2_char, 'А');
             }
@@ -538,7 +597,10 @@ mod tests {
     fn caioi_parses_sum_and_description() {
         let c = parse("CAIOI0000050000Kasa ranok");
         match c {
-            Command::Caioi { sum_kopecks, description } => {
+            Command::Caioi {
+                sum_kopecks,
+                description,
+            } => {
                 assert_eq!(sum_kopecks, 50_000);
                 assert_eq!(description, "Kasa ranok");
             }
@@ -624,7 +686,10 @@ mod tests {
         // a non-ASCII cashier suffix.
         let c = parse("UPAS1111111111Касир");
         match c {
-            Command::Upas { password, cashier_id } => {
+            Command::Upas {
+                password,
+                cashier_id,
+            } => {
                 assert_eq!(password, "1111111111");
                 assert_eq!(cashier_id, "Касир");
             }
@@ -639,7 +704,10 @@ mod tests {
         // preserves the original bytes verbatim.
         let c = parse("UPAS123456789Кextra"); // 9 ASCII + 'К' (2 bytes) + 'extra'
         match c {
-            Command::Upas { password, cashier_id } => {
+            Command::Upas {
+                password,
+                cashier_id,
+            } => {
                 // 10 chars taken — password = 9 ASCII digits + 'К'
                 assert_eq!(password.chars().count(), 10);
                 assert!(password.starts_with("123456789"));
@@ -667,12 +735,12 @@ mod tests {
         let input = format!("GREN{twenty_two_cyrillic}");
         let c = parse(&input);
         match c {
-            Command::Gren { discount_name, upcount_name } => {
+            Command::Gren {
+                discount_name,
+                upcount_name,
+            } => {
                 // First 22 chars of body → discount; remainder ('У') → upcount.
-                assert_eq!(
-                    discount_name.as_deref(),
-                    Some("дддддддддддддддддддддд"),
-                );
+                assert_eq!(discount_name.as_deref(), Some("дддддддддддддддддддддд"),);
                 assert_eq!(upcount_name.as_deref(), Some("У"));
             }
             other => panic!("{other:?}"),
@@ -683,7 +751,10 @@ mod tests {
     fn gren_with_fewer_than_22_chars_lands_full_body_in_discount() {
         let c = parse("GRENshort");
         match c {
-            Command::Gren { discount_name, upcount_name } => {
+            Command::Gren {
+                discount_name,
+                upcount_name,
+            } => {
                 assert_eq!(discount_name.as_deref(), Some("short"));
                 assert_eq!(upcount_name, None);
             }
@@ -711,7 +782,10 @@ mod tests {
         // Description after the 11 ASCII header chars may be Cyrillic.
         let c = parse("CAIOI0000050000Каса ранок");
         match c {
-            Command::Caioi { sum_kopecks, description } => {
+            Command::Caioi {
+                sum_kopecks,
+                description,
+            } => {
                 assert_eq!(sum_kopecks, 50_000);
                 assert_eq!(description, "Каса ранок");
             }
@@ -763,7 +837,10 @@ mod tests {
         // Deposit: 50 000 kopecks (500 UAH), direction 'I' → Caioi.
         let c = parse("CAIOI0000050000desc");
         match c {
-            Command::Caioi { sum_kopecks, description } => {
+            Command::Caioi {
+                sum_kopecks,
+                description,
+            } => {
                 assert_eq!(sum_kopecks, 50_000);
                 assert_eq!(description, "desc");
             }
@@ -771,7 +848,13 @@ mod tests {
         }
         // Withdrawal: direction 'O' → Caioo.
         let c2 = parse("CAIOO0000050000desc");
-        assert!(matches!(c2, Command::Caioo { sum_kopecks: 50_000, .. }));
+        assert!(matches!(
+            c2,
+            Command::Caioo {
+                sum_kopecks: 50_000,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -808,7 +891,10 @@ mod tests {
         // draft of this parser mistyped it as `CVAR`.  This test pins
         // the correct opcode so a regression trips immediately.
         let c = parse("CVAL2USD1.00000000");
-        assert!(matches!(c, Command::Cvar(_)), "CVAL must parse, not fall through");
+        assert!(
+            matches!(c, Command::Cvar(_)),
+            "CVAL must parse, not fall through"
+        );
     }
 
     // ── Inventory guard (unchanged) ───────────────────────────────
@@ -819,24 +905,75 @@ mod tests {
         // driver actually handles as a real command.  New handlers
         // must extend this list when they add a variant.
         for opcode in [
-            "CSIN1", "SYNC", "UPAS1111111111", "SVSL1",
-            "CONF", "CONf", "GETD", "GLCN", "CCAS", "CFIS", "CNAL", "ARTD0001",
-            "PREP1", "BCHN123", "CVAL2USD1.00000000", "GRBG grp",
+            "CSIN1",
+            "SYNC",
+            "UPAS1111111111",
+            "SVSL1",
+            "CONF",
+            "CONf",
+            "GETD",
+            "GLCN",
+            "CCAS",
+            "CFIS",
+            "CNAL",
+            "ARTD0001",
+            "PREP1",
+            "BCHN123",
+            "CVAL2USD1.00000000",
+            "GRBG grp",
             "GREN                      ", // 26 chars body
             "COMP0000000000000000000000000000000000000000000000000000000000",
-            "CANC", "CTXT", "FINF name", "TGCD 123456789",
-            "FISC body", "BFIS body", "ARFI body", "ARBF body", "FICD body", "BFCD body",
-            "NLPRГА", "ACLD00", "PSDt body", "CSHG body",
+            "CANC",
+            "CTXT",
+            "FINF name",
+            "TGCD 123456789",
+            "FISC body",
+            "BFIS body",
+            "ARFI body",
+            "ARBF body",
+            "FICD body",
+            "BFCD body",
+            "NLPRГА",
+            "ACLD00",
+            "PSDt body",
+            "CSHG body",
             "CAIOI0000050000desc",
             "CAIOO0000050000desc",
-            "ZREP", "NREP", "nrep",
-            "FIRN00010025", "FIRP2026010120261231",
-            "IREN00010025", "IREP2026010120261231",
-            "ARTZ", "DIZV", "NULL", "KASS", "DBEG", "PRTX",
-            "ARMO2", "DEPTBar", "HEADLine", "BOTMLine", "BOTm01 0 0 x",
-            "NPDI0", "ZDNM disc", "CTIM123000", "SZKR1", "PZKR500",
-            "STFL", "CUTR1 1", "NALG", "NNAMA Name", "BLFI05",
-            "NCDC", "DSTR", "DISP", "DISp", "DIsp", "MDMDbb", "TSES",
+            "ZREP",
+            "NREP",
+            "nrep",
+            "FIRN00010025",
+            "FIRP2026010120261231",
+            "IREN00010025",
+            "IREP2026010120261231",
+            "ARTZ",
+            "DIZV",
+            "NULL",
+            "KASS",
+            "DBEG",
+            "PRTX",
+            "ARMO2",
+            "DEPTBar",
+            "HEADLine",
+            "BOTMLine",
+            "BOTm01 0 0 x",
+            "NPDI0",
+            "ZDNM disc",
+            "CTIM123000",
+            "SZKR1",
+            "PZKR500",
+            "STFL",
+            "CUTR1 1",
+            "NALG",
+            "NNAMA Name",
+            "BLFI05",
+            "NCDC",
+            "DSTR",
+            "DISP",
+            "DISp",
+            "DIsp",
+            "MDMDbb",
+            "TSES",
         ] {
             let cmd = parse(opcode);
             assert!(

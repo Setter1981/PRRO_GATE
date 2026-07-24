@@ -26,7 +26,10 @@ pub struct Cooldown {
 impl Cooldown {
     #[must_use]
     pub fn new(duration: Duration) -> Self {
-        Self { duration, next_allowed: Mutex::new(None) }
+        Self {
+            duration,
+            next_allowed: Mutex::new(None),
+        }
     }
 
     #[must_use]

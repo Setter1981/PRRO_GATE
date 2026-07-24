@@ -169,6 +169,9 @@ mod tests {
     fn test_mul_base_order_is_infinity() {
         let curve = Curve::dstu_pb_257();
         let result = mul_base(&curve.order, &curve);
-        assert!(result.is_zero(), "order * G via fixed_base should be infinity");
+        assert!(
+            result.is_zero(),
+            "order * G via fixed_base should be infinity"
+        );
     }
 }

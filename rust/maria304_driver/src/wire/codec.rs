@@ -149,7 +149,9 @@ pub fn decode_frame(buf: &[u8], with_crc: bool) -> Result<(Frame, usize), FrameE
         return Err(FrameError::Incomplete);
     }
 
-    let search_end = buf.len().min(1 + MAX_CMD_LEN + 2 + if with_crc { 2 } else { 0 });
+    let search_end = buf
+        .len()
+        .min(1 + MAX_CMD_LEN + 2 + if with_crc { 2 } else { 0 });
     for end_idx in (1 + MIN_CMD_LEN + 1)..search_end {
         if buf[end_idx] == END {
             let len_byte = buf[end_idx - 1];
@@ -179,7 +181,13 @@ pub fn decode_frame(buf: &[u8], with_crc: bool) -> Result<(Frame, usize), FrameE
             debug_assert!(payload.len() >= MIN_CMD_LEN);
             let text = cp866::decode(payload);
             let consumed = end_idx + 1 + if with_crc { 2 } else { 0 };
-            return Ok((Frame { text, had_crc: with_crc }, consumed));
+            return Ok((
+                Frame {
+                    text,
+                    had_crc: with_crc,
+                },
+                consumed,
+            ));
         }
     }
 
@@ -226,7 +234,10 @@ mod tests {
         let payload_len = bytes.len() - 3; // minus start/len/end
         assert_eq!(payload_len, 14 + 6);
         // Length byte must equal payload_len + 1.
-        assert_eq!(bytes[bytes.len() - 2], u8::try_from(payload_len).unwrap() + 1);
+        assert_eq!(
+            bytes[bytes.len() - 2],
+            u8::try_from(payload_len).unwrap() + 1
+        );
     }
 
     #[test]
@@ -280,7 +291,10 @@ mod tests {
         let raw = vec![b'X', 0xFE, 0xFF, b'Y'];
         let encoded = encode_frame_bytes(&raw, true).unwrap();
         let (frame, n) = decode_frame(&encoded, true).unwrap();
-        assert_eq!(frame.text, "X  Y", "sanitized bytes should decode as spaces");
+        assert_eq!(
+            frame.text, "X  Y",
+            "sanitized bytes should decode as spaces"
+        );
         assert_eq!(n, encoded.len());
     }
 
@@ -292,14 +306,20 @@ mod tests {
     #[test]
     fn decode_rejects_missing_start() {
         let buf = b"\x00PREP1\x06\xFE";
-        assert_eq!(decode_frame(buf, false).unwrap_err(), FrameError::MissingStart);
+        assert_eq!(
+            decode_frame(buf, false).unwrap_err(),
+            FrameError::MissingStart
+        );
     }
 
     #[test]
     fn decode_reports_incomplete_when_buffer_too_short() {
         let full = encode_frame("PREP1", false).unwrap();
         let partial = &full[..full.len() - 1];
-        assert_eq!(decode_frame(partial, false).unwrap_err(), FrameError::Incomplete);
+        assert_eq!(
+            decode_frame(partial, false).unwrap_err(),
+            FrameError::Incomplete
+        );
     }
 
     #[test]
@@ -352,8 +372,7 @@ mod tests {
         let frame = encode_frame("FINFПаляниця", true).unwrap();
         // CP866 for "Паляниця": П(8F) а(A0) л(AB) я(EF) н(AD) и(A8) ц(E6) я(EF)
         let expected_payload: &[u8] = &[
-            b'F', b'I', b'N', b'F',
-            0x8F, 0xA0, 0xAB, 0xEF, 0xAD, 0xA8, 0xE6, 0xEF,
+            b'F', b'I', b'N', b'F', 0x8F, 0xA0, 0xAB, 0xEF, 0xAD, 0xA8, 0xE6, 0xEF,
         ];
         assert_eq!(&frame[1..=expected_payload.len()], expected_payload);
     }
@@ -365,7 +384,10 @@ mod tests {
         // Cyrillic form end-to-end.
         let ukr = encode_frame("TEXTі", false).unwrap();
         let lat = encode_frame("TEXTi", false).unwrap();
-        assert_ne!(ukr, lat, "Ukrainian `і` must differ from Latin `i` on the wire");
+        assert_ne!(
+            ukr, lat,
+            "Ukrainian `і` must differ from Latin `i` on the wire"
+        );
         // Payload byte just after the 4-char command:
         assert_eq!(ukr[5], 0xB9, "Ukrainian `і` should encode as 0xB9");
         assert_eq!(lat[5], 0x69, "Latin `i` should encode as 0x69");

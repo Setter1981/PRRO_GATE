@@ -16,9 +16,15 @@ fn handshake_flow() -> (Session, Identity, Clock<'static>, MockBridge, Correlati
     (
         Session::new(),
         Identity::default(),
-        Clock { date: "20260420", time: "101530" },
+        Clock {
+            date: "20260420",
+            time: "101530",
+        },
         MockBridge::new(),
-        Correlation { session_uuid: "it-sess".to_string(), receipt_seq: 0 },
+        Correlation {
+            session_uuid: "it-sess".to_string(),
+            receipt_seq: 0,
+        },
     )
 }
 
@@ -57,16 +63,38 @@ fn ole_manager_init_command_sequence_byte_for_byte() {
     let (mut session, identity, clock, bridge, mut correlation) = handshake_flow();
 
     // Step 1 — CSIN1 (enable CRC).  Before this, CRC is disabled.
-    let out = exchange(&mut session, &identity, clock, &bridge, &mut correlation, "CSIN1", false);
+    let out = exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "CSIN1",
+        false,
+    );
     assert_eq!(out, vec!["DONE".to_string(), "READY".to_string()]);
     assert!(session.crc_enabled);
 
     // Step 2 — SYNC with CRC.
-    let out = exchange(&mut session, &identity, clock, &bridge, &mut correlation, "SYNC", true);
+    let out = exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "SYNC",
+        true,
+    );
     assert_eq!(out, vec!["DONE".to_string(), "READY".to_string()]);
 
     // Step 3 — UPAS<pwd><cashier>.  Default password from Identity.
-    let out = exchange(&mut session, &identity, clock, &bridge, &mut correlation, "UPAS1111111111Кассир",
+    let out = exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "UPAS1111111111Кассир",
         true,
     );
     assert_eq!(out, vec!["DONE".to_string(), "READY".to_string()]);
@@ -75,7 +103,15 @@ fn ole_manager_init_command_sequence_byte_for_byte() {
 
     // Step 4 — CONf (device state).  The decoded payload must start
     // with "CONf" and be exactly 4 + 148 = 152 chars total.
-    let out = exchange(&mut session, &identity, clock, &bridge, &mut correlation, "CONf", true);
+    let out = exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "CONf",
+        true,
+    );
     assert_eq!(out.len(), 3);
     assert!(out[0].starts_with("CONf"), "got {}", out[0]);
     assert_eq!(out[0].chars().count(), 4 + 148);
@@ -92,12 +128,34 @@ fn unknown_opcode_responds_with_done_not_error() {
     let (mut session, identity, clock, bridge, mut correlation) = handshake_flow();
 
     // Get past login first.
-    exchange(&mut session, &identity, clock, &bridge, &mut correlation, "CSIN1", false);
-    exchange(&mut session, &identity, clock, &bridge, &mut correlation, "UPAS1111111111Casher",
+    exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "CSIN1",
+        false,
+    );
+    exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "UPAS1111111111Casher",
         true,
     );
 
-    let out = exchange(&mut session, &identity, clock, &bridge, &mut correlation, "XYZA", true);
+    let out = exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "XYZA",
+        true,
+    );
     assert_eq!(out, vec!["DONE".to_string(), "READY".to_string()]);
 }
 
@@ -108,19 +166,36 @@ fn conf_payload_crc_self_verifies_on_the_wire() {
     let (mut session, identity, clock, bridge, mut correlation) = handshake_flow();
 
     // Login with CRC on.
-    exchange(&mut session, &identity, clock, &bridge, &mut correlation, "CSIN1", false);
-    exchange(&mut session, &identity, clock, &bridge, &mut correlation, "UPAS1111111111Cshr",
+    exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "CSIN1",
+        false,
+    );
+    exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "UPAS1111111111Cshr",
         true,
     );
 
     let cmd_bytes = encode_frame("CONf", true).unwrap();
-    assert_eq!(
-        crc16(&cmd_bytes),
-        0,
-        "request frame must self-verify",
-    );
+    assert_eq!(crc16(&cmd_bytes), 0, "request frame must self-verify",);
     let (Frame { text, .. }, _) = decode_frame(&cmd_bytes, true).unwrap();
-    let responses = dispatch(&mut session, Command::parse_text(&text), &identity, clock, &bridge, &mut correlation);
+    let responses = dispatch(
+        &mut session,
+        Command::parse_text(&text),
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+    );
 
     // Every response frame must self-verify end-to-end.
     for resp in responses {
@@ -133,20 +208,50 @@ fn conf_payload_crc_self_verifies_on_the_wire() {
 fn receipt_full_lifecycle_through_wire() {
     let (mut session, identity, clock, bridge, mut correlation) = handshake_flow();
 
-    exchange(&mut session, &identity, clock, &bridge, &mut correlation, "CSIN1", false);
-    exchange(&mut session, &identity, clock, &bridge, &mut correlation, "UPAS1111111111Cshr",
+    exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "CSIN1",
+        false,
+    );
+    exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "UPAS1111111111Cshr",
         true,
     );
 
     // Open receipt.
-    let out = exchange(&mut session, &identity, clock, &bridge, &mut correlation, "PREPBar1", true);
+    let out = exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "PREPBar1",
+        true,
+    );
     assert_eq!(out, vec!["DONE".to_string(), "READY".to_string()]);
     assert!(session.receipt_open());
 
     // Receipt-building commands — each replies DONE/READY in M3.
     // M4 replaces this with real line accumulation.
     for cmd in ["FISCgoods1-1000-100", "PSDt1022MERCHANTTERM", "ACLD03ABC"] {
-        let out = exchange(&mut session, &identity, clock, &bridge, &mut correlation, cmd, true);
+        let out = exchange(
+            &mut session,
+            &identity,
+            clock,
+            &bridge,
+            &mut correlation,
+            cmd,
+            true,
+        );
         assert_eq!(
             out,
             vec!["DONE".to_string(), "READY".to_string()],
@@ -156,7 +261,15 @@ fn receipt_full_lifecycle_through_wire() {
     assert_eq!(session.psdt_sequence, 1);
 
     // Close receipt — COMP replies Data + DONE + READY.
-    let out = exchange(&mut session, &identity, clock, &bridge, &mut correlation, "COMPsum", true);
+    let out = exchange(
+        &mut session,
+        &identity,
+        clock,
+        &bridge,
+        &mut correlation,
+        "COMPsum",
+        true,
+    );
     assert_eq!(out.len(), 3);
     assert!(out[0].starts_with("COMP"));
     assert_eq!(out[1], "DONE");

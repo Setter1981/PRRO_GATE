@@ -15,7 +15,10 @@ const PREP1_NO_CRC: &[u8] = &[0xFD, 0x50, 0x52, 0x45, 0x50, 0x31, 0x06, 0xFE];
 #[test]
 fn encode_prep1_produces_exact_reference_bytes() {
     let bytes = encode_frame("PREP1", false).unwrap();
-    assert_eq!(bytes, PREP1_NO_CRC, "bytes drift from Maria protocol reference");
+    assert_eq!(
+        bytes, PREP1_NO_CRC,
+        "bytes drift from Maria protocol reference"
+    );
 }
 
 #[test]
@@ -86,7 +89,10 @@ fn llv_composes_psd_slip_identically_to_reference() {
     let pan = Llv::new("4111********1111").unwrap();
     let rrn = Llv::new("123456789012").unwrap();
     let wire = format!("{merchant}{terminal}{pan}{rrn}");
-    assert_eq!(wire, "08BANK_ABC04T0011641 11********111112123456789012".replace(' ', ""));
+    assert_eq!(
+        wire,
+        "08BANK_ABC04T0011641 11********111112123456789012".replace(' ', "")
+    );
 }
 
 #[test]

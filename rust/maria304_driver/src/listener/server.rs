@@ -38,7 +38,11 @@ pub struct ListenerConfig {
 
 impl ListenerConfig {
     #[must_use]
-    pub fn new(fiscal_number: impl Into<String>, bind: impl Into<String>, identity: Identity) -> Self {
+    pub fn new(
+        fiscal_number: impl Into<String>,
+        bind: impl Into<String>,
+        identity: Identity,
+    ) -> Self {
         Self {
             fiscal_number: fiscal_number.into(),
             bind: bind.into(),
@@ -87,7 +91,10 @@ impl FnListener {
     ///
     /// # Errors
     /// Returns if binding fails or the accept loop hits an unrecoverable error.
-    pub async fn serve(self, shutdown: tokio_util::sync::CancellationToken) -> Result<(), ListenerError> {
+    pub async fn serve(
+        self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<(), ListenerError> {
         let tcp = TcpListener::bind(&self.cfg.bind).await?;
         tracing::info!(
             fn_id = %self.cfg.fiscal_number,
@@ -172,7 +179,17 @@ async fn handle_incoming(
     let _slot = SlotGuard { gate, cooldown };
     let session_uuid = session_uuid();
     tracing::info!(%peer, uuid = %session_uuid, "session accepted");
-    let run = run_connection(stream, identity, bridge, clock, session_uuid.clone(), idle, metrics, shutdown).await;
+    let run = run_connection(
+        stream,
+        identity,
+        bridge,
+        clock,
+        session_uuid.clone(),
+        idle,
+        metrics,
+        shutdown,
+    )
+    .await;
     if let Err(e) = &run {
         tracing::warn!(%peer, uuid = %session_uuid, "session ended: {e}");
     } else {

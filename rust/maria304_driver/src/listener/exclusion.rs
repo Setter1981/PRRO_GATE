@@ -20,7 +20,9 @@ pub struct ConnectionGate {
 impl ConnectionGate {
     #[must_use]
     pub fn new() -> Self {
-        Self { active: AtomicBool::new(false) }
+        Self {
+            active: AtomicBool::new(false),
+        }
     }
 
     /// Try to take the slot.  Returns `true` iff we successfully

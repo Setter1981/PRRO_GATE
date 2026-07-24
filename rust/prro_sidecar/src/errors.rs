@@ -45,19 +45,19 @@ impl axum::response::IntoResponse for SidecarError {
         // contain key-encoding hints, SQL fragments, or file paths.
         tracing::error!(error = %self, "fiscal handler error");
         let (status, msg) = match &self {
-            Self::InvalidInput(m) => (StatusCode::BAD_REQUEST,          m.clone()),
-            Self::BadRequest(m)  => (StatusCode::BAD_REQUEST,           m.clone()),
-            Self::NotFound(m)    => (StatusCode::NOT_FOUND,             m.clone()),
-            Self::License(m)     => (StatusCode::FORBIDDEN,             m.clone()),
+            Self::InvalidInput(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            Self::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
+            Self::License(m) => (StatusCode::FORBIDDEN, m.clone()),
             Self::Credentials(_) => (StatusCode::INTERNAL_SERVER_ERROR, "credential error".into()),
-            Self::CmsSign(_)     => (StatusCode::BAD_GATEWAY,           "cms sign failed".into()),
-            Self::Grpc(_)        => (StatusCode::BAD_GATEWAY,           "dps unavailable".into()),
-            Self::Db(_)          => (StatusCode::INTERNAL_SERVER_ERROR, "database error".into()),
-            Self::FnDegraded(_)        => (StatusCode::SERVICE_UNAVAILABLE, "FN_DEGRADED".into()),
-            Self::DuplicateInFlight(m) => (StatusCode::CONFLICT,          m.clone()),
-            Self::AmbiguousRequest(m)  => (StatusCode::CONFLICT,          m.clone()),
-            Self::IdempotencyConflict(m) => (StatusCode::CONFLICT,        m.clone()),
-            Self::Internal(_)          => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
+            Self::CmsSign(_) => (StatusCode::BAD_GATEWAY, "cms sign failed".into()),
+            Self::Grpc(_) => (StatusCode::BAD_GATEWAY, "dps unavailable".into()),
+            Self::Db(_) => (StatusCode::INTERNAL_SERVER_ERROR, "database error".into()),
+            Self::FnDegraded(_) => (StatusCode::SERVICE_UNAVAILABLE, "FN_DEGRADED".into()),
+            Self::DuplicateInFlight(m) => (StatusCode::CONFLICT, m.clone()),
+            Self::AmbiguousRequest(m) => (StatusCode::CONFLICT, m.clone()),
+            Self::IdempotencyConflict(m) => (StatusCode::CONFLICT, m.clone()),
+            Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
         (status, Json(serde_json::json!({"error": msg}))).into_response()
     }

@@ -17,28 +17,31 @@ pub enum CmsAdapterError {
     Db(#[from] rusqlite::Error),
 }
 
-
 /// Query `ca_endpoints` for a TSP URL matching the cert's issuer DN.
 ///
 /// Uses case-insensitive substring match: the stored `issuer_pattern` is
 /// a distinctive fragment of the issuer DN (e.g. "ацск" or "privatbank").
 pub fn resolve_tsp_url(
-    conn:      &rusqlite::Connection,
+    conn: &rusqlite::Connection,
     issuer_dn: &str,
 ) -> Result<String, CmsAdapterError> {
     let lower_dn = issuer_dn.to_lowercase();
-    let url: Option<String> = conn.query_row(
-        "SELECT tsp_url FROM ca_endpoints
+    let url: Option<String> = conn
+        .query_row(
+            "SELECT tsp_url FROM ca_endpoints
           WHERE enabled = 1
             AND tsp_url IS NOT NULL
             AND INSTR(?, lower(issuer_pattern)) > 0
           ORDER BY priority ASC
           LIMIT 1",
-        rusqlite::params![lower_dn],
-        |row| row.get(0),
-    ).optional()?;
+            rusqlite::params![lower_dn],
+            |row| row.get(0),
+        )
+        .optional()?;
 
-    url.ok_or_else(|| CmsAdapterError::NoTspMapping { issuer_dn: issuer_dn.to_string() })
+    url.ok_or_else(|| CmsAdapterError::NoTspMapping {
+        issuer_dn: issuer_dn.to_string(),
+    })
 }
 
 /// Extract the issuer DN string from a DER-encoded X.509 certificate.
@@ -49,29 +52,27 @@ pub fn extract_issuer_dn(cert_der: &[u8]) -> Result<String, CmsAdapterError> {
     let err = |msg: &str| CmsAdapterError::CertParse(msg.to_string());
 
     // SEQUENCE (Certificate) → SEQUENCE (tbsCertificate)
-    let (_, tbs_start) = a1::read_tlv(cert_der, 0)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
-    let (_, tbs_inner) = a1::read_tlv(cert_der, tbs_start)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (_, tbs_start) =
+        a1::read_tlv(cert_der, 0).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (_, tbs_inner) =
+        a1::read_tlv(cert_der, tbs_start).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
 
     let mut pos = tbs_inner;
     // Skip optional version [0]
-    if a1::peek_tag(cert_der, pos)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))? == 0xa0
-    {
-        let (end, _) = a1::read_tlv(cert_der, pos)
-            .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    if a1::peek_tag(cert_der, pos).map_err(|e| CmsAdapterError::CertParse(e.to_string()))? == 0xa0 {
+        let (end, _) =
+            a1::read_tlv(cert_der, pos).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
         pos = end;
     }
     // Skip serialNumber, signature, then read issuer (4th field)
     for _ in 0..2 {
-        let (end, _) = a1::read_tlv(cert_der, pos)
-            .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+        let (end, _) =
+            a1::read_tlv(cert_der, pos).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
         pos = end;
     }
     // issuer is next — read its raw bytes and format as hex for matching
-    let (issuer_end, issuer_inner) = a1::read_tlv(cert_der, pos)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (issuer_end, issuer_inner) =
+        a1::read_tlv(cert_der, pos).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
 
     if issuer_end > cert_der.len() {
         return Err(err("issuer sequence extends beyond cert DER"));
@@ -82,13 +83,17 @@ pub fn extract_issuer_dn(cert_der: &[u8]) -> Result<String, CmsAdapterError> {
     let mut dn_parts = Vec::new();
     let mut rdn_pos = issuer_inner;
     while rdn_pos < issuer_end {
-        let Ok((set_end, set_inner)) = a1::read_tlv(cert_der, rdn_pos) else { break };
+        let Ok((set_end, set_inner)) = a1::read_tlv(cert_der, rdn_pos) else {
+            break;
+        };
         let Ok((atv_end, atv_inner)) = a1::read_tlv(cert_der, set_inner) else {
-            rdn_pos = set_end; continue;
+            rdn_pos = set_end;
+            continue;
         };
         // Skip OID, read value
         let Ok((oid_end, _)) = a1::read_tlv(cert_der, atv_inner) else {
-            rdn_pos = set_end; continue;
+            rdn_pos = set_end;
+            continue;
         };
         if let Ok((val_end, val_inner)) = a1::read_tlv(cert_der, oid_end) {
             if val_inner < val_end && val_end <= cert_der.len() {
@@ -117,46 +122,46 @@ pub fn extract_cert_valid_to(cert_der: &[u8]) -> Result<String, CmsAdapterError>
     use prro_crypto::cms::asn1_util as a1;
 
     // Certificate (SEQUENCE) → tbsCertificate (SEQUENCE)
-    let (_, tbs_start) = a1::read_tlv(cert_der, 0)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
-    let (_, tbs_inner) = a1::read_tlv(cert_der, tbs_start)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (_, tbs_start) =
+        a1::read_tlv(cert_der, 0).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (_, tbs_inner) =
+        a1::read_tlv(cert_der, tbs_start).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
 
     let mut pos = tbs_inner;
     // Skip optional version [0]
-    if a1::peek_tag(cert_der, pos)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))? == 0xa0
-    {
-        let (end, _) = a1::read_tlv(cert_der, pos)
-            .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    if a1::peek_tag(cert_der, pos).map_err(|e| CmsAdapterError::CertParse(e.to_string()))? == 0xa0 {
+        let (end, _) =
+            a1::read_tlv(cert_der, pos).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
         pos = end;
     }
     // Skip serialNumber, signature, issuer (3 fields)
     for _ in 0..3 {
-        let (end, _) = a1::read_tlv(cert_der, pos)
-            .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+        let (end, _) =
+            a1::read_tlv(cert_der, pos).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
         pos = end;
     }
     // validity SEQUENCE
-    let (_, val_inner) = a1::read_tlv(cert_der, pos)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (_, val_inner) =
+        a1::read_tlv(cert_der, pos).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
     // notBefore — check tag then skip it
-    let not_before_tag = a1::peek_tag(cert_der, val_inner)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let not_before_tag =
+        a1::peek_tag(cert_der, val_inner).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
     if not_before_tag != 0x17 && not_before_tag != 0x18 {
-        return Err(CmsAdapterError::CertParse(
-            format!("unexpected notBefore tag 0x{not_before_tag:02x}")
-        ));
+        return Err(CmsAdapterError::CertParse(format!(
+            "unexpected notBefore tag 0x{not_before_tag:02x}"
+        )));
     }
-    let (not_after_pos, _) = a1::read_tlv(cert_der, val_inner)
-        .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
+    let (not_after_pos, _) =
+        a1::read_tlv(cert_der, val_inner).map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
     // notAfter
     let not_after_tag = a1::peek_tag(cert_der, not_after_pos)
         .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
     let (not_after_end, not_after_inner) = a1::read_tlv(cert_der, not_after_pos)
         .map_err(|e| CmsAdapterError::CertParse(e.to_string()))?;
     if not_after_end > cert_der.len() {
-        return Err(CmsAdapterError::CertParse("notAfter extends beyond cert DER".into()));
+        return Err(CmsAdapterError::CertParse(
+            "notAfter extends beyond cert DER".into(),
+        ));
     }
     let raw = std::str::from_utf8(&cert_der[not_after_inner..not_after_end])
         .map_err(|e| CmsAdapterError::CertParse(format!("notAfter UTF-8: {e}")))?;
@@ -166,27 +171,45 @@ pub fn extract_cert_valid_to(cert_der: &[u8]) -> Result<String, CmsAdapterError>
             // UTCTime: YYMMDDHHMMSSZ (13 bytes)
             // RFC 5280: year 00-49 = 2000+, year 50-99 = 1900+
             if raw.len() < 13 {
-                return Err(CmsAdapterError::CertParse(format!("UTCTime too short: {raw:?}")));
+                return Err(CmsAdapterError::CertParse(format!(
+                    "UTCTime too short: {raw:?}"
+                )));
             }
-            let yy: u32 = raw[..2].parse().map_err(|_| CmsAdapterError::CertParse(format!("UTCTime yy: {raw}")))?;
+            let yy: u32 = raw[..2]
+                .parse()
+                .map_err(|_| CmsAdapterError::CertParse(format!("UTCTime yy: {raw}")))?;
             let century = if yy <= 49 { 2000u32 } else { 1900u32 };
             let yyyy = century + yy;
             Ok(format!(
                 "{:04}-{}-{}T{}:{}:{}Z",
-                yyyy, &raw[2..4], &raw[4..6], &raw[6..8], &raw[8..10], &raw[10..12]
+                yyyy,
+                &raw[2..4],
+                &raw[4..6],
+                &raw[6..8],
+                &raw[8..10],
+                &raw[10..12]
             ))
         }
         0x18 => {
             // GeneralizedTime: YYYYMMDDHHMMSSZ (15 bytes)
             if raw.len() < 15 {
-                return Err(CmsAdapterError::CertParse(format!("GeneralizedTime too short: {raw:?}")));
+                return Err(CmsAdapterError::CertParse(format!(
+                    "GeneralizedTime too short: {raw:?}"
+                )));
             }
             Ok(format!(
                 "{}-{}-{}T{}:{}:{}Z",
-                &raw[..4], &raw[4..6], &raw[6..8], &raw[8..10], &raw[10..12], &raw[12..14]
+                &raw[..4],
+                &raw[4..6],
+                &raw[6..8],
+                &raw[8..10],
+                &raw[10..12],
+                &raw[12..14]
             ))
         }
-        tag => Err(CmsAdapterError::CertParse(format!("unexpected notAfter tag 0x{tag:02x}"))),
+        tag => Err(CmsAdapterError::CertParse(format!(
+            "unexpected notAfter tag 0x{tag:02x}"
+        ))),
     }
 }
 
@@ -233,8 +256,10 @@ mod tests {
     fn resolve_tsp_unknown_issuer_returns_error() {
         let conn = make_db_with_endpoints();
         let err = resolve_tsp_url(&conn, "CN=Unknown, O=UnknownCA, C=UA").unwrap_err();
-        assert!(matches!(err, CmsAdapterError::NoTspMapping { .. }),
-                "expected NoTspMapping, got {err}");
+        assert!(
+            matches!(err, CmsAdapterError::NoTspMapping { .. }),
+            "expected NoTspMapping, got {err}"
+        );
     }
 
     #[test]
@@ -273,7 +298,8 @@ mod tests {
             -- Row with NULL tsp_url: must NOT be returned even if pattern matches
             INSERT INTO ca_endpoints VALUES
                 (1,'null_tsp',NULL,NULL,NULL,'testissuer',10,1);",
-        ).unwrap();
+        )
+        .unwrap();
 
         let err = resolve_tsp_url(&conn, "CN=Test, O=TestIssuer, C=UA").unwrap_err();
         assert!(
@@ -300,7 +326,8 @@ mod tests {
             );
             INSERT INTO ca_endpoints VALUES
                 (1,'catch_all',NULL,'https://catch-all.example.com/tsp/',NULL,'',10,1);",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Any issuer DN must match the empty pattern
         let url = resolve_tsp_url(&conn, "CN=Anyone, O=AnyOrg, C=UA").unwrap();
@@ -363,8 +390,14 @@ mod tests {
     #[test]
     fn extract_cert_valid_to_utctime() {
         // UTCTime "270101000000Z" → "2027-01-01T00:00:00Z"
-        let not_before = [0x17u8, 0x0d, b'2', b'6', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
-        let not_after  = [0x17u8, 0x0d, b'2', b'7', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
+        let not_before = [
+            0x17u8, 0x0d, b'2', b'6', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0',
+            b'Z',
+        ];
+        let not_after = [
+            0x17u8, 0x0d, b'2', b'7', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0',
+            b'Z',
+        ];
         let der = make_minimal_cert_der(&not_before, &not_after);
         let result = extract_cert_valid_to(&der).unwrap();
         assert_eq!(result, "2027-01-01T00:00:00Z");
@@ -373,8 +406,14 @@ mod tests {
     #[test]
     fn extract_cert_valid_to_utctime_century_50_to_99() {
         // UTCTime "991231235959Z" → year 99 ≥ 50 → 1999-12-31T23:59:59Z
-        let not_before = [0x17u8, 0x0d, b'9', b'8', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
-        let not_after  = [0x17u8, 0x0d, b'9', b'9', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9', b'5', b'9', b'Z'];
+        let not_before = [
+            0x17u8, 0x0d, b'9', b'8', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0',
+            b'Z',
+        ];
+        let not_after = [
+            0x17u8, 0x0d, b'9', b'9', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9', b'5', b'9',
+            b'Z',
+        ];
         let der = make_minimal_cert_der(&not_before, &not_after);
         let result = extract_cert_valid_to(&der).unwrap();
         assert_eq!(result, "1999-12-31T23:59:59Z");
@@ -383,8 +422,14 @@ mod tests {
     #[test]
     fn extract_cert_valid_to_generalizedtime() {
         // GeneralizedTime "20270101000000Z" → "2027-01-01T00:00:00Z"
-        let not_before = [0x18u8, 0x0f, b'2', b'0', b'2', b'6', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
-        let not_after  = [0x18u8, 0x0f, b'2', b'0', b'2', b'7', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
+        let not_before = [
+            0x18u8, 0x0f, b'2', b'0', b'2', b'6', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0',
+            b'0', b'0', b'Z',
+        ];
+        let not_after = [
+            0x18u8, 0x0f, b'2', b'0', b'2', b'7', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0',
+            b'0', b'0', b'Z',
+        ];
         let der = make_minimal_cert_der(&not_before, &not_after);
         let result = extract_cert_valid_to(&der).unwrap();
         assert_eq!(result, "2027-01-01T00:00:00Z");
@@ -442,7 +487,8 @@ mod tests {
             -- Pattern with LIKE wildcard — with INSTR this must only match if '%' is in the DN
             INSERT INTO ca_endpoints VALUES
                 (1,'percent_ca',NULL,'https://percent.example.com/tsp/',NULL,'%',10,1);",
-        ).unwrap();
+        )
+        .unwrap();
 
         // A normal issuer DN (no '%') must NOT match this pattern with INSTR
         let result = resolve_tsp_url(&conn, "CN=Normal CA, O=NormalOrg, C=UA");
@@ -467,11 +513,15 @@ mod tests {
             );
             INSERT INTO ca_endpoints VALUES
                 (1,'percent_ca',NULL,'https://percent.example.com/tsp/',NULL,'%',10,1);",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Issuer DN that literally contains '%' must match the '%' pattern
         let url = resolve_tsp_url(&conn, "CN=CA 100% Trusted, O=Org, C=UA");
-        assert!(url.is_ok(), "DN containing '%' must match pattern '%' via INSTR");
+        assert!(
+            url.is_ok(),
+            "DN containing '%' must match pattern '%' via INSTR"
+        );
     }
 
     // ── F. Priority ordering: lower number wins ───────────────────────────────
@@ -493,7 +543,8 @@ mod tests {
             INSERT INTO ca_endpoints VALUES
                 (1,'high_priority',NULL,'https://first.example.com/tsp/',NULL,'test',10,1),
                 (2,'low_priority', NULL,'https://second.example.com/tsp/',NULL,'corp',20,1);",
-        ).unwrap();
+        )
+        .unwrap();
 
         // priority=10 wins over priority=20 (ORDER BY priority ASC → smallest first)
         let url = resolve_tsp_url(&conn, "testcorp").unwrap();

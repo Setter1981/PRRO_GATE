@@ -2997,6 +2997,17 @@ async fn live_smoke_11_offline_drain_real_xml() {
         hex_lower(doc_id.as_bytes())
     );
 
+    // fs_mode fix: seed_extended_sell_prepared is smoke 6's ONLINE seeder
+    // (fiscal_documents.fs_mode='ONLINE'), and it bypasses stage_acquire (which
+    // in production sets fs_mode from the node mode). This doc is processed
+    // OFFLINE, and list_drain_candidates filters `fs_mode='OFFLINE'` — so the
+    // drain skipped it (empty backlog). Force it to match the offline reality.
+    sqlx::query("UPDATE fiscal_documents SET fs_mode = 'OFFLINE' WHERE document_id = ?")
+        .bind(doc_id.as_bytes().to_vec())
+        .execute(pool)
+        .await
+        .expect("force fs_mode=OFFLINE on the seeded PREPARED doc");
+
     // ── Step 7: reconcile_pending_with — OFFLINE mode: stage_sign + stage_offline_ack ──
     // Node is OFFLINE → dispatch_prepared_via_chain → stage_sign (builds real
     // canonical XML) → dispatch_post_sign → stage_offline_ack (acquires the

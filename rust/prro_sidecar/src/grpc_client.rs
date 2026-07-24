@@ -5,13 +5,13 @@
 //! - 5 RPC wrappers with typed error classification
 //! - lightweight `GrpcError` that distinguishes transient vs permanent DPS codes
 
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use crate::config::DpsEndpoint;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 // Generated gRPC stubs
 use crate::generated::{
-    chk_income_service_client::ChkIncomeServiceClient,
-    Check, CheckRequest, CheckResponse, StatusResponse, RroInfoResponse,
+    chk_income_service_client::ChkIncomeServiceClient, Check, CheckRequest, CheckResponse,
+    RroInfoResponse, StatusResponse,
 };
 
 // ─── Error ────────────────────────────────────────────────────────────────────
@@ -39,24 +39,24 @@ pub enum DpsErrorCategory {
 
 pub fn classify_dps_status(status: i32) -> Option<DpsErrorCategory> {
     match status {
-        1  => None,                            // OK
-        -3 => Some(DpsErrorCategory::Transient), // ERROR_SAVE — DB write race; retry
-        -4 => Some(DpsErrorCategory::Transient), // ERROR_UNKNOWN — server-side transient; retry
+        1 => None,                                // OK
+        -3 => Some(DpsErrorCategory::Transient),  // ERROR_SAVE — DB write race; retry
+        -4 => Some(DpsErrorCategory::Transient),  // ERROR_UNKNOWN — server-side transient; retry
         -12 => Some(DpsErrorCategory::Transient), // ERROR_BAD_HASH_PREV — chain gap; retry after resync
-        -1  => Some(DpsErrorCategory::Permanent), // ERROR_VEREFY — signature verification failed
-        -2  => Some(DpsErrorCategory::Permanent), // ERROR_CHECK — cert/auth check failed
-        -5  => Some(DpsErrorCategory::Permanent), // ERROR_TYPE — unknown doc type
-        -6  => Some(DpsErrorCategory::Permanent), // ERROR_NOT_PREV_ZREPORT — prev Z-report missing
-        -7  => Some(DpsErrorCategory::Permanent), // ERROR_XML — XML malformed
-        -8  => Some(DpsErrorCategory::Permanent), // ERROR_XML_DATE — date field invalid
-        -9  => Some(DpsErrorCategory::Permanent), // ERROR_XML_CHK — check XML invalid
+        -1 => Some(DpsErrorCategory::Permanent),  // ERROR_VEREFY — signature verification failed
+        -2 => Some(DpsErrorCategory::Permanent),  // ERROR_CHECK — cert/auth check failed
+        -5 => Some(DpsErrorCategory::Permanent),  // ERROR_TYPE — unknown doc type
+        -6 => Some(DpsErrorCategory::Permanent),  // ERROR_NOT_PREV_ZREPORT — prev Z-report missing
+        -7 => Some(DpsErrorCategory::Permanent),  // ERROR_XML — XML malformed
+        -8 => Some(DpsErrorCategory::Permanent),  // ERROR_XML_DATE — date field invalid
+        -9 => Some(DpsErrorCategory::Permanent),  // ERROR_XML_CHK — check XML invalid
         -10 => Some(DpsErrorCategory::Permanent), // ERROR_XML_ZREPORT — Z-report XML invalid
         -11 => Some(DpsErrorCategory::Permanent), // ERROR_OFFLINE_168 — offline >168h limit
         -13 => Some(DpsErrorCategory::Permanent), // ERROR_NOT_REGISTERED_RRO — RRO not registered
         -14 => Some(DpsErrorCategory::Permanent), // ERROR_NOT_REGISTERED_SIGNER — signer not registered
         -15 => Some(DpsErrorCategory::Permanent), // ERROR_NOT_OPEN_SHIFT — shift not open
         -16 => Some(DpsErrorCategory::Permanent), // ERROR_OFFLINE_ID — offline doc ID conflict
-        _   => Some(DpsErrorCategory::Permanent), // 0 = UNKNOWN or any future code
+        _ => Some(DpsErrorCategory::Permanent),   // 0 = UNKNOWN or any future code
     }
 }
 
@@ -73,10 +73,7 @@ pub struct DpsGrpcPool {
 impl DpsGrpcPool {
     /// Build pool with lazy-connected channels — actual TCP handshake deferred to first RPC.
     /// Construction succeeds even if DPS endpoints are temporarily unreachable.
-    pub fn new(
-        prod_cfg: &DpsEndpoint,
-        test_cfg: &DpsEndpoint,
-    ) -> Result<Self, GrpcError> {
+    pub fn new(prod_cfg: &DpsEndpoint, test_cfg: &DpsEndpoint) -> Result<Self, GrpcError> {
         let prod_ch = build_channel(prod_cfg)?;
         let test_ch = build_channel(test_cfg)?;
         Ok(Self {
@@ -112,7 +109,9 @@ fn build_channel(cfg: &DpsEndpoint) -> Result<Channel, GrpcError> {
         ClientTlsConfig::new().with_enabled_roots()
     };
 
-    ep = ep.tls_config(tls).map_err(|e: tonic::transport::Error| GrpcError::Tls(e.to_string()))?;
+    ep = ep
+        .tls_config(tls)
+        .map_err(|e: tonic::transport::Error| GrpcError::Tls(e.to_string()))?;
     // connect_lazy defers TCP handshake to first RPC — construction never fails due to network
     Ok(ep.connect_lazy())
 }
@@ -176,7 +175,7 @@ fn map_status(status: tonic::Status) -> GrpcError {
         GrpcError::Deadline
     } else {
         GrpcError::Status {
-            code:    status.code() as i32,
+            code: status.code() as i32,
             message: status.message().to_string(),
         }
     }
@@ -197,7 +196,8 @@ mod tests {
     fn classify_transient_codes() {
         assert_eq!(classify_dps_status(-3), Some(DpsErrorCategory::Transient)); // ERROR_SAVE
         assert_eq!(classify_dps_status(-4), Some(DpsErrorCategory::Transient)); // ERROR_UNKNOWN
-        assert_eq!(classify_dps_status(-12), Some(DpsErrorCategory::Transient)); // ERROR_BAD_HASH_PREV
+        assert_eq!(classify_dps_status(-12), Some(DpsErrorCategory::Transient));
+        // ERROR_BAD_HASH_PREV
     }
 
     #[test]
@@ -239,11 +239,11 @@ mod tests {
         // DpsGrpcPool::new is sync (uses connect_lazy), so no async runtime needed.
         use crate::config::DpsEndpoint;
         let bad_cfg = DpsEndpoint {
-            endpoint:  "not a valid uri at all !!!".to_string(),
+            endpoint: "not a valid uri at all !!!".to_string(),
             ca_bundle: None,
         };
         let valid_cfg = DpsEndpoint {
-            endpoint:  "https://example.com:9443".to_string(),
+            endpoint: "https://example.com:9443".to_string(),
             ca_bundle: None,
         };
         let result = DpsGrpcPool::new(&bad_cfg, &valid_cfg);
@@ -270,11 +270,11 @@ mod tests {
         // Construction must succeed for valid URI format even when no server is listening.
         use crate::config::DpsEndpoint;
         let cfg_prod = DpsEndpoint {
-            endpoint:  "https://127.0.0.1:19999".to_string(), // nothing listening here
+            endpoint: "https://127.0.0.1:19999".to_string(), // nothing listening here
             ca_bundle: None,
         };
         let cfg_test = DpsEndpoint {
-            endpoint:  "https://127.0.0.1:19998".to_string(), // nothing listening here
+            endpoint: "https://127.0.0.1:19998".to_string(), // nothing listening here
             ca_bundle: None,
         };
         let result = DpsGrpcPool::new(&cfg_prod, &cfg_test);
@@ -332,10 +332,7 @@ mod tests {
     #[test]
     fn classify_status_2_is_permanent() {
         // Status 2 is not in the named list — falls to wildcard.
-        assert_eq!(
-            classify_dps_status(2),
-            Some(DpsErrorCategory::Permanent)
-        );
+        assert_eq!(classify_dps_status(2), Some(DpsErrorCategory::Permanent));
     }
 
     // ── D. map_status for specific gRPC codes ─────────────────────────────────
