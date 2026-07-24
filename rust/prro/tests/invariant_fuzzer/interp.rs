@@ -2167,13 +2167,42 @@ async fn duplicate_idem_key(ctx: &mut FuzzCtx) -> RealOutcome {
 /// (`push_last`).  Matches `AckPath = [Ack, Ack]` (send→Ack, last→Ack).
 fn load_script(dps: &ScriptedDps, script: &DpsScript) {
     for (i, wr) in script.0.iter().copied().enumerate() {
-        let result = wire_to_result(wr);
-        if i == 0 {
-            dps.push_send(result);
-        } else {
-            dps.push_last(result);
+        match (i, wr) {
+            // CS-3 Slice E: an UnknownStatus send response MUST reach the wire through the REAL
+            // production decode (`observe_check_reply` via `scripted_raw_observation`), NOT a legacy
+            // `DpsError` (which `observe_faithful_from_legacy` degrades to NoResponse, losing the
+            // ProbeRequired classification). Push the legacy for the send counter/pop + the
+            // real-decode observation as the override the stub returns.
+            (0, WireResponse::UnknownStatus(code)) => {
+                let (legacy, obs) = unknown_status_pair(code);
+                dps.push_send(legacy);
+                dps.push_send_obs_override(obs);
+            }
+            (0, _) => dps.push_send(wire_to_result(wr)),
+            (_, _) => dps.push_last(wire_to_result(wr)),
         }
     }
+}
+
+/// CS-3 Slice E: the `(legacy, real-observation)` pair for an `UnknownStatus(code)` leaf — a raw
+/// `gen::CheckResponse{ status: code }` fed through the PRODUCTION `observe_check_reply` decode. This
+/// is the ONLY faithful path to the `UnknownStatus → ProbeRequired` leaf; a hand-built legacy
+/// `DpsError::Indeterminate` degrades to `NoResponse` in `observe_faithful_from_legacy`.
+fn unknown_status_pair(
+    code: i32,
+) -> (
+    Result<CheckAck, DpsError>,
+    prro::transports::dps::raw_reply::RawSendObservation,
+) {
+    prro::transports::dps::dto::scripted_raw_observation(
+        prro::transports::dps::gen::CheckResponse {
+            id: String::new(),
+            status: code,
+            id_sign: Vec::new(),
+            data_sign: Vec::new(),
+            error_message: String::new(),
+        },
+    )
 }
 
 /// Lay a drain's wire responses PER cohort doc (a drain submits + confirms each
@@ -2240,6 +2269,10 @@ fn wire_to_result(wr: WireResponse) -> Result<CheckAck, DpsError> {
         WireResponse::Timeout => Err(DpsError::Transport(
             "fuzz: simulated timeout (normally realized via Crash drop-injection)".to_string(),
         )),
+        // CS-3 Slice E: the legacy half of an UnknownStatus leaf. The send path routes it via
+        // `load_script`'s obs-override (real decode); this defensive arm keeps `wire_to_result` total
+        // for any last_chk position (unused by the shipped scripts — UnknownStatus is send-only).
+        WireResponse::UnknownStatus(code) => unknown_status_pair(code).0,
     }
 }
 

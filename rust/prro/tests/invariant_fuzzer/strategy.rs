@@ -23,6 +23,11 @@ fn dps_script() -> impl Strategy<Value = DpsScript> {
         Just(DpsScript::send_then_reject()),
         Just(DpsScript::superseded_tip()),
         Just(DpsScript::bad_hash_prev()),
+        // CS-3 Slice E — APPENDED LAST (corpus seed indices preserved): a parsed unnamed non-zero
+        // status → UnknownStatus → ProbeRequired HELD. `-4` is the effect-class representative; the
+        // directed corpus (`directed_unknown_status_probe.rs` + the fuzzer's directed pins) covers
+        // `-17` / outside-enum. Feeds the REAL decode via `interp::load_script` obs-override.
+        Just(DpsScript::unknown_status(-4)),
     ]
 }
 
@@ -51,6 +56,9 @@ fn shift_dps_script() -> impl Strategy<Value = DpsScript> {
         Just(DpsScript::send_ack_then_last_not_found()),
         Just(DpsScript::send_then_reject()),
         Just(DpsScript::superseded_tip()),
+        // CS-3 Slice E — APPENDED LAST: SHIFT_OPEN / Z_REPORT also meet the UnknownStatus leaf
+        // (doc-type-agnostic — `-4` is not the `-2/-15` close-shift split). ProbeRequired HELD.
+        Just(DpsScript::unknown_status(-4)),
     ]
 }
 

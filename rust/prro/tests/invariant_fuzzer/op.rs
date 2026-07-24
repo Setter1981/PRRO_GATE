@@ -30,6 +30,14 @@ pub enum WireResponse {
     Superseded,
     BadHashPrev,
     NotFound,
+    /// CS-3 Slice E oracle: a parsed DPS envelope carrying an unnamed non-zero status code
+    /// (`-4 ERROR_UNKNOWN`, `-17`, …) → the `UnknownStatus` evidence leaf → `ProbeRequired` HELD.
+    /// **Appended LAST** so existing regression-corpus seed indices are preserved. Unlike the
+    /// other arms, this MUST reach the wire through the REAL production decode
+    /// (`observe_check_reply` / `scripted_raw_observation`), NOT a legacy `DpsError` — a legacy
+    /// `Indeterminate` degrades to `NoResponse` in `observe_faithful_from_legacy`, losing the
+    /// `ProbeRequired` classification (see `interp::load_script` + `ScriptedDps` obs-override).
+    UnknownStatus(i32),
 }
 
 /// An ORDERED queue of per-call wire responses for a wire-hitting op.  A real
@@ -71,6 +79,13 @@ impl DpsScript {
     /// The send is rejected for a bad previous-hash chain link.
     pub fn bad_hash_prev() -> Self {
         Self(vec![WireResponse::BadHashPrev])
+    }
+
+    /// CS-3 Slice E: the DPS returns a parsed envelope with an unnamed non-zero status `code`
+    /// (`-4`/`-17`) → `UnknownStatus → ProbeRequired` HELD (SENDING + STOP + PENDING_APPLY, one wire,
+    /// no auto-resend). A single send response (the leaf HOLDS; no `last_chk` in the send path).
+    pub fn unknown_status(code: i32) -> Self {
+        Self(vec![WireResponse::UnknownStatus(code)])
     }
 }
 

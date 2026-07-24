@@ -639,6 +639,54 @@ fn generator_emits_online_and_offline_returns() {
     );
 }
 
+/// CS-3 Slice E (anti-silent-zero) — the generator ACTUALLY emits the `UnknownStatus` wire leaf on
+/// BOTH the online-sell lane (`dps_script`, 6 arms) AND the shift/Z lane (`shift_dps_script`, 5
+/// arms) over a large deterministic draw, so the `ProbeRequired`-HELD path is really exercised by
+/// the property harness — not just the directed corpus.  Dropping the appended `unknown_status`
+/// arm from either `prop_oneof!` makes this RED loudly (the revert-canary for the Track-1 alphabet
+/// extension) instead of silently never fuzzing the leaf.
+#[test]
+fn generator_emits_unknown_status_on_sell_and_shift_lanes() {
+    let mut runner = TestRunner::deterministic();
+    let strat = strategy::op_sequence();
+    let unk = DpsScript::unknown_status(-4);
+    let mut sell_lane = 0usize; // dps_script carriers
+    let mut shift_lane = 0usize; // shift_dps_script carriers
+    for _ in 0..2000 {
+        let seq = strat.new_tree(&mut runner).unwrap().current();
+        for op in &seq {
+            match op {
+                Op::OnlineShiftOpen(s) | Op::OnlineZReport(s) if s == &unk => shift_lane += 1,
+                Op::OnlineSell(s)
+                | Op::OnlineReturn(s)
+                | Op::GoOnline(s)
+                | Op::Drain(s)
+                | Op::OnlineServiceIn(s)
+                | Op::OnlineServiceOut(s)
+                | Op::OnlineEpz(s)
+                    if s == &unk =>
+                {
+                    sell_lane += 1
+                }
+                _ => {}
+            }
+        }
+    }
+    // Density floor, not just `> 0`: unk is 1/5 of a shift draw over 2 shift ops and 1/6 of a sell
+    // draw over 7 script ops — both expected in the many-hundreds over a 2000×~4.5-len draw, so
+    // `>= 100` is astronomically non-flaky yet ALSO trips on a future under-weighting.
+    assert!(
+        shift_lane >= 100,
+        "UnknownStatus under-emitted on the shift/Z lane ({shift_lane} over 2000 seqs) — the \
+         appended arm is dropped or severely skewed (anti-silent-zero)"
+    );
+    assert!(
+        sell_lane >= 100,
+        "UnknownStatus under-emitted on the sell lane ({sell_lane} over 2000 seqs) — the \
+         appended arm is dropped or severely skewed (anti-silent-zero)"
+    );
+}
+
 // ── Lane-correctness reinforcements (pure model behaviours) ─────────────────
 
 /// A DPS reject of an online doc → `inline::run` returns Err(DpsRejected) → the
