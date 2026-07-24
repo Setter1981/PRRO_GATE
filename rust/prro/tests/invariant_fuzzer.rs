@@ -1375,6 +1375,48 @@ async fn operator_complete_offline_kind_on_online_hold_refused_intact() {
     assert!(held.fence_held);
 }
 
+/// CS-3 operator-completion (1b) [end-to-end] — the BRICK property's SECOND half: a HELD reservation
+/// blocks, a legal completion RELEASES the fence, and the NEXT document passes.  Drives
+/// `[OnlineSell(unknown_status(-4)) → OperatorComplete(Accepted) → OnlineSell(ack_path)]` through
+/// the GENERATIVE `run_harness` (the release oracle + the `<= 1` count invariant + the per-doc
+/// differential all fire on each op).  A clean run proves the hold releases (node un-halts) AND the
+/// subsequent sell ISSUES (Ack) rather than being refused for STOP_MODE — the "next document passes
+/// after completion" property, verified end-to-end against real prod.
+#[tokio::test]
+async fn operator_complete_releases_then_next_sell_issues() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[
+            Op::OnlineSell(DpsScript::unknown_status(-4)),
+            Op::OperatorComplete(OperatorResolutionKind::Accepted),
+            Op::OnlineSell(DpsScript::ack_path()),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// CS-3 operator-completion (1b) [end-to-end] — `OperatorComplete` with NO held reservation is an
+/// inert no-op (Refused-predicted, `Release(None)`): drives `[OnlineSell(ack_path) →
+/// OperatorComplete(Accepted)]`; the first sell ISSUES (no hold rests), so the completion refuses and
+/// mutates nothing (no row / no lnd / no seed advance — asserted by the Release branch).
+#[tokio::test]
+async fn operator_complete_without_hold_is_inert() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[
+            Op::OnlineSell(DpsScript::ack_path()),
+            Op::OperatorComplete(OperatorResolutionKind::Accepted),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 // ── CS-3 held-leaf expansion: Superseded + BadHashPrev (Increment 3) ─────────
 
 /// CS-3 Increment 3 [pure] — the Superseded leaf's DURABLE routing class is `TransientRetry` (the
@@ -2885,6 +2927,54 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     "ExpectedNoIssuanceRow {op:?} sanity: model codes_consumed never decreases"
                 );
             }
+            // CS-3 operator-completion (1b) — a release/refuse op. NOT the per-doc differential: a
+            // release TRANSITIONS the held doc (it is not a fresh issuance) and un-halts the node.
+            oracle::OpClass::Release => {
+                let predicted = match &expected {
+                    ExpectedOutcome::Release(r) => r,
+                    _ => unreachable!("classify maps Release ⇒ OpClass::Release"),
+                };
+                match (predicted, &real) {
+                    // Refused-predicted (no hold rests, or an origin cross-check contradiction): prod
+                    // refuses BEFORE any mutation → the hold / no-op is fully intact.
+                    (None, interp::RealOutcome::Refused(_)) => {
+                        assert_eq!(
+                            ctx.observed_doc_count().await,
+                            doc_count_before,
+                            "refused completion {op:?} minted a fiscal_documents row"
+                        );
+                        assert_eq!(
+                            ctx.read_next_lnd().await,
+                            next_lnd_before,
+                            "refused completion {op:?} allocated an lnd"
+                        );
+                        assert_eq!(
+                            ctx.read_seed().await,
+                            prior_tip,
+                            "refused completion {op:?} advanced the seed"
+                        );
+                    }
+                    // Released: the REAL durable witness must match the model's INDEPENDENT contract
+                    // (incl the unconditional anti-BRICK invariant — a released reservation can never
+                    // rest STOP_MODE / fenced), and the seed must advance iff the model advanced.
+                    (Some(w), interp::RealOutcome::Released(obs)) => {
+                        if let Err(d) = oracle::check_release_witness(obs, w) {
+                            panic!("release-witness divergence on {op:?}: {d:?}");
+                        }
+                        let real_advanced =
+                            ctx.read_seed().await.as_deref() != prior_tip.as_deref();
+                        let model_advanced = model.seed != seed_at_op_start;
+                        assert_eq!(
+                            real_advanced, model_advanced,
+                            "release {op:?} — real seed-advance ({real_advanced}) must match the \
+                             model's ({model_advanced})"
+                        );
+                    }
+                    (exp, got) => panic!(
+                        "release prediction/real mismatch on {op:?}: model {exp:?} vs real {got:?}"
+                    ),
+                }
+            }
         }
 
         // CS-3 Increment 2 — at-most-one-ACTIVE delivery reservation per FN (double-issue guard).
@@ -2898,6 +2988,12 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             "double-issue: {active_reservations} ACTIVE delivery reservations for the FN after \
              {op:?} — at most one may be in-flight per FN (ux_reservation_active)"
         );
+
+        // CS-3 1b — re-sync the model's operator-completion hold PRECONDITION from reality after
+        // every op (a drain can create/clear a CS-3 reservation-hold the pure model does not track).
+        // The release OUTCOME stays independently predicted; only "is a completable hold resting +
+        // its origin" is state-synced (the `adopt_fault_deferred` pattern for docs/mode).
+        model.sync_held_reservation(&ctx.pool).await;
 
         // Mode-INDEPENDENT AUD-K8-1 teeth (bounded-postcond on wire calls).
         // A drain re-tick on a `RequiresManualReconciliation` FN must make NO new

@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use crate::op::{DpsScript, L5Kind, Op, Stage};
+use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, Stage};
 
 /// The result-able wire-response shapes for a wire op.  `timeout_at_call` is
 /// intentionally EXCLUDED — the timeout SCENARIO is realized via `Crash`
@@ -148,6 +148,28 @@ fn op() -> impl Strategy<Value = Op> {
         // the side-effect-free property (making X consume an lnd / write a row)
         // makes a seeded harness with Op::XReport go RED — the durable teeth.
         Just(Op::XReport),
+        // CS-3 operator-completion (1b) — APPENDED LAST (same seed-index-preservation rule).  A
+        // no-op refusal when no held reservation rests (interp guards → no prop_filter), so it is a
+        // first-class intent insertable ANYWHERE: the generator combines it with arbitrary
+        // HELD/crash/reboot/stale prehistory.  When a hold DOES rest, it drives the REAL
+        // `resolve_operator_pending` and the release oracle asserts the anti-BRICK witness — the
+        // "next document passes after completion" half of the property.
+        // 1b generates only `Accepted` + `NotAccepted` — the two kinds that resolve ANY online hold
+        // WITHOUT an operator-supplied seed.  Two kinds are EXCLUDED (deferred to the "drain-holds +
+        // offline origin-keying" increment):
+        //   - `NotAcceptedOffline`: on an OFFLINE-origin hold it RELEASES with an OLA-cohort cancel +
+        //     a chain rewind (delivery_reservation.rs:1400-1429).  Its online-origin REFUSAL is
+        //     covered by the directed `operator_complete_offline_kind_on_online_hold_refused_intact`.
+        //   - `MacReseed`: needs the operator's CORRECTED chain seed.  A generatively-arbitrary seed
+        //     produces a `ChainSeedMismatch` (the fuzzer surfaced this — prod does NOT validate the
+        //     operator's seed against the expected chain tip, so a wrong seed corrupts the chain; a
+        //     potential hardening finding, docs/CS3_FUZZER_ORACLE_DOSSIER.md).  A valid-seed MacReseed
+        //     is directed-only.
+        prop_oneof![
+            Just(OperatorResolutionKind::Accepted),
+            Just(OperatorResolutionKind::NotAccepted),
+        ]
+        .prop_map(Op::OperatorComplete),
     ]
 }
 

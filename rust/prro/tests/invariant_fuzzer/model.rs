@@ -84,6 +84,14 @@ pub enum ExpectedOutcome {
     /// (re-sync from the real DB).  Task 4 enriches drain / go_online into
     /// `Mutated`.  The pure model does NOT mutate here.
     Fault,
+    /// CS-3 operator-completion (1b): the predicted outcome of an `OperatorComplete` op.
+    /// `Some(ReleasedWitness)` ⟺ the model predicts a LEGAL release (the held doc transitions, the
+    /// fence clears, the node un-halts — the model has ALSO mutated `self` accordingly); `None` ⟺ the
+    /// model predicts a REFUSED completion (no held reservation rests, or an origin cross-check
+    /// contradiction) → the hold is left intact and `self` is unchanged.  The release oracle
+    /// (`run_harness`) asserts the anti-BRICK witness + the doc/seed/mode transition, NOT the per-doc
+    /// differential (a release is not a fresh issuance).
+    Release(Option<ReleasedWitness>),
 }
 
 /// Deterministic in-memory ledger predictor for one `fiscal_number`.
@@ -159,6 +167,17 @@ pub struct RefModel {
     // at the NEXT shift-open, and left UNTOUCHED by a force-close (so the next
     // open carries the force-closed shift's opening, exactly like prod).
     pub carry_cash_kop: i64,
+
+    /// CS-3 operator-completion (1b) — the FN's CS-3 `PENDING_APPLY` RESERVATION-hold as
+    /// `(held_lnd, online_origin)`, if any (the fence enforces ≤1).  This is a reality-tracked
+    /// PRECONDITION (the "is a completable hold resting, and of which origin" state), RE-SYNCED by the
+    /// harness from the real `delivery_reservation` table after every op via
+    /// `sync_held_reservation` — NOT independently predicted per-op.  It is NARROWER than "a Sending
+    /// doc under STOP_MODE": a drain/crash transport failure commits SENDING + halts WITHOUT a CS-3
+    /// reservation and is NOT operator-completable.  The release OUTCOME (`released_witness` axes)
+    /// stays INDEPENDENTLY predicted + checked — only this precondition is state-synced (the pattern
+    /// of `adopt_fault_deferred`, which syncs `docs`/`mode`/`session` from reality).
+    pub held_reservation: Option<(i64, bool)>,
 }
 
 /// L0 — the cash amount used by every SELL/RETURN in the fuzzer fixture.
@@ -186,6 +205,7 @@ impl RefModel {
             session_has_end: false,
             cash_on_hand: 0,   // L0: opening = 0 (first shift; carry is L3/L4)
             carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
+            held_reservation: None,
         }
     }
 
@@ -206,6 +226,7 @@ impl RefModel {
             session_has_end: false,
             cash_on_hand: 0,   // L0: no open shift → no cash-on-hand
             carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
+            held_reservation: None,
         }
     }
 
@@ -228,6 +249,7 @@ impl RefModel {
             session_has_end: false,
             cash_on_hand: 0,   // L0: opening = 0 (first shift)
             carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
+            held_reservation: None,
         }
     }
 
@@ -248,6 +270,7 @@ impl RefModel {
             session_has_end: false,
             cash_on_hand: 0,   // L0: no open shift
             carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
+            held_reservation: None,
         }
     }
 
@@ -401,16 +424,72 @@ impl RefModel {
             }
             // A true replay (re-runs an already-DONE row) — no fiscal mutation.
             Op::DuplicateIdemKey => ExpectedOutcome::NoMutation,
-            // CS-3 operator-completion — DIRECTED-ONLY in this increment (deliberately NOT in the
-            // generator, so this arm is unreachable from `run_harness`). The directed release teeth
-            // drive `run_op` and assert the `ReleasedWitness` via `check_release_witness` directly.
-            // NOTE: this is `NoMutation` (a safe no-op prediction for the "no held reservation rests"
-            // case), explicitly NOT `Fault` (which would route a future generative release into the
-            // `adopt_fault_deferred` hole). A follow-up increment that appends the generator arm MUST
-            // replace this with a real `released_witness`-based prediction gated on model-tracked hold
-            // state — see docs/CS3_FUZZER_ORACLE_DOSSIER.md.
-            Op::OperatorComplete(_) => ExpectedOutcome::NoMutation,
+            // CS-3 operator-completion (1b) — the generative release prediction. Finds the model's
+            // HELD doc (≤1 by the fence), predicts a legal release (mutating self so the NEXT op sees
+            // the un-halted node — the second half of the BRICK property) or a Refused completion
+            // (origin cross-check / no hold), and returns `Release(Some|None)` for the release oracle.
+            Op::OperatorComplete(kind) => self.apply_operator_complete(*kind),
         }
+    }
+
+    /// CS-3 operator-completion (1b) — predict + apply a completion against the model's HELD doc.
+    ///
+    /// The held doc is the single `Sending` doc (the fence enforces ≤1 active).  With no hold, or an
+    /// origin cross-check contradiction, the completion is REFUSED (`Release(None)`) and `self` is
+    /// UNCHANGED (the hold survives).  A legal completion RELEASES: the held doc transitions
+    /// (`Sent` for Accepted / `RequiresManualReconciliation` otherwise), the node un-halts to the
+    /// predicted mode (NEVER STOP_MODE — the anti-BRICK guarantee), and the seed advances for the
+    /// seed-moving kinds (Accepted stamps the doc's chain tip; MacReseed re-bases).  Mutating `self`
+    /// is what lets a SUBSEQUENT op issue again — the "next document passes" half of the property.
+    fn apply_operator_complete(&mut self, kind: OperatorResolutionKind) -> ExpectedOutcome {
+        // A completion releases ONLY a doc under a CS-3 PENDING_APPLY RESERVATION-hold — tracked
+        // explicitly in `held_reservation_lnd` (set when an online wire op holds; re-derived from the
+        // real `delivery_reservation` table on a fault re-sync). This is NARROWER than "a Sending doc
+        // under STOP_MODE": a drain / crash transport failure can commit a doc SENDING + halt the node
+        // WITHOUT a CS-3 reservation (verified — real `operator_complete` returns "no held reservation
+        // rests" there), and such a doc is NOT operator-completable. Absent ⇒ inert no-op → Refused.
+        let Some((held_lnd, online_origin)) = self.held_reservation else {
+            return ExpectedOutcome::Release(None);
+        };
+        // Active offline session (prod checks OPENING/OPEN/DRAINING). The current alphabet holds only
+        // on an ONLINE node with no offline session, so this is None ⇒ false; `is_some()` is a safe
+        // over-approximation for a future offline-hold slice.
+        let has_active_offline_session = self.session.is_some();
+        let origin_blocked = self.mode == NodeMode::Blocked;
+        let Some(witness) = released_witness(
+            kind,
+            online_origin,
+            has_active_offline_session,
+            origin_blocked,
+        ) else {
+            // Origin cross-check contradiction: prod fail-closes BEFORE any mutation — hold intact.
+            return ExpectedOutcome::Release(None);
+        };
+        // Release: transition the held doc, un-halt the node, advance the seed for the seed-movers.
+        let new_doc_state = match kind {
+            OperatorResolutionKind::Accepted => DocState::Sent,
+            _ => DocState::RequiresManualReconciliation,
+        };
+        self.docs.insert(held_lnd, new_doc_state);
+        self.mode = node_mode_from_str(witness.node_mode);
+        // Seed advance mirrors prod completion: Accepted advances ONLY for an ONLINE-origin doc
+        // (delivery_reservation.rs:1374 `if online`) — an OFFLINE-origin doc already advanced the
+        // seed at issuance, so its Accepted completion leaves the tip untouched.  MacReseed is
+        // ONLINE-only and re-bases the tip.  The differential seed check is STRUCTURAL (advanced iff
+        // the model advanced), so the exact value only needs to CHANGE from the pre-completion tip.
+        let advances_seed = match kind {
+            OperatorResolutionKind::Accepted => online_origin,
+            OperatorResolutionKind::MacReseed => true,
+            OperatorResolutionKind::NotAccepted | OperatorResolutionKind::NotAcceptedOffline => {
+                false
+            }
+        };
+        if advances_seed {
+            self.seed = Some(synth_unsigned_hash(held_lnd));
+        }
+        // The hold is discharged (`held_reservation` is re-synced from reality by the harness after
+        // this op — the fence is now clear, so a subsequent op can hold anew).
+        ExpectedOutcome::Release(Some(witness))
     }
 
     /// L6 — X-report (поточний звіт): a pure read.  ALWAYS `NoMutation` — the
@@ -1687,6 +1766,27 @@ impl RefModel {
         self.cash_on_hand = prro::services::cash_ledger::cash_on_hand_for_fn(pool, &fiscal_number)
             .await
             .unwrap();
+        // held_reservation is synced by the harness after every op (`sync_held_reservation`), so it
+        // is NOT re-derived here — adopt covers docs/mode/session/seed/cash only.
+    }
+
+    /// CS-3 operator-completion (1b) — RE-SYNC the reality-tracked hold PRECONDITION from the real
+    /// `delivery_reservation` table: `Some((held_lnd, online_origin))` for the FN's `PENDING_APPLY`
+    /// reservation (the fence enforces ≤1), else `None`.  `online_origin` mirrors prod's completion
+    /// origin cross-check (`delivery_reservation.rs:1343` — `offline_fiscal_no IS NULL`).  The harness
+    /// calls this after EVERY op so `held_reservation` reflects reality entering the next op (a drain
+    /// can create a hold the pure model does not predict); the release OUTCOME stays independent.
+    pub async fn sync_held_reservation(&mut self, pool: &SqlitePool) {
+        self.held_reservation = sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT fd.lnd, fd.offline_fiscal_no FROM delivery_reservation dr \
+             JOIN fiscal_documents fd \
+               ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+             WHERE dr.apply_state = 'PENDING_APPLY' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .map(|(lnd, offline_fiscal_no)| (lnd, offline_fiscal_no.is_none()));
     }
 
     /// **U1 A1 funnel wrapper — `read_seed_fixture`.**  The tagged primitive for
@@ -1758,6 +1858,17 @@ fn synth_unsigned_hash(lnd: i64) -> [u8; 32] {
     let mut h = [0u8; 32];
     h[..8].copy_from_slice(&lnd.to_be_bytes());
     h
+}
+
+/// CS-3 operator-completion (1b) — map the `ReleasedWitness` DB-text `node_mode` back to the model's
+/// `NodeMode` so a release un-halts the model consistently with the DB.  Never `StopMode`.
+fn node_mode_from_str(mode: &str) -> NodeMode {
+    match mode {
+        "ONLINE" => NodeMode::Online,
+        "GOING_ONLINE" => NodeMode::GoingOnline,
+        "BLOCKED" => NodeMode::Blocked,
+        other => panic!("released_witness produced an unexpected node_mode {other:?}"),
+    }
 }
 
 /// Online-lane outcome state from the wire script.  The happy `AckPath`
