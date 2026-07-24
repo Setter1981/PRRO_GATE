@@ -117,15 +117,21 @@ read the real reservation row) then encoded independently:
 
 ## Op → expected-FSM matrix (wire leaves)
 
-| Wire script leaf | model `online_outcome_state` | held witness (`online_held_witness`) |
-|---|---|---|
-| `[Ack, Ack]` | `Ack` (issued, seed advances at SEND) | `None` (released — see leaf-expansion) |
-| `[Ack, NotFound]` | `Sent` (D5 held-at-SENT) | `None` (pending leaf-expansion) |
-| `[Reject]` | `Rejected` (non-issued row, seed NOT advanced) | `None` (RELEASES to REJECTED — documented gap) |
-| `[Superseded]` | `Sending` (`_`) | **Some**: SUBMITTED_UNKNOWN / NO_RESPONSE / TransientRetry / NoNodeEffect / NoResponse / — / PENDING_APPLY / STOP_MODE / fence |
-| `[BadHashPrev]` | `Sending` (`_`) | **Some**: SUBMITTED / PARSED_DPS_ENVELOPE / MacRecovery / MacReseedPending / Rejected / — / PENDING_APPLY / STOP_MODE / fence |
-| `[Ack, NotFound]` | `Sent` (D5 held-at-SENT) | `None` (online release-at-SEND — documented gap) |
-| `[UnknownStatus(c)]` | `Sending` (`_`) | **Some**: SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired / ProbeRequired / UnknownStatus / code=c / PENDING_APPLY / STOP_MODE / fence=held |
+| Wire script leaf | model `online_outcome_state` | held witness (`online_held_witness`) | offline-drain (`offline_held_witness`) |
+|---|---|---|---|
+| `[Ack, Ack]` | `Ack` (issued, seed advances at SEND) | `None` (released — see leaf-expansion) | `None` (issued — same) |
+| `[Reject]` | `Rejected` (non-issued row, seed NOT advanced) | `None` (RELEASES to REJECTED) | **Some** (C-i): SUBMITTED / PARSED_DPS_ENVELOPE / **TerminalReject** / NoNodeEffect / Rejected / — / **PENDING_APPLY** / **STOP_MODE** / **fence** — HOLDS → RMR |
+| `[Superseded]` | `Sending` (`_`) | **Some**: SUBMITTED_UNKNOWN / NO_RESPONSE / TransientRetry / NoNodeEffect / NoResponse / — / PENDING_APPLY / STOP_MODE / fence | same as online (classifier is origin-agnostic) |
+| `[BadHashPrev]` | `Sending` (`_`) | **Some**: SUBMITTED / PARSED_DPS_ENVELOPE / MacRecovery / MacReseedPending / Rejected / — / PENDING_APPLY / STOP_MODE / fence | same as online |
+| `[Ack, NotFound]` | `Sent` (D5 held-at-SENT) | `None` (release-at-SEND) | `None` (release-at-SEND — VERIFIED non-divergence, C-i) |
+| `[UnknownStatus(c)]` | `Sending` (`_`) | **Some**: SUBMITTED_UNKNOWN / PARSED_DPS_ENVELOPE / ProbeRequired / ProbeRequired / UnknownStatus / code=c / PENDING_APPLY / STOP_MODE / fence=held | same as online |
+
+**(C-i) origin key:** the offline `[Reject]` differs from online ONLY in the APPLY decision. The
+classifier axes (`submission_certainty` / `response_provenance` / `routing_class` / `node_effect` /
+`evidence_*`) are byte-identical (same prod delivery classifier runs on the drain send); the
+divergence is `apply_state` (`PENDING_APPLY` held vs `APPLIED` released), `node_mode` (`STOP_MODE` vs
+`ONLINE`), `fence_held` (`true` vs `false`), doc (`SENDING` held vs `REJECTED` non-issued). The
+backlog doc crossed the local-commit threshold (`OFFLINE_LOCAL_ACK`) so a reject can NOT roll it back.
 
 Release (operator-completion) matrix: `Accepted` → doc SENT + APPLIED + fence clear + node ONLINE
 (no session) / GOING_ONLINE (active session) / BLOCKED (origin-blocked); `NotAccepted` / `MacReseed`
@@ -185,11 +191,12 @@ op Reboot changed the held reservation (before=Some(...) after=None)`.
 
 1. ✅ **Crash/replay axis-checks** (P4) — DONE (`3c44be11`).
 2. **Drain-holds + held-leaf origin-keying** (offline half — the MOST IMPORTANT remaining gap; do NOT
-   defer it behind the easier steps 3/4). Sub-parts, in the intended order: (i) origin-keying —
-   `[Reject]` (online releases to REJECTED; offline-drain holds) and `[Ack,NotFound]` (release-at-SEND)
-   origin-keyed witnesses; (ii) drain-produced HELD witness (the held-witness oracle firing after a
-   drain, not just a direct send — map MINOR-2); (iii) `NotAcceptedOffline` cohort-cancel + chain
-   rewind — LAST (the hard one).
+   defer it behind the easier steps 3/4). Sub-parts, in the intended order: (i) ✅ **DONE** —
+   origin-keying: `[Reject]` (online releases to REJECTED; offline-drain holds → RMR) encoded +
+   proven, `[Ack,NotFound]` empirically shown to be a **non-divergence** (release-at-SEND both
+   origins) — see "(C-i) offline origin-keyed held witnesses" below; (ii) drain-produced HELD witness
+   (the held-witness oracle firing GENERATIVELY after a drain, not just a direct send — map MINOR-2);
+   (iii) `NotAcceptedOffline` cohort-cancel + chain rewind — LAST (the hard one).
 3. **Increment 2 part (b)** — fence-IDENTITY strengthening (P3): the fence pointer NAMES this doc's
    reservation at the CURRENT `delivery_generation`, not merely non-NULL (columns confirmed, mig 034).
 4. **RETURN idempotent replay** (P2) — a held RETURN re-driven / crash+reboot re-issue.
@@ -285,3 +292,60 @@ canary-proven**: neutralize guards A+B in prod → both RED (Released, not refus
 pristine). Subtlety: guard B only accepts `seed == local last-issued tip`, so a valid reseed is a
 value no-op — the model's generative `apply_operator_complete` still marks MacReseed `advances_seed=true`
 (unexercised: generator-excluded), a documented latent model imprecision, not wired.
+
+### ✅ (C-i) offline origin-keyed held witnesses — `[Reject]` holds / `[Ack,NotFound]` releases
+
+Task #18 (C) sub-part (i). Test/model-side only; prod FROZEN (0 `src` diff). Method mirrored Increment
+3 exactly: a throwaway instrumented probe drove the four leaves through the REAL seam on the offline
+(`new_offline_open_shift(3)` → `OfflineSell` → `GoOnline([leaf])`) and online fixtures, DUMPED the real
+`delivery_reservation` row + `node_state` mode/fence + shift, THEN the tuple was encoded INDEPENDENTLY
+in the model (no prod `classify()` import). The probe was removed after; the values are pinned by teeth.
+
+**Empirical ground truth (probe 2026-07-24, all four leaves):**
+
+| leaf · origin | routing_class | evidence | apply_state | doc | node_mode | fence | held? |
+|---|---|---|---|---|---|---|---|
+| `[Reject]` · **offline-drain** | **TerminalReject** | Rejected | **PENDING_APPLY** | SENDING | **STOP_MODE** | **✓** | **HOLDS → shift RMR** |
+| `[Reject]` · online | TerminalReject | Rejected | APPLIED | REJECTED | ONLINE | ✗ | releases (non-issued) |
+| `[Ack,NotFound]` · offline-drain | — (NULL) | Accepted | APPLIED | SENT | GOING_ONLINE | ✗ | releases-at-SEND |
+| `[Ack,NotFound]` · online | — (NULL) | Accepted | APPLIED | SENT | ONLINE | ✗ | releases-at-SEND |
+
+- **`[Reject]` is the genuine origin divergence.** Same classifier axes both origins; the offline
+  drain HOLDS (the backlog doc crossed the local-commit threshold — `OFFLINE_LOCAL_ACK` — so it can't
+  roll back to a non-issued `REJECTED`), online APPLIES the reject. `model::offline_held_witness` (new,
+  parallel to `online_held_witness`) encodes the `[Reject]` held tuple and delegates every other leaf
+  to `online_held_witness` (the classifier is origin-agnostic for Superseded/BadHashPrev/UnknownStatus,
+  and `[Ack,Ack]`/`[Ack,NotFound]` release on both).
+- **`[Ack,NotFound]` is a VERIFIED non-divergence** — both origins release-at-SEND (APPLIED reservation,
+  doc SENT, fence clear; the `NotFound` lastChk only defers the KVT quittance). The model's `None` for
+  the leaf is an honest, probe-confirmed coverage boundary, not a gap.
+- **Teeth (5, all directed — C-ii wires the generative firing):**
+  `offline_reject_holds_terminal_reject_origin_keyed` [pure: offline Some vs online None],
+  `offline_reject_held_witness_reds_on_prod_apply_regression` [pure canary: an APPLIED/unfenced
+  regression — the held doc silently released like the online lane — REDs against the held contract],
+  `directed_offline_reject_held_witness_matches_real_reservation` [e2e: real drain → probe → match],
+  `directed_online_reject_releases_to_rejected_no_hold` [e2e: the origin counterpart],
+  `directed_offline_ack_notfound_releases_at_send_not_held` [e2e: the non-divergence].
+- **Canaries personally proven** (revert-canary): flip `offline_held_witness` `routing_class`
+  → e2e RED `real "TerminalReject" != model "TransientRetry"`; flip `apply_state` (the origin-key axis)
+  → e2e RED `real "PENDING_APPLY" != model "APPLIED"`. Both reverted; model pristine.
+- **Verification:** fuzzer **152/152** (was 147); fmt + crate-scoped clippy `-D` clean; prod pristine.
+- **Adversarial review (internal 3-lens panel, unanimous GO, zero soundness blockers):** Lens A
+  (fidelity) confirmed every encoded axis against FROZEN prod source — the origin key is exactly
+  `delivery_reservation.rs` `Some("Rejected") => if !online { HeldNotAutoRelease }` (offline holds
+  PENDING_APPLY) vs the online release-to-REJECTED default branch; STOP_MODE/fence from
+  `record_outcome`'s `offline_reject_hold` early-halt; `[Ack,NotFound]` release-both-origins from the
+  `Accepted` apply branch. Lens B adversarially attacked the `_ => online_held_witness` delegation
+  (hypothesis: offline Superseded/BadHashPrev diverge on node_mode/fence) and REFUTED it — both lanes
+  route through `stage_send::run → record_outcome`, whose early node-safety halt sets
+  STOP_MODE+PENDING_APPLY **origin-agnostically**, so the delegation is sound. Lens C confirmed
+  independence (hardcoded literals, no prod `classify()` import), non-vacuous canary, and ZERO
+  generative-capstone regression risk (`offline_held_witness` is referenced ONLY by the 5 new teeth;
+  `run_harness` still uses `online_held_witness` on the online lane). The doc-type-agnostic claim
+  (the probe/e2e drove the interposed `OFFLINE_SESSION_BEGIN`, not a `SELL`) was resolved sound: the
+  `offline_reject_hold` predicate is keyed on `kind=="Rejected" && offline-origin`, NOT on doc_type.
+- **→ C-ii handoff note (Lens B MINOR):** the delegation arm (`_ => online_held_witness` for
+  Superseded/BadHashPrev/UnknownStatus/[Ack,Ack]/[Ack,NotFound]) is currently **sound-but-unpinned**
+  (no test exercises it; the 5 teeth only pass `[Reject]`/`[Ack,NotFound]`). When C-ii wires the
+  drain-produced held-witness oracle into the GENERATIVE `run_harness`, route the OFFLINE ops through
+  `offline_held_witness` (not `online_held_witness`) so the delegation branch gets real coverage.

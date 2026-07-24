@@ -2003,6 +2003,54 @@ pub fn online_held_witness(script: &DpsScript) -> Option<HeldWitness> {
     }
 }
 
+/// The ORIGIN-KEYED held-witness prediction for a HELD wire outcome observed on the **OFFLINE
+/// drain** lane (`backlog_drain::drain` re-driving an offline-issued backlog doc), keyed on the wire
+/// `script`'s leaf.  The offline lane runs the SAME production delivery classifier as an online send
+/// (same `submission_certainty` / `response_provenance` / `routing_class` / `node_effect` /
+/// `evidence_*` axes), so for every leaf EXCEPT `[Reject]` the durable held tuple is identical to
+/// [`online_held_witness`] and this delegates to it.  The **`[Reject]` leaf is the one genuine
+/// origin divergence** — hence a separate function rather than a shared one.
+///
+/// **`[Reject]` origin divergence (empirically grounded, probe 2026-07-24):**
+///   - ONLINE `[Reject]`: the reject is APPLIED at SEND → the doc rests `REJECTED` (a non-issued
+///     row, D2 pin — the seed is NOT advanced), the reservation is `APPLIED`, the fence is CLEAR,
+///     the node stays `ONLINE`.  Nothing is held → [`online_held_witness`] correctly returns `None`.
+///   - OFFLINE-drain `[Reject]`: the backlog doc has already crossed the local-commit threshold
+///     (it rests `OFFLINE_LOCAL_ACK`), so a reject can NOT roll it back to `REJECTED`.  The drain
+///     instead HOLDS it: the doc rests `SENDING` under a `PENDING_APPLY` reservation, the node halts
+///     `STOP_MODE`, the FN fence pointer is SET, and the shift escalates to
+///     `RequiresManualReconciliation` (the confirmed primary W9b manual-recon surface — CLAUDE.md
+///     §16.7 trigger family 1, edges 6/14).  The classifier axes are byte-identical to the online
+///     reject (`SUBMITTED` / `PARSED_DPS_ENVELOPE` / `TerminalReject` / `Rejected`); the divergence
+///     is purely in the APPLY decision — `apply_state` (`PENDING_APPLY` vs `APPLIED`), `node_mode`
+///     (`STOP_MODE` vs `ONLINE`), and `fence_held` (`true` vs `false`).
+///
+/// These strings are hardcoded from the empirical probe + the CLAUDE.md persistence contract, NOT
+/// read from production `classify()` / the routing table — the same independence discipline as
+/// [`online_held_witness`].
+///
+/// `[Ack, NotFound]` is NOT listed: the probe confirmed it RELEASES at SEND on BOTH origins
+/// (`APPLIED` reservation, doc `SENT`, fence clear — the send Ack is the issuance moment, the
+/// `NotFound` lastChk merely defers the KVT quittance), so it correctly delegates to
+/// [`online_held_witness`]'s `None` — a VERIFIED non-divergence, not a coverage gap.
+pub fn offline_held_witness(script: &DpsScript) -> Option<HeldWitness> {
+    match script.0.as_slice() {
+        [WireResponse::Reject, ..] => Some(HeldWitness {
+            submission_certainty: "SUBMITTED",
+            response_provenance: "PARSED_DPS_ENVELOPE",
+            routing_class: "TerminalReject",
+            node_effect: "NoNodeEffect",
+            evidence_kind: "Rejected",
+            evidence_code: None,
+            apply_state: "PENDING_APPLY",
+            node_mode: "STOP_MODE",
+            fence_held: true,
+        }),
+        // Every other leaf holds (or releases) identically on the offline lane.
+        _ => online_held_witness(script),
+    }
+}
+
 /// The INDEPENDENT model-side mirror of the durable witness AFTER a legal operator completion
 /// releases a HELD reservation — the CS-3 eternal-BRICK contract, as DB-TEXT literals.  Encoded
 /// from the SPEC (the completion effect matrix in `delivery_reservation.rs` completion +

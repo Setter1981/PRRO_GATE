@@ -1636,6 +1636,144 @@ async fn directed_bad_hash_prev_held_witness_matches_real_reservation() {
     let _ = run_harness(&[Op::OnlineSell(DpsScript::bad_hash_prev())], ctx, model).await;
 }
 
+// ── CS-3 offline origin-keyed held witnesses: [Reject] holds / [Ack,NotFound] releases (C-i) ──
+
+/// CS-3 (C-i) [pure] — the ORIGIN divergence for the `[Reject]` leaf. On the OFFLINE-drain lane a
+/// per-doc reject HOLDS (the backlog doc crossed the local-commit threshold — `OFFLINE_LOCAL_ACK` —
+/// so it can NOT be rolled back to a non-issued `REJECTED` like an online send); the durable witness
+/// is `TerminalReject` under a `PENDING_APPLY` reservation, node `STOP_MODE`, fence SET (→ shift
+/// `RequiresManualReconciliation`, the confirmed W9b manual-recon surface). The ONLINE `[Reject]`
+/// RELEASES (APPLIED → non-issued `REJECTED`, D2 pin) → NO held witness. The classifier axes are
+/// identical across origins; the divergence is purely `apply_state` / `node_mode` / `fence_held`.
+#[test]
+fn offline_reject_holds_terminal_reject_origin_keyed() {
+    let off = model::offline_held_witness(&DpsScript::send_then_reject())
+        .expect("the OFFLINE-drain [Reject] leaf HOLDS (crossed the local-commit threshold)");
+    assert_eq!(off.routing_class, "TerminalReject");
+    assert_eq!(off.evidence_kind, "Rejected");
+    assert_eq!(off.submission_certainty, "SUBMITTED");
+    assert_eq!(off.response_provenance, "PARSED_DPS_ENVELOPE");
+    assert_eq!(
+        off.apply_state, "PENDING_APPLY",
+        "the offline reject is HELD, NOT applied — the origin key"
+    );
+    assert_eq!(off.node_mode, "STOP_MODE");
+    assert!(off.fence_held, "the FN fence stays SET on a held reject");
+    // ORIGIN KEY: the ONLINE [Reject] releases, so `online_held_witness` has NO witness for it — the
+    // whole reason a separate offline-keyed function exists.
+    assert!(
+        model::online_held_witness(&DpsScript::send_then_reject()).is_none(),
+        "online [Reject] releases to a non-issued REJECTED row (D2), it must NOT hold"
+    );
+}
+
+/// CS-3 (C-i) [PROD-flip canary] — the held-witness oracle catches a prod regression that APPLIED
+/// the offline reject (silently rolling the held, already-committed offline doc to a released
+/// `REJECTED` like the online lane — a real fiscal-loss bug). Constructs a real-shaped `ObservedHeld`
+/// whose `apply_state` is `APPLIED` / fence clear / node `ONLINE` and asserts `check_held_witness`
+/// diverges from the model's `PENDING_APPLY` / `STOP_MODE` held contract — proving the oracle reads
+/// the REAL reservation's apply decision, not merely the model.
+#[test]
+fn offline_reject_held_witness_reds_on_prod_apply_regression() {
+    let model_w = model::offline_held_witness(&DpsScript::send_then_reject())
+        .expect("the offline [Reject] leaf holds");
+    let prod_regressed = interp::ObservedHeld {
+        submission_certainty: "SUBMITTED".into(),
+        response_provenance: "PARSED_DPS_ENVELOPE".into(),
+        routing_class: Some("TerminalReject".into()),
+        node_effect: "NoNodeEffect".into(),
+        evidence_kind: "Rejected".into(),
+        evidence_code: None,
+        apply_state: "APPLIED".into(), // ← the regression: released instead of held
+        node_mode: "ONLINE".into(),
+        fence_held: false,
+    };
+    assert!(
+        oracle::check_held_witness(Some(&prod_regressed), &model_w).is_err(),
+        "an APPLIED/unfenced offline reject (the held doc silently released) must RED against the \
+         PENDING_APPLY/STOP_MODE held contract — the oracle catches a real prod regression"
+    );
+}
+
+/// CS-3 (C-i) [end-to-end] — the fuzzer's held-witness oracle asserts the REAL persisted delivery
+/// axes for an OFFLINE-drain reject; the model's INDEPENDENT origin-keyed contract (`TerminalReject`
+/// held under `PENDING_APPLY` / `STOP_MODE` / fence) MATCHES real prod. Drives the real
+/// `backlog_drain::drain` (via `GoOnline`), then probes the held reservation directly (the harness
+/// held-witness check is direct-send-gated; drain-produced holds are wired generatively in C-ii).
+/// CANARY: flip the model's offline `[Reject]` `routing_class` (or `apply_state`) → this REDs.
+#[tokio::test]
+async fn directed_offline_reject_held_witness_matches_real_reservation() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await;
+    let (_res_id, rid) = ctx
+        .active_held_reservation()
+        .await
+        .expect("an offline-drain reject HOLDS a PENDING_APPLY reservation");
+    let observed = ctx.read_held_witness(&rid).await;
+    let expected = model::offline_held_witness(&DpsScript::send_then_reject())
+        .expect("the offline [Reject] leaf holds");
+    oracle::check_held_witness(observed.as_ref(), &expected).unwrap_or_else(|d| {
+        panic!("offline reject held-witness must match the real reservation: {d:?}")
+    });
+}
+
+/// CS-3 (C-i) [end-to-end] — the ORIGIN counterpart: an ONLINE `[Reject]` RELEASES. The doc rests
+/// `REJECTED` (a non-issued row, D2 — seed NOT advanced), the reservation is APPLIED, and NO held
+/// reservation rests. This is the empirical other half of the origin divergence (offline holds,
+/// online releases) that justifies the separate offline-keyed witness.
+#[tokio::test]
+async fn directed_online_reject_releases_to_rejected_no_hold() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // An online reject surfaces as a typed `Refused(DpsRejected)` outcome; the durable doc rests
+    // REJECTED (a non-issued row) — read it straight from the ledger.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::send_then_reject())).await;
+    let doc_state: String = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd DESC LIMIT 1",
+    )
+    .bind(ctx.fn_id())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        doc_state, "REJECTED",
+        "an online reject must rest REJECTED (non-issued row, D2 — seed not advanced)"
+    );
+    assert!(
+        ctx.active_held_reservation().await.is_none(),
+        "an ONLINE reject RELEASES (APPLIED → non-issued REJECTED); it must NOT hold a reservation"
+    );
+    assert!(
+        model::online_held_witness(&DpsScript::send_then_reject()).is_none(),
+        "the model agrees: online [Reject] has no held witness"
+    );
+}
+
+/// CS-3 (C-i) [end-to-end] — `[Ack, NotFound]` is a VERIFIED non-divergence: it RELEASES at SEND on
+/// BOTH origins. The send Ack is the issuance moment (advance-at-SEND) → the drained doc rests `SENT`
+/// with an APPLIED reservation and a CLEAR fence; the `NotFound` lastChk merely defers the KVT
+/// quittance (a converging `SENT`, not a fenced halt). So there is NO held reservation offline, and
+/// the model correctly returns `None` for the leaf — an honest coverage boundary, not a gap. Guards
+/// against a future editor inventing a false offline hold for `[Ack, NotFound]`.
+#[tokio::test]
+async fn directed_offline_ack_notfound_releases_at_send_not_held() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+    let _ = interp::run_op(
+        &mut ctx,
+        &Op::GoOnline(DpsScript::send_ack_then_last_not_found()),
+    )
+    .await;
+    assert!(
+        ctx.active_held_reservation().await.is_none(),
+        "offline [Ack,NotFound] releases at SEND (APPLIED, doc SENT); it must NOT hold"
+    );
+    assert!(
+        model::offline_held_witness(&DpsScript::send_ack_then_last_not_found()).is_none(),
+        "the model agrees: offline [Ack,NotFound] has no held witness (released-at-SEND)"
+    );
+}
+
 // ── CS-3 at-most-one-active-reservation (Increment 2) ────────────────────────
 
 /// CS-3 Increment 2 [end-to-end] — at most ONE active delivery reservation per FN. An issued ACK
