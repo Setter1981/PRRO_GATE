@@ -33,8 +33,8 @@ use prro::db::invariant_scan::Violation;
 use prro::db::models::enums::{DocState, ShiftState};
 use prro::services::reconciliation::online_convergence::TickSummary;
 
-use crate::interp::{ObservedDoc, ObservedHeld, RealOutcome};
-use crate::model::{ExpectedOutcome, HeldWitness, Mutation};
+use crate::interp::{ObservedDoc, ObservedHeld, ObservedRelease, RealOutcome};
+use crate::model::{ExpectedOutcome, HeldWitness, Mutation, ReleasedWitness};
 
 /// The op classification the differential dispatches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +120,10 @@ pub fn check_differential(
             RealOutcome::Crashed { .. } => Err(Divergence(
                 "ExpectedNoMutation/NoIssuanceRow but the real op crashed".to_string(),
             )),
+            // CS-3 operator-completion — a release is checked by the SEPARATE `check_release_witness`
+            // pass (like `check_ledger_delta`), not the per-doc differential.  Inert here (the release
+            // op is directed-only this increment; the generative call site + prediction land later).
+            RealOutcome::Released(_) => Ok(()),
         },
     }
 }
@@ -237,6 +241,48 @@ pub fn check_held_witness(
         return Err(Divergence(format!(
             "held-witness fence_held mismatch: real {} != model {}",
             o.fence_held, expected.fence_held
+        )));
+    }
+    Ok(())
+}
+
+/// CS-3 operator-completion — assert the REAL durable witness after a legal completion matches the
+/// model's INDEPENDENT [`ReleasedWitness`].  The load-bearing anti-BRICK checks are the last two:
+/// `apply_state == "APPLIED"`, `fence_held == false`, and — always — `node_mode != "STOP_MODE"`.  A
+/// completion that leaves the reservation `PENDING_APPLY`, the fence set, or the node in `STOP_MODE`
+/// is an eternal BRICK and REDs here.
+pub fn check_release_witness(
+    observed: &ObservedRelease,
+    expected: &ReleasedWitness,
+) -> Result<(), Divergence> {
+    let axes: [(&str, &str, &str); 3] = [
+        (
+            "apply_state",
+            observed.apply_state.as_str(),
+            expected.apply_state,
+        ),
+        ("node_mode", observed.node_mode.as_str(), expected.node_mode),
+        ("doc_state", observed.doc_state.as_str(), expected.doc_state),
+    ];
+    for (axis, real, exp) in axes {
+        if real != exp {
+            return Err(Divergence(format!(
+                "release-witness {axis} mismatch: real {real:?} != model {exp:?}"
+            )));
+        }
+    }
+    if observed.fence_held != expected.fence_held {
+        return Err(Divergence(format!(
+            "release-witness fence_held mismatch: real {} != model {}",
+            observed.fence_held, expected.fence_held
+        )));
+    }
+    // The unconditional anti-BRICK invariant — independent of the model tuple: a released
+    // reservation can NEVER rest bricked (node halted STOP_MODE) nor with the fence still held.
+    if observed.node_mode == "STOP_MODE" || observed.fence_held {
+        return Err(Divergence(format!(
+            "release-witness BRICK: released reservation still halted/fenced (mode={:?}, fence_held={})",
+            observed.node_mode, observed.fence_held
         )));
     }
     Ok(())

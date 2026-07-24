@@ -171,6 +171,26 @@ pub enum Op {
     GoOnlineWithoutBacklog,
     OfflineSellDuringGoingOnline,
     SellWithClosedShift,
+    /// CS-3 operator-completion — the SOLE legal exit from a `PENDING_APPLY` + `STOP_MODE` HELD
+    /// reservation (the eternal-BRICK guard).  Drives the real `admin::resolve_operator_pending`
+    /// seam against the doc held by the most-recent wire op; a no-op when no held reservation rests.
+    /// **Appended LAST** (preserves the `Op` discriminant order the regression corpus depends on).
+    OperatorComplete(OperatorResolutionKind),
+}
+
+/// The operator's verified resolution of a HELD reservation.  A test-local mirror of the prod
+/// `OperatorResolution` (op.rs must not import prod types into the generator); the interpreter maps
+/// each kind to the real `OperatorResolution` when it drives `resolve_operator_pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorResolutionKind {
+    /// DPS accepted (operator supplies the observed FN) → doc `SENT`, seed advances, node released.
+    Accepted,
+    /// DPS did not accept (ONLINE origin) → doc `REQUIRES_MANUAL_RECONCILIATION`, node released.
+    NotAccepted,
+    /// OFFLINE-origin not accepted → doc RMR + OLA-cohort cancel + chain rewind.
+    NotAcceptedOffline,
+    /// `-12` MacReseed (operator supplies the corrected seed) → doc RMR, seed re-based, node released.
+    MacReseed,
 }
 
 /// L5 amount-shape for an [`Op::L5Probe`].  Each violation kind targets exactly

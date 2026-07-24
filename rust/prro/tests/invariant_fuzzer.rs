@@ -39,7 +39,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{FileFailurePersistence, TestRunner};
 
 use model::{ExpectedOutcome, RefModel};
-use op::{DpsScript, L5Kind, Op, Stage, WireResponse};
+use op::{DpsScript, L5Kind, Op, OperatorResolutionKind, Stage, WireResponse};
 
 /// Every `DocState` variant — the test enumerates the domain to prove the
 /// model's issued predicate mirrors the SSOT const for ALL states (the
@@ -1182,6 +1182,138 @@ async fn held_witness_unknown_status_matches_real_reservation() {
     let ctx = interp::FuzzCtx::new_online_open_shift().await;
     let model = RefModel::new_online_open_shift();
     let _ = run_harness(&[Op::OnlineSell(DpsScript::unknown_status(-4))], ctx, model).await;
+}
+
+// ── CS-3 operator-completion / eternal-BRICK oracle (Increment 1) ────────────
+
+/// CS-3 anti-BRICK teeth [pure comparator] — the model's INDEPENDENT `released_witness` for a legal
+/// `Accepted` completion (no offline session, not origin-blocked) is `{APPLIED, ONLINE, fence:false,
+/// SENT}`, and `check_release_witness` (a) passes a faithful released witness, (b) REDs an eternal
+/// BRICK (node still STOP_MODE + fence held + PENDING_APPLY) regardless of the model tuple, and
+/// (c) REDs when the model wrongly predicts the node stays halted. This is the comparator half; the
+/// end-to-end half drives the real `resolve_operator_pending` seam.
+#[test]
+fn release_witness_accepted_clears_fence_and_stop() {
+    let expected = model::released_witness(OperatorResolutionKind::Accepted, false, false);
+    assert_eq!(expected.apply_state, "APPLIED");
+    assert_eq!(expected.node_mode, "ONLINE");
+    assert!(!expected.fence_held);
+    assert_eq!(expected.doc_state, "SENT");
+
+    let faithful = interp::ObservedRelease {
+        apply_state: "APPLIED".into(),
+        node_mode: "ONLINE".into(),
+        fence_held: false,
+        doc_state: "SENT".into(),
+    };
+    assert!(
+        oracle::check_release_witness(&faithful, &expected).is_ok(),
+        "a faithful released witness must pass"
+    );
+
+    // The unconditional anti-BRICK invariant bites regardless of the model tuple.
+    let bricked = interp::ObservedRelease {
+        apply_state: "PENDING_APPLY".into(),
+        node_mode: "STOP_MODE".into(),
+        fence_held: true,
+        doc_state: "SENDING".into(),
+    };
+    assert!(
+        oracle::check_release_witness(&bricked, &expected).is_err(),
+        "a completion leaving the node STOP_MODE + fenced is an eternal BRICK and must RED"
+    );
+
+    // Model-side canary: a model that wrongly predicts the node stays STOP_MODE post-Accepted
+    // diverges from the faithful ONLINE witness — proving node_mode is asserted (non-vacuous).
+    let mut wrong = expected.clone();
+    wrong.node_mode = "STOP_MODE";
+    assert!(
+        oracle::check_release_witness(&faithful, &wrong).is_err(),
+        "asserting node_mode: faithful ONLINE vs a bricked model prediction must RED"
+    );
+}
+
+/// CS-3 anti-BRICK teeth [end-to-end] — a HELD `UnknownStatus` reservation (node STOP_MODE,
+/// PENDING_APPLY, fence held) is RELEASED by the SOLE legal exit `admin::resolve_operator_pending`
+/// (Accepted): the real durable witness matches the model's INDEPENDENT contract AND the node is no
+/// longer bricked (mode != STOP_MODE, fence cleared, doc terminal SENT).  CANARY: driving
+/// `admin::reset_stop_mode` INSTEAD of `resolve_operator_pending` in `interp::operator_complete`
+/// flips STOP→GOING_ONLINE WITHOUT applying — the reservation rests PENDING_APPLY forever with the
+/// fence held → `check_release_witness`'s BRICK arm REDs.
+#[tokio::test]
+async fn directed_operator_complete_releases_unknown_status_hold() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // 1) establish the HELD UnknownStatus reservation.
+    let held = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::unknown_status(-4))).await;
+    assert!(
+        matches!(held, interp::RealOutcome::Doc(_)),
+        "sell must rest a held Doc: {held:?}"
+    );
+    // 2) the operator completes it (Accepted) — the brick-exit.
+    let released = interp::run_op(
+        &mut ctx,
+        &Op::OperatorComplete(OperatorResolutionKind::Accepted),
+    )
+    .await;
+    let interp::RealOutcome::Released(obs) = released else {
+        panic!("expected a Released outcome, got {released:?}");
+    };
+    // 3) the model's independent contract matches real prod AND the node is un-bricked.
+    let expected = model::released_witness(OperatorResolutionKind::Accepted, false, false);
+    oracle::check_release_witness(&obs, &expected).unwrap_or_else(|d| {
+        panic!("release witness diverged from the independent contract: {d:?}")
+    });
+    assert_ne!(
+        obs.node_mode, "STOP_MODE",
+        "the node must exit STOP after completion"
+    );
+    assert!(
+        !obs.fence_held,
+        "the FN fence must be cleared after completion"
+    );
+    assert_eq!(
+        obs.doc_state, "SENT",
+        "an Accepted completion issues the doc (SENT)"
+    );
+}
+
+/// CS-3 anti-BRICK teeth [negative] — an ILLEGAL completion (a real reservation named under the
+/// WRONG fiscal number) is REFUSED before any tx (`admin.rs` `ReservationFnMismatch`), and the HOLD
+/// is left fully INTACT (PENDING_APPLY, STOP_MODE, fence held).  Guards against a completion that
+/// releases on an unauthorized operator action.
+#[tokio::test]
+async fn operator_complete_fn_mismatch_refused_hold_intact() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::unknown_status(-4))).await;
+    let rid = ctx.last_request_id().expect("held doc recorded");
+    let reservation_id = ctx
+        .reservation_id_for_request(&rid)
+        .await
+        .expect("held reservation present");
+
+    // A wrong FN naming a REAL reservation → refused BEFORE the tx (nothing mutated).
+    let res = prro::admin::resolve_operator_pending(
+        &ctx.pool,
+        "9999999999",
+        reservation_id,
+        prro::db::repositories::delivery_reservation::OperatorResolution::Accepted {
+            fiscal_number: "5000000001".to_string(),
+        },
+    )
+    .await;
+    assert!(res.is_err(), "an FN-mismatched completion must be refused");
+
+    // The hold is fully INTACT — the illegal action released nothing.
+    let held = ctx
+        .read_held_witness(&rid)
+        .await
+        .expect("reservation intact");
+    assert_eq!(
+        held.apply_state, "PENDING_APPLY",
+        "a refused completion must NOT release the hold"
+    );
+    assert_eq!(held.node_mode, "STOP_MODE", "the node stays halted");
+    assert!(held.fence_held, "the FN fence stays held");
 }
 
 /// Tier-1 slice 1 — online Z_REPORT is a genuine fuzzer op, not a side test:

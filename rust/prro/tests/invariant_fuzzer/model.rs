@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::SqlitePool;
 
-use crate::op::{DpsScript, L5Kind, Op, WireResponse};
+use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, WireResponse};
 use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
 
 /// U1 D3 — model-local FORK of the offline-origin "issued" set.  Deliberately a
@@ -401,6 +401,15 @@ impl RefModel {
             }
             // A true replay (re-runs an already-DONE row) — no fiscal mutation.
             Op::DuplicateIdemKey => ExpectedOutcome::NoMutation,
+            // CS-3 operator-completion — DIRECTED-ONLY in this increment (deliberately NOT in the
+            // generator, so this arm is unreachable from `run_harness`). The directed release teeth
+            // drive `run_op` and assert the `ReleasedWitness` via `check_release_witness` directly.
+            // NOTE: this is `NoMutation` (a safe no-op prediction for the "no held reservation rests"
+            // case), explicitly NOT `Fault` (which would route a future generative release into the
+            // `adopt_fault_deferred` hole). A follow-up increment that appends the generator arm MUST
+            // replace this with a real `released_witness`-based prediction gated on model-tracked hold
+            // state — see docs/CS3_FUZZER_ORACLE_DOSSIER.md.
+            Op::OperatorComplete(_) => ExpectedOutcome::NoMutation,
         }
     }
 
@@ -1822,5 +1831,56 @@ pub fn online_held_witness(script: &DpsScript) -> Option<HeldWitness> {
             fence_held: true,
         }),
         _ => None,
+    }
+}
+
+/// The INDEPENDENT model-side mirror of the durable witness AFTER a legal operator completion
+/// releases a HELD reservation — the CS-3 eternal-BRICK contract, as DB-TEXT literals.  Encoded
+/// from the SPEC (the completion effect matrix in `delivery_reservation.rs` completion +
+/// `resolve_operator_pending`), NOT read from production.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedWitness {
+    pub apply_state: &'static str,
+    pub node_mode: &'static str,
+    pub fence_held: bool,
+    pub doc_state: &'static str,
+}
+
+/// The independent prediction of the durable witness after a LEGAL operator completion.  Derived
+/// PURELY from the chosen resolution + the model's OWN tracked state (an active offline session, an
+/// origin-blocked hold), NOT from any production call.  The load-bearing anti-BRICK invariant is
+/// baked in: EVERY legal completion yields `apply_state == "APPLIED"`, `fence_held == false`, and a
+/// `node_mode` that is NEVER `"STOP_MODE"` — a released reservation can never rest bricked.
+///
+/// Contract (SPEC, `delivery_reservation.rs` completion 1367-1512):
+///   - `apply_state`  = "APPLIED" always; `fence_held` = false always (the sole pointer-clear branch).
+///   - `node_mode`    = "BLOCKED" iff the hold was origin-blocked (offline `-11`, over the 168h
+///     ceiling — INV-05, un-blocking is a separate recovery); else "GOING_ONLINE" iff an active
+///     offline session must finish draining; else "ONLINE".
+///   - `doc_state`    = "SENT" for `Accepted` (issued); "REQUIRES_MANUAL_RECONCILIATION" for
+///     `NotAccepted` / `NotAcceptedOffline` / `MacReseed`.
+pub fn released_witness(
+    resolution: OperatorResolutionKind,
+    has_active_offline_session: bool,
+    origin_blocked: bool,
+) -> ReleasedWitness {
+    let node_mode = if origin_blocked {
+        "BLOCKED"
+    } else if has_active_offline_session {
+        "GOING_ONLINE"
+    } else {
+        "ONLINE"
+    };
+    let doc_state = match resolution {
+        OperatorResolutionKind::Accepted => "SENT",
+        OperatorResolutionKind::NotAccepted
+        | OperatorResolutionKind::NotAcceptedOffline
+        | OperatorResolutionKind::MacReseed => "REQUIRES_MANUAL_RECONCILIATION",
+    };
+    ReleasedWitness {
+        apply_state: "APPLIED",
+        node_mode,
+        fence_held: false,
+        doc_state,
     }
 }
