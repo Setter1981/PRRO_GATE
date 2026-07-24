@@ -1379,6 +1379,87 @@ async fn differential_offline_shift_open_drain_reject_escalates_edge6_rmr() {
     assert_eq!(model.shift_state, ShiftState::RequiresManualReconciliation);
 }
 
+async fn assert_online_closed_shift_true_noop(op: Op) {
+    let mut ctx = interp::FuzzCtx::new_online_closed_shift().await;
+    let mut model = RefModel::new_online_closed_shift();
+
+    let docs_before = ctx.observed_doc_count().await;
+    let next_lnd_before = ctx.read_next_lnd().await;
+    let seed_before = ctx.read_seed().await;
+    let codes_before = ctx.consumed_codes_count().await;
+    let sends_before = ctx.send_calls();
+    let lasts_before = ctx.last_calls();
+
+    let expected = model.apply(&op);
+    assert!(
+        matches!(expected, ExpectedOutcome::NoMutation),
+        "closed-shift op {op:?} must model as a true no-op"
+    );
+    let real = interp::run_op(&mut ctx, &op).await;
+    oracle::check_differential(&real, &expected, seed_before.as_deref())
+        .unwrap_or_else(|d| panic!("closed-shift op {op:?} must match true no-op: {d:?}"));
+
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        docs_before,
+        "closed-shift op {op:?} minted a fiscal row"
+    );
+    assert_eq!(
+        ctx.read_next_lnd().await,
+        next_lnd_before,
+        "closed-shift op {op:?} allocated an lnd"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "closed-shift op {op:?} advanced the seed"
+    );
+    assert_eq!(
+        ctx.consumed_codes_count().await,
+        codes_before,
+        "closed-shift op {op:?} consumed an offline code"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "closed-shift op {op:?} made a send_chk wire call"
+    );
+    assert_eq!(
+        ctx.last_calls(),
+        lasts_before,
+        "closed-shift op {op:?} made a last_chk wire call"
+    );
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::Closed,
+        "closed-shift op {op:?} moved the shift"
+    );
+    assert_eq!(
+        ctx.read_node_mode().await,
+        NodeMode::Online,
+        "closed-shift op {op:?} moved the node mode"
+    );
+}
+
+/// Closed-shift fail-closed matrix: receipt, Z, offline-lane aliases, and
+/// wrong-lane shift controls must all be TRUE no-ops on an online CLOSED shift.
+/// Only `OnlineShiftOpen` is allowed to mint a lifecycle doc from this fixture,
+/// and that opener is pinned by `differential_online_shift_open_opens_shift_matches_model`.
+#[tokio::test]
+async fn online_closed_shift_blocks_receipt_z_and_wrong_lane_as_true_noops() {
+    for op in [
+        Op::OnlineSell(DpsScript::ack_path()),
+        Op::OnlineReturn(DpsScript::ack_path()),
+        Op::OnlineZReport(DpsScript::ack_path()),
+        Op::OfflineSell,
+        Op::OfflineReturn,
+        Op::OfflineZReport,
+        Op::OfflineShiftOpen,
+    ] {
+        assert_online_closed_shift_true_noop(op).await;
+    }
+}
+
 /// Acceptance [3]: an invalid op (`SellWithClosedShift`) is `ExpectedNoMutation`
 /// — the differential accepts the real refusal and asserts no fiscal issuance
 /// (the seed does not advance).  It NEVER applies an lnd+1 expectation here.
