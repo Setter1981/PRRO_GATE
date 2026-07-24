@@ -1417,6 +1417,28 @@ async fn operator_complete_without_hold_is_inert() {
     .await;
 }
 
+/// CS-3 crash/replay (P4) [end-to-end] — a committed HELD reservation SURVIVES a Reboot and stays
+/// operator-completable across the restart.  Drives `[OnlineSell(unknown_status(-4)) → Reboot →
+/// OperatorComplete(Accepted)]`: the sell holds (PENDING_APPLY + STOP + fence); the Reboot's boot
+/// recovery must PRESERVE the hold (run_harness's crash/replay pin asserts held-before == held-after
+/// across the Reboot — no illegal release, no doc loss); then the operator releases it post-reboot
+/// (node un-halts, doc → SENT).  Proves the eternal-BRICK exit survives a crash/replay boundary.
+#[tokio::test]
+async fn held_reservation_survives_reboot_then_operator_releases() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[
+            Op::OnlineSell(DpsScript::unknown_status(-4)),
+            Op::Reboot,
+            Op::OperatorComplete(OperatorResolutionKind::Accepted),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 // ── CS-3 held-leaf expansion: Superseded + BadHashPrev (Increment 3) ─────────
 
 /// CS-3 Increment 3 [pure] — the Superseded leaf's DURABLE routing class is `TransientRetry` (the
@@ -2564,6 +2586,9 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         let cohort_before = ctx.full_drain_cohort_count().await; // MH: drain re-drives ≤ cohort
         let next_lnd_before = ctx.read_next_lnd().await; // MH/B2: a drain/no-op allocates no lnd
         let doc_count_before = ctx.observed_doc_count().await; // B2: TrueNoMutation mints no row
+                                                               // CS-3 crash/replay (P4): the FN's held reservation BEFORE the op — a crash / reboot must
+                                                               // PRESERVE it (boot recovery may not release or lose a committed PENDING_APPLY hold).
+        let held_res_before = ctx.active_held_reservation().await;
 
         let real = interp::run_op(&mut ctx, op).await;
         // O2: an Offline-node Crash that never reached the wire COMPLETES as a real
@@ -2988,6 +3013,21 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             "double-issue: {active_reservations} ACTIVE delivery reservations for the FN after \
              {op:?} — at most one may be in-flight per FN (ux_reservation_active)"
         );
+
+        // CS-3 crash/replay (P4) — a CRASH / REBOOT must PRESERVE a committed PENDING_APPLY held
+        // reservation: boot recovery scans + resumes non-terminal docs, but it may NOT release a hold
+        // (only an operator completes it) nor lose the doc. A change here is an illegal HELD release /
+        // doc loss across recovery. (Drain / GoOnline legitimately mutate holds, so they are excluded
+        // — the operator-completion + count oracles cover those; this is the recovery-specific pin.)
+        if matches!(op, Op::Crash(_) | Op::Reboot | Op::RepeatReboot) {
+            let held_res_after = ctx.active_held_reservation().await;
+            assert_eq!(
+                held_res_after, held_res_before,
+                "crash/replay: op {op:?} changed the held reservation (before={held_res_before:?} \
+                 after={held_res_after:?}) — a crash/reboot must preserve a committed PENDING_APPLY \
+                 hold (no illegal release / no doc loss across recovery)"
+            );
+        }
 
         // CS-3 1b — re-sync the model's operator-completion hold PRECONDITION from reality after
         // every op (a drain can create/clear a CS-3 reservation-hold the pure model does not track).
