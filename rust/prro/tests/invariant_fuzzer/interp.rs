@@ -106,6 +106,23 @@ pub struct ObservedDoc {
     pub shift_state_after: ShiftState,
 }
 
+/// CS-3 Slice E — the REAL durable delivery-axis witness read back from `delivery_reservation` +
+/// `node_state` for a HELD online doc.  Compared against the model's independent
+/// [`crate::model::HeldWitness`] by [`crate::oracle::check_held_witness`].  DB-TEXT values verbatim
+/// (no decode), so a persisted-classifier regression surfaces as a plain string mismatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedHeld {
+    pub submission_certainty: String,
+    pub response_provenance: String,
+    pub routing_class: Option<String>,
+    pub node_effect: String,
+    pub evidence_kind: String,
+    pub evidence_code: Option<i64>,
+    pub apply_state: String,
+    pub node_mode: String,
+    pub fence_held: bool,
+}
+
 /// What `run_op` observed for one op.
 #[derive(Debug, Clone)]
 pub enum RealOutcome {
@@ -629,6 +646,69 @@ impl FuzzCtx {
         .await
         .unwrap();
         v
+    }
+
+    /// CS-3 Slice E — the REAL durable delivery-axis witness for a doc: the latest
+    /// `delivery_reservation` attempt (joined by `request_id`) + the node's `mode` and FN fence
+    /// pointer.  `None` ⇒ the doc has NO reservation row (a pre-send / invalid-ingress refusal never
+    /// reserves), so the held-witness oracle has nothing to assert.  Reads DB-text verbatim.
+    pub async fn read_held_witness(&self, request_id: &[u8; 16]) -> Option<ObservedHeld> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<i64>,
+            String,
+        )> = sqlx::query_as(
+            "SELECT dr.submission_certainty, dr.response_provenance, dr.routing_class, \
+                        dr.node_effect, dr.evidence_kind, dr.evidence_code, dr.apply_state \
+                 FROM delivery_reservation dr \
+                 JOIN fiscal_documents fd \
+                   ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+                 WHERE fd.fiscal_number = ? AND fd.request_id = ? \
+                 ORDER BY dr.attempt_no DESC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&request_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        let (
+            certainty,
+            provenance,
+            routing,
+            node_effect,
+            evidence_kind,
+            evidence_code,
+            apply_state,
+        ) = row?;
+        let (mode, fence): (String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT mode, active_delivery_reservation_id FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        Some(ObservedHeld {
+            submission_certainty: certainty,
+            response_provenance: provenance,
+            routing_class: routing,
+            node_effect,
+            evidence_kind,
+            evidence_code,
+            apply_state,
+            node_mode: mode,
+            fence_held: fence.is_some(),
+        })
+    }
+
+    /// The `request_id` of the doc minted by the MOST RECENT wire op (`self.last_row`), used to key
+    /// the held-witness read.  `None` before any wire op has run.
+    pub fn last_request_id(&self) -> Option<[u8; 16]> {
+        self.last_row.as_ref().map(|r| r.request_id)
     }
 
     /// B10 TEETH — verify the lazy-BEGIN two-doc chain is genuinely LINKED after a

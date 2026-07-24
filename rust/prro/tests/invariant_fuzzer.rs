@@ -1131,6 +1131,59 @@ fn differential_catches_lnd_divergence() {
     );
 }
 
+/// CS-3 Slice E teeth [pure comparator] — the held-witness oracle FLAGS a persisted-routing
+/// divergence: a real reservation whose `routing_class` is `TransientRetry` while the model predicts
+/// the `UnknownStatus` `ProbeRequired` contract MUST return `Err`, not pass.  This is the comparator
+/// half of the routing tooth; the end-to-end half
+/// (`held_witness_unknown_status_matches_real_reservation`) drives real production.  The second
+/// assertion (the faithful witness passes) guards against a vacuous always-`Err` comparator.
+#[test]
+fn held_witness_catches_routing_class_divergence() {
+    let expected = model::online_held_witness(&DpsScript::unknown_status(-4))
+        .expect("the UnknownStatus leaf has a held witness");
+    let regressed = interp::ObservedHeld {
+        submission_certainty: "SUBMITTED_UNKNOWN".into(),
+        response_provenance: "PARSED_DPS_ENVELOPE".into(),
+        routing_class: Some("TransientRetry".into()), // ← the pre-Slice-E regression shape
+        node_effect: "ProbeRequired".into(),
+        evidence_kind: "UnknownStatus".into(),
+        evidence_code: Some(-4),
+        apply_state: "PENDING_APPLY".into(),
+        node_mode: "STOP_MODE".into(),
+        fence_held: true,
+    };
+    assert!(
+        oracle::check_held_witness(Some(&regressed), &expected).is_err(),
+        "a TransientRetry routing_class must be flagged against the ProbeRequired contract"
+    );
+    let faithful = interp::ObservedHeld {
+        routing_class: Some("ProbeRequired".into()),
+        ..regressed
+    };
+    assert!(
+        oracle::check_held_witness(Some(&faithful), &expected).is_ok(),
+        "the faithful ProbeRequired witness must PASS (comparator is not vacuously always-Err)"
+    );
+    assert!(
+        oracle::check_held_witness(None, &expected).is_err(),
+        "a MISSING reservation row while the model predicted a held witness must be flagged"
+    );
+}
+
+/// CS-3 Slice E teeth [end-to-end] — the fuzzer's held-witness oracle asserts the REAL persisted
+/// delivery axes for an online `UnknownStatus(-4)` sell: the model's INDEPENDENT contract
+/// (`ProbeRequired` / `SUBMITTED_UNKNOWN` / `PARSED_DPS_ENVELOPE` / `PENDING_APPLY` / `STOP_MODE` /
+/// fence held) MATCHES real production, read back from `delivery_reservation` + `node_state`.
+/// `run_harness` panics on ANY held-witness divergence, so a clean run IS the pass.  CANARY: flip
+/// `model::online_held_witness`'s `routing_class` to `"TransientRetry"` → this REDs (proving the
+/// oracle reads the REAL reservation row, not the model's own prediction).
+#[tokio::test]
+async fn held_witness_unknown_status_matches_real_reservation() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(&[Op::OnlineSell(DpsScript::unknown_status(-4))], ctx, model).await;
+}
+
 /// Tier-1 slice 1 — online Z_REPORT is a genuine fuzzer op, not a side test:
 /// model predicts the Z doc and the shift transition, interpreter drives the
 /// production inline Z dispatcher, and the differential checks both.
@@ -2414,6 +2467,32 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 if matches!(op, Op::OnlineZReport(_) | Op::OfflineZReport) {
                     if let Err(d) = oracle::check_latest_z_aggregation(&ctx.pool).await {
                         panic!("Z aggregation oracle on {op:?}: {d:?}");
+                    }
+                }
+                // CS-3 Slice E — HELD delivery-axis witness. For an online wire op whose leaf the
+                // model encodes (`online_held_witness` → Some, i.e. the UnknownStatus ProbeRequired
+                // surface) that ACTUALLY produced a doc RESTING SENDING (the held online outcome),
+                // assert the REAL persisted reservation axes + node halt + FN fence match the model's
+                // INDEPENDENT prediction. The `doc_state == Sending` gate is load-bearing: `inline::run`
+                // dispatches by NODE MODE, so the SAME op on an OFFLINE-seeded node takes the offline
+                // lane (OFFLINE_LOCAL_ACK, no held reservation) — only a genuinely held SENDING doc
+                // carries the delivery-axis witness. A prod regression on the persisted routing_class
+                // (e.g. ProbeRequired → TransientRetry) REDs HERE (canary-proven).
+                if let interp::RealOutcome::Doc(doc) = &real {
+                    if doc.doc_state == DocState::Sending {
+                        if let Some(expected_held) =
+                            op.wire_script().and_then(model::online_held_witness)
+                        {
+                            let rid = ctx
+                                .last_request_id()
+                                .expect("a held online Doc op recorded a last_row");
+                            let observed_held = ctx.read_held_witness(&rid).await;
+                            if let Err(d) =
+                                oracle::check_held_witness(observed_held.as_ref(), &expected_held)
+                            {
+                                panic!("held-witness divergence on {op:?}: {d:?}");
+                            }
+                        }
                     }
                 }
             }

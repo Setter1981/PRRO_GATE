@@ -1771,3 +1771,56 @@ fn online_outcome_state(script: &DpsScript) -> DocState {
         _ => DocState::Sending,
     }
 }
+
+/// The INDEPENDENT model-side mirror of the durable `delivery_reservation` witness that a HELD
+/// online outcome persists — the CS-3 Slice E delivery-axis contract, as DB-TEXT literals.
+///
+/// These strings are hardcoded from the SPEC (the Slice E directed pin
+/// `directed_unknown_status_probe.rs` + migration 038), **NOT** read from production `classify()` /
+/// `routing_for_indeterminate()` / the production routing table.  That independence is the whole
+/// point: if a prod regression flips the persisted `routing_class` back to `TransientRetry`, the
+/// oracle sees the model still predicting `ProbeRequired` and REDs — a real finding to adjudicate,
+/// never silently tuned to match prod.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldWitness {
+    pub submission_certainty: &'static str,
+    pub response_provenance: &'static str,
+    pub routing_class: &'static str,
+    pub node_effect: &'static str,
+    pub evidence_kind: &'static str,
+    pub evidence_code: Option<i64>,
+    pub apply_state: &'static str,
+    pub node_mode: &'static str,
+    pub fence_held: bool,
+}
+
+/// The independent delivery-axis prediction for a HELD online wire outcome, keyed on the wire
+/// `script`'s leaf.  Returns `Some(HeldWitness)` for the leaves whose held-reservation contract this
+/// model encodes, `None` otherwise (the oracle then skips the axis-check for that leaf — a DOCUMENTED
+/// coverage boundary, not a silent pass).
+///
+/// Increment 1 covers the **`UnknownStatus`** leaf (the Slice E `ProbeRequired` surface — a parsed
+/// DPS envelope with an unnamed non-zero status).  Other held leaves (`Superseded` →
+/// `ServerFiscalIdMismatch`/`WrapperBug`, `BadHashPrev`) are deliberately `None` here pending a
+/// follow-up increment that encodes their (distinct) axis tuple; leaving them `None` is honest —
+/// the model does not yet claim their contract, so it must not assert it.
+pub fn online_held_witness(script: &DpsScript) -> Option<HeldWitness> {
+    match script.0.as_slice() {
+        // A parsed envelope carrying an unnamed non-zero status → SubmittedUnknown / ProbeRequired
+        // HELD: the doc rests SENDING, the reservation stays PENDING_APPLY (apply did NOT
+        // auto-release), the node halts STOP_MODE, and the FN fence pointer is still SET.  The raw
+        // status `code` is preserved verbatim in `evidence_code`.
+        [WireResponse::UnknownStatus(code), ..] => Some(HeldWitness {
+            submission_certainty: "SUBMITTED_UNKNOWN",
+            response_provenance: "PARSED_DPS_ENVELOPE",
+            routing_class: "ProbeRequired",
+            node_effect: "ProbeRequired",
+            evidence_kind: "UnknownStatus",
+            evidence_code: Some(*code as i64),
+            apply_state: "PENDING_APPLY",
+            node_mode: "STOP_MODE",
+            fence_held: true,
+        }),
+        _ => None,
+    }
+}

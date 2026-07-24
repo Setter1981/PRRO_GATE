@@ -33,8 +33,8 @@ use prro::db::invariant_scan::Violation;
 use prro::db::models::enums::{DocState, ShiftState};
 use prro::services::reconciliation::online_convergence::TickSummary;
 
-use crate::interp::{ObservedDoc, RealOutcome};
-use crate::model::{ExpectedOutcome, Mutation};
+use crate::interp::{ObservedDoc, ObservedHeld, RealOutcome};
+use crate::model::{ExpectedOutcome, HeldWitness, Mutation};
 
 /// The op classification the differential dispatches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +174,69 @@ fn check_doc_against_mutation(
         return Err(Divergence(format!(
             "chain-continuity: real previous_hash {:?} != prior real tip {:?}",
             doc.previous_hash, prior_tip_real
+        )));
+    }
+    Ok(())
+}
+
+/// CS-3 Slice E — assert the REAL durable delivery-axis witness (read from `delivery_reservation` +
+/// `node_state`) matches the model's INDEPENDENT [`HeldWitness`] prediction for a HELD online
+/// outcome.  `observed == None` while the model predicted a witness is itself a divergence: the
+/// contract says a held outcome MUST persist a reservation row.  Every axis compares as DB-TEXT, so a
+/// persisted-classifier regression (e.g. `ProbeRequired` → `TransientRetry`) surfaces as a plain
+/// mismatch — the fuzzer's independent oracle for the Slice E routing contract.
+pub fn check_held_witness(
+    observed: Option<&ObservedHeld>,
+    expected: &HeldWitness,
+) -> Result<(), Divergence> {
+    let o = observed.ok_or_else(|| {
+        Divergence(format!(
+            "held-witness: model predicted a held reservation ({expected:?}) but the doc has NO \
+             delivery_reservation row (a held outcome MUST reserve)"
+        ))
+    })?;
+    let string_axes: [(&str, &str, &str); 7] = [
+        (
+            "submission_certainty",
+            o.submission_certainty.as_str(),
+            expected.submission_certainty,
+        ),
+        (
+            "response_provenance",
+            o.response_provenance.as_str(),
+            expected.response_provenance,
+        ),
+        (
+            "routing_class",
+            o.routing_class.as_deref().unwrap_or("<NULL>"),
+            expected.routing_class,
+        ),
+        ("node_effect", o.node_effect.as_str(), expected.node_effect),
+        (
+            "evidence_kind",
+            o.evidence_kind.as_str(),
+            expected.evidence_kind,
+        ),
+        ("apply_state", o.apply_state.as_str(), expected.apply_state),
+        ("node_mode", o.node_mode.as_str(), expected.node_mode),
+    ];
+    for (axis, real, exp) in string_axes {
+        if real != exp {
+            return Err(Divergence(format!(
+                "held-witness {axis} mismatch: real {real:?} != model {exp:?}"
+            )));
+        }
+    }
+    if o.evidence_code != expected.evidence_code {
+        return Err(Divergence(format!(
+            "held-witness evidence_code mismatch: real {:?} != model {:?}",
+            o.evidence_code, expected.evidence_code
+        )));
+    }
+    if o.fence_held != expected.fence_held {
+        return Err(Divergence(format!(
+            "held-witness fence_held mismatch: real {} != model {}",
+            o.fence_held, expected.fence_held
         )));
     }
     Ok(())

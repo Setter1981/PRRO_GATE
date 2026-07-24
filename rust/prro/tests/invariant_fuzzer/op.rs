@@ -190,3 +190,22 @@ pub enum L5Kind {
     /// Control — a good of 15_000 kop paid in full by cash (converts + issues).
     Valid,
 }
+
+impl Op {
+    /// CS-3 Slice E — the wire `DpsScript` carried by an online wire op that mints a HELD-able Doc
+    /// (rests SENDING under a reservation), for the held-witness delivery-axis oracle.  `None` for
+    /// non-wire / offline / recovery ops (`GoOnline` / `Drain` produce a `Recovered` ledger-delta,
+    /// not a single held Doc, so they are intentionally excluded).
+    pub fn wire_script(&self) -> Option<&DpsScript> {
+        match self {
+            Op::OnlineSell(s)
+            | Op::OnlineReturn(s)
+            | Op::OnlineServiceIn(s)
+            | Op::OnlineServiceOut(s)
+            | Op::OnlineEpz(s)
+            | Op::OnlineShiftOpen(s)
+            | Op::OnlineZReport(s) => Some(s),
+            _ => None,
+        }
+    }
+}
