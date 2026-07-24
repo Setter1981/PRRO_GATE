@@ -1105,9 +1105,15 @@ async fn operator_complete(ctx: &mut FuzzCtx, kind: OperatorResolutionKind) -> R
     };
     let resolution = match kind {
         // Accepted needs the operator-observed NON-EMPTY server fiscal number (prod validates only
-        // non-empty, delivery_reservation.rs:1368) — a distinct test SFN literal.
+        // non-empty, delivery_reservation.rs:1368). It MUST equal the DPS stub's assigned FN
+        // (`SERVER_FISCAL_NO`): in reality the operator supplies the exact number DPS assigned, so a
+        // SUBSEQUENT drain that re-probes this now-`SENT` offline-origin doc (a completed drain-held
+        // doc re-enters the cohort — `SENT` is a drain-candidate state) confirms it via `last_chk`
+        // WITHOUT a spurious `LastChkIdMismatch`. An UNRELATED literal here forks the FN and
+        // structurally-halts the go-online drain forever (node stuck `GoingOnline`) — a fixture
+        // artifact, NOT a prod fault (fuzzer liveness finding, task #18 offline-half).
         OperatorResolutionKind::Accepted => OperatorResolution::Accepted {
-            fiscal_number: "5000000001".to_string(),
+            fiscal_number: SERVER_FISCAL_NO.to_string(),
         },
         OperatorResolutionKind::NotAccepted => OperatorResolution::NotAccepted,
         OperatorResolutionKind::NotAcceptedOffline => OperatorResolution::NotAcceptedOffline,

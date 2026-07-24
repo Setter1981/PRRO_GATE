@@ -1676,7 +1676,6 @@ impl RefModel {
         .await
         .unwrap();
         self.shift_lifecycle_lnds = shift_lifecycle_lnds.into_iter().map(|(lnd,)| lnd).collect();
-        let tip_lnd = self.docs.keys().copied().max().unwrap_or(0);
 
         // mode / shift_state / next_lnd ← node_state.
         let (mode, shift_state, next_lnd): (NodeMode, ShiftState, i64) =
@@ -1695,10 +1694,32 @@ impl RefModel {
         self.mode = mode;
         self.shift_state = shift_state;
         self.next_lnd = next_lnd;
-        // STRUCTURAL seed: Some iff real Some (synthetic placeholder bytes) —
-        // read through the tagged `read_seed_fixture` wrapper.
+        // STRUCTURAL seed: Some iff real Some (synthetic placeholder bytes) — read
+        // through the tagged `read_seed_fixture` wrapper.  The synthetic per-lnd
+        // placeholder must track the ACTUAL chain tip — the doc whose
+        // `unsigned_xml_sha256` equals the real seed — NOT `max(lnd)`: a HELD /
+        // non-issued `SENDING` doc (a BadHashPrev / UnknownStatus hold) can carry the
+        // MAX lnd WITHOUT having advanced the seed, so `max(lnd)` would place the
+        // placeholder on a doc the real chain tip has not reached.  When that held doc
+        // is LATER issued (operator completion / drain), the real seed advances onto
+        // its hash while the model already sat there → the op's real seed-advance
+        // would spuriously read as "no model advance" (fuzzer online seed-advance
+        // finding, task #18).  Fall back to `max(lnd)` only when the seed matches no
+        // doc (e.g. a MacReseed rebase — generator-excluded).
         let real_seed = Self::read_seed_fixture(pool).await;
-        self.seed = real_seed.is_some().then(|| synth_unsigned_hash(tip_lnd));
+        let tip_lnd: i64 = match &real_seed {
+            Some(seed) => sqlx::query_scalar::<_, i64>(
+                "SELECT lnd FROM fiscal_documents WHERE unsigned_xml_sha256 = ? \
+                 ORDER BY lnd DESC LIMIT 1",
+            )
+            .bind(&seed[..])
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| self.docs.keys().copied().max().unwrap_or(0)),
+            None => 0,
+        };
+        self.seed = real_seed.as_ref().map(|_| synth_unsigned_hash(tip_lnd));
 
         // offline session + codes ← real.
         self.session = sqlx::query_scalar::<_, prro::db::types::DbOfflineSessionState>(

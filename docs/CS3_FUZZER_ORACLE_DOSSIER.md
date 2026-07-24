@@ -233,3 +233,38 @@ correct in each; the model was tightened, never prod):
 These are the fuzzer doing its job: an INDEPENDENT model that, when it disagrees with prod, forces an
 adjudication (prod-correct-model-tightened, or a prod finding). Every 1b divergence was the former
 except the MacReseed ChainSeedMismatch above.
+
+## Rebase-onto-#338 latent findings (task #18 — offline-half kickoff)
+
+The branch was rebased onto `main` `bc6f1937` (MacReseed hardening #338 + CI #339). **#338 is INERT
+for any non-MacReseed resolution** (its guards are gated on `if let MacReseed`; the completion SELECT
+only ADDS a `node_effect` column — same row). The two capstone REDs the rebase surfaced were therefore
+NOT #338 regressions but **latent cases the `RngSeed::Random` capstone had not previously sampled** —
+both `OperatorComplete(Accepted)` on a held doc. Each now carries a directed regression tooth AND a
+pinned generative seed (`tests/invariant_fuzzer.regressions`). Fuzzer **143/143** after both fixes.
+
+1. **Harness fixture-FN fidelity (offline liveness)** — shrank to
+   `[Crash(Send), GoOnline([UnknownStatus(-4)]), OperatorComplete(Accepted)]`. An operator-`Accepted`
+   go-online-drain held doc → `SENT` RE-ENTERS the drain cohort (`SENT` is a drain-candidate state);
+   the settle-drain re-probes it via `last_chk`. The interp operator-completion stub FN
+   (`"5000000001"`) ≠ the DPS stub's assigned FN (`SERVER_FISCAL_NO` = `"DPS-FN-ONLINE-1"`), forking a
+   `LastChkIdMismatch` → structural-drift halt (§410) → node STUCK `GoingOnline` → the terminal
+   liveness gate fires. **NOT a prod fault**: in reality the operator supplies the exact FN DPS
+   assigned (they match on re-probe), and a genuine operator FN typo is CORRECTLY fail-closed by this
+   very guard. Fix = fixture fidelity: `interp::operator_complete` Accepted FN → `SERVER_FISCAL_NO`.
+   Tooth `harness_offline_operator_accepted_held_drain_doc_resettles_online` (**canary proven**:
+   revert the FN → liveness RED). With a faithful FN the drain converges the whole cohort to ACK and
+   the node settles `Online`.
+
+2. **Model resync seed-placeholder (online seed-advance)** — shrank to
+   `[OnlineServiceIn([Ack,Ack]), OnlineSell([BadHashPrev]), OperatorComplete(Accepted)]`. The
+   post-fault resync `model::adopt_fault_deferred` placed the STRUCTURAL seed placeholder on
+   `max(lnd)` — the held (`SENDING`, non-issued) BadHashPrev sell — instead of the real chain tip (the
+   issued ServiceIn predecessor). When the operator later `Accepted`-completes the held doc, prod
+   advances the seed onto that doc's hash; the model already sat on that lnd → the completion's real
+   seed-advance read as "no model advance" → the Release differential (`invariant_fuzzer.rs:2992`)
+   diverged. **Prod correct → MODEL tightened** (a 5th, 1b-class adjudication): `tip_lnd` now tracks
+   the doc whose `unsigned_xml_sha256` equals the real seed (falls back to `max(lnd)` only when the
+   seed matches no doc, e.g. a generator-excluded MacReseed rebase). Tooth
+   `harness_online_operator_accepted_after_badhashprev_hold_seed_advance` (**canary proven**: revert
+   `tip_lnd` to `max(lnd)` → seed-advance RED).

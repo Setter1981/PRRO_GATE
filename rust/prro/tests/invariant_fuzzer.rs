@@ -3419,6 +3419,56 @@ fn harness_offline_no_code_sell_mirrors_aborted_row() {
     );
 }
 
+/// REGRESSION (task #18 offline-half — fuzzer liveness finding) — a held go-online
+/// DRAIN doc that the operator completes as `Accepted` (→ `SENT` + the DPS-assigned
+/// server fiscal number) RE-ENTERS the drain cohort (`SENT` is a drain-candidate
+/// state) and a SUBSEQUENT settle-drain re-probes it via `last_chk`. The operator's
+/// completion FN MUST equal the DPS stub's assigned FN (`SERVER_FISCAL_NO`, interp
+/// fixture fidelity — in reality the operator supplies the exact number DPS assigned):
+/// else the confirm forks on `LastChkIdMismatch`, structurally halts the FN drain,
+/// and the node is STUCK `GoingOnline` (the offline capstone's terminal liveness gate
+/// fires). With a faithful FN the drain converges the whole cohort to ACK and the node
+/// settles to `Online`. **Canary:** revert the `SERVER_FISCAL_NO` FN in
+/// `interp::operator_complete` (Accepted arm) back to an unrelated literal → this REDs
+/// with the `LIVENESS: node did not settle …` panic. The offline capstone shrank the
+/// generative net to exactly this 3-op sequence.
+#[test]
+fn harness_offline_operator_accepted_held_drain_doc_resettles_online() {
+    drive(
+        &[
+            Op::Crash(Stage::Send),
+            Op::GoOnline(DpsScript::unknown_status(-4)),
+            Op::OperatorComplete(OperatorResolutionKind::Accepted),
+        ],
+        true,
+    );
+}
+
+/// REGRESSION (task #18 — fuzzer online seed-advance finding) — a held online sell
+/// (`BadHashPrev` → MAC-recovery / MacReseedPending hold, a Fault the model DEFERS)
+/// carries the MAX lnd while NON-issued (`SENDING`, seed NOT advanced). When the
+/// operator later completes it `Accepted`, prod advances the seed onto that doc's
+/// hash. The post-fault resync (`model::adopt_fault_deferred`) must place the
+/// STRUCTURAL seed placeholder on the ACTUAL chain tip (the doc whose
+/// `unsigned_xml_sha256` equals the real seed = the issued predecessor), NOT
+/// `max(lnd)` (the held doc): else the model already sits on the held lnd → the
+/// completion's real seed-advance reads as "no model advance" and the Release
+/// differential (invariant_fuzzer.rs:2992) diverges. **Canary:** revert
+/// `adopt_fault_deferred`'s `tip_lnd` back to `self.docs.keys().max()` → this REDs
+/// with `real seed-advance (true) must match the model's (false)`. The online
+/// capstone shrank the generative net to exactly this 3-op sequence.
+#[test]
+fn harness_online_operator_accepted_after_badhashprev_hold_seed_advance() {
+    drive(
+        &[
+            Op::OnlineServiceIn(DpsScript::ack_path()),
+            Op::OnlineSell(DpsScript::bad_hash_prev()),
+            Op::OperatorComplete(OperatorResolutionKind::Accepted),
+        ],
+        false,
+    );
+}
+
 /// B1/MH — a Fault-deferred EXOTIC drain (the model cannot cleanly predict it) is
 /// now VERIFIED by the bounded safety postconds in run_harness, not blindly
 /// resync'd.  Driving [OfflineSell x2, GoOnline([Superseded])] exercises the MH
