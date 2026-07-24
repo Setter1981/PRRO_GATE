@@ -1830,12 +1830,17 @@ pub fn online_held_witness(script: &DpsScript) -> Option<HeldWitness> {
             node_mode: "STOP_MODE",
             fence_held: true,
         }),
-        // Superseded (server fiscal-id mismatch): the faithful adapter DEGRADES it to a NoResponse
-        // record, so the DURABLE class is `TransientRetry` / `NoNodeEffect` (NOT the `WrapperBug`
-        // diagnostic OVERLAY that `error_routing`/the strategy comment mention — the overlay never
-        // reaches the persisted reservation). It still HOLDS: SENDING under PENDING_APPLY + STOP_MODE
-        // + fence. `node_effect == NoNodeEffect` while `node_mode == STOP_MODE` is REAL prod — the
-        // halt comes from the HELD record, not the classifier's node-effect axis.
+        // Superseded (server fiscal-id mismatch → `DpsError::ServerFiscalIdMismatch`): the
+        // DURABLE persisted class is `TransientRetry` / `NoNodeEffect`.  TWO prod classifiers
+        // disagree on this input, and the model deliberately encodes the one that OWNS the
+        // persisted reservation: the modern `classify_started` maps the NoResponse cause
+        // (`CallFailedWithoutTrustedDpsEnvelope`) to `TransientRetry` (delivery/mod.rs) and is the
+        // sole writer of `record_outcome`; the legacy `error_routing`'s `WrapperBug`/`ErrorRetryable`
+        // (error_routing.rs:413) is a DIAGNOSTIC OVERLAY that feeds only the return value / audit,
+        // NEVER the durable reservation.  Encoding the overlay would be the classic green-but-unsound
+        // trap.  It still HOLDS: SENDING under PENDING_APPLY + STOP_MODE + fence.  `node_effect ==
+        // NoNodeEffect` while `node_mode == STOP_MODE` is REAL prod — the halt comes from the HELD
+        // record, not the classifier's node-effect axis.
         [WireResponse::Superseded, ..] => Some(HeldWitness {
             submission_certainty: "SUBMITTED_UNKNOWN",
             response_provenance: "NO_RESPONSE",
@@ -1878,24 +1883,39 @@ pub struct ReleasedWitness {
     pub doc_state: &'static str,
 }
 
-/// The independent prediction of the durable witness after a LEGAL operator completion.  Derived
-/// PURELY from the chosen resolution + the model's OWN tracked state (an active offline session, an
-/// origin-blocked hold), NOT from any production call.  The load-bearing anti-BRICK invariant is
-/// baked in: EVERY legal completion yields `apply_state == "APPLIED"`, `fence_held == false`, and a
-/// `node_mode` that is NEVER `"STOP_MODE"` — a released reservation can never rest bricked.
+/// The independent prediction of a legal operator completion — `Some(ReleasedWitness)` if the
+/// resolution RELEASES the hold, `None` if prod REFUSES it (an origin cross-check contradiction —
+/// the model predicts a `Refused` outcome shape, NOT a release).  Derived PURELY from the resolution,
+/// the doc's ORIGIN, and the model's OWN tracked state (active offline session, origin-blocked hold),
+/// NOT from any production call.  The load-bearing anti-BRICK invariant is baked into the release
+/// branch: EVERY legal completion yields `apply_state == "APPLIED"`, `fence_held == false`, and a
+/// `node_mode` that is NEVER `"STOP_MODE"`.
 ///
-/// Contract (SPEC, `delivery_reservation.rs` completion 1367-1512):
-///   - `apply_state`  = "APPLIED" always; `fence_held` = false always (the sole pointer-clear branch).
-///   - `node_mode`    = "BLOCKED" iff the hold was origin-blocked (offline `-11`, over the 168h
-///     ceiling — INV-05, un-blocking is a separate recovery); else "GOING_ONLINE" iff an active
-///     offline session must finish draining; else "ONLINE".
-///   - `doc_state`    = "SENT" for `Accepted` (issued); "REQUIRES_MANUAL_RECONCILIATION" for
-///     `NotAccepted` / `NotAcceptedOffline` / `MacReseed`.
+/// Contract (SPEC, `delivery_reservation.rs` completion):
+///   - Origin cross-check (1351-1359) — REFUSED (⇒ `None`) BEFORE any mutation: `NotAccepted` on an
+///     OFFLINE-origin doc, `NotAcceptedOffline` on an ONLINE-origin doc, `MacReseed` on an
+///     OFFLINE-origin doc (a seed rewind on the wrong origin would fork a live chain).
+///   - Release branch (1367-1512): `apply_state` = "APPLIED"; `fence_held` = false (the sole
+///     pointer-clear branch); `node_mode` = "BLOCKED" iff origin-blocked (offline `-11`, INV-05) /
+///     else "GOING_ONLINE" iff an active offline session must drain / else "ONLINE"; `doc_state` =
+///     "SENT" for `Accepted` (issued) / "REQUIRES_MANUAL_RECONCILIATION" otherwise.
 pub fn released_witness(
     resolution: OperatorResolutionKind,
+    online_origin: bool,
     has_active_offline_session: bool,
     origin_blocked: bool,
-) -> ReleasedWitness {
+) -> Option<ReleasedWitness> {
+    // Origin cross-check (delivery_reservation.rs:1351-1359): a resolution whose origin contradicts
+    // the doc's origin is fail-closed BEFORE any mutation — the model predicts Refused (None).
+    let refused = match resolution {
+        OperatorResolutionKind::NotAccepted => !online_origin, // ONLINE origin only
+        OperatorResolutionKind::NotAcceptedOffline => online_origin, // OFFLINE origin only
+        OperatorResolutionKind::MacReseed => !online_origin,   // ONLINE origin only
+        OperatorResolutionKind::Accepted => false,             // valid on both origins
+    };
+    if refused {
+        return None;
+    }
     let node_mode = if origin_blocked {
         "BLOCKED"
     } else if has_active_offline_session {
@@ -1909,10 +1929,10 @@ pub fn released_witness(
         | OperatorResolutionKind::NotAcceptedOffline
         | OperatorResolutionKind::MacReseed => "REQUIRES_MANUAL_RECONCILIATION",
     };
-    ReleasedWitness {
+    Some(ReleasedWitness {
         apply_state: "APPLIED",
         node_mode,
         fence_held: false,
         doc_state,
-    }
+    })
 }
