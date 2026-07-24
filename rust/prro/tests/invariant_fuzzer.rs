@@ -1194,7 +1194,8 @@ async fn held_witness_unknown_status_matches_real_reservation() {
 /// end-to-end half drives the real `resolve_operator_pending` seam.
 #[test]
 fn release_witness_accepted_clears_fence_and_stop() {
-    let expected = model::released_witness(OperatorResolutionKind::Accepted, false, false);
+    let expected = model::released_witness(OperatorResolutionKind::Accepted, true, false, false)
+        .expect("Accepted on an online-origin hold always releases");
     assert_eq!(expected.apply_state, "APPLIED");
     assert_eq!(expected.node_mode, "ONLINE");
     assert!(!expected.fence_held);
@@ -1259,7 +1260,8 @@ async fn directed_operator_complete_releases_unknown_status_hold() {
         panic!("expected a Released outcome, got {released:?}");
     };
     // 3) the model's independent contract matches real prod AND the node is un-bricked.
-    let expected = model::released_witness(OperatorResolutionKind::Accepted, false, false);
+    let expected = model::released_witness(OperatorResolutionKind::Accepted, true, false, false)
+        .expect("Accepted on an online-origin hold always releases");
     oracle::check_release_witness(&obs, &expected).unwrap_or_else(|d| {
         panic!("release witness diverged from the independent contract: {d:?}")
     });
@@ -1316,6 +1318,63 @@ async fn operator_complete_fn_mismatch_refused_hold_intact() {
     assert!(held.fence_held, "the FN fence stays held");
 }
 
+/// CS-3 anti-BRICK teeth [pure] — the origin cross-check (MAJOR-1 fix): a resolution whose origin
+/// contradicts the doc's origin is REFUSED (the model predicts `None`, not a release), mirroring
+/// `delivery_reservation.rs:1351-1359`.  ONLINE-origin: `NotAcceptedOffline` refused; `NotAccepted`
+/// / `MacReseed` / `Accepted` release.  OFFLINE-origin: `NotAccepted` / `MacReseed` refused;
+/// `NotAcceptedOffline` / `Accepted` release.
+#[test]
+fn released_witness_refuses_origin_contradicting_completion() {
+    use OperatorResolutionKind::*;
+    // ONLINE-origin doc:
+    assert!(
+        model::released_witness(NotAcceptedOffline, true, false, false).is_none(),
+        "NotAcceptedOffline on an ONLINE-origin doc must be refused (OriginMismatch)"
+    );
+    assert!(model::released_witness(NotAccepted, true, false, false).is_some());
+    assert!(model::released_witness(MacReseed, true, false, false).is_some());
+    assert!(model::released_witness(Accepted, true, false, false).is_some());
+    // OFFLINE-origin doc:
+    assert!(
+        model::released_witness(NotAccepted, false, false, false).is_none(),
+        "NotAccepted on an OFFLINE-origin doc must be refused (OriginMismatch)"
+    );
+    assert!(
+        model::released_witness(MacReseed, false, false, false).is_none(),
+        "MacReseed on an OFFLINE-origin doc must be refused (MacReseedNotOfflineDefined)"
+    );
+    assert!(model::released_witness(NotAcceptedOffline, false, false, false).is_some());
+    assert!(model::released_witness(Accepted, false, false, false).is_some());
+}
+
+/// CS-3 anti-BRICK teeth [end-to-end] — prod REFUSES an origin-contradicting completion and leaves
+/// the hold INTACT: `NotAcceptedOffline` on an ONLINE-origin UnknownStatus hold → prod
+/// `OriginMismatch` (delivery_reservation.rs:1352) → `Refused`, and the reservation stays
+/// PENDING_APPLY / STOP_MODE / fenced.  Confirms the model's `None` prediction (MAJOR-1) matches
+/// prod — and that an origin-wrong operator action can NEVER release (a fork-safety guard).
+#[tokio::test]
+async fn operator_complete_offline_kind_on_online_hold_refused_intact() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::unknown_status(-4))).await;
+    let rid = ctx.last_request_id().expect("held doc recorded");
+    let out = interp::run_op(
+        &mut ctx,
+        &Op::OperatorComplete(OperatorResolutionKind::NotAcceptedOffline),
+    )
+    .await;
+    assert!(
+        matches!(out, interp::RealOutcome::Refused(_)),
+        "NotAcceptedOffline on an online-origin hold must be Refused, got {out:?}"
+    );
+    let held = ctx.read_held_witness(&rid).await.expect("hold intact");
+    assert_eq!(
+        held.apply_state, "PENDING_APPLY",
+        "the refused completion must not release"
+    );
+    assert_eq!(held.node_mode, "STOP_MODE");
+    assert!(held.fence_held);
+}
+
 // ── CS-3 held-leaf expansion: Superseded + BadHashPrev (Increment 3) ─────────
 
 /// CS-3 Increment 3 [pure] — the Superseded leaf's DURABLE routing class is `TransientRetry` (the
@@ -1332,6 +1391,35 @@ fn superseded_durable_class_is_transient_retry_not_wrapperbug() {
     assert_eq!(w.node_effect, "NoNodeEffect");
     assert_eq!(w.evidence_kind, "NoResponse");
     assert_eq!(w.response_provenance, "NO_RESPONSE");
+}
+
+/// CS-3 Increment 3 [PROD-flip canary] — the held-witness oracle catches a prod regression toward
+/// the OTHER legitimate answer, not merely a model flip. Superseded's diagnostic overlay is
+/// `WrapperBug`; if prod ever persisted THAT into the durable reservation (instead of the modern
+/// `TransientRetry`), the oracle must RED. Constructs a real-shaped `ObservedHeld` whose
+/// `routing_class` is `WrapperBug` and asserts `check_held_witness` diverges from the model's
+/// durable `TransientRetry` contract — proving the independence anchor is not merely the
+/// test-harness decode (adversarial-review MAJOR-3 hardening).
+#[test]
+fn superseded_held_witness_reds_if_prod_persists_wrapperbug_overlay() {
+    let model_w = model::online_held_witness(&DpsScript::superseded_tip())
+        .expect("the Superseded leaf holds");
+    let prod_regressed = interp::ObservedHeld {
+        submission_certainty: "SUBMITTED_UNKNOWN".into(),
+        response_provenance: "NO_RESPONSE".into(),
+        routing_class: Some("WrapperBug".into()), // ← the durable record wrongly took the overlay label
+        node_effect: "NoNodeEffect".into(),
+        evidence_kind: "NoResponse".into(),
+        evidence_code: None,
+        apply_state: "PENDING_APPLY".into(),
+        node_mode: "STOP_MODE".into(),
+        fence_held: true,
+    };
+    assert!(
+        oracle::check_held_witness(Some(&prod_regressed), &model_w).is_err(),
+        "a durable WrapperBug (the overlay leaking into the record) must RED against the \
+         TransientRetry contract — the oracle catches a real prod regression, not just a model flip"
+    );
 }
 
 /// CS-3 Increment 3 [end-to-end] — the fuzzer's held-witness oracle asserts the REAL persisted
