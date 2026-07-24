@@ -18,15 +18,25 @@
 
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::delivery_reservation::{
-    self, complete_operator_pending, resume_crashed_reservation, CompletionError, CompletionResult,
-    ModeTarget, NewReservation, OperatorResolution,
+    self, authorize_submission, complete_operator_pending, record_outcome,
+    resume_crashed_reservation, AttemptObservation, Authorization, CompletionError,
+    CompletionResult, ModeTarget, NewReservation, OperatorResolution,
 };
 use prro::db::tx::with_immediate;
+use prro_domain::delivery::evidence::EvidenceDiscriminant;
+use prro_domain::delivery::{
+    classify, AuthorizedGeneration, DecodedResponseDigest, DpsProtocolBinding, DpsProtocolId,
+    EnvelopeHash, NonOkStatusCode, ObservedOutcomeV1, PositiveGeneration, ProtocolContractVersion,
+    SendOutcome, SendResponse, SubmissionEvidence,
+};
+use prro_domain::enums::DocType;
 use sqlx::SqlitePool;
 
 const TS: &str = "2026-07-20T00:00:00Z";
 const SEED: [u8; 32] = [0x77; 32];
 const OPSEED: [u8; 32] = [0x99; 32];
+/// The last-issued chain tip a MacReseed hardening fixture pins (distinct from `OPSEED`).
+const PRED_TIP: [u8; 32] = [0x55; 32];
 
 async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -184,6 +194,113 @@ fn is_err(err: &anyhow::Error, pred: impl Fn(&CompletionError) -> bool) -> bool 
     err.downcast_ref::<CompletionError>().is_some_and(pred)
 }
 
+// ── MacReseed hardening fixtures (faithful `-12` hold + issued predecessor) ──────────
+//
+// A real `MacReseedPending` hold is a `-12` (BadHashPrev) DPS reject recorded through the
+// production `record_outcome` boundary — NOT the crash path `held_pending` drives. These mirror
+// `record_outcome.rs`'s domain builders so the hold row satisfies the evidence-union trigger
+// (evidence_kind=Rejected, node_effect=MacReseedPending, routing_class=MacRecovery) BY
+// CONSTRUCTION rather than by a raw UPDATE the evidence-immutability trigger would reject.
+
+fn binding() -> DpsProtocolBinding {
+    DpsProtocolBinding {
+        protocol_id: DpsProtocolId::FscoZzd,
+        contract_version: ProtocolContractVersion(1),
+        capability_profile_version: None,
+        endpoint_config_revision: None,
+    }
+}
+fn started(response: SendResponse) -> SubmissionEvidence {
+    SubmissionEvidence::Started {
+        response,
+        binding: binding(),
+        envelope_hash: EnvelopeHash([0u8; 32]),
+    }
+}
+fn from_code(code: i32) -> SubmissionEvidence {
+    started(SendResponse::parsed(SendOutcome::from_server_code(
+        NonOkStatusCode::from_transport(code).unwrap(),
+        DocType::Sell,
+        DecodedResponseDigest::from_transport_digest([0xAB; 32]),
+    )))
+}
+fn build(ev: &SubmissionEvidence, gen: i64) -> (EvidenceDiscriminant, ObservedOutcomeV1) {
+    let classified = classify(ev);
+    let disc = EvidenceDiscriminant::from_evidence(ev);
+    let outcome = ObservedOutcomeV1::record(
+        &classified,
+        None,
+        AuthorizedGeneration::Started(PositiveGeneration::new(gen).unwrap()),
+    )
+    .expect("observed-outcome mint");
+    (disc, outcome)
+}
+async fn authorize(pool: &SqlitePool, res_byte: u8, doc: DocumentId, fscl: &str) -> Authorization {
+    let row = new_res(res_byte, doc, fscl);
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            authorize_submission(tx, row, TS)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .expect("authorize")
+}
+
+/// Drive a fresh reservation to a REAL `-12` BadHashPrev / `MacReseedPending` hold:
+/// `OUTCOME_OBSERVED` + `PENDING_APPLY` + `node_effect = MacReseedPending` + node `STOP_MODE`.
+async fn held_macreseed_pending(pool: &SqlitePool, res_byte: u8, doc: DocumentId, fscl: &str) {
+    let auth = authorize(pool, res_byte, doc, fscl).await;
+    let ev = from_code(-12); // BadHashPrev → MacReseedPending (held)
+    let (disc, outcome) = build(&ev, 1);
+    let obs = AttemptObservation::from_authorization(auth, ev);
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            record_outcome(tx, &obs, &outcome, &disc)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })
+    .await
+    .expect("-12 records the MacReseedPending hold");
+}
+
+/// Insert an ISSUED online predecessor (`SENT` + non-empty `server_fiscal_no`) carrying
+/// `unsigned_xml_sha256 = tip`, and pin `node_state.last_known_unsigned_xml_sha256 = tip` so the
+/// FN chain is coherent. This is the value `invariant_scan` (and the guard) treats as the expected
+/// chain tip. `lnd` must be below the held `-12` doc's lnd so it is the last-issued row.
+async fn seed_issued_predecessor(
+    pool: &SqlitePool,
+    fscl: &str,
+    doc_byte: u8,
+    lnd: i64,
+    tip: &[u8],
+) {
+    sqlx::query(
+        "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+            state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+            payload_sha256_canonical, unsigned_xml_sha256, server_fiscal_no) \
+         VALUES (?, ?, ?, ?, 'SELL', 'SENT', 'b1', 't1', 'ONLINE', \
+            '2026-07-17T12:00:00Z', '{}', ?, ?, 'F-PRED')",
+    )
+    .bind(vec![doc_byte; 16])
+    .bind(vec![doc_byte ^ 0xFF; 16])
+    .bind(fscl)
+    .bind(lnd)
+    .bind(vec![0u8; 32])
+    .bind(tip)
+    .execute(pool)
+    .await
+    .expect("seed issued predecessor");
+    sqlx::query("UPDATE node_state SET last_known_unsigned_xml_sha256 = ? WHERE fiscal_number = ?")
+        .bind(tip)
+        .bind(fscl)
+        .execute(pool)
+        .await
+        .expect("pin node_state chain tip");
+}
+
 // ───────────────────────────── oc01 accepted online ──────────────────────────
 
 #[tokio::test]
@@ -276,7 +393,11 @@ async fn oc04_mac_reseed_installs_operator_seed_and_manual() {
     let (_d, pool) = fresh_pool().await;
     let fscl = "5000000004";
     let doc = seed_doc(&pool, fscl, 0x11, "SELL", None).await;
-    held_pending(&pool, 0x01, doc, fscl).await;
+    // A real `-12` MacReseedPending hold, with an issued predecessor whose chain tip is the seed
+    // the operator installs (OPSEED). MacReseed hardening: the seed must equal the last-issued tip
+    // AND the hold must be MacReseedPending — both hold here, so the happy path still installs it.
+    seed_issued_predecessor(&pool, fscl, 0x10, 0x10, &OPSEED).await;
+    held_macreseed_pending(&pool, 0x01, doc, fscl).await;
     let r = complete(&pool, 0x01, OperatorResolution::MacReseed { seed: OPSEED })
         .await
         .expect("MAC reseed completes");
@@ -294,6 +415,77 @@ async fn oc04_mac_reseed_installs_operator_seed_and_manual() {
         read_apply_state(&pool, 0x01).await.as_deref(),
         Some("APPLIED")
     );
+}
+
+// ───────── oc23 MacReseed on a non-MacReseedPending hold refused (guard A) ─────────
+//
+// MacReseed hardening (prod finding 2026-07-24): the fuzzer drove `MacReseed` on a NoResponse /
+// crash hold (node_effect = NoNodeEffect) — NOT a `-12` MacReseedPending hold — and prod installed
+// the operator seed anyway, silently re-basing the chain (a later `invariant_scan`
+// ChainSeedMismatch, no fail-closed). Now fail-closed BEFORE any mutation.
+#[tokio::test]
+async fn oc23_mac_reseed_on_non_macreseedpending_hold_refused_nothing_mutated() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5000000023";
+    let doc = seed_doc(&pool, fscl, 0x11, "SELL", None).await;
+    held_pending(&pool, 0x01, doc, fscl).await; // NoResponse / NoNodeEffect crash hold
+    let err = complete(&pool, 0x01, OperatorResolution::MacReseed { seed: OPSEED })
+        .await
+        .expect_err("MacReseed on a non-MacReseedPending hold must be refused");
+    assert!(
+        is_err(&err, |e| matches!(
+            e,
+            CompletionError::MacReseedHoldMismatch
+        )),
+        "expected MacReseedHoldMismatch, got {err:?}"
+    );
+    // Nothing mutated — seed absent, doc still SENDING, reservation still PENDING under STOP.
+    assert!(read_seed(&pool, fscl).await.is_none(), "seed unchanged");
+    assert_eq!(read_doc_state(&pool, 0x11).await, "SENDING");
+    assert_eq!(
+        read_apply_state(&pool, 0x01).await.as_deref(),
+        Some("PENDING_APPLY")
+    );
+    assert!(read_pointer(&pool, fscl).await.is_some(), "pointer intact");
+    assert_eq!(read_mode(&pool, fscl).await, "STOP_MODE");
+}
+
+// ───────── oc24 MacReseed seed not matching the chain tip refused (guard B) ─────────
+//
+// MacReseed hardening: even on a valid `-12` MacReseedPending hold, an operator seed that does not
+// equal the last-issued chain tip re-bases `node_state` to an unrelated value (a durable
+// ChainSeedMismatch). Now fail-closed BEFORE any mutation.
+#[tokio::test]
+async fn oc24_mac_reseed_wrong_seed_refused_nothing_mutated() {
+    let (_d, pool) = fresh_pool().await;
+    let fscl = "5000000024";
+    let doc = seed_doc(&pool, fscl, 0x11, "SELL", None).await;
+    seed_issued_predecessor(&pool, fscl, 0x10, 0x10, &PRED_TIP).await; // chain tip = PRED_TIP
+    held_macreseed_pending(&pool, 0x01, doc, fscl).await;
+    // OPSEED != PRED_TIP → the operator seed does not match the expected chain tip.
+    let err = complete(&pool, 0x01, OperatorResolution::MacReseed { seed: OPSEED })
+        .await
+        .expect_err("a MacReseed seed != the chain tip must be refused");
+    assert!(
+        is_err(&err, |e| matches!(
+            e,
+            CompletionError::MacReseedSeedMismatch
+        )),
+        "expected MacReseedSeedMismatch, got {err:?}"
+    );
+    // Nothing mutated — seed still the pinned tip, doc still SENDING, reservation PENDING under STOP.
+    assert_eq!(
+        read_seed(&pool, fscl).await.as_deref(),
+        Some(&PRED_TIP[..]),
+        "seed unchanged (still the chain tip)"
+    );
+    assert_eq!(read_doc_state(&pool, 0x11).await, "SENDING");
+    assert_eq!(
+        read_apply_state(&pool, 0x01).await.as_deref(),
+        Some("PENDING_APPLY")
+    );
+    assert!(read_pointer(&pool, fscl).await.is_some(), "pointer intact");
+    assert_eq!(read_mode(&pool, fscl).await, "STOP_MODE");
 }
 
 // ───────────────────── oc05 GOING_ONLINE with active drain ────────────────────
