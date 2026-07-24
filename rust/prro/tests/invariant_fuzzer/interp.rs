@@ -693,6 +693,46 @@ impl FuzzCtx {
         v
     }
 
+    /// CS-3 (C-iii) — the FN's docs as `(lnd, state)` ordered by lnd, for asserting the durable
+    /// OLA-cohort effects of a `NotAcceptedOffline` completion (later `OFFLINE_LOCAL_ACK` successors
+    /// → `CANCELLED`; the held doc → `RMR`).
+    pub async fn read_doc_states_by_lnd(&self) -> Vec<(i64, String)> {
+        sqlx::query_as(
+            "SELECT lnd, state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd ASC",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// CS-3 (C-iii) — a doc's immutable `previous_hash` (the chain tip it chained onto at issuance),
+    /// keyed by `request_id`. A `NotAcceptedOffline` completion rewinds `node_state`'s seed to the
+    /// held doc's own `previous_hash` (`Some(prev)` → predecessor tip, `None` → genesis).
+    pub async fn read_previous_hash(&self, request_id: &[u8; 16]) -> Option<Vec<u8>> {
+        sqlx::query_scalar(
+            "SELECT previous_hash FROM fiscal_documents WHERE fiscal_number = ? AND request_id = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&request_id[..])
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// CS-3 (C-iii) test setup — force a doc (by lnd) into an ISSUED state, realizing the fork-guard
+    /// precondition: a `NotAcceptedOffline` completion on an earlier held doc must REFUSE (fork guard —
+    /// a later ISSUED successor cannot be rewound away) rather than cancel it.
+    pub async fn force_doc_state_by_lnd(&self, lnd: i64, state: &str) {
+        sqlx::query("UPDATE fiscal_documents SET state = ? WHERE fiscal_number = ? AND lnd = ?")
+            .bind(state)
+            .bind(self.fn_id.as_str())
+            .bind(lnd)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+    }
+
     /// CS-3 MacReseed (task #18 (B)) — the FN's last-issued chain tip, the value guard B validates
     /// the operator's `-12` MacReseed seed against (`fiscal_documents::last_issued_unsigned_xml_sha256`,
     /// the SHARED `is_issued` projection `invariant_scan` walks to). A directed MacReseed VALID-path

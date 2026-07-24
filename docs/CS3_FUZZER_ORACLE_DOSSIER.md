@@ -416,3 +416,35 @@ prod FROZEN (0 src diff); no model change (reuses C-i's `offline_held_witness`).
 - **Verification:** fuzzer **158/158** (was 154; +4 teeth); fmt + clippy `-D` clean; prod FROZEN.
   Large-N (`FUZZ_CASES=4096`) generative capstones re-run — the drain held-witness check now fires at
   scale on both lanes without false-RED.
+
+### 🟡 (C-iii) NotAcceptedOffline OLA-cohort cancel + chain rewind — DIRECTED slice (generative deferred)
+
+Task #18 (C) sub-part (iii), "the hard one". This lands the DIRECTED slice; the GENERATIVE arm is a
+documented follow-on (below). Test-side only; prod FROZEN (0 src diff).
+
+- **Empirical ground truth (probe, removed):** cohort `2×OfflineSell → GoOnline([Reject])` holds the
+  offline-origin `OFFLINE_SESSION_BEGIN` (lnd 1) with two later `OFFLINE_LOCAL_ACK` SELL successors
+  (lnd 2, 3). A real `OperatorComplete(NotAcceptedOffline)` on the held doc → `Released(APPLIED /
+  GOING_ONLINE / fence-clear / RMR)`; durably: **held doc → RMR**, **lnd 2 & 3 → CANCELLED**, node
+  seed **rewound `Some([17,…]) → None`** (the held doc is lnd 1, so its `previous_hash` is genesis).
+  Confirms the prod machinery (`delivery_reservation.rs` `offline_cohort_cleanup` + rewind to the
+  doc's own `previous_hash`) verbatim.
+- **Teeth (2 directed e2e):** `directed_not_accepted_offline_cancels_cohort_and_rewinds` — asserts the
+  full gap-4b effect against the REAL ledger (held→RMR; later OLA successors→CANCELLED; seed==held
+  doc's `previous_hash` AND seed actually moved) + the INDEPENDENT `released_witness`.
+  `directed_not_accepted_offline_refuses_on_later_issued_successor` — **fork guard**: force a later
+  successor (lnd 3) ISSUED (`SENT`), then `NotAcceptedOffline` must REFUSE (`LaterSuccessorIssued`) and
+  mutate NOTHING (cohort + seed intact — the tx rolls back). **Canary personally proven:** expecting a
+  successor to stay `OFFLINE_LOCAL_ACK` → RED `left (2,"CANCELLED") != right (2,"OFFLINE_LOCAL_ACK")`
+  (the assert reads real prod) → reverted. New test-side interp accessors: `read_doc_states_by_lnd`,
+  `read_previous_hash`, `force_doc_state_by_lnd`.
+- **⚠️ Latent model imprecision (documented, NOT wired — the generative blocker):**
+  `model::apply_operator_complete` marks `NotAcceptedOffline` `advances_seed=false` (seed UNCHANGED),
+  but prod REWINDS the seed (`Some → previous_hash`) — a CHANGE. Unexercised (NotAcceptedOffline is
+  generator-excluded; the directed teeth use `released_witness` + direct DB asserts, not
+  `apply_operator_complete`). **A generative NotAcceptedOffline increment MUST first fix this** (model
+  the rewind: seed → the held doc's `previous_hash`) AND teach the model to predict the OLA-cohort
+  cancellation for arbitrary prehistories, THEN remove the `strategy.rs` exclusion + wire the
+  cohort/rewind oracle into `run_harness`. That is the genuinely-hard remaining work; the directed
+  slice here pins the CONTRACT so the generative model has a verified target.
+- **Verification:** fuzzer **160/160** (was 158; +2 teeth); fmt + clippy `-D` clean; prod FROZEN.

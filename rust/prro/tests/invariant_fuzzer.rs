@@ -1932,6 +1932,110 @@ async fn harness_offline_drain_reject_fires_held_witness_check() {
     .await;
 }
 
+// ── CS-3 (C-iii) NotAcceptedOffline RELEASE: OLA-cohort cancel + chain rewind + fork guard ────────
+
+/// Build the C-iii cohort: an offline-open-shift FN with a HELD offline-origin doc (the drain-rejected
+/// `OFFLINE_SESSION_BEGIN`, lnd 1) and two LATER `OFFLINE_LOCAL_ACK` SELL successors (lnd 2, 3) in the
+/// same session. Returns `(ctx, held_request_id)`.
+async fn build_offline_cohort_with_held_begin() -> (interp::FuzzCtx, [u8; 16]) {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(5).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // BEGIN lnd1 + SELL lnd2 (OLA)
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await; // SELL lnd3 (OLA)
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::send_then_reject())).await; // holds BEGIN lnd1
+    let (_res, held_rid) = ctx
+        .active_held_reservation()
+        .await
+        .expect("the drain HOLDS the offline-origin BEGIN (lnd1)");
+    (ctx, held_rid)
+}
+
+/// CS-3 (C-iii) [end-to-end] — an operator `NotAcceptedOffline` on an OFFLINE-origin held doc RELEASES
+/// with the full gap-4b effect: (1) the held doc → RMR; (2) every LATER `OFFLINE_LOCAL_ACK` cohort
+/// successor in the session → CANCELLED (fork guard — they chained onto a now-rewound-away tip);
+/// (3) `node_state`'s chain seed is REWOUND to the held doc's own immutable `previous_hash`
+/// (here genesis → NULL, since the held doc is lnd 1); (4) the release witness is APPLIED / fence-clear
+/// / un-halted (GOING_ONLINE — an active offline session must still drain). All read from the REAL
+/// ledger; the model's release-witness is INDEPENDENT (`released_witness`). CANARY: expecting the
+/// successors to remain `OFFLINE_LOCAL_ACK`, or the seed unchanged, REDs (the assertions read real prod).
+#[tokio::test]
+async fn directed_not_accepted_offline_cancels_cohort_and_rewinds() {
+    use OperatorResolutionKind::NotAcceptedOffline;
+    let (mut ctx, held_rid) = build_offline_cohort_with_held_begin().await;
+    // Capture the held doc's previous_hash + the advanced seed BEFORE completion.
+    let held_prev_hash = ctx.read_previous_hash(&held_rid).await; // genesis → None
+    let seed_before = ctx.read_seed().await;
+    assert!(
+        seed_before.is_some(),
+        "the offline issuances advanced the local seed before the rewind"
+    );
+    // Complete NotAcceptedOffline — offline-origin held → RELEASE (the cross-check passes).
+    let out = interp::run_op(&mut ctx, &Op::OperatorComplete(NotAcceptedOffline)).await;
+    match out {
+        interp::RealOutcome::Released(obs) => {
+            let expected = model::released_witness(NotAcceptedOffline, false, true, false)
+                .expect("offline-origin NotAcceptedOffline RELEASES (not refused)");
+            oracle::check_release_witness(&obs, &expected)
+                .unwrap_or_else(|d| panic!("NotAcceptedOffline release witness: {d:?}"));
+        }
+        other => panic!("expected a Released outcome, got {other:?}"),
+    }
+    // (1)+(2) durable cohort: held doc → RMR; later OLA successors → CANCELLED.
+    assert_eq!(
+        ctx.read_doc_states_by_lnd().await,
+        vec![
+            (1, "REQUIRES_MANUAL_RECONCILIATION".to_string()),
+            (2, "CANCELLED".to_string()),
+            (3, "CANCELLED".to_string()),
+        ],
+        "held BEGIN → RMR; later OFFLINE_LOCAL_ACK successors → CANCELLED"
+    );
+    // (3) chain rewind: node seed == the held doc's own previous_hash (genesis → None here). The seed
+    // MUST have actually changed (Some → None) — a no-op would be a fork (successors cancelled but the
+    // tip still names this doc's advance).
+    assert_eq!(
+        ctx.read_seed().await,
+        held_prev_hash,
+        "seed rewound to the held doc's previous_hash"
+    );
+    assert_ne!(
+        ctx.read_seed().await,
+        seed_before,
+        "the rewind actually moved the seed (Some → None)"
+    );
+}
+
+/// CS-3 (C-iii) [end-to-end, fork guard] — the OLA-cohort cleanup is FAIL-CLOSED: if a LATER successor
+/// is ISSUED (advanced the local MAC seed at OLA), rewinding this predecessor would fork the live
+/// chain, so `NotAcceptedOffline` must REFUSE (`LaterSuccessorIssued`) and mutate NOTHING (the whole tx
+/// rolls back). Forces lnd 3 to an ISSUED state (`SENT`), then asserts the completion is Refused AND
+/// the held doc + cohort + seed are all INTACT. CANARY: were prod to cancel-through the issued
+/// successor (a fork), the doc-state / seed asserts would RED.
+#[tokio::test]
+async fn directed_not_accepted_offline_refuses_on_later_issued_successor() {
+    use OperatorResolutionKind::NotAcceptedOffline;
+    let (mut ctx, _held_rid) = build_offline_cohort_with_held_begin().await;
+    // Realize the fork-guard precondition: a later successor (lnd3) is ISSUED.
+    ctx.force_doc_state_by_lnd(3, "SENT").await;
+    let states_before = ctx.read_doc_states_by_lnd().await;
+    let seed_before = ctx.read_seed().await;
+    let out = interp::run_op(&mut ctx, &Op::OperatorComplete(NotAcceptedOffline)).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Refused(_)),
+        "a later ISSUED successor must FAIL the NotAcceptedOffline completion closed, got {out:?}"
+    );
+    // Nothing mutated: cohort + seed intact (the tx rolled back).
+    assert_eq!(
+        ctx.read_doc_states_by_lnd().await,
+        states_before,
+        "a refused fork-guard completion must leave the cohort UNCHANGED"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "a refused fork-guard completion must NOT rewind the seed"
+    );
+}
+
 // ── CS-3 at-most-one-active-reservation (Increment 2) ────────────────────────
 
 /// CS-3 Increment 2 [end-to-end] — at most ONE active delivery reservation per FN. An issued ACK
