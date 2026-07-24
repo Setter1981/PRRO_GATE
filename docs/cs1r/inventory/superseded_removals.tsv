@@ -13,11 +13,10 @@
 # (module in manifest form, e.g. `prro::write_path_dps_error_routing`).
 #
 # NOTE: the per-base-exact rule (control 2) means this registry lists ONLY removals that are real
-# vs the CURRENT PR base (origin/main). The 15 CS-3 S7-1 (#336) rows were pruned here: #336 is now
-# merged into main, so its removals are no longer removals-vs-base (they would read STALE). Their
-# supersession record lives in the #336 commit (224ad46) + this file's git history.
-#
-# ── CS-3 Slice E Pin 2 (Track A total projection): 3 inline pins retired-and-replaced ──
-prro	services::write_path::stage_send::tests::f3_remote_status_projects_probe_required_from_evidence_not_legacy	prro	services::write_path::stage_send::tests::wire_decision_from_locks_authority_tuple	F3 RemoteAuthStatus divergent-leaf projection subsumed by the TOTAL wire_decision_from authority-tuple pin (RemoteAuthStatus row); project_decision_from_evidence deleted
-prro	services::write_path::stage_send::tests::f3_unknown_nonzero_projects_transient_retry_from_evidence_not_legacy	prro	services::write_path::stage_send::tests::wire_decision_from_locks_authority_tuple	F3 UnknownStatus divergent-leaf projection subsumed by the TOTAL wire_decision_from authority-tuple pin (UnknownStatus row); project_decision_from_evidence deleted
-prro	services::write_path::error_routing::tests::s7_target_wire_decision_maps_empty_sfn_to_held_not_sent	prro::write_path_stage4_send	empty_server_fiscal_no_routes_to_typed_error_no_4b_persist	target_wire_decision + ok_but_no_fiscal_number_routing retired as dead code (empty-SFN is now the STRUCTURAL OkButNoFiscalNumber evidence leaf in wire_decision_from); coverage is the end-to-end empty-SFN OkButNoFiscalNumber HELD test
+# vs the CURRENT PR base (origin/main). A row is PRUNED here once its PR merges into main — a merged
+# removal is no longer a removal-vs-base and would read STALE. Pruned so far:
+#   * 15 CS-3 S7-1 (#336) rows — record in commit 224ad46;
+#   * 3 CS-3 Slice E Pin 2 (#337) rows — record in the #337 merge (origin/main 5360ecf4).
+# Their supersession records live in those commits + this file's git history. The registry is
+# currently EMPTY (no removals pending vs origin/main); the gate handles that (see the
+# empty-registry guard in inventory_gate.sh + the teeth in inventory_gate_teeth.sh).

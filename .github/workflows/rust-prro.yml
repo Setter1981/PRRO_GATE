@@ -68,6 +68,20 @@ jobs:
     name: x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
 
+    # Serial compile+link (one codegen/link job at a time). The ubuntu-latest
+    # runner (~7 GB) intermittently OOMs the `lld` linker
+    # (`ld terminated with signal 7 [Bus error], core dumped`) when linking the
+    # ~200 workspace test binaries in parallel, failing this REQUIRED context
+    # non-deterministically — observed 4/5 link attempts on PR #338, in BOTH the
+    # `Test` step and the inventory-gate `nextest list`, always on unrelated
+    # binaries (`cert_refresher_smoke`, `live_dps_extended_smoke`, …). `-j1` caps
+    # peak link memory deterministically. Scoped to THIS heavy x86 job only;
+    # nextest RUNTIME parallelism is untouched (the OOM is at LINK, before any
+    # test runs). If serial build later hits the step timeout, raise the timeout
+    # before reintroducing parallelism.
+    env:
+      CARGO_BUILD_JOBS: "1"
+
     steps:
       # fetch-depth: 0 — the CS-1R R1 provenance test (`cs1_test_provenance`)
       # shells `git show f2c17b1:… / f2628ba:…` to compare the CS-1 base/head

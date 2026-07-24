@@ -97,7 +97,12 @@ if [ "${1:-}" = "--pr" ]; then
   # Approved (removed_module, removed_test) identities from the registry.
   # Columns (TAB): removed_module  removed_test  repl_module  repl_test  reason
   if [ -f "$REGISTRY" ]; then
-    grep -vE '^[[:space:]]*(#|$)' "$REGISTRY" | cut -f1,2 | sort -u > "$TMP/approved_ident.tsv"
+    # `|| true`: an EMPTY registry (all-comments — zero removals pending vs base) is a legitimate
+    # state; `grep -v` then exits 1 and would abort under `set -euo pipefail`. Match the empty
+    # approved-set the missing-file else-branch produces (any real removal is still caught as
+    # unapproved below — this cannot weaken the gate; proven by inventory_gate_teeth.sh).
+    { grep -vE '^[[:space:]]*(#|$)' "$REGISTRY" || true; } | cut -f1,2 | sort -u \
+      > "$TMP/approved_ident.tsv"
   else
     : > "$TMP/approved_ident.tsv"
   fi
