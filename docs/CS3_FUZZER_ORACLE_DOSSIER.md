@@ -268,3 +268,20 @@ pinned generative seed (`tests/invariant_fuzzer.regressions`). Fuzzer **143/143*
    seed matches no doc, e.g. a generator-excluded MacReseed rebase). Tooth
    `harness_online_operator_accepted_after_badhashprev_hold_seed_advance` (**canary proven**: revert
    `tip_lnd` to `max(lnd)` → seed-advance RED).
+
+### (B) MacReseed directed teeth — #338 guard A/B conformance
+
+The MacReseed seed-validation finding (above, "Production findings") landed as prod hardening #338
+(two fail-closed guards in `complete_operator_pending`). The fuzzer now MIRRORS the prod teeth
+`oc23`/`oc24` through its REAL seam. MacReseed stays generator-EXCLUDED (needs the operator's corrected
+chain seed) → directed-only via `interp::operator_complete_macreseed(ctx, seed)` (explicit seed, not
+the `[0x5a;32]` placeholder) + `FuzzCtx::last_issued_tip`. Model contract:
+`model::macreseed_completion_releases(online_origin, hold_is_macreseed_pending, seed_matches_tip)` —
+releases iff all three hold, INDEPENDENT of prod. Four teeth: the model contract [pure]; the VALID
+reseed (seed==tip on a MacReseedPending hold → doc RMR, fence clear, node un-halted, scan clean); guard
+A (non-MacReseedPending hold → `MacReseedHoldMismatch`, hold intact, seed unchanged); guard B (seed≠tip
+→ `MacReseedSeedMismatch`, hold intact, seed unchanged = no ChainSeedMismatch). **Both guard teeth
+canary-proven**: neutralize guards A+B in prod → both RED (Released, not refused) → restore (prod
+pristine). Subtlety: guard B only accepts `seed == local last-issued tip`, so a valid reseed is a
+value no-op — the model's generative `apply_operator_complete` still marks MacReseed `advances_seed=true`
+(unexercised: generator-excluded), a documented latent model imprecision, not wired.

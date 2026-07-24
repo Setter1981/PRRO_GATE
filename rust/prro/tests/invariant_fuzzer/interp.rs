@@ -663,6 +663,21 @@ impl FuzzCtx {
         v
     }
 
+    /// CS-3 MacReseed (task #18 (B)) — the FN's last-issued chain tip, the value guard B validates
+    /// the operator's `-12` MacReseed seed against (`fiscal_documents::last_issued_unsigned_xml_sha256`,
+    /// the SHARED `is_issued` projection `invariant_scan` walks to). A directed MacReseed VALID-path
+    /// test supplies THIS as the operator seed (in reality the operator supplies the DPS-assigned tip).
+    /// `None` if no doc has issued yet.
+    pub async fn last_issued_tip(&self) -> Option<[u8; 32]> {
+        prro::db::repositories::fiscal_documents::last_issued_unsigned_xml_sha256(
+            &self.pool,
+            self.fn_id.as_str(),
+        )
+        .await
+        .unwrap()
+        .map(|v| <[u8; 32]>::try_from(v.as_slice()).expect("chain tip is 32 bytes"))
+    }
+
     /// CS-3 Slice E — the REAL durable delivery-axis witness for a doc: the latest
     /// `delivery_reservation` attempt (joined by `request_id`) + the node's `mode` and FN fence
     /// pointer.  `None` ⇒ the doc has NO reservation row (a pre-send / invalid-ingress refusal never
@@ -1124,6 +1139,33 @@ async fn operator_complete(ctx: &mut FuzzCtx, kind: OperatorResolutionKind) -> R
         ctx.fn_id.as_str(),
         reservation_id,
         resolution,
+    )
+    .await
+    {
+        Ok(_) => RealOutcome::Released(ctx.read_release_witness(&rid).await),
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// CS-3 MacReseed directed driver (task #18 (B)) — drive the REAL `resolve_operator_pending` with an
+/// operator-supplied `MacReseed { seed }` against the FN's active held reservation, using an EXPLICIT
+/// seed (NOT the `[0x5a; 32]` placeholder in `operator_complete`). MacReseed is generator-EXCLUDED (it
+/// needs the operator's CORRECTED chain seed), so it is DIRECTED-only: the valid-path test supplies
+/// `last_issued_tip` (guards A+B pass), the guard-B test a wrong seed, the guard-A test drives it on a
+/// non-`MacReseedPending` hold.  Mirrors the prod teeth `operator_completion::oc23`/`oc24` through the
+/// fuzzer's REAL seam.  A no-op refusal when no held reservation rests.
+pub async fn operator_complete_macreseed(ctx: &FuzzCtx, seed: [u8; 32]) -> RealOutcome {
+    use prro::db::repositories::delivery_reservation::OperatorResolution;
+    let Some((reservation_id, rid)) = ctx.active_held_reservation().await else {
+        return RealOutcome::Refused(
+            "operator_complete_macreseed: no held reservation rests".into(),
+        );
+    };
+    match prro::admin::resolve_operator_pending(
+        &ctx.pool,
+        ctx.fn_id.as_str(),
+        reservation_id,
+        OperatorResolution::MacReseed { seed },
     )
     .await
     {

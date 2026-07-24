@@ -1439,6 +1439,133 @@ async fn held_reservation_survives_reboot_then_operator_releases() {
     .await;
 }
 
+// ── CS-3 MacReseed directed teeth (task #18 (B)) — mirror prod oc23/oc24 ─────
+
+/// CS-3 MacReseed [pure] — the INDEPENDENT model contract: a `-12` MacReseed completion RELEASES iff
+/// ALL three prod gates hold (ONLINE origin + a `MacReseedPending` hold + seed == last-issued tip);
+/// any one failing is a fail-closed refusal. Mirrors `delivery_reservation.rs` guard A (:1393) /
+/// guard B (:1408) + the origin cross-check (:1378).
+#[test]
+fn macreseed_completion_releases_iff_online_macreseed_hold_and_seed_matches_tip() {
+    use model::macreseed_completion_releases as releases;
+    assert!(
+        releases(true, true, true),
+        "online MacReseedPending hold + seed==tip → releases"
+    );
+    assert!(
+        !releases(true, false, true),
+        "hold != MacReseedPending → guard A refuses"
+    );
+    assert!(
+        !releases(true, true, false),
+        "seed != tip → guard B refuses"
+    );
+    assert!(
+        !releases(false, true, true),
+        "OFFLINE-origin MacReseed → origin cross-check refuses"
+    );
+}
+
+/// CS-3 MacReseed [end-to-end] VALID path — an operator `-12` MacReseed on a `MacReseedPending`
+/// (BadHashPrev) hold, with the seed == the last-issued chain tip, RELEASES: doc → RMR, fence cleared,
+/// node un-halted (anti-BRICK), seed re-based to the tip, scan clean. Proves the #338 guards do NOT
+/// over-reject a LEGITIMATE reseed. Setup: a prior issued sell (the predecessor tip) + a BadHashPrev
+/// sell (the MacReseedPending hold). **Canary:** revert guard B in prod → the valid reseed would still
+/// release (this stays green), but the guard-B tooth REDs; revert the RMR mapping → this REDs.
+#[tokio::test]
+async fn macreseed_valid_seed_equals_tip_releases_to_rmr() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await; // predecessor tip
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::bad_hash_prev())).await; // MacReseedPending hold
+    let rid = ctx.last_request_id().expect("held sell recorded");
+    let tip = ctx
+        .last_issued_tip()
+        .await
+        .expect("a predecessor issued → tip is Some");
+    let out = interp::operator_complete_macreseed(&ctx, tip).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Released(_)),
+        "a valid MacReseed (seed==tip, MacReseedPending hold) must release, got {out:?}"
+    );
+    let rel = ctx.read_release_witness(&rid).await;
+    assert_eq!(rel.apply_state, "APPLIED");
+    assert_eq!(
+        rel.doc_state, "REQUIRES_MANUAL_RECONCILIATION",
+        "MacReseed resolves the held doc to RMR"
+    );
+    assert!(!rel.fence_held, "the FN fence is cleared");
+    assert_ne!(
+        rel.node_mode, "STOP_MODE",
+        "the node is un-halted (anti-BRICK)"
+    );
+    assert_eq!(
+        ctx.read_seed().await.as_deref(),
+        Some(&tip[..]),
+        "the seed is re-based to the operator tip"
+    );
+    oracle::assert_clean(&ctx.pool).await;
+}
+
+/// CS-3 MacReseed [end-to-end] guard A — a MacReseed on a NON-`MacReseedPending` hold (an
+/// UnknownStatus / ProbeRequired hold) is fail-closed `MacReseedHoldMismatch` BEFORE any mutation: the
+/// hold is fully intact and the seed unchanged. Guard A precedes guard B, so any seed triggers it.
+/// **Canary:** revert guard A in prod (`delivery_reservation.rs:1393`) → prod installs the operator
+/// seed on a hold that never asked for a reseed → this REDs (a release, not a refusal).
+#[tokio::test]
+async fn macreseed_on_non_macreseed_hold_refused_hold_intact() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::unknown_status(-4))).await; // ProbeRequired hold
+    let rid = ctx.last_request_id().expect("held sell recorded");
+    let before = ctx.read_held_witness(&rid).await.expect("a hold rests");
+    let seed_before = ctx.read_seed().await;
+    let out = interp::operator_complete_macreseed(&ctx, [0x11; 32]).await;
+    assert!(
+        matches!(&out, interp::RealOutcome::Refused(e) if e.contains("only valid for a MacReseedPending")),
+        "MacReseed on a non-MacReseedPending hold must be MacReseedHoldMismatch, got {out:?}"
+    );
+    assert_eq!(
+        ctx.read_held_witness(&rid).await.as_ref(),
+        Some(&before),
+        "the refused completion mutated the held reservation"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "the refused completion advanced the seed"
+    );
+}
+
+/// CS-3 MacReseed [end-to-end] guard B — a MacReseed on a valid `MacReseedPending` hold but with a
+/// seed != the last-issued tip is fail-closed `MacReseedSeedMismatch` BEFORE any mutation: the hold is
+/// intact and the seed unchanged. The unchanged seed IS the "no ChainSeedMismatch" guarantee (a wrong
+/// seed would re-base `node_state` to a value unrelated to the chain — the prod defect #338 fixed).
+/// **Canary:** revert guard B in prod (`delivery_reservation.rs:1408`) → prod re-bases the seed to the
+/// bogus value → this REDs (a release + a moved seed, not a refusal).
+#[tokio::test]
+async fn macreseed_wrong_seed_refused_hold_intact_seed_unchanged() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await; // predecessor tip
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::bad_hash_prev())).await; // MacReseedPending hold
+    let rid = ctx.last_request_id().expect("held sell recorded");
+    let before = ctx.read_held_witness(&rid).await.expect("a hold rests");
+    let seed_before = ctx.read_seed().await;
+    let out = interp::operator_complete_macreseed(&ctx, [0x5a; 32]).await; // != the real tip
+    assert!(
+        matches!(&out, interp::RealOutcome::Refused(e) if e.contains("does not match the expected chain tip")),
+        "MacReseed with seed != tip must be MacReseedSeedMismatch, got {out:?}"
+    );
+    assert_eq!(
+        ctx.read_held_witness(&rid).await.as_ref(),
+        Some(&before),
+        "the refused completion mutated the held reservation"
+    );
+    assert_eq!(
+        ctx.read_seed().await,
+        seed_before,
+        "the refused completion advanced the seed (would be a ChainSeedMismatch)"
+    );
+}
+
 // ── CS-3 held-leaf expansion: Superseded + BadHashPrev (Increment 3) ─────────
 
 /// CS-3 Increment 3 [pure] — the Superseded leaf's DURABLE routing class is `TransientRetry` (the

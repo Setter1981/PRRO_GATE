@@ -2068,3 +2068,19 @@ pub fn released_witness(
         doc_state,
     })
 }
+
+/// CS-3 MacReseed (task #18 (B)) — the INDEPENDENT model prediction of whether a `-12` MacReseed
+/// completion RELEASES the hold, composing the THREE prod fail-closed gates in
+/// `complete_operator_pending` (`delivery_reservation.rs`): the ORIGIN cross-check (MacReseed is
+/// ONLINE-origin only, :1378 `MacReseedNotOfflineDefined`), guard A (the hold's `node_effect` must be
+/// `MacReseedPending`, :1393 `MacReseedHoldMismatch`), and guard B (the operator seed must equal the
+/// last-issued chain tip, :1408 `MacReseedSeedMismatch`).  Encoded from the SPEC, NOT read from prod —
+/// the `macreseed_*` directed teeth prove the REAL seam agrees. All three must hold to release; any one
+/// failing is a fail-closed refusal BEFORE any mutation (hold intact, seed unchanged).
+pub fn macreseed_completion_releases(
+    online_origin: bool,
+    hold_is_macreseed_pending: bool,
+    seed_matches_tip: bool,
+) -> bool {
+    online_origin && hold_is_macreseed_pending && seed_matches_tip
+}
