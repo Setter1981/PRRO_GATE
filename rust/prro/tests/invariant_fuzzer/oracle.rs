@@ -51,6 +51,9 @@ pub enum OpClass {
     ExpectedNoIssuanceRow,
     /// A fault / recovery op — deferred to Task 5 (bounded postcond + re-sync).
     FaultOrRecovery,
+    /// CS-3 operator-completion (1b) — a release/refuse op. `run_harness` owns the comparison
+    /// (`check_release_witness` + the doc/seed/mode transition), NOT the per-doc differential.
+    Release,
 }
 
 /// A differential mismatch — carries a human-readable reason (the fuzzer reports
@@ -67,6 +70,7 @@ pub fn classify(expected: &ExpectedOutcome) -> OpClass {
         ExpectedOutcome::NoMutation => OpClass::ExpectedNoMutation,
         ExpectedOutcome::NoIssuanceRow => OpClass::ExpectedNoIssuanceRow,
         ExpectedOutcome::Fault => OpClass::FaultOrRecovery,
+        ExpectedOutcome::Release(_) => OpClass::Release,
     }
 }
 
@@ -87,6 +91,7 @@ pub fn check_differential(
 ) -> Result<(), Divergence> {
     match classify(expected) {
         OpClass::FaultOrRecovery => Ok(()), // Task 5 owns fault/recovery
+        OpClass::Release => Ok(()),         // 1b: run_harness owns the release comparison
         OpClass::PredictableMutating => {
             let m = match expected {
                 ExpectedOutcome::Mutated(m) => m,

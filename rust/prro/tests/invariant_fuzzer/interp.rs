@@ -743,6 +743,31 @@ impl FuzzCtx {
         .unwrap()
     }
 
+    /// CS-3 operator-completion (1b) — the FN's ACTIVE (`PENDING_APPLY`) held reservation as
+    /// `(reservation_id, request_id)`: the reservation the operator resolves + its doc's request_id
+    /// for the release-witness read.  `None` if no held reservation rests.  The fence enforces ≤1, so
+    /// this targets THE held reservation blocking the FN — independent of which doc was the last wire
+    /// op (a drain can hold a doc that is not the most-recent sell).
+    pub async fn active_held_reservation(&self) -> Option<([u8; 16], [u8; 16])> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT dr.reservation_id, fd.request_id \
+             FROM delivery_reservation dr \
+             JOIN fiscal_documents fd \
+               ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+             WHERE dr.fiscal_number = ? AND dr.apply_state = 'PENDING_APPLY' LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        row.map(|(r, q)| {
+            (
+                <[u8; 16]>::try_from(r.as_slice()).expect("reservation_id is 16 bytes"),
+                <[u8; 16]>::try_from(q.as_slice()).expect("request_id is 16 bytes"),
+            )
+        })
+    }
+
     /// CS-3 operator-completion — the `reservation_id` of the latest reservation attempt for a doc
     /// (keyed by `request_id`), the handle `resolve_operator_pending` completes.  `None` if the doc
     /// has no reservation row.
@@ -1067,26 +1092,16 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
 }
 
 /// CS-3 operator-completion — drive the REAL `admin::resolve_operator_pending` seam (the SOLE legal
-/// exit from a `PENDING_APPLY` + `STOP_MODE` HELD reservation — the eternal-BRICK guard) against the
-/// doc held by the most-recent wire op.  A no-op refusal when no held reservation rests (so the
-/// generator can emit it freely without a `prop_filter`).  On success reads back the durable
-/// `ReleasedWitness`; on a typed refusal (e.g. FN-mismatch) the hold is left intact (prod rolls the
-/// whole tx back) and the outcome is `Refused`.
+/// exit from a `PENDING_APPLY` HELD reservation — the eternal-BRICK guard) against the FN's ACTIVE
+/// held reservation (the fence enforces ≤1).  The operator resolves THE held reservation blocking
+/// the FN, NOT "the most-recent wire op's doc" — these can differ (a DRAIN can create a held
+/// reservation on a doc that is not the last direct sell).  A no-op refusal when no held reservation
+/// rests (so the generator can emit it freely without a `prop_filter`).  On success reads back the
+/// durable `ReleasedWitness`; on a typed refusal (e.g. FN-mismatch) the hold is left intact.
 async fn operator_complete(ctx: &mut FuzzCtx, kind: OperatorResolutionKind) -> RealOutcome {
     use prro::db::repositories::delivery_reservation::OperatorResolution;
-    let Some(rid) = ctx.last_request_id() else {
-        return RealOutcome::Refused("operator_complete: no prior wire op".into());
-    };
-    // Only a doc RESTING under a PENDING_APPLY reservation is completable.
-    let rests_held = ctx
-        .read_held_witness(&rid)
-        .await
-        .is_some_and(|h| h.apply_state == "PENDING_APPLY");
-    if !rests_held {
+    let Some((reservation_id, rid)) = ctx.active_held_reservation().await else {
         return RealOutcome::Refused("operator_complete: no held reservation rests".into());
-    }
-    let Some(reservation_id) = ctx.reservation_id_for_request(&rid).await else {
-        return RealOutcome::Refused("operator_complete: reservation vanished".into());
     };
     let resolution = match kind {
         // Accepted needs the operator-observed NON-EMPTY server fiscal number (prod validates only
