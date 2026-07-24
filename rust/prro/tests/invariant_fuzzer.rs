@@ -1357,6 +1357,30 @@ async fn directed_bad_hash_prev_held_witness_matches_real_reservation() {
     let _ = run_harness(&[Op::OnlineSell(DpsScript::bad_hash_prev())], ctx, model).await;
 }
 
+// ── CS-3 at-most-one-active-reservation (Increment 2) ────────────────────────
+
+/// CS-3 Increment 2 [end-to-end] — at most ONE active delivery reservation per FN. An issued ACK
+/// sell (its reservation RELEASED) followed by a HELD `UnknownStatus` sell (its reservation ACTIVE)
+/// leaves 2 reservation ROWS but only 1 ACTIVE at every settled point — `run_harness` asserts
+/// `active_reservation_count() <= 1` UNCONDITIONALLY after every op.  CANARY: broadening
+/// `active_reservation_count`'s predicate to `COUNT(*)` (all rows) makes the post-2nd-op count 2 →
+/// the harness REDs — proving both that the assertion catches `> 1` AND that the ACTIVE predicate
+/// correctly excludes the terminal (released) reservation.
+#[tokio::test]
+async fn directed_at_most_one_active_reservation_per_fn() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[
+            Op::OnlineSell(DpsScript::ack_path()),
+            Op::OnlineSell(DpsScript::unknown_status(-4)),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 /// Tier-1 slice 1 — online Z_REPORT is a genuine fuzzer op, not a side test:
 /// model predicts the Z doc and the shift transition, interpreter drives the
 /// production inline Z dispatcher, and the differential checks both.
@@ -2774,6 +2798,18 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 );
             }
         }
+
+        // CS-3 Increment 2 — at-most-one-ACTIVE delivery reservation per FN (double-issue guard).
+        // UNCONDITIONAL after every op (a HELD reservation is exactly when a second active row would
+        // be the fork, so this must NOT sit behind the `is_settled` gate). Prod enforces `<= 1` via
+        // the `ux_reservation_active` partial unique index (migration 035:53-55); a `> 1` on
+        // unmodified prod is a REAL double-issue finding, not a test bug.
+        let active_reservations = ctx.active_reservation_count().await;
+        assert!(
+            active_reservations <= 1,
+            "double-issue: {active_reservations} ACTIVE delivery reservations for the FN after \
+             {op:?} — at most one may be in-flight per FN (ux_reservation_active)"
+        );
 
         // Mode-INDEPENDENT AUD-K8-1 teeth (bounded-postcond on wire calls).
         // A drain re-tick on a `RequiresManualReconciliation` FN must make NO new
