@@ -198,16 +198,12 @@ non-first held doc; shift_state prediction on the completion — D2 in `run_harn
 
 ---
 
-## 6. `bd` finding (BLOCKED — env)
+## 6. `bd` finding — FILED
 
-`bd` is installed (`/home/setter/.local/bin/bd` v1.0.0) but its embedded-dolt DB manifest
-(`/home/setter/prro_gate/.beads/embeddeddolt/PRRO_GATE/.dolt/noms/manifest`) is `-rw------- root root`
-— unreadable as `setter` (uid 1000). Fix ownership (`sudo chown -R setter:setter .beads/embeddeddolt`)
-or file via the `!`-prefix, then:
+**`PRRO_GATE-2nk`** (P2, `bug`, open; labels `cs3` / `fuzzer-finding` / `invariant-scan`) — body = this
+doc; discovery context (branch `fuzzer-cs3-oracle`, commit `f5403279`) in its `context`. No
+`discovered-from` parent: the CS-3 fuzzer-oracle track has no bead (the sibling MacReseed fuzzer-finding
+is likewise untracked in `bd`); link it if a track bead is later created.
 
-```bash
-bd create "invariant_scan not cohort-cancel-aware: false ChainBreak+ChainSeedMismatch after NotAcceptedOffline cohort-cancel" \
-  --type bug --priority 1 \
-  --deps discovered-from:<task-18-cs3-fuzzer-oracle-bead> \
-  --body-file docs/CS3_INVARIANT_SCAN_COHORT_CANCEL_FINDING.md
-```
+(Env note for future sessions: `bd`'s embedded-dolt DB under `.beads/embeddeddolt` had been left
+`root`-owned — `bd` fails "permission denied" as `setter` until `sudo chown -R setter:setter .beads`.)
