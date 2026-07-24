@@ -54,7 +54,7 @@ use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
 use crate::common::scripted_dps::ScriptedDps;
 use crate::common::{det_signing_ctx, drain_test_guard};
-use crate::op::{DpsScript, L5Kind, Op, Stage, WireResponse};
+use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, Stage, WireResponse};
 
 /// A `(previous_hash, unsigned_xml_sha256)` chain-hash pair as read from a
 /// `fiscal_documents` row — both columns nullable.  Named to satisfy
@@ -123,6 +123,17 @@ pub struct ObservedHeld {
     pub fence_held: bool,
 }
 
+/// CS-3 operator-completion — the REAL durable witness read back AFTER a legal operator completion
+/// released a HELD reservation.  Compared against the model's independent
+/// [`crate::model::ReleasedWitness`] by [`crate::oracle::check_release_witness`].  DB-TEXT verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedRelease {
+    pub apply_state: String,
+    pub node_mode: String,
+    pub fence_held: bool,
+    pub doc_state: String,
+}
+
 /// What `run_op` observed for one op.
 #[derive(Debug, Clone)]
 pub enum RealOutcome {
@@ -148,6 +159,10 @@ pub enum RealOutcome {
         cash_on_hand_kop: i64,
         turnover_json: String,
     },
+    /// CS-3 operator-completion — a legal `resolve_operator_pending` released a HELD reservation;
+    /// carries the durable witness read back (`APPLIED` / fence-clear / node un-halted / doc
+    /// terminal).  The anti-BRICK oracle asserts this against the model's `ReleasedWitness`.
+    Released(ObservedRelease),
 }
 
 // ─── Race state threaded through `run_op` ───────────────────────────────────
@@ -711,6 +726,58 @@ impl FuzzCtx {
         self.last_row.as_ref().map(|r| r.request_id)
     }
 
+    /// CS-3 operator-completion — the `reservation_id` of the latest reservation attempt for a doc
+    /// (keyed by `request_id`), the handle `resolve_operator_pending` completes.  `None` if the doc
+    /// has no reservation row.
+    pub async fn reservation_id_for_request(&self, request_id: &[u8; 16]) -> Option<[u8; 16]> {
+        let id: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT dr.reservation_id \
+             FROM delivery_reservation dr \
+             JOIN fiscal_documents fd \
+               ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+             WHERE fd.fiscal_number = ? AND fd.request_id = ? \
+             ORDER BY dr.attempt_no DESC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&request_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        id.map(|v| <[u8; 16]>::try_from(v.as_slice()).expect("reservation_id is 16 bytes"))
+    }
+
+    /// CS-3 operator-completion — the REAL durable witness AFTER a legal completion: the reservation
+    /// `apply_state`, the node `mode` + FN-fence pointer, and the doc's terminal `state`.  Mirrors
+    /// `read_held_witness` (SAME JOIN + node_state read) but keyed for the release axes.
+    pub async fn read_release_witness(&self, request_id: &[u8; 16]) -> ObservedRelease {
+        let (apply_state, doc_state): (String, String) = sqlx::query_as(
+            "SELECT dr.apply_state, fd.state \
+             FROM delivery_reservation dr \
+             JOIN fiscal_documents fd \
+               ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+             WHERE fd.fiscal_number = ? AND fd.request_id = ? \
+             ORDER BY dr.attempt_no DESC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&request_id[..])
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let (mode, fence): (String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT mode, active_delivery_reservation_id FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        ObservedRelease {
+            apply_state,
+            node_mode: mode,
+            fence_held: fence.is_some(),
+            doc_state,
+        }
+    }
+
     /// B10 TEETH — verify the lazy-BEGIN two-doc chain is genuinely LINKED after a
     /// `b10_lazy_begin_interposed` op:
     ///   (a) BEGIN.previous_hash == the pre-op MAC tip (`prior_tip`);
@@ -978,6 +1045,52 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         Op::GoOnlineWithoutBacklog => go_online(ctx, &DpsScript(Vec::new())).await,
         Op::OfflineSellDuringGoingOnline => offline_sell_during_going_online(ctx).await,
         Op::SellWithClosedShift => sell_with_closed_shift(ctx).await,
+        Op::OperatorComplete(kind) => operator_complete(ctx, *kind).await,
+    }
+}
+
+/// CS-3 operator-completion — drive the REAL `admin::resolve_operator_pending` seam (the SOLE legal
+/// exit from a `PENDING_APPLY` + `STOP_MODE` HELD reservation — the eternal-BRICK guard) against the
+/// doc held by the most-recent wire op.  A no-op refusal when no held reservation rests (so the
+/// generator can emit it freely without a `prop_filter`).  On success reads back the durable
+/// `ReleasedWitness`; on a typed refusal (e.g. FN-mismatch) the hold is left intact (prod rolls the
+/// whole tx back) and the outcome is `Refused`.
+async fn operator_complete(ctx: &mut FuzzCtx, kind: OperatorResolutionKind) -> RealOutcome {
+    use prro::db::repositories::delivery_reservation::OperatorResolution;
+    let Some(rid) = ctx.last_request_id() else {
+        return RealOutcome::Refused("operator_complete: no prior wire op".into());
+    };
+    // Only a doc RESTING under a PENDING_APPLY reservation is completable.
+    let rests_held = ctx
+        .read_held_witness(&rid)
+        .await
+        .is_some_and(|h| h.apply_state == "PENDING_APPLY");
+    if !rests_held {
+        return RealOutcome::Refused("operator_complete: no held reservation rests".into());
+    }
+    let Some(reservation_id) = ctx.reservation_id_for_request(&rid).await else {
+        return RealOutcome::Refused("operator_complete: reservation vanished".into());
+    };
+    let resolution = match kind {
+        // Accepted needs the operator-observed NON-EMPTY server fiscal number (prod validates only
+        // non-empty, delivery_reservation.rs:1368) — a distinct test SFN literal.
+        OperatorResolutionKind::Accepted => OperatorResolution::Accepted {
+            fiscal_number: "5000000001".to_string(),
+        },
+        OperatorResolutionKind::NotAccepted => OperatorResolution::NotAccepted,
+        OperatorResolutionKind::NotAcceptedOffline => OperatorResolution::NotAcceptedOffline,
+        OperatorResolutionKind::MacReseed => OperatorResolution::MacReseed { seed: [0x5a; 32] },
+    };
+    match prro::admin::resolve_operator_pending(
+        &ctx.pool,
+        ctx.fn_id.as_str(),
+        reservation_id,
+        resolution,
+    )
+    .await
+    {
+        Ok(_) => RealOutcome::Released(ctx.read_release_witness(&rid).await),
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
 }
 
