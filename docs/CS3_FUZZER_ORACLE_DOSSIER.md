@@ -194,9 +194,10 @@ op Reboot changed the held reservation (before=Some(...) after=None)`.
    defer it behind the easier steps 3/4). Sub-parts, in the intended order: (i) ✅ **DONE** —
    origin-keying: `[Reject]` (online releases to REJECTED; offline-drain holds → RMR) encoded +
    proven, `[Ack,NotFound]` empirically shown to be a **non-divergence** (release-at-SEND both
-   origins) — see "(C-i) offline origin-keyed held witnesses" below; (ii) drain-produced HELD witness
-   (the held-witness oracle firing GENERATIVELY after a drain, not just a direct send — map MINOR-2);
-   (iii) `NotAcceptedOffline` cohort-cancel + chain rewind — LAST (the hard one).
+   origins) — see "(C-i) offline origin-keyed held witnesses" below; (ii) ✅ **DONE** — drain-produced
+   HELD witness fires GENERATIVELY in `run_harness` (routes OFFLINE lane through `offline_held_witness`,
+   pinning the delegation — see "(C-ii)" below); (iii) `NotAcceptedOffline` cohort-cancel + chain rewind
+   — LAST (the hard one).
 3. **Increment 2 part (b)** — fence-IDENTITY strengthening (P3): ✅ **DONE for the held-witness
    surface** (external-audit MAJOR fix — the `fence_held` axis + `active_held_reservation` now assert
    the fence NAMES this doc's reservation at the CURRENT `delivery_generation`, prod predicate
@@ -347,11 +348,10 @@ in the model (no prod `classify()` import). The probe was removed after; the val
   `run_harness` still uses `online_held_witness` on the online lane). The doc-type-agnostic claim
   (the probe/e2e drove the interposed `OFFLINE_SESSION_BEGIN`, not a `SELL`) was resolved sound: the
   `offline_reject_hold` predicate is keyed on `kind=="Rejected" && offline-origin`, NOT on doc_type.
-- **→ C-ii handoff note (Lens B MINOR):** the delegation arm (`_ => online_held_witness` for
-  Superseded/BadHashPrev/UnknownStatus/[Ack,Ack]/[Ack,NotFound]) is currently **sound-but-unpinned**
-  (no test exercises it; the 5 teeth only pass `[Reject]`/`[Ack,NotFound]`). When C-ii wires the
-  drain-produced held-witness oracle into the GENERATIVE `run_harness`, route the OFFLINE ops through
-  `offline_held_witness` (not `online_held_witness`) so the delegation branch gets real coverage.
+- **→ C-ii handoff note (Lens B MINOR) — ✅ RESOLVED in (C-ii) below:** the delegation arm
+  (`_ => online_held_witness` for Superseded/BadHashPrev/UnknownStatus/[Ack,Ack]/[Ack,NotFound]) was
+  sound-but-unpinned; (C-ii) now exercises it both directedly (3 e2e drain teeth) and generatively
+  (`run_harness` routes OFFLINE drains through `offline_held_witness`).
 
 ### ✅ (C-i) external cross-model audit — NO_GO → RESOLVED (fence authority + [Ack,NotFound] honesty)
 
@@ -385,3 +385,34 @@ findings, both **model/oracle-should-tighten, NOT a prod defect**, both fixed:
 - **Verification:** fuzzer **154/154** (was 152; +2 fence canaries); fmt + clippy `-D` clean; prod
   FROZEN (0 src diff). Large-N (`FUZZ_CASES=4096`) generative capstones re-run to re-validate the
   touched generative fence path.
+
+### ✅ (C-ii) drain-produced HELD witness — generative wiring + delegation pinned
+
+Task #18 (C) sub-part (ii) — the held-witness oracle now fires after a DRAIN, not only a direct send,
+and the OFFLINE lane routes through `offline_held_witness` (closing the Lens-B MINOR). Test-side only;
+prod FROZEN (0 src diff); no model change (reuses C-i's `offline_held_witness`).
+
+- **Delegation empirically pinned (probe, then removed).** A throwaway probe drove
+  `OfflineSell → GoOnline([leaf])` through the REAL `backlog_drain::drain` for the three DELEGATED
+  leaves and confirmed each drain-produced held witness MATCHES `offline_held_witness` (= the online
+  tuple), with `fence_held = true` (the C-i fence-authority predicate holds on a genuine drain hold):
+  `[Superseded]` → SUBMITTED_UNKNOWN/NO_RESPONSE/TransientRetry/NoNodeEffect/NoResponse/PENDING_APPLY/
+  STOP_MODE/fence; `[BadHashPrev]` → SUBMITTED/PARSED/MacRecovery/MacReseedPending/Rejected/…;
+  `[UnknownStatus(-4)]` → SUBMITTED_UNKNOWN/PARSED/ProbeRequired/ProbeRequired/UnknownStatus/code=-4/….
+  So the `_ => online_held_witness` delegation is now EXERCISED (Lens-B MINOR closed), not assumed.
+- **Generative wiring** (`run_harness`, post-match, arm-independent): after an `Op::GoOnline`/`Op::Drain`
+  that NEWLY produced a fence-authoritative held reservation (`held_res_before.is_none()` → a hold now
+  rests) AND whose leaf `offline_held_witness` encodes, assert the real persisted axes match. The
+  `held_res_before.is_none()` guard is **load-bearing**: a drain on an already-halted node NO-OPs over a
+  prior op's hold (before==after), and that stale hold's leaf need not equal the drain's script —
+  attributing it would false-RED. Fires generatively on `[Reject]` (origin-key) + the three delegated
+  leaves across both capstones.
+- **Teeth (4):** 3 directed e2e (`directed_offline_drain_{superseded,bad_hash_prev,unknown_status}_
+  held_witness_matches_real_reservation`, shared `assert_offline_drain_held_matches`) + 1
+  generative-path (`harness_offline_drain_reject_fires_held_witness_check`, runs the FULL `run_harness`
+  on `[OfflineSell, GoOnline([Reject])]`). **Canary personally proven:** flip `offline_held_witness`
+  `[Reject]` routing_class → the generative-path tooth REDs with `drain-produced held-witness
+  divergence on GoOnline([Reject]): real "TerminalReject" != model "TransientRetry"` → reverted.
+- **Verification:** fuzzer **158/158** (was 154; +4 teeth); fmt + clippy `-D` clean; prod FROZEN.
+  Large-N (`FUZZ_CASES=4096`) generative capstones re-run — the drain held-witness check now fires at
+  scale on both lanes without false-RED.

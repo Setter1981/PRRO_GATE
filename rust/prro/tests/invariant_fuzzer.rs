@@ -1870,6 +1870,68 @@ async fn directed_offline_ack_notfound_releases_at_send_not_held() {
     );
 }
 
+// ── CS-3 (C-ii) drain-produced held witness — the delegation, empirically pinned ─────────────
+
+/// CS-3 (C-ii) [end-to-end] — a drain-produced HELD witness matches the model on the OFFLINE lane for
+/// each DELEGATED leaf (Superseded / BadHashPrev / UnknownStatus). These leaves route through
+/// `offline_held_witness`'s `_ => online_held_witness` arm: the offline drain (`backlog_drain::drain`
+/// via `GoOnline`) re-drives the SAME production delivery classifier as an online send, so the durable
+/// held tuple is byte-identical to the online one — and, per the C-i fence-authority fix, the drain
+/// hold's fence is AUTHORITATIVE (`fence_held = true` computed by the full predicate). This PINS the
+/// Lens-B delegation empirically (previously sound-but-unexercised). CANARY: flip the delegated
+/// leaf's `online_held_witness` tuple → this REDs (shared with the online directed teeth).
+#[tokio::test]
+async fn directed_offline_drain_superseded_held_witness_matches_real_reservation() {
+    assert_offline_drain_held_matches(DpsScript::superseded_tip()).await;
+}
+
+#[tokio::test]
+async fn directed_offline_drain_bad_hash_prev_held_witness_matches_real_reservation() {
+    assert_offline_drain_held_matches(DpsScript::bad_hash_prev()).await;
+}
+
+#[tokio::test]
+async fn directed_offline_drain_unknown_status_held_witness_matches_real_reservation() {
+    assert_offline_drain_held_matches(DpsScript::unknown_status(-4)).await;
+}
+
+/// Shared body: drive an OFFLINE-drain hold of `script`'s leaf through the REAL `backlog_drain::drain`
+/// (via `GoOnline`), probe the fence-authoritative held reservation, and assert it matches the model's
+/// INDEPENDENT `offline_held_witness` prediction.
+async fn assert_offline_drain_held_matches(script: DpsScript) {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+    let _ = interp::run_op(&mut ctx, &Op::GoOnline(script.clone())).await;
+    let (_res_id, rid) = ctx
+        .active_held_reservation()
+        .await
+        .expect("the offline drain HOLDS a fence-authoritative PENDING_APPLY reservation");
+    let observed = ctx.read_held_witness(&rid).await;
+    let expected =
+        model::offline_held_witness(&script).expect("the delegated leaf holds on the offline lane");
+    oracle::check_held_witness(observed.as_ref(), &expected).unwrap_or_else(|d| {
+        panic!("drain-produced held-witness must match the real reservation for {script:?}: {d:?}")
+    });
+}
+
+/// CS-3 (C-ii) [end-to-end, GENERATIVE PATH] — drives the FULL `run_harness` (not a standalone probe)
+/// on an offline drain-hold sequence, so the NEW drain-produced held-witness check in `run_harness`
+/// (post-match, `Op::GoOnline`/`Drain` + `held_res_before.is_none()` guard) actually FIRES. A clean run
+/// IS the pass. This is the generative-wiring analogue of the directed probe above. CANARY: flip
+/// `model::offline_held_witness`'s `[Reject]` tuple → this REDs with "drain-produced held-witness
+/// divergence on GoOnline(...)" — proving the GENERATIVE wiring bites, not merely the directed teeth.
+#[tokio::test]
+async fn harness_offline_drain_reject_fires_held_witness_check() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(
+        &[Op::OfflineSell, Op::GoOnline(DpsScript::send_then_reject())],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 // ── CS-3 at-most-one-active-reservation (Increment 2) ────────────────────────
 
 /// CS-3 Increment 2 [end-to-end] — at most ONE active delivery reservation per FN. An issued ACK
@@ -3388,6 +3450,32 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                  after={held_res_after:?}) — a crash/reboot must preserve a committed PENDING_APPLY \
                  hold (no illegal release / no doc loss across recovery)"
             );
+        }
+
+        // CS-3 (C-ii) — drain-produced HELD witness. A drain (`GoOnline` / `Drain`) holds a re-driven
+        // cohort doc via a DIFFERENT path than a direct send (it returns `Recovered`, not a SENDING
+        // `Doc`), so the direct-send held-witness gate in the PredictableMutating arm never fires for
+        // it. When THIS drain NEWLY produced a fence-authoritative held reservation — `held_res_before`
+        // None → a hold now rests — AND the model encodes the leaf's OFFLINE held tuple, assert the
+        // REAL persisted axes match. The `held_res_before.is_none()` guard is load-bearing: a drain on
+        // an already-halted node merely NO-OPs over a prior op's hold (before == after, both Some), and
+        // that stale hold's leaf need not equal this drain's script — attributing it here would
+        // false-RED. This routes the OFFLINE lane through `offline_held_witness`, pinning the `[Reject]`
+        // origin-key AND the delegated (Superseded / BadHashPrev / UnknownStatus) leaves GENERATIVELY.
+        if let Op::GoOnline(script) | Op::Drain(script) = op {
+            if held_res_before.is_none() {
+                if let (Some((_res_id, rid)), Some(expected_held)) = (
+                    ctx.active_held_reservation().await,
+                    model::offline_held_witness(script),
+                ) {
+                    let observed_held = ctx.read_held_witness(&rid).await;
+                    if let Err(d) =
+                        oracle::check_held_witness(observed_held.as_ref(), &expected_held)
+                    {
+                        panic!("drain-produced held-witness divergence on {op:?}: {d:?}");
+                    }
+                }
+            }
         }
 
         // CS-3 1b — re-sync the model's operator-completion hold PRECONDITION from reality after
