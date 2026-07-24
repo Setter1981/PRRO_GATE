@@ -1334,10 +1334,13 @@ pub async fn is_online_origin_tx(
 /// which is stale when the tail is offline-origin).  Result equals the
 /// `invariant_scan` MAC-walk's final `expected` by construction (same issued
 /// predicate + max-lnd).  `None` ⟺ no issued doc (genesis).  Pool-bound read.
-pub async fn last_issued_unsigned_xml_sha256(
-    pool: &SqlitePool,
+pub async fn last_issued_unsigned_xml_sha256<'e, E>(
+    executor: E,
     fiscal_number: &str,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<Vec<u8>>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     // A.3 / D4 — FETCH-THEN-FILTER: a SQL string cannot host the Rust
     // [`is_issued`] predicate (the online arm keys on `server_fiscal_no`, not a
     // state literal), so fetch candidate rows in descending `lnd` order and
@@ -1360,7 +1363,7 @@ pub async fn last_issued_unsigned_xml_sha256(
          ORDER BY lnd DESC",
     )
     .bind(fiscal_number)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()

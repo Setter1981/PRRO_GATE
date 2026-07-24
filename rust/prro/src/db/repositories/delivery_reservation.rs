@@ -1232,6 +1232,21 @@ pub enum CompletionError {
     /// MacReseed cell; refused rather than blindly advancing the offline seed (a fork hazard).
     #[error("MacReseed is not defined for an offline-origin document")]
     MacReseedNotOfflineDefined,
+    /// MacReseed hardening (prod finding 2026-07-24) — a `MacReseed` resolution on a hold whose
+    /// recorded `node_effect` is not `MacReseedPending` (i.e. not a `-12` BadHashPrev hold).
+    /// MacReseed installs an operator-supplied chain seed; a hold that never asked for a reseed
+    /// (a NoResponse / SubmittedUnknown crash hold, etc.) has no reseed warrant. Fail-closed BEFORE
+    /// any mutation — nothing changed.
+    #[error("MacReseed is only valid for a MacReseedPending (-12) hold")]
+    MacReseedHoldMismatch,
+    /// MacReseed hardening (prod finding 2026-07-24) — the operator-supplied MacReseed seed does not
+    /// equal the expected chain tip (the last ISSUED doc's `unsigned_xml_sha256`, the value
+    /// `invariant_scan` walks to). A wrong / stale / typo'd operator seed would re-base
+    /// `node_state.last_known_unsigned_xml_sha256` to a value unrelated to the document chain and
+    /// corrupt it (a later `ChainSeedMismatch`, with no fail-closed at the mutation). Fail-closed
+    /// BEFORE any mutation — nothing changed.
+    #[error("MacReseed seed does not match the expected chain tip")]
+    MacReseedSeedMismatch,
     /// CS-3 gap 4b — a later offline successor in the session is already ISSUED (advanced the local
     /// MAC seed at OFFLINE_LOCAL_ACK: SENT / KVT1 / KVT2 / ERROR_RETRYABLE / REJECTED / RMR / ACK).
     /// Rewinding this predecessor would fork the chain — fail-closed, nothing mutated.
@@ -1289,15 +1304,22 @@ pub async fn complete_operator_pending(
     resolution: OperatorResolution,
 ) -> Result<CompletionResult, CompletionError> {
     #[allow(clippy::type_complexity)]
-    let row: Option<(String, Option<String>, Option<i64>, String, Vec<u8>)> = sqlx::query_as(
-        "SELECT state, apply_state, authorized_generation, fiscal_number, document_id \
-         FROM delivery_reservation WHERE reservation_id = ?",
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<i64>,
+        String,
+        Vec<u8>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT state, apply_state, authorized_generation, fiscal_number, document_id, \
+             node_effect FROM delivery_reservation WHERE reservation_id = ?",
     )
     .bind(&reservation_id[..])
     .fetch_optional(&mut **tx)
     .await
     .map_err(CompletionError::Db)?;
-    let (state, apply_state, authed_gen, fiscal_number, doc_id_blob) =
+    let (state, apply_state, authed_gen, fiscal_number, doc_id_blob, node_effect) =
         row.ok_or(CompletionError::ReservationNotFound)?;
     if state != "OUTCOME_OBSERVED" || apply_state.as_deref() != Some("PENDING_APPLY") {
         return Err(CompletionError::NotPendingApply);
@@ -1357,6 +1379,35 @@ pub async fn complete_operator_pending(
             return Err(CompletionError::MacReseedNotOfflineDefined)
         }
         _ => {}
+    }
+
+    // MacReseed hardening (prod finding 2026-07-24) — the `-12` seed is supplied by the operator by
+    // hand, so validate it fail-closed BEFORE any mutation. Without this a wrong / stale / typo'd
+    // seed silently re-bases `node_state.last_known_unsigned_xml_sha256` to a value unrelated to the
+    // document chain and corrupts it (surfaced only later by `invariant_scan` as `ChainSeedMismatch`,
+    // with no fail-closed at the mutation). The cross-check above already guaranteed `online` here.
+    if let OperatorResolution::MacReseed { seed } = &resolution {
+        // (A) hold-type gate — MacReseed is defined ONLY for a `-12` MacReseedPending hold (§3.2).
+        // A hold that never asked for a reseed (a NoResponse / SubmittedUnknown crash hold, etc.)
+        // carries no reseed warrant: refuse rather than install an operator seed it did not request.
+        if node_effect.as_deref() != Some("MacReseedPending") {
+            return Err(CompletionError::MacReseedHoldMismatch);
+        }
+        // (B) expected-tip gate — the corrected seed must equal the chain tip the ledger scan
+        // trusts: the last ISSUED doc's `unsigned_xml_sha256`, via the SHARED `is_issued` projection
+        // `invariant_scan` walks to (`fiscal_documents::last_issued_unsigned_xml_sha256`). Any other
+        // value IS a `ChainSeedMismatch` by definition, so a wrong operator seed fails closed here
+        // instead of corrupting the chain.
+        let expected_tip =
+            crate::db::repositories::fiscal_documents::last_issued_unsigned_xml_sha256(
+                &mut **tx,
+                &fiscal_number,
+            )
+            .await
+            .map_err(CompletionError::Db)?;
+        if expected_tip.as_deref() != Some(&seed[..]) {
+            return Err(CompletionError::MacReseedSeedMismatch);
+        }
     }
 
     let mut seed_advanced = false;
