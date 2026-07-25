@@ -112,3 +112,13 @@ The fix must span, consistently, so scan == last_issued == boot:
 - Whether the held doc's terminal should change (5.1a) vs. a projection change (5.1b) — a design call
   touching fiscal state semantics + legal offline-receipt history. NOT decided here.
 - The scan stays REVERTED (bc6f1937 pristine) until 5.1 is decided.
+
+## 7. Resolution (2026-07-25)
+
+Decided: **variant 5.1b, direct-`previous_hash`** — see `COORDINATED_FIX_DESIGN_active_chain_tip.md`.
+`is_issued` is UNCHANGED (option 5.1a rejected — it would have altered legal offline-receipt history and,
+critically, could NOT recover a non-doc T=112 rewind seed). A new `active_chain_tip_unsigned_xml_sha256`
+projection reads the `chain_superseded_at`-marked held doc's `previous_hash` DIRECTLY; boot, MacReseed
+guard-B, and `invariant_scan` all call it. `last_issued_unsigned_xml_sha256` was reverted to honest
+"last issued doc" semantics. Scope is `NotAcceptedOffline`-rewind durability ONLY — standalone T=112
+(`PRRO_GATE-hpc`) and MacReseed (`PRRO_GATE-mcc`) NC-03 recovery remain open parallel bds.
