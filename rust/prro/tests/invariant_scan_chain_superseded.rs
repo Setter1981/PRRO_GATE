@@ -476,3 +476,87 @@ async fn active_tip_skips_signed_crash_artifact_above_tip() {
         "a non-issued SIGNED crash artifact above the tip must be walked past, not treated as the tip"
     );
 }
+
+/// Tooth 8 (external re-review MAJOR — re-anchor, CLEAN direction) — after a `NotAcceptedOffline`
+/// rewind to a NON-doc T=112 seed `Hs` (present on NO doc's unsigned), a NEW active doc that chains
+/// onto `Hs` is a CORRECT post-rewind ledger and must scan CLEAN. Bites the missing re-anchor: without
+/// `expected = marker.previous_hash` the walk keeps the pre-rewind tip (`Hp = h(9)`) and false-`ChainBreak`s
+/// the active doc (`Hs != Hp`).
+#[tokio::test]
+async fn scan_reanchors_active_expected_to_rewind_target_nondoc() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, Some(h(12))).await; // node seed = active tip = D3
+                                                      // D0: pre-rewind issued predecessor Hp = h(9).
+    seed_off(&pool, shift, 9, "OFFLINE_LOCAL_ACK", None, h(9), false).await;
+    // D1: held doc rewound to a NON-doc T=112 seed Hs = h(0xC0) (no doc carries it), marked.
+    seed_off(
+        &pool,
+        shift,
+        10,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        Some(h(0xC0)),
+        h(10),
+        true,
+    )
+    .await;
+    // D2: cancelled cohort, chains onto D1.
+    seed_off(&pool, shift, 11, "CANCELLED", Some(h(10)), h(11), false).await;
+    // D3: NEW active issuance chaining onto the rewind target Hs — the correct post-rewind link.
+    seed_off(
+        &pool,
+        shift,
+        12,
+        "OFFLINE_LOCAL_ACK",
+        Some(h(0xC0)),
+        h(12),
+        false,
+    )
+    .await;
+    assert_eq!(
+        scan(&pool).await.unwrap(),
+        vec![],
+        "an active doc chaining onto a NON-doc rewind target is a correct post-rewind ledger — CLEAN"
+    );
+}
+
+/// Tooth 9 (external re-review MAJOR — the false-negative bite) — an active doc FORKED off the STALE
+/// pre-rewind predecessor (`Hp = h(9)`) INSTEAD of the exact rewind target (`Hs = h(0xC0)`) MUST
+/// `ChainBreak`. Without the re-anchor the walk's `expected` is stuck at `Hp`, so the fork is silently
+/// accepted (and the final seed check passes because active_chain_tip returns the newer H3) — the exact
+/// lost-fork-detection the external audit confirmed.
+#[tokio::test]
+async fn scan_flags_active_doc_forked_off_stale_predecessor() {
+    let pool = fresh_pool().await;
+    let shift = seed_fn(&pool).await;
+    seed_node_state(&pool, shift, Some(h(12))).await;
+    seed_off(&pool, shift, 9, "OFFLINE_LOCAL_ACK", None, h(9), false).await;
+    seed_off(
+        &pool,
+        shift,
+        10,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        Some(h(0xC0)),
+        h(10),
+        true,
+    )
+    .await;
+    seed_off(&pool, shift, 11, "CANCELLED", Some(h(10)), h(11), false).await;
+    // D3 forks off the STALE predecessor Hp = h(9), NOT the rewind target Hs = h(0xC0).
+    seed_off(
+        &pool,
+        shift,
+        12,
+        "OFFLINE_LOCAL_ACK",
+        Some(h(9)),
+        h(12),
+        false,
+    )
+    .await;
+    let v = scan(&pool).await.unwrap();
+    assert!(
+        v.iter()
+            .any(|x| matches!(x, Violation::ChainBreak { lnd: 12, .. })),
+        "a doc forked off the pre-rewind predecessor instead of the rewind target must ChainBreak, got: {v:#?}"
+    );
+}

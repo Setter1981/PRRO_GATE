@@ -87,11 +87,17 @@ returns "some other doc's unsigned" (last_issued, with or without exclusion) is 
 4. **Three consumers rewired to `active_chain_tip`**: NC-03 boot `reconstruct_lost_node_state`
    (`boot_phase.rs`), MacReseed guard-B expected-tip (`delivery_reservation.rs`), and the
    `invariant_scan` final-seed check (`invariant_scan.rs`).
-5. **`invariant_scan` MAC-walk**: two `continue` guards on the pristine walk — skip
-   `chain_superseded_at IS NOT NULL` (rewound orphan) and skip `CANCELLED` (dead cohort) — plus the
-   final seed check now compares `node_seed` against `active_chain_tip` (shared projection → scan and
-   boot cannot diverge). Per-doc `previous_hash != expected` ChainBreak UNCHANGED, so real forks/breaks
-   are still caught; `ABORTED` stays in the walk (F4).
+5. **`invariant_scan` MAC-walk**: at a `chain_superseded_at` doc, **RE-ANCHOR** the active tip —
+   `expected = held.previous_hash` — then skip (the rewind moved the seed to that target, so the next
+   ACTIVE doc must chain onto it, not the pre-rewind tip); skip `CANCELLED` (dead cohort); the final
+   seed check compares `node_seed` against `active_chain_tip` (shared projection → scan and boot cannot
+   diverge). The re-anchor is load-bearing (external re-review MAJOR): without it a doc forked off the
+   STALE pre-rewind predecessor is silently accepted (lost fork detection) and a legit doc chaining onto
+   a non-doc T=112 rewind target false-`ChainBreak`s — pinned by `scan_flags_active_doc_forked_off_stale_predecessor`
+   + `scan_reanchors_active_expected_to_rewind_target_nondoc`. Per-doc `previous_hash != expected`
+   ChainBreak otherwise UNCHANGED; `ABORTED` stays in the active walk (F4). *Follow-up `PRRO_GATE-psv`:
+   the DEAD-cohort internal sub-chain check still uses the global physical-previous row rather than a
+   session-scoped cohort tracker (UNSURE, ABORTED-interleave; F4 hardening, reachability unproven).*
 
 ## 6. Explicitly out of scope (parallel findings, do NOT conflate)
 

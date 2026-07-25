@@ -351,7 +351,19 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             // Keyed on the EXPLICIT marker, NOT the RMR state — a general RMR (Sent→NotFound / ER-drain
             // / MacReseed) is not superseded and stays in the active walk (bd PRRO_GATE-2nk).  It IS the
             // cohort's predecessor, so it sets `prev_row_unsigned` for the sub-chain check below.
+            //
+            // RE-ANCHOR the ACTIVE tip to the rewind target (external re-review MAJOR): the completion
+            // rewound the seed to THIS doc's `previous_hash`, so the next ACTIVE doc must chain onto
+            // THAT (a possibly-non-doc T=112 seed), NOT the pre-rewind tip.  Without re-anchoring,
+            // `expected` would stay stuck at the last pre-marker issued hash → (a) a legit doc chaining
+            // onto a non-doc rewind target would FALSE-`ChainBreak`, and worse (b) a doc FORKED off the
+            // STALE pre-rewind predecessor would be silently accepted (a lost fork detection — the exact
+            // fork this whole fix exists to make detectable).  The marker's OWN back-pointer is NOT
+            // checked against `expected` here: a T=112 replenish advanced the seed to `previous_hash`
+            // WITHOUT a doc, so that transition is invisible to the walk and cannot be validated from
+            // the ledger — only re-anchored onto.
             if chain_superseded_at.is_some() {
+                expected = previous_hash;
                 prev_row_unsigned = unsigned_sha;
                 continue;
             }
