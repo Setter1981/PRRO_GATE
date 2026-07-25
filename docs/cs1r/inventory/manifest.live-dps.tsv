@@ -1341,6 +1341,8 @@ live-dps	prro	prro::invariant_fuzzer	drain_and_go_online_out_of_precondition_are
 live-dps	prro	prro::invariant_fuzzer	fault_crash_kvt1_reboot_probe_no_resend	false
 live-dps	prro	prro::invariant_fuzzer	fault_crash_send_reboot_bounded_postcond_and_clean	false
 live-dps	prro	prro::invariant_fuzzer	fault_resync_then_next_op_is_differential_clean	false
+live-dps	prro	prro::invariant_fuzzer	fence_integrity_catches_foreign_pointer_over_a_resting_hold	false
+live-dps	prro	prro::invariant_fuzzer	fence_integrity_catches_stale_generation_over_a_resting_hold	false
 live-dps	prro	prro::invariant_fuzzer	fuzz_cases_reads_env_with_256_default	false
 live-dps	prro	prro::invariant_fuzzer	generator_emits_online_and_offline_returns	false
 live-dps	prro	prro::invariant_fuzzer	generator_emits_unknown_status_on_sell_and_shift_lanes	false
@@ -1355,6 +1357,7 @@ live-dps	prro	prro::invariant_fuzzer	harness_offline_seeded	false
 live-dps	prro	prro::invariant_fuzzer	harness_online_operator_accepted_after_badhashprev_hold_seed_advance	false
 live-dps	prro	prro::invariant_fuzzer	harness_online_seeded	false
 live-dps	prro	prro::invariant_fuzzer	harness_recovered_go_online_full_snapshot_verified	false
+live-dps	prro	prro::invariant_fuzzer	held_online_return_survives_reboot_with_no_resend_or_reissue	false
 live-dps	prro	prro::invariant_fuzzer	held_reservation_survives_reboot_then_operator_releases	false
 live-dps	prro	prro::invariant_fuzzer	held_witness_catches_routing_class_divergence	false
 live-dps	prro	prro::invariant_fuzzer	held_witness_unknown_status_matches_real_reservation	false
@@ -1400,6 +1403,7 @@ live-dps	prro	prro::invariant_fuzzer	offline_shift_open_refused_after_lazy_begin
 live-dps	prro	prro::invariant_fuzzer	online_return_ack_path_matches_model	false
 live-dps	prro	prro::invariant_fuzzer	online_return_bad_hash_prev_within_d4_bound	false
 live-dps	prro	prro::invariant_fuzzer	online_return_d5_gated_by_non_issued_sibling	false
+live-dps	prro	prro::invariant_fuzzer	online_return_duplicate_idem_key_makes_no_second_fiscalization	false
 live-dps	prro	prro::invariant_fuzzer	online_return_produces_a_genuine_return_doc	false
 live-dps	prro	prro::invariant_fuzzer	online_return_reject_matches_model_no_issuance_row	false
 live-dps	prro	prro::invariant_fuzzer	online_sell_ack_then_lastchk_not_found_holds_at_sent	false
