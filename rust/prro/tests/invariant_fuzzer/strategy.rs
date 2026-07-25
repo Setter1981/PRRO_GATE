@@ -154,12 +154,13 @@ fn op() -> impl Strategy<Value = Op> {
         // HELD/crash/reboot/stale prehistory.  When a hold DOES rest, it drives the REAL
         // `resolve_operator_pending` and the release oracle asserts the anti-BRICK witness — the
         // "next document passes after completion" half of the property.
-        // 1b generates only `Accepted` + `NotAccepted` — the two kinds that resolve ANY online hold
-        // WITHOUT an operator-supplied seed.  Two kinds are EXCLUDED (deferred to the "drain-holds +
-        // offline origin-keying" increment):
-        //   - `NotAcceptedOffline`: on an OFFLINE-origin hold it RELEASES with an OLA-cohort cancel +
-        //     a chain rewind (delivery_reservation.rs:1400-1429).  Its online-origin REFUSAL is
-        //     covered by the directed `operator_complete_offline_kind_on_online_hold_refused_intact`.
+        // 1b generates `Accepted` + `NotAccepted` + `NotAcceptedOffline` — the kinds that resolve a
+        // hold WITHOUT an operator-supplied seed.  `NotAcceptedOffline` on an OFFLINE-origin hold
+        // RELEASES with an OLA-cohort cancel + a chain rewind to the held doc's own `previous_hash`
+        // (delivery_reservation.rs); on an ONLINE-origin hold it REFUSES (origin cross-check).  Its
+        // generative release is re-enabled now that `invariant_scan` is cohort-cancel-aware (bd
+        // PRRO_GATE-2nk: `active_chain_tip` + the marker re-anchor no longer false-positive on the
+        // rewound cohort).  One kind stays EXCLUDED:
         //   - `MacReseed`: needs the operator's CORRECTED chain seed.  A generatively-arbitrary seed
         //     produces a `ChainSeedMismatch` (the fuzzer surfaced this — prod does NOT validate the
         //     operator's seed against the expected chain tip, so a wrong seed corrupts the chain; a
@@ -168,6 +169,7 @@ fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
             Just(OperatorResolutionKind::Accepted),
             Just(OperatorResolutionKind::NotAccepted),
+            Just(OperatorResolutionKind::NotAcceptedOffline),
         ]
         .prop_map(Op::OperatorComplete),
     ]

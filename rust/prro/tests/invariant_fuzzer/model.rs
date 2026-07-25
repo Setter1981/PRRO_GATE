@@ -465,6 +465,38 @@ impl RefModel {
             // Origin cross-check contradiction: prod fail-closes BEFORE any mutation — hold intact.
             return ExpectedOutcome::Release(None);
         };
+        // bd PRRO_GATE-2nk (§5a) — OFFLINE-origin `NotAcceptedOffline` RELEASE: the gap-4b cohort-cancel
+        // + chain rewind (delivery_reservation.rs offline_cohort_cleanup). Reached only for an offline
+        // hold (an online-origin NotAcceptedOffline already returned Release(None) via the witness gate).
+        if matches!(kind, OperatorResolutionKind::NotAcceptedOffline) {
+            // FORK GUARD (offline_cohort_cleanup): a later successor that is neither a cancellable
+            // OFFLINE_LOCAL_ACK nor already dead (CANCELLED/ABORTED) → prod REFUSES, mutating nothing.
+            // One-session approximation ("all later lnds" ≈ same session) is safe for this alphabet
+            // (a halted offline hold admits no online-origin successor); a multi-session breach would RED.
+            let later_fork = self.docs.range((held_lnd + 1)..).any(|(_, st)| {
+                !matches!(
+                    st,
+                    DocState::OfflineLocalAck | DocState::Cancelled | DocState::Aborted
+                )
+            });
+            if later_fork {
+                return ExpectedOutcome::Release(None);
+            }
+            let cancel: Vec<i64> = self
+                .docs
+                .range((held_lnd + 1)..)
+                .filter(|(_, st)| **st == DocState::OfflineLocalAck)
+                .map(|(l, _)| *l)
+                .collect();
+            for l in cancel {
+                self.docs.insert(l, DocState::Cancelled);
+            }
+            self.seed = None; // structural rewind marker; exact value asserted relationally by run_harness
+            self.docs
+                .insert(held_lnd, DocState::RequiresManualReconciliation);
+            self.mode = node_mode_from_str(witness.node_mode); // GOING_ONLINE (active session drains)
+            return ExpectedOutcome::Release(Some(witness));
+        }
         // Release: transition the held doc, un-halt the node, advance the seed for the seed-movers.
         let new_doc_state = match kind {
             OperatorResolutionKind::Accepted => DocState::Sent,

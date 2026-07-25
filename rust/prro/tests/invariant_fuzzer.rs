@@ -1932,6 +1932,33 @@ async fn harness_offline_drain_reject_fires_held_witness_check() {
     .await;
 }
 
+/// CS-3 (C-iii) [GENERATIVE end-to-end, bd PRRO_GATE-2nk] — the FULL generative `NotAcceptedOffline`
+/// release through `run_harness`:
+/// `[OfflineSell, OfflineSell, GoOnline([Reject]), OperatorComplete(NotAcceptedOffline)]` drives the
+/// model prediction (§5a: OLA-cohort cancel + rewind marker), the relational oracle (§5b: EXACT seed
+/// rewind to the held doc's own `previous_hash` + every OLA successor → CANCELLED + held → RMR), AND the
+/// cohort-cancel-aware `invariant_scan` via `assert_clean`. This was RED before the scan re-anchor fix
+/// (`invariant_scan` false-positived `ChainBreak`/`ChainSeedMismatch` on the legitimate rewound cohort);
+/// GREEN now that `active_chain_tip` + the marker re-anchor landed. The generative analogue of
+/// `directed_not_accepted_offline_cancels_cohort_and_rewinds`, re-enabled after the scan PR merged.
+/// A clean `run_harness` IS the pass.
+#[tokio::test]
+async fn harness_generative_not_accepted_offline_cohort_cancel_and_rewind() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(5).await;
+    let model = RefModel::new_offline_open_shift(5);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::send_then_reject()),
+            Op::OperatorComplete(OperatorResolutionKind::NotAcceptedOffline),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 // ── CS-3 (C-iii) NotAcceptedOffline RELEASE: OLA-cohort cancel + chain rewind + fork guard ────────
 
 /// Build the C-iii cohort: an offline-open-shift FN with a HELD offline-origin doc (the drain-rejected
@@ -3116,6 +3143,24 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                                                                // CS-3 crash/replay (P4): the FN's held reservation BEFORE the op — a crash / reboot must
                                                                // PRESERVE it (boot recovery may not release or lose a committed PENDING_APPLY hold).
         let held_res_before = ctx.active_held_reservation().await;
+        // bd PRRO_GATE-2nk (§5b) — generative NotAcceptedOffline: snapshot the rewind target (the held
+        // doc's own immutable previous_hash) + the pre-op cohort so the Release arm asserts the EXACT
+        // rewind + OLA-cohort cancel. The structural seed check only proves the seed CHANGED; this pins
+        // it to the held doc's previous_hash (which may be a non-doc T=112 seed or genesis NULL).
+        let nao_snapshot = if matches!(
+            op,
+            Op::OperatorComplete(OperatorResolutionKind::NotAcceptedOffline)
+        ) {
+            match held_res_before.as_ref() {
+                Some((_res, held_rid)) => Some((
+                    ctx.read_previous_hash(held_rid).await,
+                    ctx.read_doc_states_by_lnd().await,
+                )),
+                None => None,
+            }
+        } else {
+            None
+        };
 
         let real = interp::run_op(&mut ctx, op).await;
         // O2: an Offline-node Crash that never reached the wire COMPLETES as a real
@@ -3505,6 +3550,14 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                             prior_tip,
                             "refused completion {op:?} advanced the seed"
                         );
+                        // bd 2nk (§5b) — a refused NotAcceptedOffline (fork guard) mutates NO doc state.
+                        if let Some((_rewind, states_before)) = &nao_snapshot {
+                            assert_eq!(
+                                &ctx.read_doc_states_by_lnd().await,
+                                states_before,
+                                "refused NotAcceptedOffline {op:?} (fork guard) mutated doc states"
+                            );
+                        }
                     }
                     // Released: the REAL durable witness must match the model's INDEPENDENT contract
                     // (incl the unconditional anti-BRICK invariant — a released reservation can never
@@ -3521,6 +3574,45 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                             "release {op:?} — real seed-advance ({real_advanced}) must match the \
                              model's ({model_advanced})"
                         );
+                        // bd 2nk (§5b) — generative NotAcceptedOffline exact cohort-cancel + rewind:
+                        // (1) seed rewound to the held doc's own previous_hash (exact — incl a non-doc
+                        // T=112 seed or genesis NULL); (2) every doc that was OFFLINE_LOCAL_ACK is now
+                        // CANCELLED (a successor) or RMR (the held doc) — a leftover OLA would be a fork
+                        // (cancelled tip, live successor); (3) exactly one held doc → RMR.
+                        if let Some((rewind_target, states_before)) = &nao_snapshot {
+                            assert_eq!(
+                                ctx.read_seed().await.as_deref(),
+                                rewind_target.as_deref(),
+                                "NotAcceptedOffline {op:?}: seed must rewind to the held doc's \
+                                 previous_hash"
+                            );
+                            let states_after = ctx.read_doc_states_by_lnd().await;
+                            for (lnd, before) in states_before {
+                                if before == "OFFLINE_LOCAL_ACK" {
+                                    let after = states_after
+                                        .iter()
+                                        .find(|(l, _)| l == lnd)
+                                        .map(|(_, s)| s.as_str());
+                                    assert!(
+                                        matches!(
+                                            after,
+                                            Some("CANCELLED")
+                                                | Some("REQUIRES_MANUAL_RECONCILIATION")
+                                        ),
+                                        "NotAcceptedOffline {op:?}: lnd {lnd} was OFFLINE_LOCAL_ACK, \
+                                         now {after:?} (must be CANCELLED successor or RMR held doc)"
+                                    );
+                                }
+                            }
+                            let rmr = states_after
+                                .iter()
+                                .filter(|(_, s)| s == "REQUIRES_MANUAL_RECONCILIATION")
+                                .count();
+                            assert_eq!(
+                                rmr, 1,
+                                "NotAcceptedOffline {op:?}: exactly one held doc → RMR, got {rmr}"
+                            );
+                        }
                     }
                     (exp, got) => panic!(
                         "release prediction/real mismatch on {op:?}: model {exp:?} vs real {got:?}"
