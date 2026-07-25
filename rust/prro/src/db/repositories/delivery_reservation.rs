@@ -1393,13 +1393,14 @@ pub async fn complete_operator_pending(
         if node_effect.as_deref() != Some("MacReseedPending") {
             return Err(CompletionError::MacReseedHoldMismatch);
         }
-        // (B) expected-tip gate — the corrected seed must equal the chain tip the ledger scan
-        // trusts: the last ISSUED doc's `unsigned_xml_sha256`, via the SHARED `is_issued` projection
-        // `invariant_scan` walks to (`fiscal_documents::last_issued_unsigned_xml_sha256`). Any other
-        // value IS a `ChainSeedMismatch` by definition, so a wrong operator seed fails closed here
-        // instead of corrupting the chain.
+        // (B) expected-tip gate — the corrected seed must equal the ACTIVE chain tip (bd
+        // PRRO_GATE-2nk): NOT merely the last issued doc's hash, because after a prior
+        // `NotAcceptedOffline` rewind the tip is the held doc's own `previous_hash` (possibly a
+        // non-doc T=112 seed). Using `active_chain_tip_unsigned_xml_sha256` here means a legitimate
+        // reseed on a rewound FN is ACCEPTED (not rejected against a resurrected doc hash); any other
+        // value IS a `ChainSeedMismatch` by definition, so a wrong operator seed still fails closed.
         let expected_tip =
-            crate::db::repositories::fiscal_documents::last_issued_unsigned_xml_sha256(
+            crate::db::repositories::fiscal_documents::active_chain_tip_unsigned_xml_sha256(
                 &mut **tx,
                 &fiscal_number,
             )
@@ -1478,9 +1479,10 @@ pub async fn complete_operator_pending(
             cancelled_cohort = cancelled;
             rewound_predecessor_seed = Some(prev);
             // Mark the held doc CHAIN-SUPERSEDED: its MAC contribution was rewound away, so the
-            // active-chain-tip projections (`last_issued_unsigned_xml_sha256` + the `invariant_scan`
-            // walk) MUST exclude it — otherwise an NC-03 boot resurrects THIS doc's hash instead of
-            // the rewound seed (H0). SAME tx as the rewind + `doc_to_rmr` (atomicity is load-bearing:
+            // active-chain-tip projection (`active_chain_tip_unsigned_xml_sha256`, used by NC-03 boot +
+            // MacReseed guard-B + the `invariant_scan` seed check) reads THIS doc's `previous_hash` as
+            // the tip — otherwise an NC-03 boot resurrects THIS doc's hash instead of the rewound seed
+            // (H0). SAME tx as the rewind + `doc_to_rmr` (atomicity is load-bearing:
             // a crash between a committed rewind and a separate marker write would leave seed=H0 with
             // no marker → boot re-picks H1). Set once; ONLY this NotAcceptedOffline arm sets it —
             // `is_issued`/RMR-state alone never marks (bd PRRO_GATE-2nk).

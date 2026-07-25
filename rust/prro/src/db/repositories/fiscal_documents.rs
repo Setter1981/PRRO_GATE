@@ -1356,19 +1356,10 @@ where
         offline_fiscal_no: Option<i64>,
         server_fiscal_no: Option<String>,
     }
-    // ACTIVE-chain-tip (not merely historical-issued): a `chain_superseded_at` doc had its MAC
-    // contribution REWOUND away by a `NotAcceptedOffline` completion (migration 039, bd
-    // PRRO_GATE-2nk).  Excluding it makes this projection return the durable rewind target H0 (== the
-    // surviving predecessor's hash, or genesis) — NOT the held RMR doc's resurrected hash — so NC-03
-    // boot reconstruction, the MacReseed guard-B tip, AND the `invariant_scan` walk all agree on the
-    // active tip (the "CANNOT diverge" invariant is preserved by giving the walk the SAME exclusion).
-    // `is_issued` itself is UNCHANGED — the superseded doc stays historical-issued for Z-quiescence /
-    // offline-code backing / legal history.
     let rows: Vec<Cand> = sqlx::query_as(
         "SELECT unsigned_xml_sha256, state, offline_fiscal_no, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
-           AND chain_superseded_at IS NULL \
          ORDER BY lnd DESC",
     )
     .bind(fiscal_number)
@@ -1378,6 +1369,76 @@ where
         .into_iter()
         .find(|r| is_issued(&r.state, r.offline_fiscal_no, r.server_fiscal_no.as_deref()))
         .and_then(|r| r.unsigned_xml_sha256))
+}
+
+/// **Active MAC-chain tip** — the seed the live chain currently rests at, which is NOT always the
+/// last issued document's hash (bd PRRO_GATE-2nk). This is the projection **recovery + the MacReseed
+/// guard-B** must use; [`last_issued_unsigned_xml_sha256`] keeps its honest "last issued doc"
+/// semantics and is a lower-level primitive.
+///
+/// The only operation that moves the tip BELOW the last issued doc is a `NotAcceptedOffline`
+/// completion: it rewinds `node_state`'s seed to the held doc's own immutable `previous_hash` and
+/// marks that doc `chain_superseded_at` (delivery_reservation.rs). Crucially, that rewind target may
+/// be a **non-document seed** — e.g. a T=112 code-replenish sets the seed to `sha256(request_xml)`
+/// with NO producing fiscal document (offline_code_replenish.rs) — so it CANNOT be recovered by
+/// "the previous issued doc's hash". It IS, however, stored verbatim as the superseded doc's
+/// `previous_hash`, so we read it DIRECTLY.
+///
+/// Walk newest-first (`lnd DESC`), skipping dead cohort docs (`CANCELLED`/`ABORTED` — their
+/// back-pointers are voided-sub-chain artifacts):
+///   - first `chain_superseded_at` doc → its `previous_hash` (the exact rewind target, incl. genesis
+///     `NULL` and non-doc seeds);
+///   - else first `is_issued` doc → its `unsigned_xml_sha256` (a normal issuance AFTER any rewind
+///     overrides the older marker, since it re-advanced the seed);
+///   - else genesis (`None`).
+///
+/// NOTE (scope, bd PRRO_GATE-mcc + T=112): this recovers the tip only when the last seed-changing
+/// event left a trace in the ledger (an issued doc, or a rewind captured on a superseded doc's
+/// `previous_hash`). A **standalone** T=112 replenish or MacReseed (seed set to a non-doc value with
+/// no subsequent rewind) leaves NO ledger trace and is NOT recoverable here — a durable
+/// seed-transition record is required (separate finding). This fn fixes the NotAcceptedOffline case.
+pub async fn active_chain_tip_unsigned_xml_sha256<'e, E>(
+    executor: E,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<Vec<u8>>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    #[derive(sqlx::FromRow)]
+    struct Cand {
+        state: String,
+        previous_hash: Option<Vec<u8>>,
+        unsigned_xml_sha256: Option<Vec<u8>>,
+        offline_fiscal_no: Option<i64>,
+        server_fiscal_no: Option<String>,
+        chain_superseded_at: Option<String>,
+    }
+    let rows: Vec<Cand> = sqlx::query_as(
+        "SELECT state, previous_hash, unsigned_xml_sha256, offline_fiscal_no, server_fiscal_no, \
+                chain_superseded_at \
+         FROM fiscal_documents \
+         WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
+         ORDER BY lnd DESC",
+    )
+    .bind(fiscal_number)
+    .fetch_all(executor)
+    .await?;
+    for r in rows {
+        if r.state == "CANCELLED" || r.state == "ABORTED" {
+            continue; // dead cohort — not a chain link
+        }
+        if r.chain_superseded_at.is_some() {
+            // The last seed-changing event was this rewind → its previous_hash IS the durable tip.
+            return Ok(r.previous_hash);
+        }
+        if is_issued(&r.state, r.offline_fiscal_no, r.server_fiscal_no.as_deref()) {
+            // A normal issuance (newer than any marker) re-advanced the seed to its own hash.
+            return Ok(r.unsigned_xml_sha256);
+        }
+        // A non-issued, non-dead doc (PREPARED/SIGNED/ENCRYPTED — a crash artifact) did not advance
+        // the seed; keep walking to the last seed-changing doc below it.
+    }
+    Ok(None) // genesis — no seed-changing doc in the ledger
 }
 
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8

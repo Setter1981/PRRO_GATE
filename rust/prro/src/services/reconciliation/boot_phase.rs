@@ -1694,8 +1694,10 @@ pub async fn run_stuck_doc_guard(pool: &SqlitePool, fiscal_number: &str) -> anyh
 /// ledger SURVIVED (partial restore / corruption / rebaseline) — NOT a fresh FN. A silent bootstrap
 /// would reset the LND allocator to 1 (the allocator reads `node_state.next_lnd`) → the next write
 /// duplicates lnd / forks the MAC chain. Reconstruct the allocator (`next_lnd = MAX(lnd)+1`) + project
-/// the MAC seed from the highest-lnd EVER-ISSUED doc (`last_issued_unsigned_xml_sha256`, per AUD-L6-1,
-/// NOT the ACK-only tail), surface any surviving OPEN shift in the CRITICAL audit (SEAM-D-1: it is NOT
+/// the MAC seed from the ACTIVE chain tip (`active_chain_tip_unsigned_xml_sha256`, AUD-L6-1 lineage but
+/// rewind-aware per bd PRRO_GATE-2nk: a `NotAcceptedOffline`-superseded held doc yields its own
+/// `previous_hash`, NOT its resurrected hash; NOT the ACK-only tail), surface any surviving OPEN shift
+/// in the CRITICAL audit (SEAM-D-1: it is NOT
 /// auto-recovered), then BLOCK. One `with_immediate` envelope; the transient `Online` is never
 /// observable (boot runs before ingress).
 ///
@@ -1725,12 +1727,16 @@ pub(crate) async fn reconstruct_lost_node_state(
         return Ok(false); // empty ledger → genuinely fresh FN (caller bootstraps)
     };
     let next_lnd = max_lnd + 1;
+    // bd PRRO_GATE-2nk — project the ACTIVE chain tip, NOT merely the last issued doc's hash: after a
+    // `NotAcceptedOffline` rewind the tip is the held doc's own `previous_hash` (which may be a non-doc
+    // T=112 seed), and last_issued would resurrect the rewound-away doc. `active_chain_tip` reads the
+    // rewind target directly from the superseded doc.
     let projected_seed: Option<[u8; 32]> =
-        match fiscal_documents::last_issued_unsigned_xml_sha256(pool, fiscal_number).await? {
+        match fiscal_documents::active_chain_tip_unsigned_xml_sha256(pool, fiscal_number).await? {
             Some(bytes) => Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
                 anyhow::anyhow!(
-                    "AUD-L6-1: last issued unsigned_xml_sha256 for FN {fiscal_number} is not \
-                     32 bytes — corrupted MAC seed, refusing to project"
+                    "AUD-L6-1: active chain tip for FN {fiscal_number} is not 32 bytes — corrupted \
+                     MAC seed, refusing to project"
                 )
             })?),
             None => None,
@@ -4452,6 +4458,42 @@ mod tests {
         DocumentId::from_bytes(<[u8; 16]>::try_from(bytes.as_slice()).unwrap())
     }
 
+    /// Seed one OFFLINE-origin fiscal document (bd PRRO_GATE-2nk boot tests). Mod-level so the
+    /// NotAcceptedOffline-rewind boot repros share it.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_off(
+        pool: &SqlitePool,
+        fscl: &str,
+        b: u8,
+        lnd: i64,
+        state: &str,
+        prev: Option<[u8; 32]>,
+        unsigned: [u8; 32],
+        session: &[u8; 16],
+    ) {
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                payload_json, payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, \
+                offline_session_id, previous_hash) \
+             VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'OFFLINE', '2026-07-17T12:34:56Z', '{}', \
+                ?, ?, ?, ?, ?)",
+        )
+        .bind(vec![b; 16])
+        .bind(vec![b ^ 0xFF; 16])
+        .bind(fscl)
+        .bind(lnd)
+        .bind(state)
+        .bind(&[0u8; 32][..])
+        .bind(&unsigned[..])
+        .bind(lnd)
+        .bind(&session[..])
+        .bind(prev.map(|h| h.to_vec()))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn emit_dispatch_error_writes_audit_and_increments_counter() {
         let (_dir, pool) = fresh_pool().await;
@@ -4539,39 +4581,6 @@ mod tests {
         };
         use crate::db::tx::with_immediate;
 
-        #[allow(clippy::too_many_arguments)]
-        async fn seed_off(
-            pool: &SqlitePool,
-            fscl: &str,
-            b: u8,
-            lnd: i64,
-            state: &str,
-            prev: Option<[u8; 32]>,
-            unsigned: [u8; 32],
-            session: &[u8; 16],
-        ) {
-            sqlx::query(
-                "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
-                    state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
-                    payload_json, payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, \
-                    offline_session_id, previous_hash) \
-                 VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'OFFLINE', '2026-07-17T12:34:56Z', '{}', \
-                    ?, ?, ?, ?, ?)",
-            )
-            .bind(vec![b; 16])
-            .bind(vec![b ^ 0xFF; 16])
-            .bind(fscl)
-            .bind(lnd)
-            .bind(state)
-            .bind(&[0u8; 32][..])
-            .bind(&unsigned[..])
-            .bind(lnd)
-            .bind(&session[..])
-            .bind(prev.map(|h| h.to_vec()))
-            .execute(pool)
-            .await
-            .unwrap();
-        }
         async fn dstate(pool: &SqlitePool, b: u8) -> String {
             sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id=?")
                 .bind(vec![b; 16])
@@ -4721,6 +4730,66 @@ mod tests {
             Some(&h0[..]),
             "NC-03 boot MUST preserve the NotAcceptedOffline rewind (seed=H0), not resurrect the RMR \
              held doc's own hash (H1={h1:02x?})"
+        );
+    }
+
+    /// Tooth 1 (audit BLOCKER, boot e2e) — the `NotAcceptedOffline` rewind target is a T=112
+    /// code-replenish seed `Hs` with NO producing fiscal doc (offline_code_replenish sets the seed to
+    /// sha256(request_xml) without minting a doc). NC-03 boot must recover `Hs` from the superseded
+    /// held doc's `previous_hash` DIRECTLY — the exclusion approach returned the previous doc / None.
+    /// No `node_state` row (NC-03 loss); the post-completion ledger is seeded directly.
+    #[tokio::test]
+    async fn nc03_boot_recovers_non_doc_t112_rewind_target() {
+        let (_dir, pool) = fresh_pool().await;
+        let fscl = "5100000098";
+        let hs = [0xC0u8; 32]; // sha256(T=112 request xml) — NO fiscal doc produces it
+        let session = [0x5Fu8; 16];
+        sqlx::query("INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '12345678', 'test')")
+            .bind(fscl).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) VALUES (?, ?, 'DRAINING', '2026-07-25T00:00:00Z')")
+            .bind(&session[..]).bind(fscl).execute(&pool).await.unwrap();
+        // Post-completion ledger: held BEGIN superseded, previous_hash = Hs (the non-doc T=112 rewind
+        // target); a cancelled cohort chained onto it. node_state is ABSENT (NC-03 loss).
+        seed_off(
+            &pool,
+            fscl,
+            0x10,
+            10,
+            "REQUIRES_MANUAL_RECONCILIATION",
+            Some(hs),
+            [0xD1; 32],
+            &session,
+        )
+        .await;
+        seed_off(
+            &pool,
+            fscl,
+            0x11,
+            11,
+            "CANCELLED",
+            Some([0xD1; 32]),
+            [0xD2; 32],
+            &session,
+        )
+        .await;
+        sqlx::query("UPDATE fiscal_documents SET chain_superseded_at = '2026-07-25T00:00:01Z' WHERE fiscal_number = ? AND lnd = 10")
+            .bind(fscl).execute(&pool).await.unwrap();
+        let recovered = reconstruct_lost_node_state(&pool, fscl, None)
+            .await
+            .expect("reconstruct");
+        assert!(recovered, "ledger survived → reconstruct returns true");
+        let seed: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number=?",
+        )
+        .bind(fscl)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            seed.as_deref(),
+            Some(&hs[..]),
+            "NC-03 boot must recover the non-doc T=112 rewind target Hs from the superseded held doc's \
+             previous_hash — the exclusion approach returned the previous doc / None (audit BLOCKER)"
         );
     }
 }

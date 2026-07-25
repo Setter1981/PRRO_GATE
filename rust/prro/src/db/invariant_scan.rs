@@ -328,6 +328,12 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         .fetch_all(pool)
         .await?;
         let mut expected: Option<Vec<u8>> = None;
+        // The unsigned hash of the immediately-preceding row (any state, lnd ASC).  Used to verify the
+        // internal continuity of the rewound-orphan sub-chain (a `chain_superseded_at` held doc + its
+        // `CANCELLED` cohort): each dead doc chained onto its lnd-predecessor at sign time, so a corrupt
+        // back-pointer THERE is still a real MAC break even though the doc is voided (audit MAJOR / bd
+        // PRRO_GATE-2nk).  Distinct from `expected`, which is the LIVE (active) chain tip.
+        let mut prev_row_unsigned: Option<Vec<u8>> = None;
         for (
             lnd,
             state,
@@ -339,21 +345,31 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         ) in docs
         {
             // A `chain_superseded_at` doc (migration 039) had its MAC contribution REWOUND away by a
-            // `NotAcceptedOffline` completion — historical-issued, but NOT the active chain tip.
-            // Exclude it from the walk (the SAME exclusion `last_issued_unsigned_xml_sha256` applies,
-            // so the two CANNOT diverge): its `previous_hash` is a rewound-away artifact (no break)
-            // and it must not advance `expected` (the seed moved below it).  Keyed on the EXPLICIT
-            // marker, NOT the RMR state — a general RMR (Sent→NotFound / ER-drain / MacReseed) is not
-            // superseded and stays in the walk (bd PRRO_GATE-2nk).
+            // `NotAcceptedOffline` completion — historical-issued, but NOT the active chain tip.  Its
+            // `previous_hash` is the rewind target (possibly a NON-doc T=112 seed), so it is neither a
+            // live link (no active-tip check) nor an advance of `expected` (the seed moved below it).
+            // Keyed on the EXPLICIT marker, NOT the RMR state — a general RMR (Sent→NotFound / ER-drain
+            // / MacReseed) is not superseded and stays in the active walk (bd PRRO_GATE-2nk).  It IS the
+            // cohort's predecessor, so it sets `prev_row_unsigned` for the sub-chain check below.
             if chain_superseded_at.is_some() {
+                prev_row_unsigned = unsigned_sha;
                 continue;
             }
-            // A `CANCELLED` doc is the dead `OFFLINE_LOCAL_ACK` cohort of the cohort-cancel: it chains
-            // onto the (superseded) held doc / its cancelled siblings, so its `previous_hash` is an
-            // artifact of the voided sub-chain, not a live link.  Skip it (no break, no advance).
-            // `ABORTED` stays checked (never issued; its `previous_hash` == the live tip, so a wrongly-
-            // chained aborted doc still breaks).
+            // A `CANCELLED` doc is the dead `OFFLINE_LOCAL_ACK` cohort of the cohort-cancel: NOT a live
+            // link (never checked against / advancing the active tip `expected`), but its `previous_hash`
+            // must still chain onto its lnd-predecessor — a corrupt back-pointer in the voided sub-chain
+            // is a real break (audit MAJOR).  `ABORTED` stays in the ACTIVE walk (never issued; its
+            // `previous_hash` == the live tip, so a wrongly-chained aborted doc still breaks there).
             if state == "CANCELLED" {
+                if previous_hash != prev_row_unsigned {
+                    out.push(Violation::ChainBreak {
+                        fiscal_number: fiscal_number.clone(),
+                        lnd,
+                        expected_hex: hex32_opt(&prev_row_unsigned),
+                        found_hex: hex32_opt(&previous_hash),
+                    });
+                }
+                prev_row_unsigned = unsigned_sha;
                 continue;
             }
             if previous_hash != expected {
@@ -391,21 +407,34 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             // `ACK`.  Without this the walk would advance `expected` only over
             // `ACK` docs while `node_state.seed` advanced at SEND → a FALSE
             // `ChainSeedMismatch` on any SENT-resting online doc.  Offline arm
-            // unchanged (`OFFLINE_ISSUED_STATES`).  This projection and
-            // `last_issued_unsigned_xml_sha256` share the fn → CANNOT diverge.
+            // unchanged (`OFFLINE_ISSUED_STATES`).  This walk and
+            // `active_chain_tip_unsigned_xml_sha256` share `is_issued` → CANNOT
+            // diverge on which docs advanced the seed.
             let issued = crate::db::repositories::fiscal_documents::is_issued(
                 &state,
                 offline_fiscal_no,
                 server_fiscal_no.as_deref(),
             );
             if issued {
-                expected = unsigned_sha;
+                expected = unsigned_sha.clone();
             }
+            prev_row_unsigned = unsigned_sha;
         }
-        if node_seed != expected {
+        // bd PRRO_GATE-2nk — the node seed must equal the ACTIVE chain tip, which after a
+        // `NotAcceptedOffline` rewind is the held doc's own `previous_hash` (possibly a non-doc T=112
+        // seed), NOT the last issued doc's hash.  Use the SAME projection recovery uses, so the scan
+        // and NC-03 boot CANNOT diverge (the pre-fix `node_seed == walk's final expected` check
+        // false-positived on the rewound tip).
+        let active_tip =
+            crate::db::repositories::fiscal_documents::active_chain_tip_unsigned_xml_sha256(
+                pool,
+                &fiscal_number,
+            )
+            .await?;
+        if node_seed != active_tip {
             out.push(Violation::ChainSeedMismatch {
                 fiscal_number,
-                walk_hex: hex32_opt(&expected),
+                walk_hex: hex32_opt(&active_tip),
                 node_state_hex: hex32_opt(&node_seed),
             });
         }
