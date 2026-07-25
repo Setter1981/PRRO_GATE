@@ -4519,4 +4519,190 @@ mod tests {
         .unwrap();
         assert_eq!(count, 2, "two distinct audit rows");
     }
+
+    /// BLOCKER-1 repro (external audit of the invariant_scan cohort-cancel PR; bd PRRO_GATE-2nk):
+    /// the durable `NotAcceptedOffline` seed REWIND is UNDONE by NC-03 boot recovery.
+    /// `reconstruct_lost_node_state` projects the MAC seed via `last_issued_unsigned_xml_sha256`,
+    /// which counts the RMR held predecessor as issued and picks ITS hash (H1) — resurrecting the
+    /// rewound-away value instead of the rewind target (H0 = the held doc's own `previous_hash`).
+    /// Runs the REAL completion (`complete_operator_pending`) + the REAL reconstruction; the step-3
+    /// asserts guard that the completion produced the oc10/oc15-pinned durable state before probing
+    /// recovery. RED today: the reconstructed seed becomes H1; it MUST be H0.
+    #[tokio::test]
+    #[ignore = "RED — proves BLOCKER-1 (bd PRRO_GATE-2nk): NotAcceptedOffline rewind not durable \
+                across NC-03 boot. Un-ignore when the coordinated active-tip-projection fix lands \
+                (docs/NOTACCEPTEDOFFLINE_REWIND_BOOT_DURABILITY_FINDING.md §5)."]
+    async fn nc03_boot_undoes_not_accepted_offline_rewind() {
+        use crate::db::models::ids::DocumentId;
+        use crate::db::repositories::delivery_reservation::{
+            authorize_submission, complete_operator_pending, resume_crashed_reservation,
+            NewReservation, OperatorResolution, ReservationId,
+        };
+        use crate::db::tx::with_immediate;
+
+        async fn seed_off(
+            pool: &SqlitePool,
+            fscl: &str,
+            b: u8,
+            lnd: i64,
+            state: &str,
+            prev: Option<[u8; 32]>,
+            unsigned: [u8; 32],
+            session: &[u8; 16],
+        ) {
+            sqlx::query(
+                "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                    state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                    payload_json, payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, \
+                    offline_session_id, previous_hash) \
+                 VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'OFFLINE', '2026-07-17T12:34:56Z', '{}', \
+                    ?, ?, ?, ?, ?)",
+            )
+            .bind(vec![b; 16])
+            .bind(vec![b ^ 0xFF; 16])
+            .bind(fscl)
+            .bind(lnd)
+            .bind(state)
+            .bind(&[0u8; 32][..])
+            .bind(&unsigned[..])
+            .bind(lnd)
+            .bind(&session[..])
+            .bind(prev.map(|h| h.to_vec()))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        async fn dstate(pool: &SqlitePool, b: u8) -> String {
+            sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id=?")
+                .bind(vec![b; 16])
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        async fn seed(pool: &SqlitePool, fscl: &str) -> Option<Vec<u8>> {
+            sqlx::query_scalar(
+                "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number=?",
+            )
+            .bind(fscl)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let (_dir, pool) = fresh_pool().await;
+        let fscl = "5100000099";
+        let h0 = [0xB0u8; 32]; // rewind target = the held BEGIN's previous_hash
+        let h1 = [0xB1u8; 32]; // the held BEGIN's OWN unsigned hash (what last_issued wrongly picks)
+        let session = [0x5Eu8; 16];
+
+        // (1) pre-completion cohort: fn_config + node_state (pre-rewind seed = TIP) + DRAINING session
+        //     + held pred (SENDING, prev=H0, unsigned=H1) + two later OLA successors (real chain).
+        sqlx::query("INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '12345678', 'test')")
+            .bind(fscl).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO node_state (fiscal_number, mode, shift_state, next_lnd, last_known_unsigned_xml_sha256) VALUES (?, 'ONLINE', 'CREATED', 1, ?)")
+            .bind(fscl).bind(&[0xEEu8; 32][..]).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) VALUES (?, ?, 'DRAINING', '2026-07-24T00:00:00Z')")
+            .bind(&session[..]).bind(fscl).execute(&pool).await.unwrap();
+        seed_off(&pool, fscl, 0x10, 10, "SENDING", Some(h0), h1, &session).await;
+        seed_off(
+            &pool,
+            fscl,
+            0x11,
+            11,
+            "OFFLINE_LOCAL_ACK",
+            None,
+            [0xB2; 32],
+            &session,
+        )
+        .await;
+        seed_off(
+            &pool,
+            fscl,
+            0x12,
+            12,
+            "OFFLINE_LOCAL_ACK",
+            None,
+            [0xB3; 32],
+            &session,
+        )
+        .await;
+
+        // Held reservation → PENDING_APPLY + STOP_MODE (mirrors operator_completion::held_pending).
+        let res_id: ReservationId = [0x01u8; 16];
+        let row = NewReservation {
+            reservation_id: res_id,
+            document_id: DocumentId::from_bytes([0x10u8; 16]),
+            fiscal_number: fscl.to_string(),
+            dps_protocol_id: "FSCO_ZZD".to_string(),
+            protocol_contract_version: 1,
+            capability_profile_version: None,
+            endpoint_config_revision: None,
+            envelope_hash: [0xAB; 32],
+        };
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                authorize_submission(tx, row, "2026-07-20T00:00:00Z")
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("authorize");
+        let fscl_o = fscl.to_string();
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                resume_crashed_reservation(tx, res_id, &fscl_o)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("resume to PENDING_APPLY + STOP_MODE");
+
+        // (2) the REAL NotAcceptedOffline completion.
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                complete_operator_pending(tx, res_id, OperatorResolution::NotAcceptedOffline)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("offline not-accepted completes");
+
+        // (3) durable post-state (oc10/oc15) — the completion did its job.
+        assert_eq!(
+            seed(&pool, fscl).await.as_deref(),
+            Some(&h0[..]),
+            "completion rewound the seed to H0 (the held doc's previous_hash)"
+        );
+        assert_eq!(dstate(&pool, 0x10).await, "REQUIRES_MANUAL_RECONCILIATION");
+        assert_eq!(dstate(&pool, 0x11).await, "CANCELLED");
+        assert_eq!(dstate(&pool, 0x12).await, "CANCELLED");
+
+        // (4) NC-03: node_state row LOST while the ledger SURVIVES.
+        sqlx::query("DELETE FROM node_state WHERE fiscal_number=?")
+            .bind(fscl)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // (5) the REAL reconstruction (the seam run_boot_reconciliation invokes for NC-03, :1871).
+        let recovered = reconstruct_lost_node_state(&pool, fscl, None)
+            .await
+            .expect("reconstruct");
+        assert!(
+            recovered,
+            "ledger survived → reconstruct returns true (BLOCKED branch)"
+        );
+
+        // (6) RED — the recovered seed MUST be the durable rewind target H0, NOT the RMR held doc's
+        //     own resurrected hash H1.  Today `last_issued_unsigned_xml_sha256` picks the RMR doc → H1.
+        assert_eq!(
+            seed(&pool, fscl).await.as_deref(),
+            Some(&h0[..]),
+            "NC-03 boot MUST preserve the NotAcceptedOffline rewind (seed=H0), not resurrect the RMR \
+             held doc's own hash (H1={h1:02x?})"
+        );
+    }
 }
