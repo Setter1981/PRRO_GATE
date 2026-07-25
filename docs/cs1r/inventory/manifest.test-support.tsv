@@ -535,6 +535,7 @@ test-support	prro	prro	services::reconciliation::boot_phase::tests::classify_sen
 test-support	prro	prro	services::reconciliation::boot_phase::tests::emit_dispatch_error_idempotent_under_repeated_calls	false
 test-support	prro	prro	services::reconciliation::boot_phase::tests::emit_dispatch_error_writes_audit_and_increments_counter	false
 test-support	prro	prro	services::reconciliation::boot_phase::tests::nc03_boot_preserves_not_accepted_offline_rewind	false
+test-support	prro	prro	services::reconciliation::boot_phase::tests::nc03_boot_recovers_non_doc_t112_rewind_target	false
 test-support	prro	prro	services::reconciliation::guard::tests::for_integration_test_only_compiles_and_borrows	false
 test-support	prro	prro	services::reconciliation::guard::tests::from_app_mutex_compiles_inside_crate	false
 test-support	prro	prro	services::reconciliation::last_chk_probe::tests::probe_decode_escalate_on_decode_error	false
@@ -1455,7 +1456,14 @@ test-support	prro	prro::invariant_scan	detects_unbacked_offline_fiscal_no	false
 test-support	prro	prro::invariant_scan	m2_n2b_rejected_offline_origin_predecessor_scans_clean	false
 test-support	prro	prro::invariant_scan	model_db_access_is_funneled_through_tagged_wrappers	false
 test-support	prro	prro::invariant_scan	stuck_non_terminal_excludes_legit_resting_states	false
+test-support	prro	prro::invariant_scan_chain_superseded	active_tip_genesis_superseded_recovers_none	false
+test-support	prro	prro::invariant_scan_chain_superseded	active_tip_newer_issued_overrides_marker	false
+test-support	prro	prro::invariant_scan_chain_superseded	active_tip_normal_predecessor_doc	false
+test-support	prro	prro::invariant_scan_chain_superseded	active_tip_recovers_t112_non_doc_rewind_target	false
+test-support	prro	prro::invariant_scan_chain_superseded	active_tip_repeat_rewind_two_markers	false
+test-support	prro	prro::invariant_scan_chain_superseded	active_tip_skips_signed_crash_artifact_above_tip	false
 test-support	prro	prro::invariant_scan_chain_superseded	cohort_cancel_marked_state_scans_clean	false
+test-support	prro	prro::invariant_scan_chain_superseded	corrupt_cancelled_subchain_still_breaks	false
 test-support	prro	prro::invariant_scan_chain_superseded	live_issued_doc_above_rewound_seed_is_flagged	false
 test-support	prro	prro::invariant_scan_chain_superseded	nested_rewind_two_superseded_docs_scans_clean	false
 test-support	prro	prro::invariant_scan_chain_superseded	unmarked_rmr_held_doc_is_not_excused	false
