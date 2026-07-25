@@ -1694,8 +1694,10 @@ pub async fn run_stuck_doc_guard(pool: &SqlitePool, fiscal_number: &str) -> anyh
 /// ledger SURVIVED (partial restore / corruption / rebaseline) — NOT a fresh FN. A silent bootstrap
 /// would reset the LND allocator to 1 (the allocator reads `node_state.next_lnd`) → the next write
 /// duplicates lnd / forks the MAC chain. Reconstruct the allocator (`next_lnd = MAX(lnd)+1`) + project
-/// the MAC seed from the highest-lnd EVER-ISSUED doc (`last_issued_unsigned_xml_sha256`, per AUD-L6-1,
-/// NOT the ACK-only tail), surface any surviving OPEN shift in the CRITICAL audit (SEAM-D-1: it is NOT
+/// the MAC seed from the ACTIVE chain tip (`active_chain_tip_unsigned_xml_sha256`, AUD-L6-1 lineage but
+/// rewind-aware per bd PRRO_GATE-2nk: a `NotAcceptedOffline`-superseded held doc yields its own
+/// `previous_hash`, NOT its resurrected hash; NOT the ACK-only tail), surface any surviving OPEN shift
+/// in the CRITICAL audit (SEAM-D-1: it is NOT
 /// auto-recovered), then BLOCK. One `with_immediate` envelope; the transient `Online` is never
 /// observable (boot runs before ingress).
 ///
@@ -1725,12 +1727,16 @@ pub(crate) async fn reconstruct_lost_node_state(
         return Ok(false); // empty ledger → genuinely fresh FN (caller bootstraps)
     };
     let next_lnd = max_lnd + 1;
+    // bd PRRO_GATE-2nk — project the ACTIVE chain tip, NOT merely the last issued doc's hash: after a
+    // `NotAcceptedOffline` rewind the tip is the held doc's own `previous_hash` (which may be a non-doc
+    // T=112 seed), and last_issued would resurrect the rewound-away doc. `active_chain_tip` reads the
+    // rewind target directly from the superseded doc.
     let projected_seed: Option<[u8; 32]> =
-        match fiscal_documents::last_issued_unsigned_xml_sha256(pool, fiscal_number).await? {
+        match fiscal_documents::active_chain_tip_unsigned_xml_sha256(pool, fiscal_number).await? {
             Some(bytes) => Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
                 anyhow::anyhow!(
-                    "AUD-L6-1: last issued unsigned_xml_sha256 for FN {fiscal_number} is not \
-                     32 bytes — corrupted MAC seed, refusing to project"
+                    "AUD-L6-1: active chain tip for FN {fiscal_number} is not 32 bytes — corrupted \
+                     MAC seed, refusing to project"
                 )
             })?),
             None => None,
@@ -4452,6 +4458,42 @@ mod tests {
         DocumentId::from_bytes(<[u8; 16]>::try_from(bytes.as_slice()).unwrap())
     }
 
+    /// Seed one OFFLINE-origin fiscal document (bd PRRO_GATE-2nk boot tests). Mod-level so the
+    /// NotAcceptedOffline-rewind boot repros share it.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_off(
+        pool: &SqlitePool,
+        fscl: &str,
+        b: u8,
+        lnd: i64,
+        state: &str,
+        prev: Option<[u8; 32]>,
+        unsigned: [u8; 32],
+        session: &[u8; 16],
+    ) {
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                payload_json, payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, \
+                offline_session_id, previous_hash) \
+             VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'OFFLINE', '2026-07-17T12:34:56Z', '{}', \
+                ?, ?, ?, ?, ?)",
+        )
+        .bind(vec![b; 16])
+        .bind(vec![b ^ 0xFF; 16])
+        .bind(fscl)
+        .bind(lnd)
+        .bind(state)
+        .bind(&[0u8; 32][..])
+        .bind(&unsigned[..])
+        .bind(lnd)
+        .bind(&session[..])
+        .bind(prev.map(|h| h.to_vec()))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn emit_dispatch_error_writes_audit_and_increments_counter() {
         let (_dir, pool) = fresh_pool().await;
@@ -4518,5 +4560,236 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 2, "two distinct audit rows");
+    }
+
+    /// BLOCKER-1 repro (external audit of the invariant_scan cohort-cancel PR; bd PRRO_GATE-2nk):
+    /// the durable `NotAcceptedOffline` seed REWIND is UNDONE by NC-03 boot recovery.
+    /// `reconstruct_lost_node_state` projects the MAC seed via `last_issued_unsigned_xml_sha256`,
+    /// which counts the RMR held predecessor as issued and picks ITS hash (H1) — resurrecting the
+    /// rewound-away value instead of the rewind target (H0 = the held doc's own `previous_hash`).
+    /// Runs the REAL completion (`complete_operator_pending`) + the REAL reconstruction; the step-3
+    /// asserts guard that the completion produced the oc10/oc15-pinned durable state before probing
+    /// recovery. Regression pin for the coordinated fix (migration 039 `chain_superseded_at` marker +
+    /// `last_issued_unsigned_xml_sha256` exclusion, bd PRRO_GATE-2nk): boot reconstructs the durable
+    /// rewind target H0 (the surviving prefix doc, lnd 9), NOT the RMR held doc's own hash H1.
+    #[tokio::test]
+    async fn nc03_boot_preserves_not_accepted_offline_rewind() {
+        use crate::db::models::ids::DocumentId;
+        use crate::db::repositories::delivery_reservation::{
+            authorize_submission, complete_operator_pending, resume_crashed_reservation,
+            NewReservation, OperatorResolution, ReservationId,
+        };
+        use crate::db::tx::with_immediate;
+
+        async fn dstate(pool: &SqlitePool, b: u8) -> String {
+            sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id=?")
+                .bind(vec![b; 16])
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        async fn seed(pool: &SqlitePool, fscl: &str) -> Option<Vec<u8>> {
+            sqlx::query_scalar(
+                "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number=?",
+            )
+            .bind(fscl)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let (_dir, pool) = fresh_pool().await;
+        let fscl = "5100000099";
+        let h0 = [0xB0u8; 32]; // rewind target = the held BEGIN's previous_hash
+        let h1 = [0xB1u8; 32]; // the held doc's OWN unsigned hash (what last_issued wrongly picked pre-fix)
+        let session = [0x5Eu8; 16];
+
+        // (1) pre-completion cohort: fn_config + node_state (pre-rewind seed = TIP) + DRAINING session
+        //     + held pred (SENDING, prev=H0, unsigned=H1) + two later OLA successors (real chain).
+        sqlx::query("INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '12345678', 'test')")
+            .bind(fscl).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO node_state (fiscal_number, mode, shift_state, next_lnd, last_known_unsigned_xml_sha256) VALUES (?, 'ONLINE', 'CREATED', 1, ?)")
+            .bind(fscl).bind(&[0xEEu8; 32][..]).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) VALUES (?, ?, 'DRAINING', '2026-07-24T00:00:00Z')")
+            .bind(&session[..]).bind(fscl).execute(&pool).await.unwrap();
+        // lnd 9: the prior active-chain tip the held BEGIN chained onto — an online SENT doc
+        // (is_issued via server_fiscal_no), unsigned = H0.  The rewind target H0 == THIS surviving
+        // doc's hash (single-writer chaining), so `last_issued(exclude superseded)` must return it.
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+                payload_sha256_canonical, server_fiscal_no, unsigned_xml_sha256, previous_hash) \
+             VALUES (?, ?, ?, 9, 'SELL', 'SENT', 'b1', 't1', 'ONLINE', '2026-07-17T12:00:00Z', '{}', \
+                ?, 'D-9', ?, NULL)",
+        )
+        .bind(vec![0x09u8; 16])
+        .bind(vec![0x09u8 ^ 0xFF; 16])
+        .bind(fscl)
+        .bind(&[0u8; 32][..])
+        .bind(&h0[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_off(&pool, fscl, 0x10, 10, "SENDING", Some(h0), h1, &session).await;
+        seed_off(
+            &pool,
+            fscl,
+            0x11,
+            11,
+            "OFFLINE_LOCAL_ACK",
+            None,
+            [0xB2; 32],
+            &session,
+        )
+        .await;
+        seed_off(
+            &pool,
+            fscl,
+            0x12,
+            12,
+            "OFFLINE_LOCAL_ACK",
+            None,
+            [0xB3; 32],
+            &session,
+        )
+        .await;
+
+        // Held reservation → PENDING_APPLY + STOP_MODE (mirrors operator_completion::held_pending).
+        let res_id: ReservationId = [0x01u8; 16];
+        let row = NewReservation {
+            reservation_id: res_id,
+            document_id: DocumentId::from_bytes([0x10u8; 16]),
+            fiscal_number: fscl.to_string(),
+            dps_protocol_id: "FSCO_ZZD".to_string(),
+            protocol_contract_version: 1,
+            capability_profile_version: None,
+            endpoint_config_revision: None,
+            envelope_hash: [0xAB; 32],
+        };
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                authorize_submission(tx, row, "2026-07-20T00:00:00Z")
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("authorize");
+        let fscl_o = fscl.to_string();
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                resume_crashed_reservation(tx, res_id, &fscl_o)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("resume to PENDING_APPLY + STOP_MODE");
+
+        // (2) the REAL NotAcceptedOffline completion.
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                complete_operator_pending(tx, res_id, OperatorResolution::NotAcceptedOffline)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("offline not-accepted completes");
+
+        // (3) durable post-state (oc10/oc15) — the completion did its job.
+        assert_eq!(
+            seed(&pool, fscl).await.as_deref(),
+            Some(&h0[..]),
+            "completion rewound the seed to H0 (the held doc's previous_hash)"
+        );
+        assert_eq!(dstate(&pool, 0x10).await, "REQUIRES_MANUAL_RECONCILIATION");
+        assert_eq!(dstate(&pool, 0x11).await, "CANCELLED");
+        assert_eq!(dstate(&pool, 0x12).await, "CANCELLED");
+
+        // (4) NC-03: node_state row LOST while the ledger SURVIVES.
+        sqlx::query("DELETE FROM node_state WHERE fiscal_number=?")
+            .bind(fscl)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // (5) the REAL reconstruction (the seam run_boot_reconciliation invokes for NC-03, :1871).
+        let recovered = reconstruct_lost_node_state(&pool, fscl, None)
+            .await
+            .expect("reconstruct");
+        assert!(
+            recovered,
+            "ledger survived → reconstruct returns true (BLOCKED branch)"
+        );
+
+        // (6) RED — the recovered seed MUST be the durable rewind target H0, NOT the RMR held doc's
+        //     own resurrected hash H1.  Today `last_issued_unsigned_xml_sha256` picks the RMR doc → H1.
+        assert_eq!(
+            seed(&pool, fscl).await.as_deref(),
+            Some(&h0[..]),
+            "NC-03 boot MUST preserve the NotAcceptedOffline rewind (seed=H0), not resurrect the RMR \
+             held doc's own hash (H1={h1:02x?})"
+        );
+    }
+
+    /// Tooth 1 (audit BLOCKER, boot e2e) — the `NotAcceptedOffline` rewind target is a T=112
+    /// code-replenish seed `Hs` with NO producing fiscal doc (offline_code_replenish sets the seed to
+    /// sha256(request_xml) without minting a doc). NC-03 boot must recover `Hs` from the superseded
+    /// held doc's `previous_hash` DIRECTLY — the exclusion approach returned the previous doc / None.
+    /// No `node_state` row (NC-03 loss); the post-completion ledger is seeded directly.
+    #[tokio::test]
+    async fn nc03_boot_recovers_non_doc_t112_rewind_target() {
+        let (_dir, pool) = fresh_pool().await;
+        let fscl = "5100000098";
+        let hs = [0xC0u8; 32]; // sha256(T=112 request xml) — NO fiscal doc produces it
+        let session = [0x5Fu8; 16];
+        sqlx::query("INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '12345678', 'test')")
+            .bind(fscl).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) VALUES (?, ?, 'DRAINING', '2026-07-25T00:00:00Z')")
+            .bind(&session[..]).bind(fscl).execute(&pool).await.unwrap();
+        // Post-completion ledger: held BEGIN superseded, previous_hash = Hs (the non-doc T=112 rewind
+        // target); a cancelled cohort chained onto it. node_state is ABSENT (NC-03 loss).
+        seed_off(
+            &pool,
+            fscl,
+            0x10,
+            10,
+            "REQUIRES_MANUAL_RECONCILIATION",
+            Some(hs),
+            [0xD1; 32],
+            &session,
+        )
+        .await;
+        seed_off(
+            &pool,
+            fscl,
+            0x11,
+            11,
+            "CANCELLED",
+            Some([0xD1; 32]),
+            [0xD2; 32],
+            &session,
+        )
+        .await;
+        sqlx::query("UPDATE fiscal_documents SET chain_superseded_at = '2026-07-25T00:00:01Z' WHERE fiscal_number = ? AND lnd = 10")
+            .bind(fscl).execute(&pool).await.unwrap();
+        let recovered = reconstruct_lost_node_state(&pool, fscl, None)
+            .await
+            .expect("reconstruct");
+        assert!(recovered, "ledger survived → reconstruct returns true");
+        let seed: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number=?",
+        )
+        .bind(fscl)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            seed.as_deref(),
+            Some(&hs[..]),
+            "NC-03 boot must recover the non-doc T=112 rewind target Hs from the superseded held doc's \
+             previous_hash — the exclusion approach returned the previous doc / None (audit BLOCKER)"
+        );
     }
 }
