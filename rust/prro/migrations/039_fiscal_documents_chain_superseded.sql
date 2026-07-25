@@ -1,0 +1,48 @@
+-- 039 — add chain_superseded_at column to fiscal_documents
+--
+-- WHY
+-- ---
+-- A `NotAcceptedOffline` operator completion durably REWINDS the local MAC seed
+-- to the held doc's own `previous_hash` (delivery_reservation.rs, gap-4b), escalates
+-- the held doc -> REQUIRES_MANUAL_RECONCILIATION, and CANCELS its later
+-- OFFLINE_LOCAL_ACK cohort.  The held doc stays historical-issued (it crossed
+-- OFFLINE_LOCAL_ACK — legal offline-receipt history, offline-code backing,
+-- Z-quiescence all still count it), but its chain CONTRIBUTION is void: the seed
+-- moved BELOW it.  The shared `is_issued`-based chain-tip projection
+-- (`fiscal_documents::last_issued_unsigned_xml_sha256`, used by NC-03 boot MAC-seed
+-- reconstruction + the MacReseed guard-B tip + the invariant_scan walk) still
+-- picks the held RMR doc's OWN hash — resurrecting the rewound-away tip on an
+-- NC-03 boot (node_state lost, ledger survives).  bd PRRO_GATE-2nk.
+--
+-- This marker splits ACTIVE-chain-tip from HISTORICAL-issued: a non-NULL
+-- `chain_superseded_at` means "historical-issued but NOT the active chain tip —
+-- its contribution was rewound away by a NotAcceptedOffline completion".  The
+-- chain-tip projections exclude it; `is_issued` itself is UNCHANGED.
+--
+-- Set ONCE, in the SAME transaction as the rewind + `doc_to_rmr` (atomicity is
+-- load-bearing: a crash between a committed rewind and a separate marker write
+-- would leave seed=H0 but no marker, so boot would re-resurrect H1).  Never cleared.
+--
+-- STRICT TABLE NOTE
+-- -----------------
+-- `fiscal_documents` is STRICT (001_baseline).  SQLite ALTER TABLE ADD COLUMN on a
+-- STRICT table accepts a nullable TEXT column: existing rows receive NULL, TEXT
+-- affinity enforced on new writes.  No table rebuild (mirror of 029 reasoning).
+--
+-- BACKWARD COMPATIBILITY
+-- ----------------------
+-- Additive nullable column.  All existing rows gain NULL `chain_superseded_at`
+-- transparently.  No existing indexes or triggers are modified.  Chain-neutral:
+-- `previous_hash` / `unsigned_xml_sha256` / the signed XML are untouched.
+--
+-- ROLLBACK REASONING
+-- ------------------
+-- Forward: ALTER TABLE ADD COLUMN (atomic in SQLite).
+-- Reverse: column becomes dead weight (SQLite cannot DROP COLUMN without a
+-- 12-step rebuild); a NULL column causes no correctness issue.  Pre-pilot: DB reset.
+--
+-- LIVE FILE SEQUENCE
+-- ------------------
+-- This file is 039; sqlx applies migrations by filename prefix order.
+
+ALTER TABLE fiscal_documents ADD COLUMN chain_superseded_at TEXT;

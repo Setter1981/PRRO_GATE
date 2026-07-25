@@ -180,15 +180,18 @@ fn hex32_opt(b: &Option<Vec<u8>>) -> String {
 }
 
 /// Chain-walk row: `(lnd, state, previous_hash, unsigned_xml_sha256,
-/// offline_fiscal_no)`.  `offline_fiscal_no` (M2-01) marks an offline-origin
-/// doc, which issues at `OfflineLocalAck` (not ACK) and so advances the seed
-/// from that state onward.
+/// offline_fiscal_no, server_fiscal_no, chain_superseded_at)`.  `offline_fiscal_no`
+/// (M2-01) marks an offline-origin doc, which issues at `OfflineLocalAck` (not ACK)
+/// and so advances the seed from that state onward.  `chain_superseded_at` (migration
+/// 039) marks a doc whose MAC contribution was REWOUND away by a `NotAcceptedOffline`
+/// completion — historical-issued, but NOT the active chain tip (excluded from the walk).
 type ChainRow = (
     i64,
     String,
     Option<Vec<u8>>,
     Option<Vec<u8>>,
     Option<i64>,
+    Option<String>,
     Option<String>,
 );
 
@@ -316,7 +319,7 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
     for (fiscal_number, node_seed) in fns {
         let docs: Vec<ChainRow> = sqlx::query_as(
             "SELECT lnd, state, previous_hash, unsigned_xml_sha256, offline_fiscal_no, \
-                    server_fiscal_no \
+                    server_fiscal_no, chain_superseded_at \
              FROM fiscal_documents \
              WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
              ORDER BY lnd ASC",
@@ -325,7 +328,34 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         .fetch_all(pool)
         .await?;
         let mut expected: Option<Vec<u8>> = None;
-        for (lnd, state, previous_hash, unsigned_sha, offline_fiscal_no, server_fiscal_no) in docs {
+        for (
+            lnd,
+            state,
+            previous_hash,
+            unsigned_sha,
+            offline_fiscal_no,
+            server_fiscal_no,
+            chain_superseded_at,
+        ) in docs
+        {
+            // A `chain_superseded_at` doc (migration 039) had its MAC contribution REWOUND away by a
+            // `NotAcceptedOffline` completion — historical-issued, but NOT the active chain tip.
+            // Exclude it from the walk (the SAME exclusion `last_issued_unsigned_xml_sha256` applies,
+            // so the two CANNOT diverge): its `previous_hash` is a rewound-away artifact (no break)
+            // and it must not advance `expected` (the seed moved below it).  Keyed on the EXPLICIT
+            // marker, NOT the RMR state — a general RMR (Sent→NotFound / ER-drain / MacReseed) is not
+            // superseded and stays in the walk (bd PRRO_GATE-2nk).
+            if chain_superseded_at.is_some() {
+                continue;
+            }
+            // A `CANCELLED` doc is the dead `OFFLINE_LOCAL_ACK` cohort of the cohort-cancel: it chains
+            // onto the (superseded) held doc / its cancelled siblings, so its `previous_hash` is an
+            // artifact of the voided sub-chain, not a live link.  Skip it (no break, no advance).
+            // `ABORTED` stays checked (never issued; its `previous_hash` == the live tip, so a wrongly-
+            // chained aborted doc still breaks).
+            if state == "CANCELLED" {
+                continue;
+            }
             if previous_hash != expected {
                 out.push(Violation::ChainBreak {
                     fiscal_number: fiscal_number.clone(),

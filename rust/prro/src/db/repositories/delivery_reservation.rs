@@ -1477,6 +1477,21 @@ pub async fn complete_operator_pending(
             }
             cancelled_cohort = cancelled;
             rewound_predecessor_seed = Some(prev);
+            // Mark the held doc CHAIN-SUPERSEDED: its MAC contribution was rewound away, so the
+            // active-chain-tip projections (`last_issued_unsigned_xml_sha256` + the `invariant_scan`
+            // walk) MUST exclude it — otherwise an NC-03 boot resurrects THIS doc's hash instead of
+            // the rewound seed (H0). SAME tx as the rewind + `doc_to_rmr` (atomicity is load-bearing:
+            // a crash between a committed rewind and a separate marker write would leave seed=H0 with
+            // no marker → boot re-picks H1). Set once; ONLY this NotAcceptedOffline arm sets it —
+            // `is_issued`/RMR-state alone never marks (bd PRRO_GATE-2nk).
+            sqlx::query(
+                "UPDATE fiscal_documents SET chain_superseded_at = datetime('now') \
+                 WHERE document_id = ? AND chain_superseded_at IS NULL",
+            )
+            .bind(DbDocumentId(doc_id))
+            .execute(&mut **tx)
+            .await
+            .map_err(CompletionError::Db)?;
             doc_to_rmr(tx, doc_id).await?;
         }
         OperatorResolution::MacReseed { seed } => {

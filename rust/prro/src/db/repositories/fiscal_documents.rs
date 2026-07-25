@@ -1356,10 +1356,19 @@ where
         offline_fiscal_no: Option<i64>,
         server_fiscal_no: Option<String>,
     }
+    // ACTIVE-chain-tip (not merely historical-issued): a `chain_superseded_at` doc had its MAC
+    // contribution REWOUND away by a `NotAcceptedOffline` completion (migration 039, bd
+    // PRRO_GATE-2nk).  Excluding it makes this projection return the durable rewind target H0 (== the
+    // surviving predecessor's hash, or genesis) — NOT the held RMR doc's resurrected hash — so NC-03
+    // boot reconstruction, the MacReseed guard-B tip, AND the `invariant_scan` walk all agree on the
+    // active tip (the "CANNOT diverge" invariant is preserved by giving the walk the SAME exclusion).
+    // `is_issued` itself is UNCHANGED — the superseded doc stays historical-issued for Z-quiescence /
+    // offline-code backing / legal history.
     let rows: Vec<Cand> = sqlx::query_as(
         "SELECT unsigned_xml_sha256, state, offline_fiscal_no, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
+           AND chain_superseded_at IS NULL \
          ORDER BY lnd DESC",
     )
     .bind(fiscal_number)

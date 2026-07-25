@@ -4527,12 +4527,11 @@ mod tests {
     /// rewound-away value instead of the rewind target (H0 = the held doc's own `previous_hash`).
     /// Runs the REAL completion (`complete_operator_pending`) + the REAL reconstruction; the step-3
     /// asserts guard that the completion produced the oc10/oc15-pinned durable state before probing
-    /// recovery. RED today: the reconstructed seed becomes H1; it MUST be H0.
+    /// recovery. Regression pin for the coordinated fix (migration 039 `chain_superseded_at` marker +
+    /// `last_issued_unsigned_xml_sha256` exclusion, bd PRRO_GATE-2nk): boot reconstructs the durable
+    /// rewind target H0 (the surviving prefix doc, lnd 9), NOT the RMR held doc's own hash H1.
     #[tokio::test]
-    #[ignore = "RED — proves BLOCKER-1 (bd PRRO_GATE-2nk): NotAcceptedOffline rewind not durable \
-                across NC-03 boot. Un-ignore when the coordinated active-tip-projection fix lands \
-                (docs/NOTACCEPTEDOFFLINE_REWIND_BOOT_DURABILITY_FINDING.md §5)."]
-    async fn nc03_boot_undoes_not_accepted_offline_rewind() {
+    async fn nc03_boot_preserves_not_accepted_offline_rewind() {
         use crate::db::models::ids::DocumentId;
         use crate::db::repositories::delivery_reservation::{
             authorize_submission, complete_operator_pending, resume_crashed_reservation,
@@ -4540,6 +4539,7 @@ mod tests {
         };
         use crate::db::tx::with_immediate;
 
+        #[allow(clippy::too_many_arguments)]
         async fn seed_off(
             pool: &SqlitePool,
             fscl: &str,
@@ -4592,7 +4592,7 @@ mod tests {
         let (_dir, pool) = fresh_pool().await;
         let fscl = "5100000099";
         let h0 = [0xB0u8; 32]; // rewind target = the held BEGIN's previous_hash
-        let h1 = [0xB1u8; 32]; // the held BEGIN's OWN unsigned hash (what last_issued wrongly picks)
+        let h1 = [0xB1u8; 32]; // the held doc's OWN unsigned hash (what last_issued wrongly picked pre-fix)
         let session = [0x5Eu8; 16];
 
         // (1) pre-completion cohort: fn_config + node_state (pre-rewind seed = TIP) + DRAINING session
@@ -4603,6 +4603,24 @@ mod tests {
             .bind(fscl).bind(&[0xEEu8; 32][..]).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) VALUES (?, ?, 'DRAINING', '2026-07-24T00:00:00Z')")
             .bind(&session[..]).bind(fscl).execute(&pool).await.unwrap();
+        // lnd 9: the prior active-chain tip the held BEGIN chained onto — an online SENT doc
+        // (is_issued via server_fiscal_no), unsigned = H0.  The rewind target H0 == THIS surviving
+        // doc's hash (single-writer chaining), so `last_issued(exclude superseded)` must return it.
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+                payload_sha256_canonical, server_fiscal_no, unsigned_xml_sha256, previous_hash) \
+             VALUES (?, ?, ?, 9, 'SELL', 'SENT', 'b1', 't1', 'ONLINE', '2026-07-17T12:00:00Z', '{}', \
+                ?, 'D-9', ?, NULL)",
+        )
+        .bind(vec![0x09u8; 16])
+        .bind(vec![0x09u8 ^ 0xFF; 16])
+        .bind(fscl)
+        .bind(&[0u8; 32][..])
+        .bind(&h0[..])
+        .execute(&pool)
+        .await
+        .unwrap();
         seed_off(&pool, fscl, 0x10, 10, "SENDING", Some(h0), h1, &session).await;
         seed_off(
             &pool,
