@@ -52,7 +52,7 @@ real production path.
 - **STATUS:** complete: reservation migration 032 + repository/tests in PR #295; specs #3–#5 locked
   in PRs #296–#299.
 
-## CS-3 · Double-issue keystone (step 2c — THE semantic PR) 🟡
+## CS-3 · Double-issue keystone (step 2c — THE semantic PR) ✅
 - Typed DPS outcome `NotSubmitted | SubmittedUnknown | ResponseObserved(...)` + reservation FSM
   `ReservedNotStarted → CallStarted → OutcomeObserved`; **eliminate the blind resend**
   (started-call → `SubmittedUnknown`; reconciliation on the original protocol, never resend).
@@ -65,6 +65,17 @@ real production path.
 - **ORACLE:** remediation rev 3.1 is committed at PR #331 (`806b661`) with DESIGN GO.
 - **REMAINING EXIT WORK:** implement D/E on the production path and prove lifetime call-once,
   crash-safe record/apply, offline-reject chain hold, verified operator release, and zero blind resend.
+- **✅ CLOSED (2026-07-25):** production D/E landed (S7-1 cutover PR #336, `224ad46`) — double-issue
+  closed end-to-end. The CS-3 fuzzer-oracle track merged (PR #341, squash `949d7cc1`): independent
+  delivery-axis model, held-witness authority, crash/replay P4, MacReseed directed, offline C-i/ii/iii,
+  **generative NotAcceptedOffline**, **P3 standalone per-op fence-identity**, **P2 RETURN idempotent
+  replay** — FUZZ_CASES=4096 full suite 2317/2317, every tooth RED-canary-proven. The recovery bug the
+  fuzzer surfaced (bd PRRO_GATE-2nk — NotAcceptedOffline seed-rewind durability across NC-03 boot) was
+  fixed + merged (PR #340, `a049e8b5`; `active_chain_tip` direct-`previous_hash` + cohort-aware scan).
+  Remaining as tracked follow-ups (NOT CS-3 blockers): **mcc** re-adjudication (prove valid MacReseed
+  post-#338 is a no-op tip → close as superseded, else a real fix), **2ds→hpc** (T=112 contract →
+  durable non-doc seed witness; must close before CS-8), generative MacReseed, **psv** (P3 dead-cohort
+  hardening — off critical path until reachability is proven). Next: mcc → 2ds+hpc → CS-4.
 
 ## CS-4 · The coordinator (spec #6) 🔴
 - Author **spec #6** (coordinator command-lifecycle + `admission = f(axes)` + anti-god-object
