@@ -72,7 +72,16 @@ pub const HEAD_SHA: &str = "f2628ba";
 /// re-anchored to the cutover commit: `git_show(LIVE_DRIFT_BASE_SHA, file) == worktree`, and it
 /// still fails RED on any FURTHER non-neutral drift vs this base. No carve-out, no weakening of
 /// the immutable proof. Re-anchor again (bump this) at the next adjudicated frozen-file change.
-pub const LIVE_DRIFT_BASE_SHA: &str = "9ec0b41";
+///
+/// CS-3 fuzzer-oracle re-anchor (2026-07-25, bd PRRO_GATE-2nk): the fuzzer track made adjudicated
+/// additions to the frozen `invariant_fuzzer/{interp,model}.rs` (independent delivery-axis model +
+/// generative NotAcceptedOffline re-enable). ONLY those two of the 79 frozen files changed vs main;
+/// the live-drift leg re-anchors to the fuzzer-track tip; the immutable `f2c17b1..f2628ba` leg is
+/// UNTOUCHED. No supersession (0 removals — additions-only). FINAL CS-3 re-anchor to `b1fec955` (the
+/// tip after P3 fence-identity + P2 RETURN idem-replay): the earlier `f0824fad`/`041628a6` bumps were
+/// intermediate (before those two teeth); this is the single re-anchor at the TRUE CS-3 tip covering
+/// the frozen `invariant_fuzzer/{interp,model}.rs` + `tests/invariant_scan.rs` WRAPPERS edits.
+pub const LIVE_DRIFT_BASE_SHA: &str = "b1fec955";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is

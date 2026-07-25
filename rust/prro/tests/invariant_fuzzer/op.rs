@@ -30,6 +30,14 @@ pub enum WireResponse {
     Superseded,
     BadHashPrev,
     NotFound,
+    /// CS-3 Slice E oracle: a parsed DPS envelope carrying an unnamed non-zero status code
+    /// (`-4 ERROR_UNKNOWN`, `-17`, …) → the `UnknownStatus` evidence leaf → `ProbeRequired` HELD.
+    /// **Appended LAST** so existing regression-corpus seed indices are preserved. Unlike the
+    /// other arms, this MUST reach the wire through the REAL production decode
+    /// (`observe_check_reply` / `scripted_raw_observation`), NOT a legacy `DpsError` — a legacy
+    /// `Indeterminate` degrades to `NoResponse` in `observe_faithful_from_legacy`, losing the
+    /// `ProbeRequired` classification (see `interp::load_script` + `ScriptedDps` obs-override).
+    UnknownStatus(i32),
 }
 
 /// An ORDERED queue of per-call wire responses for a wire-hitting op.  A real
@@ -71,6 +79,13 @@ impl DpsScript {
     /// The send is rejected for a bad previous-hash chain link.
     pub fn bad_hash_prev() -> Self {
         Self(vec![WireResponse::BadHashPrev])
+    }
+
+    /// CS-3 Slice E: the DPS returns a parsed envelope with an unnamed non-zero status `code`
+    /// (`-4`/`-17`) → `UnknownStatus → ProbeRequired` HELD (SENDING + STOP + PENDING_APPLY, one wire,
+    /// no auto-resend). A single send response (the leaf HOLDS; no `last_chk` in the send path).
+    pub fn unknown_status(code: i32) -> Self {
+        Self(vec![WireResponse::UnknownStatus(code)])
     }
 }
 
@@ -156,6 +171,26 @@ pub enum Op {
     GoOnlineWithoutBacklog,
     OfflineSellDuringGoingOnline,
     SellWithClosedShift,
+    /// CS-3 operator-completion — the SOLE legal exit from a `PENDING_APPLY` + `STOP_MODE` HELD
+    /// reservation (the eternal-BRICK guard).  Drives the real `admin::resolve_operator_pending`
+    /// seam against the doc held by the most-recent wire op; a no-op when no held reservation rests.
+    /// **Appended LAST** (preserves the `Op` discriminant order the regression corpus depends on).
+    OperatorComplete(OperatorResolutionKind),
+}
+
+/// The operator's verified resolution of a HELD reservation.  A test-local mirror of the prod
+/// `OperatorResolution` (op.rs must not import prod types into the generator); the interpreter maps
+/// each kind to the real `OperatorResolution` when it drives `resolve_operator_pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorResolutionKind {
+    /// DPS accepted (operator supplies the observed FN) → doc `SENT`, seed advances, node released.
+    Accepted,
+    /// DPS did not accept (ONLINE origin) → doc `REQUIRES_MANUAL_RECONCILIATION`, node released.
+    NotAccepted,
+    /// OFFLINE-origin not accepted → doc RMR + OLA-cohort cancel + chain rewind.
+    NotAcceptedOffline,
+    /// `-12` MacReseed (operator supplies the corrected seed) → doc RMR, seed re-based, node released.
+    MacReseed,
 }
 
 /// L5 amount-shape for an [`Op::L5Probe`].  Each violation kind targets exactly
@@ -174,4 +209,23 @@ pub enum L5Kind {
     Underpaid,
     /// Control — a good of 15_000 kop paid in full by cash (converts + issues).
     Valid,
+}
+
+impl Op {
+    /// CS-3 Slice E — the wire `DpsScript` carried by an online wire op that mints a HELD-able Doc
+    /// (rests SENDING under a reservation), for the held-witness delivery-axis oracle.  `None` for
+    /// non-wire / offline / recovery ops (`GoOnline` / `Drain` produce a `Recovered` ledger-delta,
+    /// not a single held Doc, so they are intentionally excluded).
+    pub fn wire_script(&self) -> Option<&DpsScript> {
+        match self {
+            Op::OnlineSell(s)
+            | Op::OnlineReturn(s)
+            | Op::OnlineServiceIn(s)
+            | Op::OnlineServiceOut(s)
+            | Op::OnlineEpz(s)
+            | Op::OnlineShiftOpen(s)
+            | Op::OnlineZReport(s) => Some(s),
+            _ => None,
+        }
+    }
 }

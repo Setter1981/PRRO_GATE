@@ -54,7 +54,7 @@ use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
 use crate::common::scripted_dps::ScriptedDps;
 use crate::common::{det_signing_ctx, drain_test_guard};
-use crate::op::{DpsScript, L5Kind, Op, Stage, WireResponse};
+use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, Stage, WireResponse};
 
 /// A `(previous_hash, unsigned_xml_sha256)` chain-hash pair as read from a
 /// `fiscal_documents` row — both columns nullable.  Named to satisfy
@@ -106,6 +106,34 @@ pub struct ObservedDoc {
     pub shift_state_after: ShiftState,
 }
 
+/// CS-3 Slice E — the REAL durable delivery-axis witness read back from `delivery_reservation` +
+/// `node_state` for a HELD online doc.  Compared against the model's independent
+/// [`crate::model::HeldWitness`] by [`crate::oracle::check_held_witness`].  DB-TEXT values verbatim
+/// (no decode), so a persisted-classifier regression surfaces as a plain string mismatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedHeld {
+    pub submission_certainty: String,
+    pub response_provenance: String,
+    pub routing_class: Option<String>,
+    pub node_effect: String,
+    pub evidence_kind: String,
+    pub evidence_code: Option<i64>,
+    pub apply_state: String,
+    pub node_mode: String,
+    pub fence_held: bool,
+}
+
+/// CS-3 operator-completion — the REAL durable witness read back AFTER a legal operator completion
+/// released a HELD reservation.  Compared against the model's independent
+/// [`crate::model::ReleasedWitness`] by [`crate::oracle::check_release_witness`].  DB-TEXT verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedRelease {
+    pub apply_state: String,
+    pub node_mode: String,
+    pub fence_held: bool,
+    pub doc_state: String,
+}
+
 /// What `run_op` observed for one op.
 #[derive(Debug, Clone)]
 pub enum RealOutcome {
@@ -131,6 +159,10 @@ pub enum RealOutcome {
         cash_on_hand_kop: i64,
         turnover_json: String,
     },
+    /// CS-3 operator-completion — a legal `resolve_operator_pending` released a HELD reservation;
+    /// carries the durable witness read back (`APPLIED` / fence-clear / node un-halted / doc
+    /// terminal).  The anti-BRICK oracle asserts this against the model's `ReleasedWitness`.
+    Released(ObservedRelease),
 }
 
 // ─── Race state threaded through `run_op` ───────────────────────────────────
@@ -341,6 +373,36 @@ impl FuzzCtx {
              WHERE fiscal_number = ? AND offline_fiscal_no IS NOT NULL",
         )
         .bind(DbOfflineSessionId(foreign))
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Adversarial-audit canary support: repoint the FN fence to a FOREIGN reservation id — a
+    /// non-NULL pointer that does NOT name the held reservation (an open P3 / forked fence). A
+    /// presence-only `fence_held = active_delivery_reservation_id IS NOT NULL` check would
+    /// false-green; the authority predicate must compute `fence_held = false` and RED.
+    pub async fn corrupt_active_fence_to_foreign(&self) {
+        sqlx::query(
+            "UPDATE node_state SET active_delivery_reservation_id = ? WHERE fiscal_number = ?",
+        )
+        .bind(&[0xA5u8; 16][..])
+        .bind(self.fn_id.as_str())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Adversarial-audit canary support: advance `node_state.delivery_generation` past the held
+    /// reservation's `authorized_generation` (a monotonic +1 — the schema permits an increase). The
+    /// fence pointer still names the reservation, but at a STALE generation → the authority predicate
+    /// must compute `fence_held = false` and RED (an ABA-style generation drift).
+    pub async fn bump_delivery_generation(&self) {
+        sqlx::query(
+            "UPDATE node_state SET delivery_generation = delivery_generation + 1 \
+             WHERE fiscal_number = ?",
+        )
         .bind(self.fn_id.as_str())
         .execute(&self.pool)
         .await
@@ -631,6 +693,291 @@ impl FuzzCtx {
         v
     }
 
+    /// CS-3 (C-iii) — the FN's docs as `(lnd, state)` ordered by lnd, for asserting the durable
+    /// OLA-cohort effects of a `NotAcceptedOffline` completion (later `OFFLINE_LOCAL_ACK` successors
+    /// → `CANCELLED`; the held doc → `RMR`).
+    pub async fn read_doc_states_by_lnd(&self) -> Vec<(i64, String)> {
+        sqlx::query_as(
+            "SELECT lnd, state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd ASC",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// CS-3 (C-iii) — a doc's immutable `previous_hash` (the chain tip it chained onto at issuance),
+    /// keyed by `request_id`. A `NotAcceptedOffline` completion rewinds `node_state`'s seed to the
+    /// held doc's own `previous_hash` (`Some(prev)` → predecessor tip, `None` → genesis).
+    pub async fn read_previous_hash(&self, request_id: &[u8; 16]) -> Option<Vec<u8>> {
+        sqlx::query_scalar(
+            "SELECT previous_hash FROM fiscal_documents WHERE fiscal_number = ? AND request_id = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&request_id[..])
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// CS-3 (C-iii) test setup — force a doc (by lnd) into an ISSUED state, realizing the fork-guard
+    /// precondition: a `NotAcceptedOffline` completion on an earlier held doc must REFUSE (fork guard —
+    /// a later ISSUED successor cannot be rewound away) rather than cancel it.
+    pub async fn force_doc_state_by_lnd(&self, lnd: i64, state: &str) {
+        sqlx::query("UPDATE fiscal_documents SET state = ? WHERE fiscal_number = ? AND lnd = ?")
+            .bind(state)
+            .bind(self.fn_id.as_str())
+            .bind(lnd)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+    }
+
+    /// CS-3 MacReseed (task #18 (B)) — the FN's last-issued chain tip, the value guard B validates
+    /// the operator's `-12` MacReseed seed against (`fiscal_documents::last_issued_unsigned_xml_sha256`,
+    /// the SHARED `is_issued` projection `invariant_scan` walks to). A directed MacReseed VALID-path
+    /// test supplies THIS as the operator seed (in reality the operator supplies the DPS-assigned tip).
+    /// `None` if no doc has issued yet.
+    pub async fn last_issued_tip(&self) -> Option<[u8; 32]> {
+        prro::db::repositories::fiscal_documents::last_issued_unsigned_xml_sha256(
+            &self.pool,
+            self.fn_id.as_str(),
+        )
+        .await
+        .unwrap()
+        .map(|v| <[u8; 32]>::try_from(v.as_slice()).expect("chain tip is 32 bytes"))
+    }
+
+    /// CS-3 Slice E — the REAL durable delivery-axis witness for a doc: the latest
+    /// `delivery_reservation` attempt (joined by `request_id`) + the node's `mode` and FN fence
+    /// pointer.  `None` ⇒ the doc has NO reservation row (a pre-send / invalid-ingress refusal never
+    /// reserves), so the held-witness oracle has nothing to assert.  Reads DB-text verbatim.
+    pub async fn read_held_witness(&self, request_id: &[u8; 16]) -> Option<ObservedHeld> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<i64>,
+            String,
+            String,
+            Vec<u8>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT dr.submission_certainty, dr.response_provenance, dr.routing_class, \
+                        dr.node_effect, dr.evidence_kind, dr.evidence_code, dr.apply_state, \
+                        dr.state, dr.reservation_id, dr.authorized_generation \
+                 FROM delivery_reservation dr \
+                 JOIN fiscal_documents fd \
+                   ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+                 WHERE fd.fiscal_number = ? AND fd.request_id = ? \
+                 ORDER BY dr.attempt_no DESC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&request_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        let (
+            certainty,
+            provenance,
+            routing,
+            node_effect,
+            evidence_kind,
+            evidence_code,
+            apply_state,
+            res_state,
+            reservation_id,
+            authorized_generation,
+        ) = row?;
+        let (mode, active_ptr, delivery_generation): (String, Option<Vec<u8>>, i64) =
+            sqlx::query_as(
+                "SELECT mode, active_delivery_reservation_id, delivery_generation \
+                 FROM node_state WHERE fiscal_number = ?",
+            )
+            .bind(self.fn_id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        // `fence_held` is the FENCE AUTHORITY, not mere pointer presence: this doc's reservation IS
+        // the node's ACTIVE, CURRENT-generation held one — the exact prod exemption predicate the
+        // referential scan walks (`src/db/invariant_scan.rs:228-237`, the StuckSending HOLD carve-out).
+        // A foreign pointer, a stale `delivery_generation`, or a non-`OUTCOME_OBSERVED` reservation
+        // makes this FALSE → the held-witness oracle REDs on a broken/forked fence (a `fence.is_some()`
+        // presence check would false-green there — adversarial-audit MAJOR fix).
+        let fence_held = res_state == "OUTCOME_OBSERVED"
+            && apply_state == "PENDING_APPLY"
+            && active_ptr.as_deref() == Some(reservation_id.as_slice())
+            && authorized_generation == Some(delivery_generation);
+        Some(ObservedHeld {
+            submission_certainty: certainty,
+            response_provenance: provenance,
+            routing_class: routing,
+            node_effect,
+            evidence_kind,
+            evidence_code,
+            apply_state,
+            node_mode: mode,
+            fence_held,
+        })
+    }
+
+    /// The `request_id` of the doc minted by the MOST RECENT wire op (`self.last_row`), used to key
+    /// the held-witness read.  `None` before any wire op has run.
+    pub fn last_request_id(&self) -> Option<[u8; 16]> {
+        self.last_row.as_ref().map(|r| r.request_id)
+    }
+
+    /// CS-3 Increment 2 — the count of ACTIVE delivery reservations for this FN, using the SAME
+    /// predicate as the prod `ux_reservation_active` UNIQUE index (migration 035:53-55), spec-COPIED
+    /// not imported.  Prod already enforces `<= 1` via that partial unique index; the fuzzer asserts
+    /// the same structurally after every op, so a `> 1` (a double-issue — two in-flight reservations
+    /// for one FN) or a dropped index REDs.
+    pub async fn active_reservation_count(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_reservation WHERE fiscal_number = ? \
+             AND (state IN ('RESERVED_NOT_STARTED','CALL_STARTED') \
+                  OR (state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY'))",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// CS-3 Increment 2 part (b) — P3 fence-IDENTITY (standalone, per-op residual). The held-witness
+    /// read asserts the fence AUTHORITY only when a witness is EXPECTED; this asserts it UNCONDITIONALLY
+    /// after every op, so a fence corruption on a SETTLED state (a foreign / stale-generation pointer
+    /// over a resting hold, which no held-witness read would revisit) is still caught. Sound predicate
+    /// (prod `invariant_scan.rs:228-237` fence authority + Increment 2 ≤1-active): a `PENDING_APPLY`
+    /// hold MUST be NAMED by `node_state.active_delivery_reservation_id` at the CURRENT
+    /// `delivery_generation`. Returns `Ok(())` or `Err(reason)`. Deliberately does NOT assert the
+    /// converse ("a set pointer names a live reservation") — that would depend on pointer-clearing on
+    /// every terminal path and risk a false-RED; the hold-is-fenced direction is the sound residual and
+    /// is exactly what `corrupt_active_fence_to_foreign` / `bump_delivery_generation` break.
+    pub async fn fence_integrity(&self) -> Result<(), String> {
+        let (ptr, gen): (Option<Vec<u8>>, i64) = sqlx::query_as(
+            "SELECT active_delivery_reservation_id, delivery_generation \
+             FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let pending: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT reservation_id, authorized_generation FROM delivery_reservation \
+             WHERE fiscal_number = ? AND state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY'",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        for (rid, agen) in &pending {
+            if ptr.as_deref() != Some(rid.as_slice()) {
+                return Err(format!(
+                    "PENDING_APPLY hold {rid:02x?} is not named by the fence pointer {ptr:02x?} \
+                     (foreign / dangling fence over a resting hold)"
+                ));
+            }
+            if *agen != gen {
+                return Err(format!(
+                    "PENDING_APPLY hold fenced at STALE generation {agen} != node_state {gen} \
+                     (ABA-style generation drift)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// CS-3 operator-completion (1b) — the FN's ACTIVE (`PENDING_APPLY`) held reservation as
+    /// `(reservation_id, request_id)`: the reservation the operator resolves + its doc's request_id
+    /// for the release-witness read.  `None` if no held reservation rests.  The fence enforces ≤1, so
+    /// this targets THE held reservation blocking the FN — independent of which doc was the last wire
+    /// op (a drain can hold a doc that is not the most-recent sell).
+    pub async fn active_held_reservation(&self) -> Option<([u8; 16], [u8; 16])> {
+        // The FULL fence-authority predicate (prod `invariant_scan.rs:228-237`), not merely "any
+        // PENDING_APPLY": the reservation must BE the node's active, current-generation held one.
+        // Sound by Increment 2 (≤1 active reservation — a PENDING_APPLY reservation is exactly the
+        // single active one), so this is behavior-preserving in every sound state; under a corrupted
+        // / forked fence it fail-closes to None instead of blessing a stray PENDING_APPLY row.
+        let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT dr.reservation_id, fd.request_id \
+             FROM delivery_reservation dr \
+             JOIN fiscal_documents fd \
+               ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+             JOIN node_state ns ON ns.fiscal_number = dr.fiscal_number \
+             WHERE dr.fiscal_number = ? \
+               AND dr.state = 'OUTCOME_OBSERVED' \
+               AND dr.apply_state = 'PENDING_APPLY' \
+               AND dr.reservation_id = ns.active_delivery_reservation_id \
+               AND dr.authorized_generation = ns.delivery_generation LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        row.map(|(r, q)| {
+            (
+                <[u8; 16]>::try_from(r.as_slice()).expect("reservation_id is 16 bytes"),
+                <[u8; 16]>::try_from(q.as_slice()).expect("request_id is 16 bytes"),
+            )
+        })
+    }
+
+    /// CS-3 operator-completion — the `reservation_id` of the latest reservation attempt for a doc
+    /// (keyed by `request_id`), the handle `resolve_operator_pending` completes.  `None` if the doc
+    /// has no reservation row.
+    pub async fn reservation_id_for_request(&self, request_id: &[u8; 16]) -> Option<[u8; 16]> {
+        let id: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT dr.reservation_id \
+             FROM delivery_reservation dr \
+             JOIN fiscal_documents fd \
+               ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+             WHERE fd.fiscal_number = ? AND fd.request_id = ? \
+             ORDER BY dr.attempt_no DESC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&request_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        id.map(|v| <[u8; 16]>::try_from(v.as_slice()).expect("reservation_id is 16 bytes"))
+    }
+
+    /// CS-3 operator-completion — the REAL durable witness AFTER a legal completion: the reservation
+    /// `apply_state`, the node `mode` + FN-fence pointer, and the doc's terminal `state`.  Mirrors
+    /// `read_held_witness` (SAME JOIN + node_state read) but keyed for the release axes.
+    pub async fn read_release_witness(&self, request_id: &[u8; 16]) -> ObservedRelease {
+        let (apply_state, doc_state): (String, String) = sqlx::query_as(
+            "SELECT dr.apply_state, fd.state \
+             FROM delivery_reservation dr \
+             JOIN fiscal_documents fd \
+               ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+             WHERE fd.fiscal_number = ? AND fd.request_id = ? \
+             ORDER BY dr.attempt_no DESC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&request_id[..])
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let (mode, fence): (String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT mode, active_delivery_reservation_id FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        ObservedRelease {
+            apply_state,
+            node_mode: mode,
+            fence_held: fence.is_some(),
+            doc_state,
+        }
+    }
+
     /// B10 TEETH — verify the lazy-BEGIN two-doc chain is genuinely LINKED after a
     /// `b10_lazy_begin_interposed` op:
     ///   (a) BEGIN.previous_hash == the pre-op MAC tip (`prior_tip`);
@@ -898,6 +1245,75 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         Op::GoOnlineWithoutBacklog => go_online(ctx, &DpsScript(Vec::new())).await,
         Op::OfflineSellDuringGoingOnline => offline_sell_during_going_online(ctx).await,
         Op::SellWithClosedShift => sell_with_closed_shift(ctx).await,
+        Op::OperatorComplete(kind) => operator_complete(ctx, *kind).await,
+    }
+}
+
+/// CS-3 operator-completion — drive the REAL `admin::resolve_operator_pending` seam (the SOLE legal
+/// exit from a `PENDING_APPLY` HELD reservation — the eternal-BRICK guard) against the FN's ACTIVE
+/// held reservation (the fence enforces ≤1).  The operator resolves THE held reservation blocking
+/// the FN, NOT "the most-recent wire op's doc" — these can differ (a DRAIN can create a held
+/// reservation on a doc that is not the last direct sell).  A no-op refusal when no held reservation
+/// rests (so the generator can emit it freely without a `prop_filter`).  On success reads back the
+/// durable `ReleasedWitness`; on a typed refusal (e.g. FN-mismatch) the hold is left intact.
+async fn operator_complete(ctx: &mut FuzzCtx, kind: OperatorResolutionKind) -> RealOutcome {
+    use prro::db::repositories::delivery_reservation::OperatorResolution;
+    let Some((reservation_id, rid)) = ctx.active_held_reservation().await else {
+        return RealOutcome::Refused("operator_complete: no held reservation rests".into());
+    };
+    let resolution = match kind {
+        // Accepted needs the operator-observed NON-EMPTY server fiscal number (prod validates only
+        // non-empty, delivery_reservation.rs:1368). It MUST equal the DPS stub's assigned FN
+        // (`SERVER_FISCAL_NO`): in reality the operator supplies the exact number DPS assigned, so a
+        // SUBSEQUENT drain that re-probes this now-`SENT` offline-origin doc (a completed drain-held
+        // doc re-enters the cohort — `SENT` is a drain-candidate state) confirms it via `last_chk`
+        // WITHOUT a spurious `LastChkIdMismatch`. An UNRELATED literal here forks the FN and
+        // structurally-halts the go-online drain forever (node stuck `GoingOnline`) — a fixture
+        // artifact, NOT a prod fault (fuzzer liveness finding, task #18 offline-half).
+        OperatorResolutionKind::Accepted => OperatorResolution::Accepted {
+            fiscal_number: SERVER_FISCAL_NO.to_string(),
+        },
+        OperatorResolutionKind::NotAccepted => OperatorResolution::NotAccepted,
+        OperatorResolutionKind::NotAcceptedOffline => OperatorResolution::NotAcceptedOffline,
+        OperatorResolutionKind::MacReseed => OperatorResolution::MacReseed { seed: [0x5a; 32] },
+    };
+    match prro::admin::resolve_operator_pending(
+        &ctx.pool,
+        ctx.fn_id.as_str(),
+        reservation_id,
+        resolution,
+    )
+    .await
+    {
+        Ok(_) => RealOutcome::Released(ctx.read_release_witness(&rid).await),
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// CS-3 MacReseed directed driver (task #18 (B)) — drive the REAL `resolve_operator_pending` with an
+/// operator-supplied `MacReseed { seed }` against the FN's active held reservation, using an EXPLICIT
+/// seed (NOT the `[0x5a; 32]` placeholder in `operator_complete`). MacReseed is generator-EXCLUDED (it
+/// needs the operator's CORRECTED chain seed), so it is DIRECTED-only: the valid-path test supplies
+/// `last_issued_tip` (guards A+B pass), the guard-B test a wrong seed, the guard-A test drives it on a
+/// non-`MacReseedPending` hold.  Mirrors the prod teeth `operator_completion::oc23`/`oc24` through the
+/// fuzzer's REAL seam.  A no-op refusal when no held reservation rests.
+pub async fn operator_complete_macreseed(ctx: &FuzzCtx, seed: [u8; 32]) -> RealOutcome {
+    use prro::db::repositories::delivery_reservation::OperatorResolution;
+    let Some((reservation_id, rid)) = ctx.active_held_reservation().await else {
+        return RealOutcome::Refused(
+            "operator_complete_macreseed: no held reservation rests".into(),
+        );
+    };
+    match prro::admin::resolve_operator_pending(
+        &ctx.pool,
+        ctx.fn_id.as_str(),
+        reservation_id,
+        OperatorResolution::MacReseed { seed },
+    )
+    .await
+    {
+        Ok(_) => RealOutcome::Released(ctx.read_release_witness(&rid).await),
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
 }
 
@@ -2167,13 +2583,42 @@ async fn duplicate_idem_key(ctx: &mut FuzzCtx) -> RealOutcome {
 /// (`push_last`).  Matches `AckPath = [Ack, Ack]` (send→Ack, last→Ack).
 fn load_script(dps: &ScriptedDps, script: &DpsScript) {
     for (i, wr) in script.0.iter().copied().enumerate() {
-        let result = wire_to_result(wr);
-        if i == 0 {
-            dps.push_send(result);
-        } else {
-            dps.push_last(result);
+        match (i, wr) {
+            // CS-3 Slice E: an UnknownStatus send response MUST reach the wire through the REAL
+            // production decode (`observe_check_reply` via `scripted_raw_observation`), NOT a legacy
+            // `DpsError` (which `observe_faithful_from_legacy` degrades to NoResponse, losing the
+            // ProbeRequired classification). Push the legacy for the send counter/pop + the
+            // real-decode observation as the override the stub returns.
+            (0, WireResponse::UnknownStatus(code)) => {
+                let (legacy, obs) = unknown_status_pair(code);
+                dps.push_send(legacy);
+                dps.push_send_obs_override(obs);
+            }
+            (0, _) => dps.push_send(wire_to_result(wr)),
+            (_, _) => dps.push_last(wire_to_result(wr)),
         }
     }
+}
+
+/// CS-3 Slice E: the `(legacy, real-observation)` pair for an `UnknownStatus(code)` leaf — a raw
+/// `gen::CheckResponse{ status: code }` fed through the PRODUCTION `observe_check_reply` decode. This
+/// is the ONLY faithful path to the `UnknownStatus → ProbeRequired` leaf; a hand-built legacy
+/// `DpsError::Indeterminate` degrades to `NoResponse` in `observe_faithful_from_legacy`.
+fn unknown_status_pair(
+    code: i32,
+) -> (
+    Result<CheckAck, DpsError>,
+    prro::transports::dps::raw_reply::RawSendObservation,
+) {
+    prro::transports::dps::dto::scripted_raw_observation(
+        prro::transports::dps::gen::CheckResponse {
+            id: String::new(),
+            status: code,
+            id_sign: Vec::new(),
+            data_sign: Vec::new(),
+            error_message: String::new(),
+        },
+    )
 }
 
 /// Lay a drain's wire responses PER cohort doc (a drain submits + confirms each
@@ -2240,6 +2685,10 @@ fn wire_to_result(wr: WireResponse) -> Result<CheckAck, DpsError> {
         WireResponse::Timeout => Err(DpsError::Transport(
             "fuzz: simulated timeout (normally realized via Crash drop-injection)".to_string(),
         )),
+        // CS-3 Slice E: the legacy half of an UnknownStatus leaf. The send path routes it via
+        // `load_script`'s obs-override (real decode); this defensive arm keeps `wire_to_result` total
+        // for any last_chk position (unused by the shipped scripts — UnknownStatus is send-only).
+        WireResponse::UnknownStatus(code) => unknown_status_pair(code).0,
     }
 }
 

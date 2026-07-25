@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use crate::op::{DpsScript, L5Kind, Op, Stage};
+use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, Stage};
 
 /// The result-able wire-response shapes for a wire op.  `timeout_at_call` is
 /// intentionally EXCLUDED — the timeout SCENARIO is realized via `Crash`
@@ -23,6 +23,11 @@ fn dps_script() -> impl Strategy<Value = DpsScript> {
         Just(DpsScript::send_then_reject()),
         Just(DpsScript::superseded_tip()),
         Just(DpsScript::bad_hash_prev()),
+        // CS-3 Slice E — APPENDED LAST (corpus seed indices preserved): a parsed unnamed non-zero
+        // status → UnknownStatus → ProbeRequired HELD. `-4` is the effect-class representative; the
+        // directed corpus (`directed_unknown_status_probe.rs` + the fuzzer's directed pins) covers
+        // `-17` / outside-enum. Feeds the REAL decode via `interp::load_script` obs-override.
+        Just(DpsScript::unknown_status(-4)),
     ]
 }
 
@@ -51,6 +56,9 @@ fn shift_dps_script() -> impl Strategy<Value = DpsScript> {
         Just(DpsScript::send_ack_then_last_not_found()),
         Just(DpsScript::send_then_reject()),
         Just(DpsScript::superseded_tip()),
+        // CS-3 Slice E — APPENDED LAST: SHIFT_OPEN / Z_REPORT also meet the UnknownStatus leaf
+        // (doc-type-agnostic — `-4` is not the `-2/-15` close-shift split). ProbeRequired HELD.
+        Just(DpsScript::unknown_status(-4)),
     ]
 }
 
@@ -140,6 +148,30 @@ fn op() -> impl Strategy<Value = Op> {
         // the side-effect-free property (making X consume an lnd / write a row)
         // makes a seeded harness with Op::XReport go RED — the durable teeth.
         Just(Op::XReport),
+        // CS-3 operator-completion (1b) — APPENDED LAST (same seed-index-preservation rule).  A
+        // no-op refusal when no held reservation rests (interp guards → no prop_filter), so it is a
+        // first-class intent insertable ANYWHERE: the generator combines it with arbitrary
+        // HELD/crash/reboot/stale prehistory.  When a hold DOES rest, it drives the REAL
+        // `resolve_operator_pending` and the release oracle asserts the anti-BRICK witness — the
+        // "next document passes after completion" half of the property.
+        // 1b generates `Accepted` + `NotAccepted` + `NotAcceptedOffline` — the kinds that resolve a
+        // hold WITHOUT an operator-supplied seed.  `NotAcceptedOffline` on an OFFLINE-origin hold
+        // RELEASES with an OLA-cohort cancel + a chain rewind to the held doc's own `previous_hash`
+        // (delivery_reservation.rs); on an ONLINE-origin hold it REFUSES (origin cross-check).  Its
+        // generative release is re-enabled now that `invariant_scan` is cohort-cancel-aware (bd
+        // PRRO_GATE-2nk: `active_chain_tip` + the marker re-anchor no longer false-positive on the
+        // rewound cohort).  One kind stays EXCLUDED:
+        //   - `MacReseed`: needs the operator's CORRECTED chain seed.  A generatively-arbitrary seed
+        //     produces a `ChainSeedMismatch` (the fuzzer surfaced this — prod does NOT validate the
+        //     operator's seed against the expected chain tip, so a wrong seed corrupts the chain; a
+        //     potential hardening finding, docs/CS3_FUZZER_ORACLE_DOSSIER.md).  A valid-seed MacReseed
+        //     is directed-only.
+        prop_oneof![
+            Just(OperatorResolutionKind::Accepted),
+            Just(OperatorResolutionKind::NotAccepted),
+            Just(OperatorResolutionKind::NotAcceptedOffline),
+        ]
+        .prop_map(Op::OperatorComplete),
     ]
 }
 
