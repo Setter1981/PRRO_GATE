@@ -603,6 +603,97 @@ async fn online_return_bad_hash_prev_within_d4_bound() {
     let _ = run_harness(&[Op::OnlineReturn(DpsScript::bad_hash_prev())], ctx, model).await;
 }
 
+/// CS-3 P2 — RETURN idempotent replay [directed]. An ISSUED `OnlineReturn` re-driven via a true
+/// idem-key replay (`DuplicateIdemKey` re-runs `inline::run` on the SAME inbox row) takes the
+/// idempotent Noop → resolve-against-ledger path: NO second RETURN doc is minted and NO fresh wire
+/// send is made — re-fiscalization of a RETURN is impossible. The RETURN analogue of the sell-side
+/// idempotency (doc-type-agnostic, symmetry (c)). CANARY: were the replay to re-issue, the doc-count
+/// / wire-count asserts RED.
+#[tokio::test]
+async fn online_return_duplicate_idem_key_makes_no_second_fiscalization() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // Build cash first — the in-lease INV-21 guard refuses a RETURN on an empty drawer.
+    let sell = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(sell, interp::RealOutcome::Doc(_)),
+        "SELL must issue to build cash: {sell:?}"
+    );
+    let issued = interp::run_op(&mut ctx, &Op::OnlineReturn(DpsScript::ack_path())).await;
+    assert!(
+        matches!(issued, interp::RealOutcome::Doc(_)),
+        "the ack-path RETURN must issue a doc: {issued:?}"
+    );
+    let docs_before = ctx.observed_doc_count().await;
+    let sends_before = ctx.send_calls();
+    let replay = interp::run_op(&mut ctx, &Op::DuplicateIdemKey).await;
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        docs_before,
+        "RETURN idem-key replay minted a SECOND doc — re-fiscalization"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "RETURN idem-key replay made a FRESH wire send (a replay resolves from the ledger)"
+    );
+    assert_eq!(
+        ctx.count_doc_type("RETURN").await,
+        1,
+        "exactly ONE RETURN doc must exist after the replay — re-fiscalization is impossible"
+    );
+    assert!(
+        matches!(
+            replay,
+            interp::RealOutcome::Doc(_) | interp::RealOutcome::Refused(_)
+        ),
+        "a RETURN replay must resolve idempotently (Noop-against-ledger / refused), got {replay:?}"
+    );
+}
+
+/// CS-3 P2 — a HELD `OnlineReturn` (`UnknownStatus(-4)` → PENDING_APPLY under STOP_MODE) SURVIVES a
+/// Reboot with NO resend and NO re-issue: boot recovery preserves the held reservation + its single
+/// wire send (wire-count stays 1), and mints no new RETURN doc. The RETURN analogue of the P4
+/// crash/replay held-survival invariant (doc-type-agnostic). CANARY: an illegal boot release would
+/// change `active_held_reservation`; a boot resend would bump `send_calls`.
+#[tokio::test]
+async fn held_online_return_survives_reboot_with_no_resend_or_reissue() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // Build cash first — the in-lease INV-21 guard refuses a RETURN on an empty drawer.
+    let sell = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(sell, interp::RealOutcome::Doc(_)),
+        "SELL must issue to build cash: {sell:?}"
+    );
+    let held = interp::run_op(&mut ctx, &Op::OnlineReturn(DpsScript::unknown_status(-4))).await;
+    assert!(
+        matches!(held, interp::RealOutcome::Doc(_)),
+        "the UnknownStatus RETURN must rest a held Doc: {held:?}"
+    );
+    let held_before = ctx.active_held_reservation().await;
+    assert!(
+        held_before.is_some(),
+        "the UnknownStatus RETURN holds a PENDING_APPLY reservation"
+    );
+    let docs_before = ctx.observed_doc_count().await;
+    let sends_before = ctx.send_calls();
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+    assert_eq!(
+        ctx.active_held_reservation().await,
+        held_before,
+        "reboot lost / changed the held RETURN reservation (illegal boot release)"
+    );
+    assert_eq!(
+        ctx.observed_doc_count().await,
+        docs_before,
+        "reboot re-issued the RETURN"
+    );
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before,
+        "reboot re-sent the held RETURN — wire-count must stay 1 (no resend across recovery)"
+    );
+}
+
 /// PR-R-fuzz (anti-silent-zero) — the generator ACTUALLY emits both Return ops
 /// over a large deterministic draw, so Return / mixed sequences are really
 /// exercised by the property harness.  A dropped or zero weight makes this RED
