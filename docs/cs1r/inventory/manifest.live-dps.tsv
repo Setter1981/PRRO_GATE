@@ -534,6 +534,7 @@ live-dps	prro	prro	services::reconciliation::boot_phase::tests::answered_wire_co
 live-dps	prro	prro	services::reconciliation::boot_phase::tests::classify_send_dispatch_maps_every_variant	false
 live-dps	prro	prro	services::reconciliation::boot_phase::tests::emit_dispatch_error_idempotent_under_repeated_calls	false
 live-dps	prro	prro	services::reconciliation::boot_phase::tests::emit_dispatch_error_writes_audit_and_increments_counter	false
+live-dps	prro	prro	services::reconciliation::boot_phase::tests::nc03_boot_preserves_not_accepted_offline_rewind	false
 live-dps	prro	prro	services::reconciliation::guard::tests::for_integration_test_only_compiles_and_borrows	false
 live-dps	prro	prro	services::reconciliation::guard::tests::from_app_mutex_compiles_inside_crate	false
 live-dps	prro	prro	services::reconciliation::last_chk_probe::tests::probe_decode_escalate_on_decode_error	false
@@ -1454,6 +1455,10 @@ live-dps	prro	prro::invariant_scan	detects_unbacked_offline_fiscal_no	false
 live-dps	prro	prro::invariant_scan	m2_n2b_rejected_offline_origin_predecessor_scans_clean	false
 live-dps	prro	prro::invariant_scan	model_db_access_is_funneled_through_tagged_wrappers	false
 live-dps	prro	prro::invariant_scan	stuck_non_terminal_excludes_legit_resting_states	false
+live-dps	prro	prro::invariant_scan_chain_superseded	cohort_cancel_marked_state_scans_clean	false
+live-dps	prro	prro::invariant_scan_chain_superseded	live_issued_doc_above_rewound_seed_is_flagged	false
+live-dps	prro	prro::invariant_scan_chain_superseded	nested_rewind_two_superseded_docs_scans_clean	false
+live-dps	prro	prro::invariant_scan_chain_superseded	unmarked_rmr_held_doc_is_not_excused	false
 live-dps	prro	prro::kill_point_matrix	boot_kvt2_chain_seed_mismatch_closed_shift_no_abort	false
 live-dps	prro	prro::kill_point_matrix	boot_kvt2_chain_seed_mismatch_escalates_manual	false
 live-dps	prro	prro::kill_point_matrix	boot_skips_rmr_but_online_fn_no_redrive	false
