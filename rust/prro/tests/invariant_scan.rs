@@ -1073,6 +1073,7 @@ fn model_db_access_is_funneled_through_tagged_wrappers() {
         "adopt_fault_deferred", // post-fault recovery residue (was resync_from_db)
         "adopt_precondition",   // mode/shift/session precondition residue
         "read_seed_fixture",    // seed-fixture grounding
+        "sync_held_reservation", // CS-3 held-reservation precondition re-sync (C-i; funneled, outcome-independent)
     ];
     // The DB-access tokens sqlx exposes; a raw one outside a wrapper is a leak.
     const MARKERS: &[&str] = &[
