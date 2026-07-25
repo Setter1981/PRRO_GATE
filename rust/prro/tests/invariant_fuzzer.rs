@@ -1184,6 +1184,48 @@ async fn held_witness_unknown_status_matches_real_reservation() {
     let _ = run_harness(&[Op::OnlineSell(DpsScript::unknown_status(-4))], ctx, model).await;
 }
 
+/// CS-3 Increment 2 part (b) — P3 fence-IDENTITY (standalone, per-op) [directed canary]. The
+/// unconditional `fence_integrity` invariant (asserted after every op in `run_harness`) catches a
+/// corrupted fence over a RESTING hold that no held-witness read would revisit. Establish a held
+/// `UnknownStatus` reservation (fenced), assert integrity PASSES, then repoint the fence to a FOREIGN
+/// reservation id and assert it REDs. Proves the invariant reads the REAL fence authority, not mere
+/// pointer presence (a presence check would false-green on the foreign pointer).
+#[tokio::test]
+async fn fence_integrity_catches_foreign_pointer_over_a_resting_hold() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let held = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::unknown_status(-4))).await;
+    assert!(
+        matches!(held, interp::RealOutcome::Doc(_)),
+        "the UnknownStatus sell must rest a held Doc: {held:?}"
+    );
+    ctx.fence_integrity()
+        .await
+        .expect("an intact fenced hold must pass fence_integrity (not vacuously always-Err)");
+    ctx.corrupt_active_fence_to_foreign().await;
+    assert!(
+        ctx.fence_integrity().await.is_err(),
+        "a FOREIGN fence pointer over a PENDING_APPLY hold must RED (authority, not presence)"
+    );
+}
+
+/// CS-3 Increment 2 part (b) — P3 fence-IDENTITY (standalone, per-op) [directed canary, stale gen].
+/// Same as above but bumps `delivery_generation` past the hold's `authorized_generation`: the pointer
+/// still names the reservation, but at a STALE generation → an ABA-style fence drift that the
+/// authority predicate must RED.
+#[tokio::test]
+async fn fence_integrity_catches_stale_generation_over_a_resting_hold() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::unknown_status(-4))).await;
+    ctx.fence_integrity()
+        .await
+        .expect("an intact fenced hold must pass");
+    ctx.bump_delivery_generation().await;
+    assert!(
+        ctx.fence_integrity().await.is_err(),
+        "a STALE delivery_generation over a PENDING_APPLY hold must RED (generation drift)"
+    );
+}
+
 // ── CS-3 operator-completion / eternal-BRICK oracle (Increment 1) ────────────
 
 /// CS-3 anti-BRICK teeth [pure comparator] — the model's INDEPENDENT `released_witness` for a legal
@@ -3632,6 +3674,15 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             "double-issue: {active_reservations} ACTIVE delivery reservations for the FN after \
              {op:?} — at most one may be in-flight per FN (ux_reservation_active)"
         );
+
+        // CS-3 Increment 2 part (b) — P3 fence-IDENTITY (standalone, per-op). UNCONDITIONAL after every
+        // op: a PENDING_APPLY hold must be NAMED by the fence at the CURRENT delivery_generation. The
+        // held-witness read only asserts this when a witness is EXPECTED; this catches a foreign /
+        // stale-generation fence over a RESTING hold on any op (incl. settled no-ops the held-witness
+        // read never revisits). Sound by Increment 2 (≤1 active).
+        if let Err(reason) = ctx.fence_integrity().await {
+            panic!("P3 fence-identity violated after {op:?}: {reason}");
+        }
 
         // CS-3 crash/replay (P4) — a CRASH / REBOOT must PRESERVE a committed PENDING_APPLY held
         // reservation: boot recovery scans + resumes non-terminal docs, but it may NOT release a hold

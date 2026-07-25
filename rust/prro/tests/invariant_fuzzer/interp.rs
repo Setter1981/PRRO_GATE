@@ -847,6 +847,50 @@ impl FuzzCtx {
         .unwrap()
     }
 
+    /// CS-3 Increment 2 part (b) — P3 fence-IDENTITY (standalone, per-op residual). The held-witness
+    /// read asserts the fence AUTHORITY only when a witness is EXPECTED; this asserts it UNCONDITIONALLY
+    /// after every op, so a fence corruption on a SETTLED state (a foreign / stale-generation pointer
+    /// over a resting hold, which no held-witness read would revisit) is still caught. Sound predicate
+    /// (prod `invariant_scan.rs:228-237` fence authority + Increment 2 ≤1-active): a `PENDING_APPLY`
+    /// hold MUST be NAMED by `node_state.active_delivery_reservation_id` at the CURRENT
+    /// `delivery_generation`. Returns `Ok(())` or `Err(reason)`. Deliberately does NOT assert the
+    /// converse ("a set pointer names a live reservation") — that would depend on pointer-clearing on
+    /// every terminal path and risk a false-RED; the hold-is-fenced direction is the sound residual and
+    /// is exactly what `corrupt_active_fence_to_foreign` / `bump_delivery_generation` break.
+    pub async fn fence_integrity(&self) -> Result<(), String> {
+        let (ptr, gen): (Option<Vec<u8>>, i64) = sqlx::query_as(
+            "SELECT active_delivery_reservation_id, delivery_generation \
+             FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let pending: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT reservation_id, authorized_generation FROM delivery_reservation \
+             WHERE fiscal_number = ? AND state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY'",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        for (rid, agen) in &pending {
+            if ptr.as_deref() != Some(rid.as_slice()) {
+                return Err(format!(
+                    "PENDING_APPLY hold {rid:02x?} is not named by the fence pointer {ptr:02x?} \
+                     (foreign / dangling fence over a resting hold)"
+                ));
+            }
+            if *agen != gen {
+                return Err(format!(
+                    "PENDING_APPLY hold fenced at STALE generation {agen} != node_state {gen} \
+                     (ABA-style generation drift)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// CS-3 operator-completion (1b) — the FN's ACTIVE (`PENDING_APPLY`) held reservation as
     /// `(reservation_id, request_id)`: the reservation the operator resolves + its doc's request_id
     /// for the release-witness read.  `None` if no held reservation rests.  The fence enforces ≤1, so
