@@ -377,9 +377,18 @@ pub async fn derive_closing_cash(
 /// Pure main-pool read, called BEFORE the write-tx (invariant #1).
 pub async fn opening_carry_for_fn(pool: &SqlitePool, fiscal_number: &str) -> sqlx::Result<i64> {
     Ok(sqlx::query_scalar::<_, i64>(
+        // ordering-justified (bd PRRO_GATE-seb): `shifts.serial` is a DEAD column —
+        // production never writes it (no INSERT lists it, no `UPDATE … SET serial`
+        // exists), so every prod row has serial = NULL and the former
+        // `ORDER BY serial DESC` was a TOTAL TIE that returned an arbitrary — in
+        // practice the OLDEST — closed shift.  `closed_at` IS written, atomically with
+        // `state = 'CLOSED'` (shifts.rs, the sole site binding `ShiftState::Closed`), so
+        // it is non-NULL for every CLOSED row; `rowid` breaks the residual tie because
+        // `CURRENT_TIMESTAMP` is only second-granular and two shifts can close inside
+        // one second.  Together they are a total order.
         "SELECT cash_balance_kop FROM shifts \
              WHERE fiscal_number = ? AND state = 'CLOSED' \
-             ORDER BY serial DESC LIMIT 1",
+             ORDER BY closed_at DESC, rowid DESC LIMIT 1",
     )
     .bind(fiscal_number)
     .fetch_optional(pool)
@@ -441,11 +450,17 @@ pub async fn reconcile_opening_anchor(
 ) -> sqlx::Result<Option<(i64, i64)>> {
     // Find the current open shift and its stored opening.
     let open_shift: Option<(Vec<u8>, i64)> = sqlx::query_as(
+        // bd PRRO_GATE-seb: no ordering needed — these states are a subset of the
+        // partial UNIQUE index `ux_shifts_one_open_per_fn(fiscal_number) WHERE state IN
+        // (CREATED, OPENING, OPENED_LOCAL_PENDING_DRAIN, OPENED,
+        // CLOSING_LOCAL_PENDING_DRAIN, CLOSING)`, so AT MOST ONE row can match and
+        // `LIMIT 1` is deterministic.  The former `ORDER BY serial DESC` was phantom
+        // (serial is NULL in production).
         "SELECT shift_id, cash_balance_kop \
          FROM shifts \
          WHERE fiscal_number = ? \
            AND state NOT IN ('CLOSED','REQUIRES_MANUAL_RECONCILIATION','ERROR','CREATED') \
-         ORDER BY serial DESC LIMIT 1",
+         LIMIT 1",
     )
     .bind(fiscal_number)
     .fetch_optional(pool)
@@ -459,7 +474,7 @@ pub async fn reconcile_opening_anchor(
     let closed: Vec<(Vec<u8>,)> = sqlx::query_as(
         "SELECT shift_id FROM shifts \
          WHERE fiscal_number = ? AND state = 'CLOSED' \
-         ORDER BY serial ASC",
+         ORDER BY closed_at ASC, rowid ASC",
     )
     .bind(fiscal_number)
     .fetch_all(pool)

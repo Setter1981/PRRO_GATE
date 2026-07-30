@@ -374,6 +374,11 @@ pub async fn last_attempt_retry_class_for(
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<crate::services::write_path::error_routing::RetryClass>> {
     let opt: Option<Option<String>> = sqlx::query_scalar(
+        // ordering-justified: `attempt_no` is allocated `COALESCE(MAX(attempt_no),0)+1` per
+        // `document_id` inside the BEGIN IMMEDIATE envelope (transport_trace.rs), so it is
+        // unique per document by the ALLOCATOR. NOTE: the index
+        // `transport_trace(document_id, attempt_no DESC, retry_class)` is NOT unique — the
+        // guarantee rests on the allocator + write lease, not on the schema.
         "SELECT retry_class FROM transport_trace \
          WHERE document_id = ? \
          ORDER BY attempt_no DESC LIMIT 1",

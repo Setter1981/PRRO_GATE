@@ -182,6 +182,8 @@ pub async fn run_auto_z_if_over_limit(
     // `fiscal_documents`; `driver_id` lives on the originating `ingress_inbox`
     // row (joined by request_id). So the auto-Z signs as the shift owner.
     let ident: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+        // scoped to a single shift of one `fiscal_number`, so `lnd` is unique here.
         "SELECT ii.driver_id, fd.signed_by_cashier_id \
          FROM fiscal_documents fd \
          JOIN ingress_inbox ii ON ii.request_id = fd.request_id \

@@ -1960,6 +1960,7 @@ live-dps	prro	prro::operators_multi_cashier_history	different_fns_each_with_one_
 live-dps	prro	prro::operators_multi_cashier_history	historical_then_active_for_same_fn_both_succeed	false
 live-dps	prro	prro::operators_multi_cashier_history	many_historical_rows_for_same_fn_allowed	false
 live-dps	prro	prro::operators_multi_cashier_history	two_active_rows_for_same_fn_rejected_by_partial_unique	false
+live-dps	prro	prro::ordering_totality_gate	every_order_by_limit_one_has_a_deterministic_winner	false
 live-dps	prro	prro::outgress_trait_quartet	dispatch_surfaces_fsco_build_unimplemented_too	false
 live-dps	prro	prro::outgress_trait_quartet	dispatch_surfaces_native_build_unimplemented_for_evpz_dps	false
 live-dps	prro	prro::outgress_trait_quartet	evpz_builder_returns_typed_unimplemented	false
@@ -2231,6 +2232,10 @@ live-dps	prro	prro::sent_not_found	sn01_sent_not_found_escalates_atomically	fals
 live-dps	prro	prro::sent_not_found	sn02_non_sent_document_refused	false
 live-dps	prro	prro::sent_not_found	sn03_refusal_leaves_node_mode_unchanged	false
 live-dps	prro	prro::sent_not_found	sn04_missing_node_state_rolls_back	false
+live-dps	prro	prro::shift_carry_ordering	opening_carry_breaks_a_same_second_close_tie_deterministically	false
+live-dps	prro	prro::shift_carry_ordering	opening_carry_is_insertion_order_independent	false
+live-dps	prro	prro::shift_carry_ordering	opening_carry_is_zero_without_a_closed_shift	false
+live-dps	prro	prro::shift_carry_ordering	opening_carry_takes_the_most_recently_closed_shift	false
 live-dps	prro	prro::shift_create_primitive	apply_shift_transition_closed_to_created_is_forbidden	false
 live-dps	prro	prro::shift_create_primitive	apply_shift_transition_redrive_is_conflict_not_error	false
 live-dps	prro	prro::shift_create_primitive	create_shift_tx_from_closed_dual_writes_shifts_and_projection	false

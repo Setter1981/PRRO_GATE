@@ -1793,6 +1793,8 @@ mod tests {
 
         // Audit row emitted з Critical severity.
         let audit: (String, String) = sqlx::query_as(
+            // ordering-justified: `audit_log.audit_id` is `INTEGER PRIMARY KEY AUTOINCREMENT` —
+            // globally unique and monotonic, so it is a total order on its own.
             "SELECT severity, event_payload_json FROM audit_log \
              WHERE event_type = 'ADMIN_STOP_MODE_RESET' \
              ORDER BY audit_id DESC LIMIT 1",
@@ -1899,6 +1901,8 @@ mod tests {
     }
 
     async fn latest_audit(pool: &SqlitePool, event_type: &str) -> Option<(String, String)> {
+        // ordering-justified: `audit_log.audit_id` is `INTEGER PRIMARY KEY AUTOINCREMENT` —
+        // globally unique and monotonic, so it is a total order on its own.
         sqlx::query_as(
             "SELECT severity, event_payload_json FROM audit_log \
              WHERE event_type = ? ORDER BY audit_id DESC LIMIT 1",

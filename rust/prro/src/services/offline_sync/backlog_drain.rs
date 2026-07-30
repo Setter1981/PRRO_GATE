@@ -3644,6 +3644,8 @@ mod eligible_arm_tests {
 
     async fn audit_latest_payload(pool: &sqlx::SqlitePool, event_type: &str) -> serde_json::Value {
         let raw: String = sqlx::query_scalar(
+            // ordering-justified: `audit_log.audit_id` is `INTEGER PRIMARY KEY AUTOINCREMENT` —
+            // globally unique and monotonic, so it is a total order on its own.
             "SELECT event_payload_json FROM audit_log \
              WHERE event_type = ? ORDER BY audit_id DESC LIMIT 1",
         )

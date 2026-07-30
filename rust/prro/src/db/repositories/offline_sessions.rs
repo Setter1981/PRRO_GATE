@@ -397,6 +397,9 @@ pub async fn acquire_code_tx(
     // — a pool containing only drill rows surfaces as `CodePoolExhausted`,
     // which the caller maps to `Refused(CodePoolExhausted)`.
     let row: Result<Option<(i64, String, String)>, sqlx::Error> = sqlx::query_as(
+        // ordering-justified: the sub-select PROJECTS the very column it orders by
+        // (`code_lnd`), so even if two rows tied the returned VALUE would be identical —
+        // the result is deterministic regardless of which tied row the plan picks.
         "UPDATE offline_codes \
          SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? \

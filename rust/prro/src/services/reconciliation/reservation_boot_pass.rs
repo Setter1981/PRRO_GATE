@@ -149,6 +149,11 @@ async fn complete_crashed_trace(
             .await?;
     // The single open (uncompleted) trace for that document, if any.
     let open: Option<(i64, String)> = sqlx::query_as(
+        // ordering-justified: `attempt_no` is allocated `COALESCE(MAX(attempt_no),0)+1` per
+        // `document_id` inside the BEGIN IMMEDIATE envelope (transport_trace.rs), so it is
+        // unique per document by the ALLOCATOR. NOTE: the index
+        // `transport_trace(document_id, attempt_no DESC, retry_class)` is NOT unique — the
+        // guarantee rests on the allocator + write lease, not on the schema.
         "SELECT attempt_no, started_at FROM transport_trace \
          WHERE document_id = ? AND outcome_kind IS NULL ORDER BY attempt_no DESC LIMIT 1",
     )

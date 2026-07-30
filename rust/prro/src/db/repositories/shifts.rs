@@ -257,10 +257,14 @@ pub async fn active_shift_for_fn(
     fiscal_number: &str,
 ) -> sqlx::Result<Option<(Vec<u8>, String)>> {
     sqlx::query_as::<_, (Vec<u8>, String)>(
+        // bd PRRO_GATE-seb: no ordering needed — the remaining states are exactly the
+        // predicate of the partial UNIQUE index
+        // `ux_shifts_one_open_per_fn(fiscal_number)`, so AT MOST ONE row can match and
+        // `LIMIT 1` is deterministic.  The former `ORDER BY serial DESC` was phantom:
+        // production never writes `shifts.serial` (bd PRRO_GATE-seb).
         "SELECT shift_id, state FROM shifts \
          WHERE fiscal_number = ? \
            AND state NOT IN ('CLOSED', 'REQUIRES_MANUAL_RECONCILIATION', 'ERROR') \
-         ORDER BY serial DESC \
          LIMIT 1",
     )
     .bind(fiscal_number)

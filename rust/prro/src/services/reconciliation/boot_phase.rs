@@ -2048,6 +2048,8 @@ pub async fn run_boot_reconciliation(
             if live_anchor_count == 0 {
                 // Forensic anchor: the latest dead lifecycle doc, if any.
                 let dead_anchor: Option<Vec<u8>> = sqlx::query_scalar(&format!(
+                    // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+                    // scoped to a single shift of one `fiscal_number`, so `lnd` is unique here.
                     "SELECT document_id FROM fiscal_documents \
                      WHERE fiscal_number = ? AND shift_id = ? \
                        AND doc_type IN {anchor_types} \
