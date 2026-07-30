@@ -81,7 +81,10 @@ pub const HEAD_SHA: &str = "f2628ba";
 /// tip after P3 fence-identity + P2 RETURN idem-replay): the earlier `f0824fad`/`041628a6` bumps were
 /// intermediate (before those two teeth); this is the single re-anchor at the TRUE CS-3 tip covering
 /// the frozen `invariant_fuzzer/{interp,model}.rs` + `tests/invariant_scan.rs` WRAPPERS edits.
-pub const LIVE_DRIFT_BASE_SHA: &str = "b1fec955";
+/// bd PRRO_GATE-x5o re-anchor (2026-07-30): the fuzzer-model cash-reversal fix edits the frozen
+/// `invariant_fuzzer/model.rs`, an adjudicated change (prod was right; the model was under-counting a
+/// cohort-cancel). Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
+pub const LIVE_DRIFT_BASE_SHA: &str = "9fc1125f";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is
