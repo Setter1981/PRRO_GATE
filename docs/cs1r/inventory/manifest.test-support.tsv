@@ -1595,6 +1595,7 @@ test-support	prro	prro::mark_rejected_if_new	mark_missing_row_returns_false	fals
 test-support	prro	prro::mark_rejected_if_new	mark_new_returns_true_and_flips_to_rejected	false
 test-support	prro	prro::mark_rejected_if_new	mark_processing_returns_false_state_untouched	false
 test-support	prro	prro::mark_rejected_if_new	mark_twice_idempotent	false
+test-support	prro	prro::mcc_nc03_adjudication	mcc_valid_macreseed_seed_is_ledger_derivable_and_survives_nc03	false
 test-support	prro	prro::migration_010_transport_trace	allocate_then_complete_round_trip	false
 test-support	prro	prro::migration_010_transport_trace	attempts_used_counts_sends_only_not_probes	false
 test-support	prro	prro::migration_010_transport_trace	attempts_used_multi_doc_returns_target_max_only	false
