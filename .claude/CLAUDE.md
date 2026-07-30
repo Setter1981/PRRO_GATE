@@ -60,14 +60,19 @@ If your change touches a hot zone, explicitly state how these invariants were pr
 
 Treat these areas as high-risk and test them after changes:
 
-- `services/write_path.py`
-- `services/reconciliation.py`
-- `repositories/*`
-- `transports/*`
-- `adapters/*`
+All paths are under `rust/prro/src/` (the `.py` tree is the retired scaffold):
+
+- `services/write_path/` — especially `inline.rs` and the `stage_*.rs` modules
+- `services/reconciliation/` — `boot_phase.rs`, `online_convergence.rs`, `operator_completion.rs`
+- `services/offline_sync/` — `backlog_drain.rs`, `offline_code_replenish.rs`, `return_online_probe.rs`
+- `db/repositories/*` — especially `fiscal_documents.rs`, `delivery_reservation.rs`, `shifts.rs`,
+  `node_state.rs`, `offline_sessions.rs`
+- `db/invariant_scan.rs` — the ledger oracle (test-gated, but it defines what "clean" means)
+- `transports/dps/*`
+- `runtime/ingress/*` — the only ingress surface
 - shift / offline / node state handling
-- migrations / schema / DDL
-- runtime startup / shutdown / health
+- `rust/prro/migrations/` — schema / DDL (sqlx, checksum-enforced)
+- runtime startup / shutdown (`app.rs`, `runtime/supervisor.rs`)
 - hooks that can change execution flow
 
 For high-risk edits:
