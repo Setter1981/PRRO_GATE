@@ -81,6 +81,19 @@ jobs:
     # before reintroducing parallelism.
     env:
       CARGO_BUILD_JOBS: "1"
+      # Peak-link-memory cap (bd PRRO_GATE-hpc, 2026-07-30). `-j1` above serialises
+      # the links but does NOT bound the peak of a SINGLE link, and debug info is the
+      # dominant contributor: once this PR added the ~201st test binary the
+      # inventory-gate `nextest list` link began dying with the SAME documented
+      # `ld terminated with signal 7 [Bus error]` on 3/3 consecutive attempts (a
+      # sibling PR on the identical base linked fine, so it is a threshold, not a
+      # code defect). `line-tables-only` keeps file:line in panics and backtraces —
+      # the only debug info CI actually reads — while dropping the type/variable DWARF
+      # that dominates link peak. Applied to BOTH profiles: test targets link their
+      # dependencies' `dev`-profile debug info too, so capping `test` alone is not
+      # enough. Scoped to THIS heavy x86 job; local dev builds are untouched.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
 
     steps:
       # fetch-depth: 0 — the CS-1R R1 provenance test (`cs1_test_provenance`)

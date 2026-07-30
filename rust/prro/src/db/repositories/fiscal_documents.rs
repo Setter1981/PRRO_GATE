@@ -1392,11 +1392,14 @@ where
 ///     overrides the older marker, since it re-advanced the seed);
 ///   - else genesis (`None`).
 ///
-/// NOTE (scope, bd PRRO_GATE-mcc + T=112): this recovers the tip only when the last seed-changing
-/// event left a trace in the ledger (an issued doc, or a rewind captured on a superseded doc's
-/// `previous_hash`). A **standalone** T=112 replenish or MacReseed (seed set to a non-doc value with
-/// no subsequent rewind) leaves NO ledger trace and is NOT recoverable here — a durable
-/// seed-transition record is required (separate finding). This fn fixes the NotAcceptedOffline case.
+/// NOTE (scope, bd PRRO_GATE-mcc + 2nk + hpc): this recovers the tip when the last seed-changing
+/// event left a trace EITHER in the ledger (an issued doc, or a rewind captured on a superseded
+/// doc's `previous_hash`) OR in the durable `chain_seed_transitions` witness (bd PRRO_GATE-hpc —
+/// the standalone T=112 replenish advances the seed to a NON-DOCUMENT value `Hs = sha256(request_xml)`
+/// with no producing fiscal document; the witness records it in the same per-FN `lnd` frame).  The
+/// doc-walk and the witness are reconciled by the §4.2 ordering rule below (strict `>` tie-break).
+/// All three seed consumers (NC-03 boot, MacReseed guard-B, invariant_scan) inherit both fixes
+/// through this ONE projection, exactly as bd 2nk folded in `chain_superseded_at`.
 pub async fn active_chain_tip_unsigned_xml_sha256<'e, E>(
     executor: E,
     fiscal_number: &str,
@@ -1404,41 +1407,99 @@ pub async fn active_chain_tip_unsigned_xml_sha256<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
+    // hpc: the projection now folds TWO sources (the doc walk + the durable T=112 witness).  It runs
+    // as ONE query so the public `E: Executor` signature — and all three call sites (boot `pool`,
+    // guard-B `&mut **tx`, scan `pool`) — stay byte-for-byte untouched (`E` is consumed once by a
+    // single `fetch_all`).  The query UNION-ALLs the fiscal_documents candidate rows with the single
+    // newest `chain_seed_transitions` witness, tagged by a `src` discriminator; the Rust below folds
+    // them via the §4.2 ordering rule.
     #[derive(sqlx::FromRow)]
-    struct Cand {
-        state: String,
+    struct Row {
+        src: String,
+        ord: i64,
+        state: Option<String>,
         previous_hash: Option<Vec<u8>>,
         unsigned_xml_sha256: Option<Vec<u8>>,
         offline_fiscal_no: Option<i64>,
         server_fiscal_no: Option<String>,
         chain_superseded_at: Option<String>,
+        new_seed: Option<Vec<u8>>,
     }
-    let rows: Vec<Cand> = sqlx::query_as(
-        "SELECT state, previous_hash, unsigned_xml_sha256, offline_fiscal_no, server_fiscal_no, \
-                chain_superseded_at \
-         FROM fiscal_documents \
-         WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
-         ORDER BY lnd DESC",
+    // Doc rows carry (src='DOC', ord=lnd, the raw columns the walk needs).  The witness row carries
+    // (src='WIT', ord=lnd_at_write, new_seed).  A `sort` key ('DOC'/'WIT') is only cosmetic — the
+    // Rust fold picks the doc-tip and the single witness independently.
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT 'DOC' AS src, lnd AS ord, state, previous_hash, unsigned_xml_sha256, \
+                offline_fiscal_no, server_fiscal_no, chain_superseded_at, NULL AS new_seed \
+           FROM fiscal_documents \
+          WHERE fiscal_number = ?1 AND unsigned_xml_sha256 IS NOT NULL \
+         UNION ALL \
+         SELECT src, ord, state, previous_hash, unsigned_xml_sha256, offline_fiscal_no, \
+                server_fiscal_no, chain_superseded_at, new_seed FROM ( \
+             SELECT 'WIT' AS src, lnd_at_write AS ord, NULL AS state, NULL AS previous_hash, \
+                    NULL AS unsigned_xml_sha256, NULL AS offline_fiscal_no, \
+                    NULL AS server_fiscal_no, NULL AS chain_superseded_at, new_seed \
+               FROM chain_seed_transitions \
+              WHERE fiscal_number = ?1 \
+              ORDER BY lnd_at_write DESC, created_at DESC, rowid DESC \
+              LIMIT 1) \
+         ORDER BY ord DESC",
     )
     .bind(fiscal_number)
     .fetch_all(executor)
     .await?;
+
+    // Doc-derived tip AND the ordinal of the doc that produced it (lnd of the superseded doc for a
+    // rewind marker, else lnd of the first issued doc).  Walk newest-first over the DOC rows only.
+    let mut doc_tip: Option<(Option<Vec<u8>>, i64)> = None;
+    let mut witness: Option<(Vec<u8>, i64)> = None;
     for r in rows {
-        if r.state == "CANCELLED" || r.state == "ABORTED" {
+        if r.src == "WIT" {
+            // Only ever one witness row (LIMIT 1 in the sub-select).  Newest T=112 seed.
+            if let Some(seed) = r.new_seed {
+                witness = Some((seed, r.ord));
+            }
+            continue;
+        }
+        if doc_tip.is_some() {
+            continue; // doc-tip already resolved; remaining DOC rows are older links
+        }
+        let state = r.state.unwrap_or_default();
+        if state == "CANCELLED" || state == "ABORTED" {
             continue; // dead cohort — not a chain link
         }
         if r.chain_superseded_at.is_some() {
             // The last seed-changing event was this rewind → its previous_hash IS the durable tip.
-            return Ok(r.previous_hash);
+            doc_tip = Some((r.previous_hash, r.ord));
+            continue;
         }
-        if is_issued(&r.state, r.offline_fiscal_no, r.server_fiscal_no.as_deref()) {
+        if is_issued(&state, r.offline_fiscal_no, r.server_fiscal_no.as_deref()) {
             // A normal issuance (newer than any marker) re-advanced the seed to its own hash.
-            return Ok(r.unsigned_xml_sha256);
+            doc_tip = Some((r.unsigned_xml_sha256, r.ord));
+            continue;
         }
         // A non-issued, non-dead doc (PREPARED/SIGNED/ENCRYPTED — a crash artifact) did not advance
         // the seed; keep walking to the last seed-changing doc below it.
     }
-    Ok(None) // genesis — no seed-changing doc in the ledger
+
+    // §4.2 selection rule.  `lnd_at_write` (witness) and `ordinal` (doc) share the SAME
+    // strictly-monotonic per-FN frame (single-writer invariant #2), so:
+    //   - a witness with lnd_at_write = k is NEWER than every doc with lnd < k → witness wins;
+    //   - a doc that consumed lnd = k (issued AT/AFTER the witness reserved k) is NEWER → doc wins.
+    // STRICT `>` on the witness side encodes the load-bearing tie-break: at equal ordinal the DOC
+    // wins (it consumed the ordinal the witness merely reserved — the after-SELL case).
+    match (doc_tip, witness) {
+        (None, None) => Ok(None),                         // genesis
+        (Some((seed, _ordinal)), None) => Ok(seed), // pure-doc chain (incl. genesis rewind None)
+        (None, Some((w_seed, _lnd))) => Ok(Some(w_seed)), // replenish before any seed-changing doc
+        (Some((d_seed, d_ordinal)), Some((w_seed, w_lnd))) => {
+            if w_lnd > d_ordinal {
+                Ok(Some(w_seed)) // witness strictly newer than the producing doc
+            } else {
+                Ok(d_seed) // doc chained at/past the witness ordinal → doc wins
+            }
+        }
+    }
 }
 
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
