@@ -40,3 +40,5 @@ cc 1d60eb424fd2feb7648df72515b34e423107808eda048eff24b07661b00ef997 # shrinks to
 cc ac5a42cdc673c328d44fda9cf6105c9644fc709fc1244fedd7bec0ea502879d9 # shrinks to ops = [OfflineShiftOpen, OnlineReturn(DpsScript([UnknownStatus(-4)]))]
 cc 800ac415bae58a77b26d9a4b85b3d92091e23602cc562f73f0ad8fe5d154dc5a # shrinks to ops = [OnlineServiceIn(DpsScript([Ack, Ack])), OnlineSell(DpsScript([BadHashPrev])), OperatorComplete(Accepted)]
 cc eecc185e75544bbacb24e8fb5fae8bb788b0a465d1c133967dfada99f9ff5d9a # shrinks to ops = [Crash(Send), GoOnline(DpsScript([UnknownStatus(-4)])), OperatorComplete(Accepted)]
+cc 1a515e8d42b234e7e1683385031a61bd42412f2a3672f10e4629269b6cb934bd # shrinks to ops = [OnlineZReport(DpsScript([Superseded]))]
+cc 4a741de8c66fd7605d99350282cf8b37e177786bca2823457694147ff27f79e3 # shrinks to ops = [OnlineShiftOpen(DpsScript([Ack, NotFound])), GoOnline(DpsScript([Superseded])), OnlineReturn(DpsScript([Reject])), OfflineShiftOpen, SellWithClosedShift, GoOnlineWithoutBacklog, RepeatDrain, Drain(DpsScript([Reject]))]
