@@ -94,21 +94,41 @@ Synergy з 36h SHIFT_OPEN cert gate (§16.10): cert validates at SHIFT_OPEN з >
 **Джерело:** Наказ МФ №317.
 
 ### INV-11 — Офлайн-операція вимагає попередньо виданого діапазону фіскальних номерів
-Без активного `offline_ranges` запис не може бути присвоєно.
+Без активного запасу офлайн-кодів запис не може бути присвоєно.
 
-**Engineering enforcement:** `_allocate_offline_fiscal_no()` в write-path перевіряє активний діапазон; повертає помилку при відсутності.
+**Engineering enforcement (verified 2026-07-30):** таблиці `offline_ranges` і функції
+`_allocate_offline_fiscal_no()` **не існують** (Python-ера). Реальний механізм — FN-scoped пул
+`offline_codes` (PK `(fiscal_number, code_lnd)`, міграція `001_baseline.sql`): код видається
+`offline_sessions::acquire_code_tx` під per-FN write-lease у `stage_sign`; за порожнього пулу документ
+відмовляється до підпису.
 
 ### INV-12 — Один офлайн-номер — один електронний документ
-Офлайн-фіскальний номер із `offline_ranges` не може бути використаний для двох документів.
+Один офлайн-код не може бути використаний для двох документів.
 
-**Engineering enforcement:** `UNIQUE INDEX uq_fiscal_documents_offline_no ON fiscal_documents(offline_fiscal_no) WHERE offline_fiscal_no IS NOT NULL`; атомарне інкрементування `next_fiscal_no` під `BEGIN IMMEDIATE`.
+**Engineering enforcement (verified 2026-07-30):** `uq_fiscal_documents_offline_no` і `next_fiscal_no`
+**не існують**. Один-код-один-документ тримає `offline_codes`: PK `(fiscal_number, code_lnd)`,
+`ux_offline_codes_consumed_by_doc` на `consumed_by_document_id` та тригер незмінності спожитого рядка
+(`001_baseline.sql`); видача — атомарна, під `BEGIN IMMEDIATE` + per-FN lease.
 
 ### INV-13 — Офлайн-чек не є фінальним підтвердженням DPS до передачі та ACK
 Локально створений офлайн-документ є тимчасовим. Він стає фіскально легітимним тільки після отримання ACK від DPS.
 
 **Engineering enforcement (M3b):** Pattern C state machine — `OFFLINE_LOCAL_ACK → Sending → Sent → Kvt1 → Kvt2 → Ack`. Документ зберігається в `fiscal_documents` з state `OFFLINE_LOCAL_ACK` (customer-facing receipt issued); drain виконується пізніше через W9b backlog drain + W12 KVT2 confirmation. Підпис застосовується **at drain time, NOT at ingress** (validated проти WebCheck decompiled + Python adapter — cross-ref M3b spec §16.11).
 
-**Round 8 architectural pin (§16.1):** `fiscal_documents` = ledger of issued receipts only. OFFLINE_LOCAL_ACK документи там legitimately persisted because customer has physical receipt; failed online attempts (DPS rejection) → audit_log only, NOT persisted.
+**Round 8 architectural pin (§16.1) — CORRECTED 2026-07-30 (A.3):** ~~`fiscal_documents` = ledger of
+issued receipts only … failed online attempts (DPS rejection) → audit_log only, NOT persisted~~.
+The real pin is **"no doc rests in a NON-TERMINAL state (`PREPARED`/`SIGNED`/`ENCRYPTED`) at a
+quiescent boundary"** — `fiscal_documents` holds issued receipts **plus their non-issued terminal
+artifacts**. Two refusal classes differ:
+- **pre-mint / invalid-ingress** refusals → `audit_log` only, no row is ever minted (this part of the
+  original pin stands);
+- **DPS terminal rejects act on an ALREADY-MINTED doc** and are split by the SEND boundary: a
+  **pre-SENT** reject CASes `Sending → Rejected` (a non-issued `Rejected` row legitimately rests —
+  lnd consumed, seed NOT advanced), a **post-SENT** reject is issued-but-unconfirmed and escalates to
+  `RequiresManualReconciliation` (never `Rejected`), and a post-sign refusal of an offline doc lands in
+  `ABORTED`.
+`OFFLINE_LOCAL_ACK` docs remain legitimately persisted (the customer holds a physical receipt).
+Persisted non-issued terminals: `REJECTED`, `CANCELLED`, `ABORTED`, `REQUIRES_MANUAL_RECONCILIATION`.
 
 ### INV-14 — Офлайн-документи зберігаються локально до підтвердження DPS
 Документи в стані `OFFLINE_LOCAL_ACK` не повинні видалятись або архівуватись до отримання `Ack` через drain pipeline.
@@ -153,7 +173,12 @@ Online ops resume only after FULL drain completes for FN (per M3b spec §3.3 onl
 ### INV-19 — Кожен перехід стану повинен бути відновлюваним або явно позначеним для ручної звірки
 Жоден документ не повинен застрягати в невизначеному стані без діагностики та recovery-шляху.
 
-**Engineering enforcement (M3b expanded taxonomy per spec §16.3):** замість бінарного `ERROR_RETRYABLE` / `REQUIRES_MANUAL_RECONCILIATION` — повна taxonomy з 5 recovery classes:
+**⚠ Verified 2026-07-30 — the five classes below are SPEC VOCABULARY, not shipped code.** Жодна з
+назв (`AutoOfflineFallback`, `TechSupportEscalation`, `KeyRotationPending`, `MacReseedRecovery`,
+`TechSupportRepair`) **не зустрічається в `rust/prro/src`**. Реальна taxonomy — `RetryClass`
+(`services/write_path/error_routing.rs`), і невідомий код ДПС іде **fail-closed** (WrapperBug →
+`ErrorRetryable` + CRITICAL audit + node `STOP_MODE`) — жодного авто-переходу в офлайн немає.
+Нижче — початковий (нереалізований) задум M3b §16.3:
 - **`AutoOfflineFallback`** — unknown DPS errors → auto-switch to OFFLINE + tech support notification (NOT Manual recon)
 - **`TechSupportEscalation`** — hard rejects що пройшли ingress validation → hold for tech support triage
 - **`KeyRotationPending`** — cashier cert near expiry → refuse SHIFT_OPEN OR auto-swap to deferred key (per §16.10 36h gate)
@@ -181,7 +206,12 @@ Every Manual landing → Critical audit + forensic snapshot capture (§8.1) + �
 
 **Формула:**
 ```
-cash_on_hand = opening_cash + Σcash(SELL) − Σcash(RETURN) [+ service_in − service_out − epz_out (L3)]
+cash_on_hand = opening_cash + Σcash(SELL) − Σcash(RETURN) + service_in − service_out − epz_out
+# ⚠ ВАЖЛИВО (verified 2026-07-30, bd PRRO_GATE-x5o): у суми входять ЛИШЕ документи зі
+# `state IN ('ACK','OFFLINE_LOCAL_ACK')` (`cash_ledger::aggregate_shift_cash_tx`).
+# Наслідок: скасований cohort-cancel'ом офлайн-чек законно ВИХОДИТЬ з обороту (готівка
+# «зникає» фіскально), а `opening_cash` береться з НАЙПІЗНІШЕ закритої зміни
+# (`closed_at DESC, rowid DESC` — bd PRRO_GATE-seb; до 2026-07-30 бралася найстаріша).
 ```
 де `opening_cash` = `cash_balance_kop` прочитана зі `shifts` при відкритті зміни (carry з попередньої закритої зміни, 0 для першої зміни).
 
@@ -193,7 +223,7 @@ cash_on_hand = opening_cash + Σcash(SELL) − Σcash(RETURN) [+ service_in − 
 - Reconcile seam: `invariant_scan::Violation::CashAnchorDrift` (check 16 у `scan()`).
 - Closing anchor: `shifts.cash_balance_kop` перезаписується закриваючим залишком у тій самій транзакції Closing→Closed (invariant #2).
 
-**L3 scope:** service-in / service-out / EPZ — нуль до L3 (TODO-gated коментар у `derive_cash_on_hand`).
+**L3 scope:** service-in / service-out / EPZ — **розведені** (`cash_ledger::derive_cash_on_hand` + `aggregate_shift_cash_tx` рахують усі три ноги); TODO-gate знято.
 
 **Порушення:** видача готівки понад наявну — юридично неприпустимо; оперативно-фінансова відповідальність касира.
 
@@ -207,16 +237,19 @@ cash_on_hand = opening_cash + Σcash(SELL) − Σcash(RETURN) [+ service_in − 
 |---|---|
 | Single-writer / LND | ✅ Реалізовано і покрито тестами (M3a + M3b W2) |
 | Shift lifecycle guards | ✅ Реалізовано і покрито тестами |
-| Channel lock enforcement | ✅ Реалізовано і покрито тестами |
+| Channel lock enforcement | ⚠ **НЕ enforced механічно (verified 2026-07-30)** — колонок `integration_owner` / `opened_via_*` / `channel_lock_acquired_at` і помилки `SHIFT_CHANNEL_SWITCH_FORBIDDEN` **не існує** (нуль входжень у `migrations/` і `src/`). Фактично: профілі (`backend_profile_id` / `transport_profile_id`) беруться з `node_state` і незмінні під час роботи, а єдина перевірка — `MissingProfileBinding` у `stage_acquire` (non-null binding). Frozen invariant #3 тримається конструкцією, а не гардом; якщо потрібна механічна гарантія — це окрема робота. |
 | Idempotency | ✅ Реалізовано і покрито тестами |
-| **24h shift limit** | ⚠ **Active engineering risk** — not yet enforced in the Rust gateway; must be enforced before production OR explicitly risk-accepted with a sign-off in the pilot log.  The offline Z_REPORT local close-of-day path (M3b W10) exists precisely so this limit has a compliant exit even when DPS is unreachable — without it the system would trap an offline shift against the 24h wall. |
-| **36h continuous offline limit** | ⚠ **Active engineering risk** — Python-era enforcement (the original ✅ row) does NOT apply to the Rust gateway, which is being built standalone.  Must be enforced before production OR explicitly risk-accepted.  Sales may be blocked at the limit; the close/reporting path must always have an exit (offline Z_REPORT local close). |
-| **168h monthly offline limit** | ⚠ **Active engineering risk** — same shape as 36h.  Must be enforced before production OR explicitly risk-accepted. |
+| **24h shift limit** | ✅ **Enforced (verified 2026-07-30)** — `services::time_budget::SHIFT_MAX_SECONDS = 24*3600`, перевірка у `write_path/inline.rs` до мінтингу, toggle за замовчуванням увімкнений. Історична нотатка нижче збережена для контексту: ⚠ was — must be enforced before production OR explicitly risk-accepted with a sign-off in the pilot log.  The offline Z_REPORT local close-of-day path (M3b W10) exists precisely so this limit has a compliant exit even when DPS is unreachable — without it the system would trap an offline shift against the 24h wall. |
+| **36h continuous offline limit** | ✅ **Enforced (verified 2026-07-30)** — `OFFLINE_SESSION_MAX_SECONDS = 36*3600`, анкер — `offline_sessions.opened_at`; відмова pre-mint для SELL/RETURN. Історична нотатка: ⚠ was — Python-era enforcement did NOT apply to the Rust gateway, which is being built standalone.  Must be enforced before production OR explicitly risk-accepted.  Sales may be blocked at the limit; the close/reporting path must always have an exit (offline Z_REPORT local close). |
+| **168h monthly offline limit** | ✅ **Enforced (verified 2026-07-30)** — `OFFLINE_MONTH_MAX_SECONDS = 168*3600`, обчислюється з `offline_sessions` (колонка `node_state.current_month_offline_seconds` мертва). |
 | Offline range allocation | ✅ Реалізовано і покрито тестами (M3b W4 + W5) |
 | Offline state model (`OfflineLocalAck` typed state) | ✅ Реалізовано (M3b W4 + W6 + W7) |
 | Offline sync service (W9 backlog drain) | ⚠ In progress — M3b W9a merged (`stage_send` widened for OfflineLocalAck source); W9b backlog drain orchestration + W12 KVT2 confirmation pending |
 | **Z-report / shift close policy** | ⚠ M3b W10 redesigned (2026-05-16) — **ONLINE Z_REPORT** over pending offline backlog MUST be blocked; **OFFLINE-mode local Z_REPORT** close-of-day MUST be allowed as Pattern C document (consumes offline code, lands `OfflineLocalAck`, drained later in `lnd` order).  Earlier blanket-block framing was an error — see `docs/OFFLINE_SHIFT_CLOSE_DECISION.md` §0.  W10 implementation pending. |
-| **Hard close-code reserve = 1** | ⚠ M3b W10 rule (2026-05-16) — reserve = one currently-unconsumed code in the FN-scoped pool (`offline_codes` PK `(fiscal_number, code_lnd)`) while that FN has an open shift and the local offline `Z_REPORT` has NOT yet been emitted; ordinary offline `SELL` / `RETURN` / `SERVICE_*` docs MUST NOT consume that last `consumed_at IS NULL` row (refused with `OFFLINE_CODE_RESERVED_FOR_CLOSE` audit; code row stays unconsumed).  The offline `Z_REPORT` close-of-day MAY consume the reserved code.  **Hard reserve is exactly 1** — it is the *last-line* legal guarantee that the offline Z_REPORT close path always has a code while a shift is open, NOT an operational refill watermark.  The operational watermark (`min_offline_codes`, commonly ~10) sits well above 1 and triggers refill *before* exhaustion; it is a recommendation, not the legal reserve.  pool=0 at close time → `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` with `reason: "code_pool_exhausted"` and **severity Critical** (NOT Warning — the 24h shift-limit trap is functionally re-asserted for the FN; audit dashboards must surface this immediately); pilot-critical / legal-critical signal that the operational watermark failed upstream.  Without this reserve, ordinary docs could exhaust the pool before close-of-day, leaving the offline Z_REPORT path empty and re-asserting the 24h trap.  **Reserve shape is channel-specific** (see plan §"DPS Channel Taxonomy"): WebCheck/gRPC = one row in `offline_codes` left `consumed_at IS NULL`; DFS HTTP/XML = one offline local ordinal / control-number slot in the `OfflineSessionId.localOfflineNum.controlNumber` derivation.  M3b W10 implements the WebCheck variant; the audit vocabulary is channel-neutral.  W10 implementation pending. |
+| **Hard close-code reserve = 1** | ⚠ M3b W10 rule (2026-05-16) — reserve = one currently-unconsumed code in the FN-scoped pool (`offline_codes` PK `(fiscal_number, code_lnd)`) while that FN has an open shift and the local offline `Z_REPORT` has NOT yet been emitted; ordinary offline `SELL` / `RETURN` / `SERVICE_*` docs MUST NOT consume that last `consumed_at IS NULL` row (refused with **`OFFLINE_CODE_RESERVE_HELD`** audit — `OFFLINE_CODE_RESERVED_FOR_CLOSE` **не існує в коді**; code row stays unconsumed).  The offline `Z_REPORT` close-of-day MAY consume the reserved code.  **⚠ Реальне правило — ДИНАМІЧНЕ (verified 2026-07-30), не «рівно 1»:**
+`reserve = (session BEGIN відсутній ? 1 : 0) + (офлайн Z ще потрібен ? 1 : 0)`, а звичайний офлайн
+`SELL`/`RETURN` допускається ⟺ `free_codes >= 1 + reserve` (`write_path/inline.rs`). Тобто пул = 2 з
+незамінтованим BEGIN **відмовляє** звичайному продажу. Нижче — початкове формулювання «рівно 1»: it is the *last-line* legal guarantee that the offline Z_REPORT close path always has a code while a shift is open, NOT an operational refill watermark.  The operational watermark (`min_offline_codes`, commonly ~10) sits well above 1 and triggers refill *before* exhaustion; it is a recommendation, not the legal reserve.  pool=0 at close time → `OFFLINE_Z_REPORT_LOCAL_CLOSE_REFUSED` with `reason: "code_pool_exhausted"` and **severity Critical** (NOT Warning — the 24h shift-limit trap is functionally re-asserted for the FN; audit dashboards must surface this immediately); pilot-critical / legal-critical signal that the operational watermark failed upstream.  Without this reserve, ordinary docs could exhaust the pool before close-of-day, leaving the offline Z_REPORT path empty and re-asserting the 24h trap.  **Reserve shape is channel-specific** (see plan §"DPS Channel Taxonomy"): WebCheck/gRPC = one row in `offline_codes` left `consumed_at IS NULL`; DFS HTTP/XML = one offline local ordinal / control-number slot in the `OfflineSessionId.localOfflineNum.controlNumber` derivation.  M3b W10 implements the WebCheck variant; the audit vocabulary is channel-neutral.  **W10 LANDED** (verified 2026-07-30 — the dynamic reserve is live in `write_path/inline.rs`). |
 | **X-report read-only** | ✅ Invariant (Rust gateway, 2026-05-16) — `X_REPORT` is a mid-shift / cash-drawer **operational report**, NOT a fiscal close-of-day document.  The Rust gateway MUST NOT sign, transport, persist as `fiscal_documents`, advance `lnd`, consume an offline code (WebCheck channel) or an offline local ordinal (DFS channel), or allocate a Z-report sequence number for an `X_REPORT` request.  W10 policy does NOT block `X_REPORT` on offline backlog — it is a no-fiscal-side-effect read; if backlog exists the response MAY carry a warning / forensic note but MUST NOT mutate fiscal state.  Consistent with the WebCheck reverse-engineering finding (X-report not signed/submitted) and with the reference DFS dispatcher (`PRRODPS/Maria/Session/MariaDispatcher.cs::ZREP → X-report`, no `/fs/doc` post).  `Z_REPORT`, in contrast, IS the fiscal close-of-day document and MAY be the offline local close — see "Z-report / shift close policy" row above. |
 | Crypto seam (passthrough/sidecar) | ✅ Реалізовано і покрито тестами |
 | Production crypto startup gate | ⚠ GAP — стартовий блокер для production конфігурації не реалізований (cross-ref INV-17 body); виправлення в A2/A4 |

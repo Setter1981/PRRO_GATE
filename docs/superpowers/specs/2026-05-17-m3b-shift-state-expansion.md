@@ -178,7 +178,15 @@ The `fiscal_documents::allowed_transition`-style whitelist for shifts.  Every ed
 | 13 | ClosingLocalPendingDrain | Closed | W9b drain reached final DPS Ack via W12 for **every backlog doc including** prior offline `SHIFT_OPEN` and the close `Z_REPORT` | offline-close happy path; see §4.3 for the "all-prior-acks" predicate |
 | 14 | ClosingLocalPendingDrain | RequiresManualReconciliation | drain rejected **any** backlog doc (offline `SHIFT_OPEN`, intermediate `SELL`/`RETURN`/`SERVICE_*`, or close `Z_REPORT` itself) | catastrophic-rollback path; reject of any drained doc terminates the close path |
 
-Total: **14 edges** (HIGH-fix Round 1 — the earlier "Opening → Opened on DocumentReject + retry" line was a duplicate; retry is doc-state-machine territory, not a separate shift edge).
+Total: ~~**14 edges**~~ → **18 edges as shipped** (CORRECTED 2026-07-30 against
+`rust/prro/tests/shift_state_whitelist_matrix.rs`, whose locked-count test asserts
+`ALLOWED_EDGES.len() == 18`). CS-3 added four beyond this table:
+**15** `Opened → RequiresManualReconciliation` (drain escalation, `offline_sync/backlog_drain.rs`),
+**16** `Opening → Closed`,
+**17** `OpenedLocalPendingDrain → Closed` (CS-3 gap 4b — offline SHIFT_OPEN not-accepted rollback),
+**18** `ClosingLocalPendingDrain → OpenedLocalPendingDrain`.
+(The original note stands: the earlier "Opening → Opened on DocumentReject + retry" line was a
+duplicate; retry is doc-state-machine territory, not a separate shift edge.)
 
 ### 4.3 ClosingLocalPendingDrain — drain progress vs state transition
 
@@ -200,7 +208,14 @@ Total: **14 edges** (HIGH-fix Round 1 — the earlier "Opening → Opened on Doc
   Unexpected transitions outside these 2 paths surface as `TransitionOutcome::Forbidden` (typed error to caller) so the bug is observable, not silently swept into `Error`.
 - **No blanket `Closing → Opened`**: see §6 — only `Authorization::DocumentReject` warrants rollback.  Hard rejects + drain rejects route to `RequiresManualReconciliation`.
 - **No `ClosingLocalPendingDrain → Opened`**: once an offline `Z_REPORT` lands `OFFLINE_LOCAL_ACK`, the shift cannot rollback to `Opened` automatically.  Local Pattern C commitment + post-local-close lockout are durable; only operator-driven `force_*` seam can undo, with full audit trail.
-- **No `OpenedLocalPendingDrain → Closed` directly**: the only path to `Closed` from a locally-opened shift is via `ClosingLocalPendingDrain` (offline `Z_REPORT` first) or through full drain to `Opened` + then `Closing → Closed` (online close after drain).  Skipping `ClosingLocalPendingDrain` would mean the close happened without a `z_report_document_id` link.
+- ~~**No `OpenedLocalPendingDrain → Closed` directly**~~ — **NO LONGER FORBIDDEN (corrected 2026-07-30).**
+  It is whitelisted as **edge 17** (`shift_state_whitelist_matrix.rs`, comment "CS-3 gap 4b: offline
+  SHIFT_OPEN not-accepted rollback") and is driven ONLY by the operator-completion seam
+  (`services/reconciliation/operator_completion.rs`) when a `NotAcceptedOffline` completion resolves an
+  offline `SHIFT_OPEN` that DPS never accepted — the shift is rolled back, not closed-with-a-Z, so the
+  missing `z_report_document_id` link is correct here. The ORIGINAL rationale still holds for the
+  ordinary close path: a normal close must go via `ClosingLocalPendingDrain` (offline `Z_REPORT` first)
+  or through full drain to `Opened` then `Closing → Closed`.
 - **While in `ClosingLocalPendingDrain`, drain ACK of a non-`Z_REPORT` doc does NOT fire a shift edge** (HIGH-fix Round 2): drain ACKs for `SELL` / `RETURN` / `SERVICE_*` / offline `SHIFT_OPEN` on the close-path are doc-state transitions only; the shift stays in `ClosingLocalPendingDrain` until the close `Z_REPORT` itself ACKs AND predicate §4.3 holds.  Only then edge 13 (`→ Closed`) fires.  This forbidden pattern is **scoped to `ClosingLocalPendingDrain`** — it does NOT apply to `OpenedLocalPendingDrain`, where edge 5 (`→ Opened`) is precisely triggered by `SHIFT_OPEN` drain ACK + empty trailing backlog.
 - **No `OpenedLocalPendingDrain → Opening`**: state graph is forward-only on the open-side; can't "downgrade" a locally-committed open back to an online-intent state.
 
@@ -1179,13 +1194,21 @@ Cross-ref: `feedback_webcheck_36h_key_expiry_gate` memory.
 
 ### 16.11 Offline-signing-at-drain pin (Round 8 Case 5 — WebCheck + Python both validated)
 
-§3.3 already implicit. Now authoritative pin: **OFFLINE_LOCAL_ACK docs are stored UNSIGNED at ingress time**. Signature applied only at DRAIN time when the document is being submitted to DPS through the W9a-widened stage_send path. MAC chain computed sequentially at drain (placeholder substituted with real previous-doc MAC from DPS's last ack response).
+§3.3 already implicit. ~~Now authoritative pin: **OFFLINE_LOCAL_ACK docs are stored UNSIGNED at ingress
+time**…~~ — **INVERTED BY B9 (corrected 2026-07-30).** Offline documents are **signed at
+`stage_sign`**, and the offline code is acquired and stamped as `<MAC ID>` in the SAME pin-tx
+(`services/write_path/stage_sign.rs`), so the code sits INSIDE the signed bytes.
+`stage_offline_ack` performs a slim `Signed → OfflineLocalAck` CAS and does **not** sign; an
+unstamped `SIGNED` doc is `Aborted`, never drained. Drain therefore submits already-signed bytes —
+it does not compute the MAC chain at drain time.
 
 Reference: WebCheck `SendingOfflineChecks.cs:65` calls `SF.SignatureFile()` ONLY at drain; placeholder `"mmmaaaccc"`. Python adapter `offline_sync.py:85-155` writes `DOCUMENT_SIGN_DEFERRED` audit at offline ingress, signs at drain. Both reference implementations agree.
 
 **Consequence**: mid-offline cert/key expiry does NOT corrupt offline-ack docs (because they're not yet signed); only blocks drain until new cert obtained.
 
-**Implementation contract**: `fiscal_documents.signed_xml_bytes` (or equivalent) MUST be NULL for `OFFLINE_LOCAL_ACK` state; populated only on transition to `Sending` during drain.
+**Implementation contract** — ~~MUST be NULL for `OFFLINE_LOCAL_ACK`~~ **REVERSED (2026-07-30):** the
+signed bytes are populated at `stage_sign`, i.e. BEFORE `OFFLINE_LOCAL_ACK`, and are byte-for-byte the
+bytes later submitted at drain (B9). Nothing re-signs during drain.
 
 Cross-ref: `feedback_webcheck_offline_sign_at_drain` memory.
 
