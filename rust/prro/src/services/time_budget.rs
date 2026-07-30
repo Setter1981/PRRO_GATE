@@ -282,6 +282,8 @@ pub async fn compute_budgets_for_fn(
 
     // (1) 24h shift — the SHIFT_OPEN business_ts of the FN's current shift.
     let shift_open_business_ts: Option<String> = sqlx::query_scalar(
+        // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+        // scoped to a single shift of one `fiscal_number`, so `lnd` is unique here.
         "SELECT fd.business_ts \
          FROM fiscal_documents fd \
          JOIN node_state ns ON ns.current_shift_id = fd.shift_id \

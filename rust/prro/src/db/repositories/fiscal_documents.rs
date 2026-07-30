@@ -998,6 +998,8 @@ pub async fn last_server_fiscal_no(
     fiscal_number: &str,
 ) -> sqlx::Result<Option<String>> {
     sqlx::query_scalar::<_, String>(
+        // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+        // scoped to one `fiscal_number`, so `lnd` breaks every tie — a total order.
         "SELECT server_fiscal_no FROM fiscal_documents \
          WHERE fiscal_number = ? AND state = 'ACK' \
                AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0 \
@@ -1033,6 +1035,8 @@ pub async fn last_submitted_server_fiscal_no(
     fiscal_number: &str,
 ) -> sqlx::Result<Option<String>> {
     sqlx::query_scalar::<_, String>(
+        // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+        // scoped to one `fiscal_number`, so `lnd` breaks every tie — a total order.
         "SELECT server_fiscal_no FROM fiscal_documents \
          WHERE fiscal_number = ? AND state IN ('SENT', 'KVT1', 'KVT2', 'ACK') \
                AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0 \
@@ -1135,6 +1139,8 @@ pub async fn newest_pending_submittable(
     fiscal_number: &str,
 ) -> sqlx::Result<Option<(i64, Option<String>)>> {
     sqlx::query_as::<_, (i64, Option<String>)>(
+        // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+        // scoped to one `fiscal_number`, so `lnd` breaks every tie — a total order.
         "SELECT lnd, server_fiscal_no FROM fiscal_documents \
          WHERE fiscal_number = ? AND state IN ('SENT', 'KVT1', 'KVT2') \
          ORDER BY lnd DESC \
@@ -1177,6 +1183,8 @@ pub async fn last_ack_unsigned_xml_sha256(
     pool: &SqlitePool,
     fiscal_number: &str,
 ) -> sqlx::Result<Option<Vec<u8>>> {
+    // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+    // scoped to one `fiscal_number`, so `lnd` breaks every tie — a total order.
     let row: Option<Option<Vec<u8>>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(
         "SELECT unsigned_xml_sha256 FROM fiscal_documents \
          WHERE fiscal_number = ? AND state = 'ACK' \
