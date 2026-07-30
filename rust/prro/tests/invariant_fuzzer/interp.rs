@@ -180,7 +180,13 @@ pub struct FuzzCtx {
     /// these remove the directories — cleanup never races a live connection.
     /// Held only for their `Drop`; never read.
     _tempdir: tempfile::TempDir,
-    _tempdir_secure: tempfile::TempDir,
+    /// bd PRRO_GATE-2ds/hpc — the fixture now owns a REAL `App` so the interpreter can drive
+    /// production services that need one (the T=112 `OfflineCodeReplenishService` takes an `App`
+    /// for the per-FN write gate + pool).  `pool` / `pool_secure` are clones of `app.db()` /
+    /// `app.db_secure()`, so every existing op still runs against the SAME database.
+    /// `App::boot` spawns NO background tasks (the loops live in `runtime::supervisor::run`, started
+    /// only by `serve`), so fuzzer determinism is unaffected.
+    pub app: prro::App,
     sign_ctx: SigningContext,
     fn_sign: CheckSignBlob,
     gate: Arc<tokio::sync::Mutex<()>>,
@@ -202,8 +208,9 @@ impl FuzzCtx {
     }
 
     pub async fn new_online_open_shift() -> Self {
-        let (pool, _tempdir) = fresh_pool().await;
-        let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
+        let (app, _tempdir) = boot_fuzz_app(None).await;
+        let pool = app.db().clone();
+        let pool_secure = app.db_secure().clone();
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Online, shift_id).await;
@@ -211,7 +218,7 @@ impl FuzzCtx {
             pool,
             pool_secure,
             _tempdir,
-            _tempdir_secure,
+            app,
             sign_ctx: det_signing_ctx(),
             fn_sign: fn_sign_blob(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -226,8 +233,9 @@ impl FuzzCtx {
     /// Fixture variant used by the cleanup test: keep all DB tempdirs under a
     /// caller-owned base dir without mutating the process-global `TMPDIR`.
     async fn new_online_open_shift_in(base: &Path) -> Self {
-        let (pool, _tempdir) = fresh_pool_in(base).await;
-        let (pool_secure, _tempdir_secure) = fresh_secure_pool_in(base).await;
+        let (app, _tempdir) = boot_fuzz_app(Some(base)).await;
+        let pool = app.db().clone();
+        let pool_secure = app.db_secure().clone();
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Online, shift_id).await;
@@ -235,7 +243,7 @@ impl FuzzCtx {
             pool,
             pool_secure,
             _tempdir,
-            _tempdir_secure,
+            app,
             sign_ctx: det_signing_ctx(),
             fn_sign: fn_sign_blob(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -250,15 +258,16 @@ impl FuzzCtx {
     /// Fixture: a fresh DB with an ONLINE node and no open/current shift.
     /// `SHIFT_OPEN` should create and open the shift through stage_acquire.
     pub async fn new_online_closed_shift() -> Self {
-        let (pool, _tempdir) = fresh_pool().await;
-        let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
+        let (app, _tempdir) = boot_fuzz_app(None).await;
+        let pool = app.db().clone();
+        let pool_secure = app.db_secure().clone();
         seed_fn_config(&pool).await;
         seed_node_state_with_shift(&pool, NodeMode::Online, ShiftState::Closed, None).await;
         Self {
             pool,
             pool_secure,
             _tempdir,
-            _tempdir_secure,
+            app,
             sign_ctx: det_signing_ctx(),
             fn_sign: fn_sign_blob(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -274,8 +283,9 @@ impl FuzzCtx {
     /// session carrying `codes` offline codes (the offline lane is fixture-
     /// seeded — there is no go_offline op, spec §5).
     pub async fn new_offline_open_shift(codes: i64) -> Self {
-        let (pool, _tempdir) = fresh_pool().await;
-        let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
+        let (app, _tempdir) = boot_fuzz_app(None).await;
+        let pool = app.db().clone();
+        let pool_secure = app.db_secure().clone();
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Offline, shift_id).await;
@@ -287,7 +297,7 @@ impl FuzzCtx {
             pool,
             pool_secure,
             _tempdir,
-            _tempdir_secure,
+            app,
             sign_ctx: det_signing_ctx(),
             fn_sign: fn_sign_blob(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -302,8 +312,9 @@ impl FuzzCtx {
     /// Fixture: a fresh DB with an OFFLINE node, no open/current shift, and an
     /// OPEN offline session carrying `codes`.  `SHIFT_OPEN` local-acks.
     pub async fn new_offline_closed_shift(codes: i64) -> Self {
-        let (pool, _tempdir) = fresh_pool().await;
-        let (pool_secure, _tempdir_secure) = fresh_secure_pool().await;
+        let (app, _tempdir) = boot_fuzz_app(None).await;
+        let pool = app.db().clone();
+        let pool_secure = app.db_secure().clone();
         seed_fn_config(&pool).await;
         seed_node_state_with_shift(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
         seed_open_offline_session(&pool).await;
@@ -314,7 +325,7 @@ impl FuzzCtx {
             pool,
             pool_secure,
             _tempdir,
-            _tempdir_secure,
+            app,
             sign_ctx: det_signing_ctx(),
             fn_sign: fn_sign_blob(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -2739,6 +2750,48 @@ fn doc_state_from_str(s: &str) -> DocState {
 /// Returns the pool **and** its backing `TempDir` guard. The caller (`FuzzCtx`)
 /// must hold the guard for the pool's lifetime: dropping it removes the per-case
 /// DB directory (RAII), replacing the old `std::mem::forget` leak.
+/// Boot a REAL `App` for one fuzz case.  Both databases live under a single per-case temp dir whose
+/// guard the caller (`FuzzCtx`) holds, so cleanup stays RAII.  The fixture takes `pool` /
+/// `pool_secure` from `app.db()` / `app.db_secure()` so every existing op runs against the SAME
+/// database the App owns — that is what lets the interpreter drive production services (e.g. the
+/// T=112 `OfflineCodeReplenishService`, which needs an `App` for the per-FN write gate) instead of
+/// re-implementing their effects, which would make the oracle vacuous.
+///
+/// `App::boot` spawns NO background tasks (the tickers live in `runtime::supervisor::run`, started
+/// only by the `serve` subcommand), so this does not perturb fuzzer determinism.
+async fn boot_fuzz_app(base: Option<&Path>) -> (prro::App, tempfile::TempDir) {
+    let dir = match base {
+        Some(b) => tempfile::Builder::new()
+            .prefix("fuzz-app-")
+            .tempdir_in(b)
+            .unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
+    let db_path = dir
+        .path()
+        .join("fuzz.db")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let toml_text = format!(
+        r#"
+app_name = "prro"
+version  = "0.1.0"
+
+[database]
+db_path = "{db_path}"
+secure_db_path = "{db_path}_secure"
+
+[admin_ui]
+enabled = false
+listen  = "127.0.0.1:8443"
+"#
+    );
+    let cfg = prro::config::AppConfig::from_toml(&toml_text).unwrap();
+    let app = prro::App::boot(cfg).await.unwrap();
+    (app, dir)
+}
+
 async fn fresh_pool() -> (SqlitePool, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fuzz.db");
