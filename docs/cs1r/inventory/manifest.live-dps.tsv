@@ -1279,6 +1279,14 @@ live-dps	prro	prro::goldens_byte_equiv	xml_shift_open_byte_equivalent	false
 live-dps	prro	prro::goldens_byte_equiv	xml_z_report_byte_equivalent_doubles_as_close_shift	false
 live-dps	prro	prro::goldens_byte_equiv	xml_z_report_extended_byte_equivalent	false
 live-dps	prro	prro::handler_503_on_missing_operator	missing_operator_yields_registry_none_and_audit_for_configured_fn	false
+live-dps	prro	prro::hpc_t112_nc03	after_sell_recovers_hsell_not_stale_hs	false
+live-dps	prro	prro::hpc_t112_nc03	crash_atomicity_all_three_coexist_on_success	false
+live-dps	prro	prro::hpc_t112_nc03	guard_b_accepts_reseed_to_hs_rejects_hp	false
+live-dps	prro	prro::hpc_t112_nc03	invariant_scan_clean_after_standalone_replenish	false
+live-dps	prro	prro::hpc_t112_nc03	nc03_pre_sell_recovers_hs	false
+live-dps	prro	prro::hpc_t112_nc03	scan_clean_when_a_doc_chains_onto_the_t112_witness	false
+live-dps	prro	prro::hpc_t112_nc03	tied_witnesses_same_second_recover_the_latest_seed	false
+live-dps	prro	prro::hpc_t112_nc03	witness_and_seed_roll_back_together_on_tx_error	false
 live-dps	prro	prro::inbox_reaper	reap_new_no_doc_terminalises_rejected	false
 live-dps	prro	prro::inbox_reaper	reap_processing_accepted_doc_converges_done	false
 live-dps	prro	prro::inbox_reaper	reap_processing_failed_doc_terminalises_rejected	false

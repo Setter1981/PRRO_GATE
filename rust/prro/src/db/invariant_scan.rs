@@ -334,6 +334,22 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         // back-pointer THERE is still a real MAC break even though the doc is voided (audit MAJOR / bd
         // PRRO_GATE-2nk).  Distinct from `expected`, which is the LIVE (active) chain tip.
         let mut prev_row_unsigned: Option<Vec<u8>> = None;
+        // bd PRRO_GATE-hpc — durable T=112 seed witnesses (`chain_seed_transitions`).  A replenish
+        // advances the seed to a NON-DOCUMENT `Hs` with no ledger row, so a document issued AFTER it
+        // legitimately carries `previous_hash = Hs`.  Without re-anchoring, the walk's running
+        // `expected` would still hold the PRE-replenish doc hash → a FALSE `ChainBreak` at that doc
+        // (empirically reproduced).  Same shape as the 039 marker re-anchor below.  `lnd_at_write` is
+        // the FN's `next_lnd` when the replenish ran (the ordinal the NEXT doc takes), so a witness
+        // applies to a doc at `lnd >= lnd_at_write`; a doc that already advanced the tip past that
+        // ordinal makes the witness stale (`last_advance_ordinal` guard).
+        let witnesses: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT lnd_at_write, new_seed FROM chain_seed_transitions \
+             WHERE fiscal_number = ? ORDER BY lnd_at_write ASC, created_at ASC, rowid ASC",
+        )
+        .bind(&fiscal_number)
+        .fetch_all(pool)
+        .await?;
+        let mut last_advance_ordinal: i64 = i64::MIN;
         for (
             lnd,
             state,
@@ -364,6 +380,7 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             // the ledger — only re-anchored onto.
             if chain_superseded_at.is_some() {
                 expected = previous_hash;
+                last_advance_ordinal = lnd;
                 prev_row_unsigned = unsigned_sha;
                 continue;
             }
@@ -383,6 +400,15 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
                 }
                 prev_row_unsigned = unsigned_sha;
                 continue;
+            }
+            // hpc: re-anchor onto the NEWEST T=112 witness that fired at/below this doc's ordinal
+            // AND after the last tip advance (a witness the chain already passed must not re-apply).
+            if let Some((w_ord, w_seed)) = witnesses
+                .iter()
+                .rfind(|(o, _)| *o <= lnd && *o > last_advance_ordinal)
+            {
+                expected = Some(w_seed.clone());
+                last_advance_ordinal = *w_ord;
             }
             if previous_hash != expected {
                 out.push(Violation::ChainBreak {
@@ -429,6 +455,7 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             );
             if issued {
                 expected = unsigned_sha.clone();
+                last_advance_ordinal = lnd;
             }
             prev_row_unsigned = unsigned_sha;
         }
