@@ -154,6 +154,14 @@ pub struct RefModel {
     //
     // **L3:** service-in/out terms wired (apply_service_io). EPZ stays 0 (fail-closed).
     pub cash_on_hand: i64,
+    /// bd PRRO_GATE-x5o — the cash delta each doc contributed to `cash_on_hand` while it counted,
+    /// keyed by lnd.  PROD derives cash from `state IN ('ACK','OFFLINE_LOCAL_ACK')`
+    /// (`cash_ledger::aggregate_shift_cash_tx`), so a doc that LEAVES that set stops counting.  The
+    /// model advances `cash_on_hand` incrementally at issuance, so it needs this per-doc ledger to
+    /// REVERSE the contribution when a transition takes the doc out of the counted set (today: the
+    /// `NotAcceptedOffline` cohort-cancel + the held doc's escalation to RMR).  Docs with no cash leg
+    /// (a DocType=9 offline BEGIN) simply have no entry.
+    pub cash_by_lnd: BTreeMap<i64, i64>,
 
     // ── Cross-shift cash carry (mirrors prod `shifts.cash_balance_kop`) ────
     // Prod carry semantics (operator decision 2026-07-10, `cash_ledger.rs:13-18`):
@@ -203,8 +211,9 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0,   // L0: opening = 0 (first shift; carry is L3/L4)
-            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
+            cash_on_hand: 0,
+            cash_by_lnd: BTreeMap::new(), // L0: opening = 0 (first shift; carry is L3/L4)
+            carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
         }
     }
@@ -224,8 +233,9 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0,   // L0: no open shift → no cash-on-hand
-            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
+            cash_on_hand: 0,
+            cash_by_lnd: BTreeMap::new(), // L0: no open shift → no cash-on-hand
+            carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
         }
     }
@@ -247,8 +257,9 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0,   // L0: opening = 0 (first shift)
-            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
+            cash_on_hand: 0,
+            cash_by_lnd: BTreeMap::new(), // L0: opening = 0 (first shift)
+            carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
         }
     }
@@ -268,8 +279,9 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0,   // L0: no open shift
-            carry_cash_kop: 0, // L0: no prior CLOSED shift → carry 0
+            cash_on_hand: 0,
+            cash_by_lnd: BTreeMap::new(), // L0: no open shift
+            carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
         }
     }
@@ -441,6 +453,22 @@ impl RefModel {
     /// predicted mode (NEVER STOP_MODE — the anti-BRICK guarantee), and the seed advances for the
     /// seed-moving kinds (Accepted stamps the doc's chain tip; MacReseed re-bases).  Mutating `self`
     /// is what lets a SUBSEQUENT op issue again — the "next document passes" half of the property.
+    /// bd PRRO_GATE-x5o — apply a cash leg AND remember it per-lnd so a later transition out of the
+    /// prod-counted set (`ACK` / `OFFLINE_LOCAL_ACK`) can reverse exactly this doc's contribution.
+    fn record_cash(&mut self, lnd: i64, delta: i64) {
+        self.cash_on_hand += delta;
+        self.cash_by_lnd.insert(lnd, delta);
+    }
+
+    /// bd PRRO_GATE-x5o — reverse `lnd`'s cash contribution because the doc left the prod-counted
+    /// set.  Idempotent: a doc whose cash was already reversed (or that never had a cash leg) is a
+    /// no-op.
+    fn uncount_cash(&mut self, lnd: i64) {
+        if let Some(delta) = self.cash_by_lnd.remove(&lnd) {
+            self.cash_on_hand -= delta;
+        }
+    }
+
     fn apply_operator_complete(&mut self, kind: OperatorResolutionKind) -> ExpectedOutcome {
         // A completion releases ONLY a doc under a CS-3 PENDING_APPLY RESERVATION-hold — tracked
         // explicitly in `held_reservation_lnd` (set when an online wire op holds; re-derived from the
@@ -490,10 +518,17 @@ impl RefModel {
                 .collect();
             for l in cancel {
                 self.docs.insert(l, DocState::Cancelled);
+                // bd PRRO_GATE-x5o: a CANCELLED doc leaves prod's cash set
+                // (`state IN ('ACK','OFFLINE_LOCAL_ACK')`), so its cash leg must be reversed —
+                // otherwise the X-report turnover oracle diverges (real 0 vs model 15000).
+                self.uncount_cash(l);
             }
             self.seed = None; // structural rewind marker; exact value asserted relationally by run_harness
             self.docs
                 .insert(held_lnd, DocState::RequiresManualReconciliation);
+            // The held doc escalates to RMR, which is ALSO outside prod's cash set — reverse its leg
+            // too (a cash-bearing held SELL, not just the DocType=9 BEGIN of this repro).
+            self.uncount_cash(held_lnd);
             self.mode = node_mode_from_str(witness.node_mode); // GOING_ONLINE (active session drains)
             return ExpectedOutcome::Release(Some(witness));
         }
@@ -665,9 +700,9 @@ impl RefModel {
         // Cash update only at ACK (matches aggregate_shift_cash filter).
         if doc_state == DocState::Ack {
             if is_out {
-                self.cash_on_hand -= CASH_AMOUNT_KOP;
+                self.record_cash(lnd, -CASH_AMOUNT_KOP);
             } else {
-                self.cash_on_hand += CASH_AMOUNT_KOP;
+                self.record_cash(lnd, CASH_AMOUNT_KOP);
             }
         }
         ExpectedOutcome::Mutated(Mutation {
@@ -746,9 +781,9 @@ impl RefModel {
         // Cash update at OLA (mirrors aggregate_shift_cash filter
         // `state IN ('ACK','OFFLINE_LOCAL_ACK')`).
         if is_out {
-            self.cash_on_hand -= CASH_AMOUNT_KOP;
+            self.record_cash(lnd, -CASH_AMOUNT_KOP);
         } else {
-            self.cash_on_hand += CASH_AMOUNT_KOP;
+            self.record_cash(lnd, CASH_AMOUNT_KOP);
         }
         ExpectedOutcome::Mutated(Mutation {
             lnd,
@@ -814,7 +849,7 @@ impl RefModel {
         }
         // Cash-OUT only at ACK (matches aggregate_shift_epz filter).
         if doc_state == DocState::Ack {
-            self.cash_on_hand -= CASH_AMOUNT_KOP;
+            self.record_cash(lnd, -CASH_AMOUNT_KOP);
         }
         ExpectedOutcome::Mutated(Mutation {
             lnd,
@@ -1284,9 +1319,9 @@ impl RefModel {
                 // is a policy question separate from INV-21 correctness.
                 if doc_state == DocState::Ack {
                     if is_return {
-                        self.cash_on_hand -= CASH_AMOUNT_KOP;
+                        self.record_cash(lnd, -CASH_AMOUNT_KOP);
                     } else {
-                        self.cash_on_hand += CASH_AMOUNT_KOP;
+                        self.record_cash(lnd, CASH_AMOUNT_KOP);
                     }
                 }
                 ExpectedOutcome::Mutated(Mutation {
@@ -1393,9 +1428,9 @@ impl RefModel {
                 self.seed = Some(unsigned_hash);
                 // L0 cash-on-hand update: offline-origin doc is issued at OLA.
                 if is_return {
-                    self.cash_on_hand -= CASH_AMOUNT_KOP;
+                    self.record_cash(lnd, -CASH_AMOUNT_KOP);
                 } else {
-                    self.cash_on_hand += CASH_AMOUNT_KOP;
+                    self.record_cash(lnd, CASH_AMOUNT_KOP);
                 }
                 ExpectedOutcome::Mutated(Mutation {
                     lnd,
