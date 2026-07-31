@@ -39,7 +39,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{FileFailurePersistence, TestRunner};
 
 use model::{ExpectedOutcome, RefModel};
-use op::{DpsScript, L5Kind, Op, OperatorResolutionKind, Stage, WireResponse};
+use op::{DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, Stage, WireResponse};
 
 /// Every `DocState` variant — the test enumerates the domain to prove the
 /// model's issued predicate mirrors the SSOT const for ALL states (the
@@ -694,6 +694,40 @@ async fn held_online_return_survives_reboot_with_no_resend_or_reissue() {
     );
 }
 
+/// bd `PRRO_GATE-hpc` (anti-silent-zero) — the generator ACTUALLY emits BOTH T=112 leaves.
+///
+/// Without this, a future weight change could silently drop the `Replenish` arm and the durable
+/// witness (migration 040) plus the `active_chain_tip` fold would quietly go back to directed-only
+/// coverage — which is exactly the gap this symbol was added to close.
+///
+/// It also pins the SCOPE: `ReplenishLeaf` has no ambiguous/timeout variant, so a future arm that
+/// starts emitting one has to change this enum and will land here first. `RULING 2` §4 keeps that
+/// branch known-red until the live capture lands (bd `PRRO_GATE-2ds`).
+#[test]
+fn generator_emits_both_replenish_leaves() {
+    let mut runner = TestRunner::deterministic();
+    let strat = strategy::op_sequence();
+    let mut granted = 0usize;
+    let mut rejected = 0usize;
+    for _ in 0..2000 {
+        let seq = strat.new_tree(&mut runner).unwrap().current();
+        for op in &seq {
+            match op {
+                Op::Replenish(ReplenishLeaf::Granted) => granted += 1,
+                Op::Replenish(ReplenishLeaf::ServerReject) => rejected += 1,
+                _ => {}
+            }
+        }
+    }
+    // Density floor, same reasoning as the UnknownStatus lanes: a dropped arm gives 0 and a halved
+    // weight roughly halves the count, so a floor well below the expected value still trips hard.
+    assert!(
+        granted >= 100 && rejected >= 100,
+        "Replenish under-emitted (granted={granted}, reject={rejected} over 2000 seqs) — the \
+         appended arm is dropped or severely skewed (anti-silent-zero)"
+    );
+}
+
 /// PR-R-fuzz (anti-silent-zero) — the generator ACTUALLY emits both Return ops
 /// over a large deterministic draw, so Return / mixed sequences are really
 /// exercised by the property harness.  A dropped or zero weight makes this RED
@@ -764,10 +798,17 @@ fn generator_emits_unknown_status_on_sell_and_shift_lanes() {
         }
     }
     // Density floor, not just `> 0`: unk is 1/5 of a shift draw over 2 shift ops and 1/6 of a sell
-    // draw over 7 script ops — both expected in the many-hundreds over a 2000×~4.5-len draw, so
-    // `>= 100` is astronomically non-flaky yet ALSO trips on a future under-weighting.
+    // draw over 7 script ops — both expected in the many-hundreds over a 2000×~4.5-len draw, so the
+    // floor is astronomically non-flaky yet ALSO trips on a future under-weighting.
+    //
+    // Floor RE-CALIBRATED 2026-07-31 (100 -> 70) when the `Replenish` arm was appended to the
+    // top-level `prop_oneof!`: one extra arm dilutes every other arm by ~1/(N+1), and the measured
+    // shift-lane count moved 100+ -> 92. The floor is deliberately NOT tuned to just-above-92 — it is
+    // set so the two failures it exists to catch still trip hard: a DROPPED arm yields 0, and a
+    // HALVED weight yields ~46. Any future alphabet growth that pushes this below 70 should be
+    // re-measured and re-justified here, not silently lowered again.
     assert!(
-        shift_lane >= 100,
+        shift_lane >= 70,
         "UnknownStatus under-emitted on the shift/Z lane ({shift_lane} over 2000 seqs) — the \
          appended arm is dropped or severely skewed (anti-silent-zero)"
     );
@@ -2092,6 +2133,77 @@ async fn harness_generative_not_accepted_offline_cohort_cancel_and_rewind() {
     .await;
 }
 
+// ── bd PRRO_GATE-hpc / 2ds — T=112 Replenish symbol ─────────────────────────────────────────────
+
+/// A granted T=112 replenish, then an offline SELL that chains onto the NON-DOCUMENT seed it
+/// installed.  This is the composition the hpc fix exists for: the replenish leaves `Hs` with no
+/// document, the durable witness (migration 040) records it, and the next issuance must chain onto
+/// `Hs` — with `invariant_scan` (driven by `assert_clean` inside `run_harness`) staying clean.
+/// Before the hpc scan re-anchor this exact shape produced a FALSE `ChainBreak`.
+#[tokio::test]
+async fn harness_replenish_then_offline_sell_chains_onto_the_non_doc_seed() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
+    let model = RefModel::new_offline_open_shift(4);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::Replenish(ReplenishLeaf::Granted),
+            Op::OfflineSell,
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// A server-rejected replenish persists NOTHING — no codes, no seed advance, no witness.  The
+/// harness's Replenish arm asserts both directions, so this pins the negative leaf.
+#[tokio::test]
+async fn harness_replenish_server_reject_persists_nothing() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let _ = run_harness(&[Op::Replenish(ReplenishLeaf::ServerReject)], ctx, model).await;
+}
+
+/// A replenish composed with a crash + reboot: the durable witness must survive recovery, so the
+/// post-reboot ledger stays clean.  Exercises the NC-03 path the hpc witness was built for,
+/// generatively rather than by a directed unit test.
+#[tokio::test]
+async fn harness_replenish_survives_crash_and_reboot() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
+    let model = RefModel::new_offline_open_shift(4);
+    let _ = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::Replenish(ReplenishLeaf::Granted),
+            Op::Crash(Stage::Sign),
+            Op::Reboot,
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// Two replenishes back-to-back with no document between them: both witnesses share the same
+/// `lnd_at_write` (a replenish allocates no lnd), so the projection must still resolve to the LATEST
+/// one.  The generative form of the tie the hpc review found by hand.
+#[tokio::test]
+async fn harness_two_replenishes_in_a_row_resolve_to_the_latest() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
+    let model = RefModel::new_offline_open_shift(4);
+    let _ = run_harness(
+        &[
+            Op::Replenish(ReplenishLeaf::Granted),
+            Op::Replenish(ReplenishLeaf::Granted),
+            Op::OfflineSell,
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 // ── CS-3 (C-iii) NotAcceptedOffline RELEASE: OLA-cohort cancel + chain rewind + fork guard ────────
 
 /// Build the C-iii cohort: an offline-open-shift FN with a HELD offline-origin doc (the drain-rejected
@@ -3276,6 +3388,10 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                                                                // CS-3 crash/replay (P4): the FN's held reservation BEFORE the op — a crash / reboot must
                                                                // PRESERVE it (boot recovery may not release or lose a committed PENDING_APPLY hold).
         let held_res_before = ctx.active_held_reservation().await;
+        // bd hpc — a T=112 replenish is the ONLY op that legitimately moves the chain seed without
+        // minting a document; it GRANTS codes rather than consuming them, so the harness needs the
+        // TOTAL pool size as well as the consumed count. Must be sampled BEFORE the op runs.
+        let codes_total_before = ctx.offline_codes_total().await;
         // bd PRRO_GATE-2nk (§5b) — generative NotAcceptedOffline: snapshot the rewind target (the held
         // doc's own immutable previous_hash) + the pre-op cohort so the Release arm asserts the EXACT
         // rewind + OLA-cohort cancel. The structural seed check only proves the seed CHANGED; this pins
@@ -3318,6 +3434,77 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
 
         let class = oracle::classify(&expected);
         match class {
+            // bd PRRO_GATE-hpc — T=112 replenish.  NARROW, ASSERTED carve-out from the
+            // "a seed advance implies an issuance" assumption: the seed DID move, and the op DID NOT
+            // allocate an lnd or mint a doc.  Every clause below is asserted in BOTH directions
+            // (granted vs server-reject), so this can never degrade into a blanket exemption.
+            oracle::OpClass::Replenish => {
+                oracle::check_differential(&real, &expected, prior_tip.as_deref()).unwrap_or_else(
+                    |d| panic!("replenish differential divergence on {op:?}: {d:?}"),
+                );
+                let granted = matches!(&real, interp::RealOutcome::Replenished { .. });
+                let seed_after = ctx.read_seed().await;
+                let seed_moved = seed_after.as_deref() != prior_tip.as_deref();
+                assert_eq!(
+                    seed_moved, granted,
+                    "replenish {op:?}: the chain seed must move IFF DPS granted codes \
+                     (granted={granted}, seed_moved={seed_moved})"
+                );
+                // The load-bearing half: a replenish allocates NO lnd.  This is what makes the
+                // witness's `lnd_at_write` ordering frame (migration 040) meaningful — a doc that
+                // later consumes that ordinal must win the tie-break against the witness.
+                assert_eq!(
+                    ctx.read_next_lnd().await,
+                    next_lnd_before,
+                    "replenish {op:?} allocated an lnd — it must not"
+                );
+                assert_eq!(
+                    ctx.observed_doc_count().await,
+                    doc_count_before,
+                    "replenish {op:?} minted a fiscal_documents row — it mints none"
+                );
+                assert_eq!(
+                    ctx.consumed_codes_count().await,
+                    codes_before,
+                    "replenish {op:?} CONSUMED a code — it only grants"
+                );
+                let codes_total_after = ctx.offline_codes_total().await;
+                if granted {
+                    // The pool grows by EXACTLY the rows prod reports as inserted. Asserting
+                    // "the pool grew" would be wrong: `insert_dps_codes_tx` uses INSERT OR IGNORE
+                    // against the partial unique index on (fiscal_number, dps_code), so a code value
+                    // DPS re-issues is legitimately deduped and inserts nothing — which is exactly the
+                    // idempotency RULING 2 §2 leans on for fresh-request recovery.
+                    let (inserted, deduped) = match &real {
+                        interp::RealOutcome::Replenished {
+                            inserted, deduped, ..
+                        } => (*inserted, *deduped),
+                        other => {
+                            panic!("granted replenish with a non-Replenished outcome: {other:?}")
+                        }
+                    };
+                    assert_eq!(
+                        codes_total_after - codes_total_before,
+                        inserted as i64,
+                        "replenish {op:?}: pool delta must equal the reported inserted count \
+                         ({codes_total_before} -> {codes_total_after}, inserted={inserted}, \
+                         deduped={deduped})"
+                    );
+                    assert!(
+                        inserted + deduped >= 1,
+                        "a granted replenish {op:?} accounted for NO codes at all \
+                         (inserted={inserted}, deduped={deduped}) — the grant went nowhere"
+                    );
+                } else {
+                    assert_eq!(
+                        codes_total_after, codes_total_before,
+                        "a server-rejected replenish {op:?} must persist NOTHING"
+                    );
+                }
+                // Keep the model's code total in step with reality (the model predicts +1 per grant;
+                // prod dedups by value, so reality is the authority on the exact count).
+                model.codes_issued = codes_total_after;
+            }
             // Fault / recovery — we do NOT predict recovery; adopt the real DB.
             oracle::OpClass::FaultOrRecovery => {
                 // MH (B1): a Fault-DEFERRED DRAIN (exotic wire script / mid-wire

@@ -54,7 +54,9 @@ use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
 use crate::common::scripted_dps::ScriptedDps;
 use crate::common::{det_signing_ctx, drain_test_guard};
-use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, Stage, WireResponse};
+use crate::op::{
+    DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, Stage, WireResponse,
+};
 
 /// A `(previous_hash, unsigned_xml_sha256)` chain-hash pair as read from a
 /// `fiscal_documents` row — both columns nullable.  Named to satisfy
@@ -163,6 +165,21 @@ pub enum RealOutcome {
     /// carries the durable witness read back (`APPLIED` / fence-clear / node un-halted / doc
     /// terminal).  The anti-BRICK oracle asserts this against the model's `ReleasedWitness`.
     Released(ObservedRelease),
+    /// bd `PRRO_GATE-hpc` / `PRRO_GATE-2ds` — a T=112 replenish COMPLETED: DPS granted a code window,
+    /// prod persisted the codes (`INSERT OR IGNORE`), advanced the chain seed to
+    /// `sha256(request_xml)` — a **non-document** seed — and appended the durable witness row
+    /// (migration 040), all in ONE `with_immediate` envelope.  This is the only outcome that mutates
+    /// the ledger WITHOUT minting a document and WITHOUT allocating an `lnd`, which is precisely what
+    /// makes the witness's `lnd_at_write` ordering frame meaningful.  A server-side refusal returns
+    /// [`RealOutcome::Refused`] instead (nothing persisted).
+    Replenished {
+        /// Codes actually inserted (duplicates are deduped by the partial unique index).
+        inserted: u64,
+        /// Codes the insert deduped away.
+        deduped: u64,
+        /// The non-document seed the replenish installed (`sha256(request_xml)`).
+        new_seed: Vec<u8>,
+    },
 }
 
 // ─── Race state threaded through `run_op` ───────────────────────────────────
@@ -1079,6 +1096,17 @@ impl FuzzCtx {
     }
 
     /// Consumed offline-code count (the harness no-issuance check).
+    /// bd `PRRO_GATE-hpc` — TOTAL offline-code rows for the FN (granted, regardless of consumption).
+    /// A T=112 replenish grows this without consuming anything, which is how the harness tells a
+    /// granted replenish apart from a refused one.
+    pub async fn offline_codes_total(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ?")
+            .bind(&self.fn_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
     pub async fn consumed_codes_count(&self) -> i64 {
         self.read_codes_consumed().await.unwrap_or(0)
     }
@@ -1218,6 +1246,8 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         // L6 — X-report (поточний звіт): a side-effect-free read through the REAL
         // ingress dispatch (`handle_command` → the ReadOnly arm → `handle_x_report`).
         Op::XReport => x_report(ctx).await,
+        // T=112 — drives the REAL `OfflineCodeReplenishService` (that is why `FuzzCtx` owns an `App`).
+        Op::Replenish(leaf) => replenish(ctx, *leaf).await,
         // L5 — drive a SELL THROUGH convert_to_signer_payload (the pre-inbox guard
         // layer).  A violation kind is refused pre-inbox (Refused, no row); Valid
         // converts + issues via inline::run.
@@ -2099,6 +2129,60 @@ async fn l5_probe(ctx: &mut FuzzCtx, kind: L5Kind) -> RealOutcome {
         Ok(_) => {
             ctx.last_row = Some(row.clone());
             RealOutcome::Doc(ctx.observe_doc_by_request_id(&row.request_id).await)
+        }
+        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+    }
+}
+
+/// T=112 offline-code replenish — drives the REAL `OfflineCodeReplenishService`.
+///
+/// This op exists because bd `PRRO_GATE-hpc` gave the standalone replenish real production seed
+/// semantics (a NON-document `Hs = sha256(request_xml)` plus the durable `chain_seed_transitions`
+/// witness folded into `active_chain_tip_unsigned_xml_sha256`) with DIRECTED coverage only.
+/// Re-implementing those effects here instead of driving the service would make the oracle agree with
+/// itself by construction — so the fixture owns a real `App` and this arm calls production.
+///
+/// Scope (RULING 2 §4): only the DECIDED leaves.  `Granted` and `ServerReject` are contractually
+/// settled; the ambiguous / transport-timeout branch stays out until the live capture lands
+/// (bd `PRRO_GATE-2ds`).
+///
+/// Codes are made unique per call from the ctx sequence so a second replenish in one case exercises a
+/// genuine INSERT rather than colliding with the previous window's dedup.
+async fn replenish(ctx: &mut FuzzCtx, leaf: ReplenishLeaf) -> RealOutcome {
+    let dps = Arc::new(ctx.new_dps());
+    ctx.seq += 1;
+    let seq = ctx.seq;
+    match leaf {
+        ReplenishLeaf::Granted => {
+            dps.push_ask_codes(Ok(prro::transports::dps::dto::OfflineCodesResponse {
+                codes: vec![format!("fuzz-code-{seq}")],
+            }))
+        }
+        ReplenishLeaf::ServerReject => {
+            dps.push_ask_codes(Err(prro::transports::dps::error::DpsError::Server {
+                code: -8,
+                message: "fuzzer: T=112 server reject".into(),
+            }))
+        }
+    }
+    let svc =
+        prro::services::offline_sync::offline_code_replenish::OfflineCodeReplenishService::new(
+            ctx.app.clone(),
+            dps,
+            Arc::new(det_signing_ctx()),
+        );
+    match svc.replenish(ctx.fn_id(), "12345678", seq as u32, 1).await {
+        Ok(summary) => {
+            let new_seed = (0..summary.new_seed_hex.len() / 2)
+                .map(|i| {
+                    u8::from_str_radix(&summary.new_seed_hex[i * 2..i * 2 + 2], 16).unwrap_or(0)
+                })
+                .collect::<Vec<u8>>();
+            RealOutcome::Replenished {
+                inserted: summary.inserted,
+                deduped: summary.deduped,
+                new_seed,
+            }
         }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }

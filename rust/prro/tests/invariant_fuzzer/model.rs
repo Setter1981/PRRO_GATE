@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::SqlitePool;
 
-use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, WireResponse};
+use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, WireResponse};
 use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
 
 /// U1 D3 — model-local FORK of the offline-origin "issued" set.  Deliberately a
@@ -92,6 +92,14 @@ pub enum ExpectedOutcome {
     /// (`run_harness`) asserts the anti-BRICK witness + the doc/seed/mode transition, NOT the per-doc
     /// differential (a release is not a fresh issuance).
     Release(Option<ReleasedWitness>),
+    /// bd `PRRO_GATE-hpc` — a T=112 replenish.  Its own class because it is the ONLY op that mutates
+    /// durable state WITHOUT minting a document: on `granted` the code pool grows and the chain seed
+    /// moves to a NON-DOCUMENT value (`sha256(request_xml)`, witnessed by migration 040), while
+    /// `next_lnd` does NOT move.  Every other mutating op ties a seed advance to an issuance, so
+    /// reusing `Mutated` / `NoMutation` here would either demand a doc that does not exist or assert
+    /// a seed that legitimately moved did not.  A dedicated variant keeps the carve-out narrow and
+    /// compiler-enforced instead of a blanket exemption.
+    Replenish { granted: bool },
 }
 
 /// Deterministic in-memory ledger predictor for one `fiscal_number`.
@@ -347,6 +355,8 @@ impl RefModel {
     /// Apply one op, mutating the model and returning the predicted outcome.
     pub fn apply(&mut self, op: &Op) -> ExpectedOutcome {
         match op {
+            // T=112 replenish — no doc, no lnd; the seed and the code pool move (bd hpc).
+            Op::Replenish(leaf) => self.apply_replenish(*leaf),
             // A "sell" outcome is determined by the NODE MODE, not the op name —
             // the interpreter runs `inline::run`, which dispatches by mode
             // (OnlineSell on an Offline node issues offline; OfflineSell on an
@@ -557,6 +567,47 @@ impl RefModel {
         // The hold is discharged (`held_reservation` is re-synced from reality by the harness after
         // this op — the fence is now clear, so a subsequent op can hold anew).
         ExpectedOutcome::Release(Some(witness))
+    }
+
+    /// bd `PRRO_GATE-hpc` — predict a T=112 replenish.
+    ///
+    /// `Granted`: prod inserts the granted codes (`INSERT OR IGNORE`) and advances the chain seed to
+    /// `sha256(request_xml)` — a value the model CANNOT compute (it builds no XML), so the advance is
+    /// recorded STRUCTURALLY, exactly as the `NotAcceptedOffline` rewind marker is.  The synthetic
+    /// value is keyed off a NEGATIVE ordinal so it can never collide with a document hash
+    /// (`synth_unsigned_hash(lnd)` for a real doc always uses a non-negative `lnd`).
+    ///
+    /// **`next_lnd` deliberately does NOT move** — that is what makes the witness's `lnd_at_write`
+    /// ordering frame meaningful, and what the after-SELL tie-break in
+    /// `active_chain_tip_unsigned_xml_sha256` depends on.
+    ///
+    /// `ServerReject`: prod persists NOTHING — no codes, no seed advance, no witness.
+    fn apply_replenish(&mut self, leaf: ReplenishLeaf) -> ExpectedOutcome {
+        // S7-2 fence (FOUND GENERATIVELY, 2026-07-31): prod refuses a replenish outright while the FN
+        // has an ACTIVE delivery reservation — `offline_code_replenish.rs` calls
+        // `delivery_reservation::fn_fence_active_tx` INSIDE the envelope and bails with
+        // "replenish refused: FN … has an active delivery reservation (S7-2 fence)" before touching
+        // the code pool or the seed. The T=112 seed advance would otherwise race a delivery that is
+        // mid-flight on the same chain. The model must predict that refusal or the differential
+        // diverges the moment the generator lands a Replenish after a held-producing op.
+        //
+        // KNOWN NARROW GAP (documented, not silently ignored): the model tracks only the
+        // PENDING_APPLY hold (`held_reservation`, re-synced from reality after every op), whereas
+        // prod's predicate also covers RESERVED_NOT_STARTED / CALL_STARTED. A crash that leaves a
+        // reservation resting mid-wire could therefore make prod refuse where the model expects a
+        // grant; if that composition is reachable the fuzzer will surface it and it gets adjudicated
+        // like any other divergence — it is NOT papered over here.
+        if self.held_reservation.is_some() {
+            return ExpectedOutcome::Replenish { granted: false };
+        }
+        match leaf {
+            ReplenishLeaf::Granted => {
+                self.codes_issued += 1;
+                self.seed = Some(synth_unsigned_hash(-self.codes_issued - 1));
+                ExpectedOutcome::Replenish { granted: true }
+            }
+            ReplenishLeaf::ServerReject => ExpectedOutcome::Replenish { granted: false },
+        }
     }
 
     /// L6 — X-report (поточний звіт): a pure read.  ALWAYS `NoMutation` — the

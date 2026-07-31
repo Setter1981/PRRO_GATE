@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, Stage};
+use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, Stage};
 
 /// The result-able wire-response shapes for a wire op.  `timeout_at_call` is
 /// intentionally EXCLUDED — the timeout SCENARIO is realized via `Crash`
@@ -172,6 +172,19 @@ fn op() -> impl Strategy<Value = Op> {
             Just(OperatorResolutionKind::NotAcceptedOffline),
         ]
         .prop_map(Op::OperatorComplete),
+        // bd PRRO_GATE-hpc / 2ds — T=112 replenish, APPENDED LAST (corpus-index preservation).
+        // The only op that moves the chain seed WITHOUT minting a document, so it is what exercises
+        // the durable witness (migration 040) and the `active_chain_tip` fold generatively — composed
+        // with crashes, drains, operator completions and reports rather than by directed tests alone.
+        //
+        // Only the two DECIDED leaves are emitted.  `RULING 2` §4 pins the ambiguous /
+        // transport-timeout branch as known-red until a live capture lands (bd PRRO_GATE-2ds, blocked
+        // on the operator): emitting it would pin a contract that has no evidence behind it yet.
+        prop_oneof![
+            Just(ReplenishLeaf::Granted),
+            Just(ReplenishLeaf::ServerReject),
+        ]
+        .prop_map(Op::Replenish),
     ]
 }
 

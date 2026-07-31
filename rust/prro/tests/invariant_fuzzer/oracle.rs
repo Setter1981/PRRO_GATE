@@ -54,6 +54,10 @@ pub enum OpClass {
     /// CS-3 operator-completion (1b) — a release/refuse op. `run_harness` owns the comparison
     /// (`check_release_witness` + the doc/seed/mode transition), NOT the per-doc differential.
     Release,
+    /// bd `PRRO_GATE-hpc` — a T=112 replenish: mutates durable state (code pool + chain seed) while
+    /// minting NO document and allocating NO `lnd`.  Its ledger assertions live in `run_harness`
+    /// (narrow and asserted, not a blanket exemption from the no-mutation invariants).
+    Replenish,
 }
 
 /// A differential mismatch — carries a human-readable reason (the fuzzer reports
@@ -71,6 +75,7 @@ pub fn classify(expected: &ExpectedOutcome) -> OpClass {
         ExpectedOutcome::NoIssuanceRow => OpClass::ExpectedNoIssuanceRow,
         ExpectedOutcome::Fault => OpClass::FaultOrRecovery,
         ExpectedOutcome::Release(_) => OpClass::Release,
+        ExpectedOutcome::Replenish { .. } => OpClass::Replenish,
     }
 }
 
@@ -109,6 +114,19 @@ pub fn check_differential(
         // Both no-issuance classes share the permissive differential shape; the
         // ledger assertions (zero rows vs ≤1 non-issued row, no seed/code) are the
         // harness's, split by class.
+        // bd hpc — the ONLY doc-less mutating class.  The shape check is here; the ledger
+        // assertions (seed moved iff granted, next_lnd UNCHANGED, no doc row, codes grew iff granted)
+        // are the harness's, so a wrong-direction outcome cannot pass silently.
+        OpClass::Replenish => {
+            let granted = matches!(expected, ExpectedOutcome::Replenish { granted: true });
+            match (granted, real) {
+                (true, RealOutcome::Replenished { .. }) => Ok(()),
+                (false, RealOutcome::Refused(_)) => Ok(()),
+                (g, other) => Err(Divergence(format!(
+                    "Replenish: model granted={g} but real outcome was {other:?}"
+                ))),
+            }
+        }
         OpClass::ExpectedNoMutation | OpClass::ExpectedNoIssuanceRow => match real {
             // A typed refusal is the expected shape (online-reject / offline-ack).
             RealOutcome::Refused(_) => Ok(()),
@@ -129,6 +147,13 @@ pub fn check_differential(
             // pass (like `check_ledger_delta`), not the per-doc differential.  Inert here (the release
             // op is directed-only this increment; the generative call site + prediction land later).
             RealOutcome::Released(_) => Ok(()),
+            // bd hpc — a replenish mutates the seed + code pool, so it can NEVER be the real shape of
+            // a no-mutation class.  Fail loudly rather than silently tolerating a class mix-up.
+            RealOutcome::Replenished { .. } => Err(Divergence(
+                "ExpectedNoMutation/NoIssuanceRow but the real op was a T=112 replenish (which \
+                 advances the seed and grows the code pool)"
+                    .to_string(),
+            )),
         },
     }
 }
