@@ -1593,6 +1593,7 @@ live-dps	prro	prro::listener_context_stamping	driver_id_validates_max_length	fal
 live-dps	prro	prro::listener_context_stamping	listener_context_stamps_driver_id_on_canonical_command	false
 live-dps	prro	prro::listener_context_stamping	listener_fn_mismatch_returns_typed_error_before_mapping	false
 live-dps	prro	prro::listener_context_stamping	plain_mapper_leaves_driver_id_none	false
+live-dps	prro	prro::live_capture_ambiguous_t112	live_capture_ambiguous_t112_connection_kill	true
 live-dps	prro	prro::live_dps_extended_smoke	host_of_isolates_authority_and_blocks_prod_tricks	false
 live-dps	prro	prro::live_dps_extended_smoke	live_probe_webcheck_exact_begin	true
 live-dps	prro	prro::live_dps_extended_smoke	live_recover_close_dangling_offline_session	true
