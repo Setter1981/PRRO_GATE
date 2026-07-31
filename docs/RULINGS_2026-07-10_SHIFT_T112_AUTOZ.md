@@ -33,6 +33,8 @@
    > - **(H2)** DPS **re-issues allocated-but-unconsumed** codes → the ambiguous case is free.
    >
    > Two places in the repo stated opposite things, both as settled fact. Neither is proven. It matters: under H1 a flapping link burns a range per break, eating the offline code-reserve floor (bd `PRRO_GATE-255`) and the monthly allocation; under H2 it costs nothing. **Only the §4 capture settles it.** The ruling's *operational* conclusion (fresh request; no byte-identical resend) holds either way — it is the *cost* claim that was unfounded.
+   >
+   > **SETTLED 2026-07-31 by the §4 capture — H2.** After a T=112 that DPS demonstrably *processed* (it had begun replying when the connection was torn down), a fresh T=112 returned **the same unconsumed code** (`e_rmC3Y4pqY` in both phases). Nothing was stranded; nothing leaked. The clause's original conclusion was right — it now rests on the case it always claimed to cover, instead of on runs that never lost a response. H1 is not supported by observed behaviour. Limit: **N=1**; H2 is *supported*, not proven.
 
 3. **The lost-response chain-tip hazard is handled by the existing settle discipline:** after an ambiguous T=112 the local tip may lag DPS's. The next fiscal send discovers this via the normal chain rules; no special-case tip adoption. The fuzzer (W3-1) models local vs remote tips separately and pins exactly this: an ambiguous T=112 followed by a fiscal doc must recover (fresh tip discovery), never silently fork.
 
@@ -41,11 +43,29 @@
    > Worth stating explicitly, because the opposite looked plausible and was checked: the MacReseed **guard-B** tip check (`delivery_reservation.rs` — the operator seed must equal `active_chain_tip`) is **never consulted** on this path. So an ambiguous T=112 cannot deadlock recovery even though its arm writes **no durable seed witness** — the witness that `bd PRRO_GATE-hpc` made durable is written only on the SUCCESS path.
    >
    > **Residual risk, NOT closed:** that self-heal parses a literal `"store "` tag out of a DPS message — a format inherited from the Python reference and **not yet observed from live DPS**. It fails loud (`HashNotExtractable`) on drift rather than corrupting, but a loud failure is still a stuck FN needing an operator. The §4 capture produces a real `-12` and should confirm the parse — so the capture settles **two** unknowns, not one.
-4. **Known-red stands until captured evidence** *(capture design added 2026-07-31 — see the note under §4 below)*: the live campaign should capture one real ambiguous/timeout T=112 on the test cabinet (kill the connection mid-call) and record what a subsequent fresh T=112 returns. If evidence contradicts (2) — e.g. DPS double-allocates windows — this ruling reopens. Until then the generator does NOT emit ambiguous-T112; the model/impl contract above is pinned by directed tests when W3 lands.
+   >
+   > **DISCHARGED 2026-07-31.** The capture forced a real `-12` and ran the production extractor against it: `regex_extract_store_hash` **parsed a live DPS message**, twice across two runs on different hashes. The Python-inherited format *is* what live DPS sends. Live shape, for the record — note the **two** spaces after the code name:
+   > ```
+   > ERROR_BAD_HASH_PREV  store <64 hex> chk <64 hex>
+   > ```
+   > The capture also showed the tip **does** move on a T=112, so the post-kill fork is real and this recovery path is load-bearing rather than theoretical.
+
+4. ~~**Known-red stands until captured evidence**~~ → **DISCHARGED 2026-07-31.** The capture ran on the test cabinet (FN `4000162280`): a T=112 was relayed to DPS and the connection torn down on DPS's first reply byte, producing the ambiguous shape (`transport error … peer closed connection without sending TLS close_notify … UnexpectedEof`) with the witness that DPS had *begun answering* — i.e. processed, not merely received. Evidence **confirms** (2) rather than contradicting it, so the ruling does not reopen.
+
+   **Consequence: the generator exclusion is no longer justified by evidence.** Ambiguous-T112 was excluded from the fuzzer *only* because the contract had none. It now has some. Re-enabling the leaf is follow-up work (bd `PRRO_GATE-2ds`), not automatic — the model must first be taught what the captured behaviour implies, and N=1 is thin ground for a generative pin.
+
+   Full log: bd `PRRO_GATE-2ds`. Harness: `rust/prro/tests/live_capture_ambiguous_t112.rs` (PR #351).
 
 **Consequences:** current prod behavior (no in-line retry) is CONFIRMED correct — no prod change; W3-1/W3-2 get their contract; a live-campaign capture item is added.
 
-> **§4 capture design (2026-07-31).** What blocks this is NOT operator availability — the infrastructure already exists: `live_smoke_8_ask_offline_codes` sends a raw T=112 to live DPS and brackets it to reveal whether the MAC chain advanced; the kill-switch (`PRRO_LIVE_DPS=1`), the host allowlist and the test FN are all in place. Two things are missing:
+> **§4 capture — PERFORMED 2026-07-31.** Design below, kept for the record; results in bd `PRRO_GATE-2ds` and in the §2/§3 notes above. Two things are worth carrying forward from doing it rather than planning it:
+>
+> - **The kill trigger matters more than the kill.** The first attempt armed the tear-down on "the client has gone quiet"; DPS answered inside that window, the RPC completed normally, and nothing ambiguous was produced. The correct trigger is the **first reply byte after the request was relayed** — it is simultaneously the strongest available witness that DPS *processed* the request and the exact instant to drop.
+> - **The experiment cost nothing after all** — but only because H2 turned out to be true. That was not knowable in advance, which is why it was gated behind its own switch.
+>
+> Original design follows.
+>
+> What blocks this is NOT operator availability — the infrastructure already exists: `live_smoke_8_ask_offline_codes` sends a raw T=112 to live DPS and brackets it to reveal whether the MAC chain advanced; the kill-switch (`PRRO_LIVE_DPS=1`), the host allowlist and the test FN are all in place. Two things are missing:
 >
 > 1. **A deterministic mid-call connection kill.** The honest mechanism is a local TCP proxy that forwards the request to DPS and then drops the connection *before* the response — that guarantees the ambiguous shape (DPS received it; we did not hear back). A short client-side timeout is NOT equivalent: it cannot establish that the request actually reached DPS, which is the whole point.
 > 2. **Acceptance that the experiment itself may burn a real code range** on the test FN — which is precisely the unknown being measured (H1 vs H2 above). Under H1 each attempt costs a range, so the run is not free and repeats are not free.
