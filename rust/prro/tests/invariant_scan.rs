@@ -1062,7 +1062,7 @@ async fn clean_null_current_shift_id_no_mirror_drift() {
 
 /// U1 A1 — mechanical exhaustiveness of the derive-don't-adopt funnel: ALL DB
 /// access in the fuzzer's `RefModel` (`invariant_fuzzer/model.rs`) MUST go through
-/// one of the three tagged wrapper fns, so no future raw read can silently
+/// one of the tagged wrapper fns listed below, so no future raw read can silently
 /// re-open a differential vacuity at the D1–D5 adoption sites.  A raw
 /// `sqlx`/`query_as`/`query_scalar`/`fetch_`/`.execute` outside a wrapper =
 /// FORBIDDEN non-empty = scan failure.  Source-text scan (the model file is a
@@ -1074,6 +1074,15 @@ fn model_db_access_is_funneled_through_tagged_wrappers() {
         "adopt_precondition",    // mode/shift/session precondition residue
         "read_seed_fixture",     // seed-fixture grounding
         "sync_held_reservation", // CS-3 held-reservation precondition re-sync (C-i; funneled, outcome-independent)
+        // CS-3 S7-2 active-reservation FENCE precondition re-sync (bd PRRO_GATE-hpc/2ds).  A
+        // SEPARATE primitive from `sync_held_reservation` on purpose: the fence predicate is
+        // strictly wider (in-flight RESERVED_NOT_STARTED / CALL_STARTED, not just the completable
+        // PENDING_APPLY hold) and the two have different consumers — collapsing them would be the
+        // very conflation the `[Crash(Send), Replenish(Granted)]` counterexample exposed.  Funneled
+        // + outcome-independent on the same terms: it re-syncs a PRECONDITION only; every predicted
+        // OUTCOME stays independently modelled.  Reads via prod's own `ACTIVE_FENCE_STATE_PREDICATE`
+        // const, so it cannot drift from the predicate `fn_fence_active_tx` enforces.
+        "sync_fence_active",
     ];
     // The DB-access tokens sqlx exposes; a raw one outside a wrapper is a leak.
     const MARKERS: &[&str] = &[
