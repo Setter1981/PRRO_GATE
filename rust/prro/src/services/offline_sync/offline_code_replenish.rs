@@ -244,25 +244,26 @@ impl OfflineCodeReplenishService {
                 // that is not proven idempotent (RULING 2 §1,
                 // `docs/RULINGS_2026-07-10_SHIFT_T112_AUTOZ.md`).
                 //
-                // ── UNRESOLVED: what a lost response COSTS on the DPS side ──
-                // Two mutually exclusive hypotheses are on record, and until
+                // ── What a lost response COSTS on the DPS side: MEASURED ──
+                // Two mutually exclusive hypotheses were on record, and until
                 // 2026-07-31 BOTH were written down as if they were fact:
                 //   (H1) each call allocates a FRESH range → a lost response
                 //        leaks that range server-side (asserted right here).
                 //   (H2) DPS RE-ISSUES allocated-but-unconsumed codes on the
-                //        next T=112, so nothing is stranded and a fresh request
-                //        re-obtains them (asserted by RULING 2 §2, grounded in
-                //        "the same opaque codes returned across our runs" —
-                //        consistent with H2 but NOT exclusive of H1, because no
-                //        run in that campaign ever lost a response mid-call).
-                // Not academic: under H1 a flapping link burns a range per
-                // break, eating the offline code-reserve floor (bd
-                // PRRO_GATE-255) and the monthly allocation. Under H2 the
-                // ambiguous case is free.
-                // SETTLED ONLY BY the RULING 2 §4 live capture (kill the
-                // connection mid-call on the test cabinet, then record what a
-                // fresh T=112 returns) — bd PRRO_GATE-2ds. Until then the
-                // fuzzer deliberately does NOT emit an ambiguous T=112 leaf.
+                //        next T=112, so nothing is stranded.
+                // The RULING 2 §4 live capture ran on 2026-07-31 and supports
+                // **H2**: after a T=112 that DPS demonstrably PROCESSED (it had
+                // begun replying when the connection was torn down), a fresh
+                // T=112 returned the SAME unconsumed code. Nothing leaked, so a
+                // flapping link does NOT burn a range per break and the offline
+                // code-reserve floor (bd PRRO_GATE-255) is not eaten by it.
+                // Limit worth keeping in view: N=1 — supported, not proven.
+                // Log + method: bd PRRO_GATE-2ds; harness
+                // tests/live_capture_ambiguous_t112.rs.
+                // The fuzzer still does not emit an ambiguous T=112 leaf: the
+                // evidence exists now, but the model has not been taught what it
+                // implies, and one observation is thin ground for a generative
+                // pin. Re-enabling it is tracked, not automatic.
                 //
                 // ── The chain fork, and why it self-heals WITHOUT an operator ──
                 // If DPS did process, its tip advanced to sha256(request.xml)
@@ -279,12 +280,13 @@ impl OfflineCodeReplenishService {
                 // seed witness (the bd PRRO_GATE-hpc witness is written only on
                 // the SUCCESS path below). Verified, not assumed — the opposite
                 // looked plausible.
-                // CAVEAT, honest: that self-heal parses a literal `"store "`
-                // tag out of a DPS message — a format inherited from the Python
-                // reference and NOT yet observed from live DPS. It fails loud
-                // (`HashNotExtractable`) rather than corrupting, but a loud
-                // failure is still a stuck FN. The §4 capture yields a real
-                // `-12` and should confirm the parse.
+                // The `"store "` parse that self-heal depends on is CONFIRMED
+                // against live DPS (2026-07-31 capture, twice on different
+                // hashes). Live shape — note the TWO spaces after the code name:
+                //   ERROR_BAD_HASH_PREV  store <64 hex> chk <64 hex>
+                // The same capture showed a T=112 DOES move the DPS tip, so the
+                // fork above is real and this recovery path is load-bearing
+                // rather than theoretical.
                 return Err(ReplenishError::DpsTransport(e.to_string()));
             }
         };
