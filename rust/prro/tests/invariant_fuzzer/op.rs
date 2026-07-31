@@ -20,6 +20,26 @@ pub enum Stage {
     Drain,
 }
 
+/// The chain tip DPS claims to hold when it answers `-12 ERROR_BAD_HASH_PREV`.
+///
+/// The stub embeds this in the `"store "` field of the error message, so the
+/// fuzzer's `-12` carries the SHAPE live DPS actually sends (captured
+/// 2026-07-31, `bd PRRO_GATE-2ds`) rather than a bare code string.
+///
+/// Nothing consumes it yet — S7-1 retired the inline MAC-recovery orchestrator,
+/// so `-12` simply HOLDS. It is here deliberately anyway: the fix for
+/// `bd PRRO_GATE-3uo` makes guard-B accept an operator seed corroborated by this
+/// very field, and that fix cannot be exercised generatively against a stub
+/// whose `-12` carries no `store` at all.
+///
+/// Deliberately distinct from every `synth_unsigned_hash(lnd)` (those carry `lnd`
+/// big-endian in the leading 8 bytes, so a leading `0xD9…` can never collide with
+/// a document hash for any plausible `lnd`).
+pub const DPS_RECOVERY_TIP: [u8; 32] = [
+    0xd9, 0x51, 0x2c, 0x0d, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44,
+    0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x0d, 0x15, 0x2c, 0x0d,
+];
+
 /// One DPS wire-call response (spec §5).  Not mapped to `Result<CheckAck, _>`
 /// here — that is the Task 2 interpreter's job.  Pure enumerable data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,6 +97,18 @@ impl DpsScript {
     }
 
     /// The send is rejected for a bad previous-hash chain link.
+    ///
+    /// ONE response, and that is the FULL contract: CS-3 S7-1 (R3) retired the
+    /// inline MAC-recovery orchestrator, so a `-12` produces a
+    /// `MacReseedPending` HELD (node `STOP_MODE`, doc rests `SENDING` under a
+    /// `PENDING_APPLY` reservation) and there is **no second wire**. Pins:
+    /// `write_path_stage4_send::minus_12_bad_hash_prev_records_held_stop_no_second_wire`,
+    /// `record_outcome::rc05_bad_hash_prev_held_stop_mode`.
+    ///
+    /// A two-response "recovery cycle" script was written for this and then
+    /// deleted: it modelled a retry that production no longer performs. The
+    /// stale `error_routing.rs` comment describing "bounded ONE auto-recovery"
+    /// is what made it look real — see `bd PRRO_GATE-3uo`.
     pub fn bad_hash_prev() -> Self {
         Self(vec![WireResponse::BadHashPrev])
     }

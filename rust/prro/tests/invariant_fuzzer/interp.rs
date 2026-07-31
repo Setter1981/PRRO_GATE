@@ -729,6 +729,25 @@ impl FuzzCtx {
         v
     }
 
+    /// The bounded MAC-recovery counter for the doc at `lnd`.
+    ///
+    /// `run_mac_recovery` claims it 0→1 before re-signing, and the claim is what
+    /// bounds recovery to ONE attempt. Reading it is how a test distinguishes
+    /// "recovery ran and succeeded" from "the doc happened to end up ACK" — the
+    /// two are indistinguishable from the doc state alone, which is exactly why
+    /// the `-12` path could stay uncovered for so long.
+    pub async fn read_mac_recovery_attempts(&self, lnd: i64) -> Option<i64> {
+        sqlx::query_scalar(
+            "SELECT mac_recovery_attempts FROM fiscal_documents \
+             WHERE fiscal_number = ? AND lnd = ?",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(lnd)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap()
+    }
+
     /// CS-3 (C-iii) — the FN's docs as `(lnd, state)` ordered by lnd, for asserting the durable
     /// OLA-cohort effects of a `NotAcceptedOffline` completion (later `OFFLINE_LOCAL_ACK` successors
     /// → `CANCELLED`; the held doc → `RMR`).
@@ -2685,6 +2704,14 @@ async fn duplicate_idem_key(ctx: &mut FuzzCtx) -> RealOutcome {
 /// response (`push_send`); positions 1+ are subsequent `last_chk` probes
 /// (`push_last`).  Matches `AckPath = [Ack, Ack]` (send→Ack, last→Ack).
 fn load_script(dps: &ScriptedDps, script: &DpsScript) {
+    // Element 0 is the SEND response; every later element is a `lastChk`.
+    //
+    // A `RetrySend` boundary marker was added here to express a SECOND send —
+    // the bounded MAC-recovery attempt #2 — and then removed: CS-3 S7-1 (R3)
+    // retired that retry, so a `-12` HOLDS and no production path makes a second
+    // send within one op. The grammar is one-send-then-lastChk because
+    // production is. If a future slice reintroduces a retry, that marker is the
+    // shape to bring back — see `bd PRRO_GATE-3uo` for why it was premature.
     for (i, wr) in script.0.iter().copied().enumerate() {
         match (i, wr) {
             // CS-3 Slice E: an UnknownStatus send response MUST reach the wire through the REAL
@@ -2756,6 +2783,11 @@ fn load_drain_script(dps: &ScriptedDps, script: &DpsScript, backlog: usize) {
 /// constructions are defined AND verified in Task 4 (the differential), where
 /// they can be checked against the real seam's routing rather than guessed.
 /// (`Timeout` is realized via `Crash` drop-injection, not a queued result.)
+/// Lowercase hex, for the live-captured `-12` message shape below.
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn wire_to_result(wr: WireResponse) -> Result<CheckAck, DpsError> {
     match wr {
         // Full ack: send → Sent; lastChk Match → ACK. The KVT1 evidence must be
@@ -2775,11 +2807,34 @@ fn wire_to_result(wr: WireResponse) -> Result<CheckAck, DpsError> {
             expected_id: SERVER_FISCAL_NO.to_string(),
             actual_id: "DPS-FN-SUPERSEDED".to_string(),
         }),
-        // Bad previous-hash chain link → Server(-12) ERROR_BAD_HASH_PREV → MAC
-        // recovery / ErrorRetryable.
+        // Bad previous-hash chain link → Server(-12) ERROR_BAD_HASH_PREV → the
+        // bounded automatic MAC recovery.
+        //
+        // The message shape is LIVE-CAPTURED, not invented (2026-07-31 against
+        // the DPS test cabinet, bd PRRO_GATE-2ds — observed twice on different
+        // hashes). Note the TWO spaces after the code name:
+        //
+        //     ERROR_BAD_HASH_PREV  store <64 hex> chk <64 hex>
+        //
+        // This matters: `mac_recovery::regex_extract_store_hash` reads the
+        // literal `"store "` tag. Until this carried one, the stub emitted a
+        // bare `"ERROR_BAD_HASH_PREV"`, extraction ALWAYS failed, and every
+        // generated `-12` explored only the `HashNotExtractable` branch — the
+        // recovery SUCCESS path had zero generative coverage. A RED-first test
+        // (`mac_recovery_drives_attempt_two_to_ack`) pinned that: the doc rested
+        // at SENDING instead of reaching ACK.
+        //
+        // `store` carries [`DPS_RECOVERY_TIP`] — the tip this simulated peer
+        // claims. `chk` is what the client sent; the extractor does not read it,
+        // and the stub does not know it, so it is zero-filled and documented
+        // rather than faked into looking meaningful.
         WireResponse::BadHashPrev => Err(DpsError::Server {
             code: -12,
-            message: "ERROR_BAD_HASH_PREV".to_string(),
+            message: format!(
+                "ERROR_BAD_HASH_PREV  store {} chk {}",
+                hex_lower(&crate::op::DPS_RECOVERY_TIP),
+                hex_lower(&[0u8; 32]),
+            ),
         }),
         // The timeout SCENARIO is realized via Crash(Send|Kvt1) drop-injection,
         // not a queued result — the generator never puts Timeout in a loaded

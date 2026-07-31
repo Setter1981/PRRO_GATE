@@ -1401,6 +1401,7 @@ live-dps	prro	prro::invariant_fuzzer	macreseed_completion_releases_iff_online_ma
 live-dps	prro	prro::invariant_fuzzer	macreseed_on_non_macreseed_hold_refused_hold_intact	false
 live-dps	prro	prro::invariant_fuzzer	macreseed_valid_seed_equals_tip_releases_to_rmr	false
 live-dps	prro	prro::invariant_fuzzer	macreseed_wrong_seed_refused_hold_intact_seed_unchanged	false
+live-dps	prro	prro::invariant_fuzzer	minus_12_holds_the_node_and_rests_the_doc_sending	false
 live-dps	prro	prro::invariant_fuzzer	mirrors_catch_seeded_mirror2_desync	false
 live-dps	prro	prro::invariant_fuzzer	mirrors_legal_empty_active_session_passes	false
 live-dps	prro	prro::invariant_fuzzer	mixed_sell_return_sequence_matches_model	false
