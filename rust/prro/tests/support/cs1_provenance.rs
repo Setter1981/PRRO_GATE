@@ -115,7 +115,16 @@ pub const HEAD_SHA: &str = "f2628ba";
 /// (zero `src/` diff). Additions-only — the two new directed pins and two `#[ignore]`d RED pins add
 /// tests, remove none, so no supersession entry. Live-drift leg only; the immutable
 /// `f2c17b1..f2628ba` proof is UNTOUCHED.
-pub const LIVE_DRIFT_BASE_SHA: &str = "4cb8dc3b";
+/// bd `PRRO_GATE-01g` re-anchor (2026-07-31): the non-document-tip fix edits the frozen
+/// `invariant_fuzzer/model.rs` (+ un-`#[ignore]`s its pin in `invariant_fuzzer.rs`). Adjudicated
+/// PROD-RIGHT unanimously by three lenses incl. an adversarial verifier: production's
+/// completion-time seed advance IS A.3 advance-at-SEND deferred until the ambiguity resolves, and
+/// `invariant_scan` is clean at every boundary. The model was aliasing a NON-DOCUMENT tip (a
+/// granted T=112 seed) onto `max(lnd)`, re-arming the task-#18 trap that the surrounding comment
+/// had disarmed under a premise ("generator-excluded") the `Replenish` symbol invalidated.
+/// Production is FROZEN (zero `src/` diff); the oracle was NOT weakened. Live-drift leg only; the
+/// immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
+pub const LIVE_DRIFT_BASE_SHA: &str = "c73099d6";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is
