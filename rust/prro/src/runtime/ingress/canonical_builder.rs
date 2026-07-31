@@ -117,6 +117,11 @@ fn map_non_z_doc_type(operation_type: &str) -> Result<DocType, BuildReject> {
         "SELL" => Ok(DocType::Sell),
         "RETURN" => Ok(DocType::Return),
         "SHIFT_OPEN" => Ok(DocType::ShiftOpen),
+        // L3 — service cash-in/out are wired fiscal ops (Signable).
+        "SERVICE_IN" => Ok(DocType::ServiceIn),
+        "SERVICE_OUT" => Ok(DocType::ServiceOut),
+        // EPZ — видача готівки за ЕПЗ (wired fiscal op, Signable).
+        "CASH_ADVANCE_EPZ" => Ok(DocType::CashAdvanceEpz),
         "Z_REPORT" | "SHIFT_CLOSE" => Err(BuildReject::ZClassRequiresAggregationBuilder {
             operation_type: operation_type.to_string(),
         }),

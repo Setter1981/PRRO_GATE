@@ -147,6 +147,43 @@ where
         "supervisor: running"
     );
 
+    // T3 (RULING 3.4) — one-time DEPRECATION audit for `shift_autoclose_enabled`.
+    // The May spec's per-FN auto-close toggle is superseded: the shift-limit
+    // auto-Z is now UNCONDITIONAL. The config key parses but is IGNORED; if it is
+    // present we emit a single boot audit so operators learn it has no effect.
+    if let Some(v) = app.config().offline.shift_autoclose_enabled {
+        tracing::warn!(
+            target: "prro::runtime::supervisor",
+            value = v,
+            "config key `offline.shift_autoclose_enabled` is DEPRECATED and IGNORED \
+             (RULING 3.4): the 24h shift-limit auto-Z is unconditional"
+        );
+        let payload = serde_json::json!({
+            "key": "offline.shift_autoclose_enabled",
+            "value": v,
+            "ruling": "RULING 3.4",
+            "effect": "parsed-but-ignored; auto-Z is unconditional",
+        })
+        .to_string();
+        if let Err(e) = audit_log::append(
+            app.db(),
+            "config",
+            "offline.shift_autoclose_enabled",
+            "CONFIG_KEY_DEPRECATED_IGNORED",
+            Severity::Warning,
+            None,
+            Some(&payload),
+        )
+        .await
+        {
+            tracing::error!(
+                target: "prro::runtime::supervisor",
+                error = %e,
+                "supervisor: deprecation audit for shift_autoclose_enabled failed (non-fatal)"
+            );
+        }
+    }
+
     // ── 5c: boot crash-recovery ONCE, before any live loop ──
     // A FRESH per-FN fn_sign for this one-shot pass (build_fn_sign stamps
     // signingTime = now()).  Held in a LOCAL that outlives the reconcile
@@ -264,6 +301,15 @@ where
             "supervisor.online_convergence_interval_seconds out of bounds; clamped"
         );
     }
+    let (auto_z_secs, auto_z_clamped) = app.config().supervisor.clamped_auto_z_interval_seconds();
+    if auto_z_clamped {
+        tracing::warn!(
+            target: "prro::runtime::supervisor",
+            raw = app.config().supervisor.auto_z_interval_seconds,
+            clamped = auto_z_secs,
+            "supervisor.auto_z_interval_seconds out of bounds; clamped"
+        );
+    }
     let backup_enabled = app.config().backup.enabled;
     let (backup_secs, backup_clamped) = app.config().backup.clamped_interval_seconds();
     if backup_enabled && backup_clamped {
@@ -296,8 +342,16 @@ where
     let convergence_handle = spawn_convergence_loop(
         app.clone(),
         Arc::clone(&registry),
-        fn_ids,
+        fn_ids.clone(),
         Duration::from_secs(converge_secs),
+        shutdown_rx.clone(),
+    );
+    // T3 (RULING 3.4) — the UNCONDITIONAL shift-limit auto-Z ticker.
+    let auto_z_handle = spawn_auto_z_loop(
+        app.clone(),
+        Arc::clone(&registry),
+        fn_ids,
+        Duration::from_secs(auto_z_secs),
         shutdown_rx.clone(),
     );
     // RS-3 inbox-reaper loop — not per-FN (inbox-global), unconditional, fixed
@@ -332,6 +386,7 @@ where
         SupervisedTask::runs_until_shutdown("drain", drain_handle),
         SupervisedTask::runs_until_shutdown("probe", probe_handle),
         SupervisedTask::runs_until_shutdown("online-convergence", convergence_handle),
+        SupervisedTask::runs_until_shutdown("auto-z", auto_z_handle),
         SupervisedTask::runs_until_shutdown("inbox-reaper", reaper_handle),
     ];
     if let Some(handle) = backup_handle {
@@ -1070,6 +1125,154 @@ async fn convergence_tick(
                 );
             }
         }
+    }
+}
+
+/// Spawn the T3 (RULING 3.4) UNCONDITIONAL auto-Z ticker — one tokio task
+/// iterating every registered FN each `interval`, closing (durably) any shift
+/// that has crossed its 24h document-derived budget. Exact structural copy of
+/// [`spawn_convergence_loop`]: `MissedTickBehavior::Skip` + `biased` select makes
+/// shutdown win, the loop returns `Ok(())` only (F1), and per-FN errors are
+/// logged-and-skipped inside [`auto_z_tick`] (never propagated). Reads the ONE
+/// production clock ([`crate::services::time_budget::SystemClock`]).
+fn spawn_auto_z_loop(
+    app: App,
+    registry: Arc<BindingsRegistry>,
+    fn_ids: Vec<String>,
+    interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        let tick_shutdown = shutdown_rx.clone();
+        let mut iv = tokio::time::interval(interval);
+        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // F1 INVARIANT: this loop must return `Ok(())` ONLY (on watch-exit).
+        // Per-FN errors are logged-and-skipped INSIDE `auto_z_tick`.
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        tracing::info!(target: "prro::runtime::supervisor", "auto-z loop: shutdown; exiting");
+                        return Ok(());
+                    }
+                }
+                _ = iv.tick() => {
+                    auto_z_tick(&app, &registry, &fn_ids, &tick_shutdown).await;
+                }
+            }
+        }
+    })
+}
+
+/// One auto-Z pass over all FNs. Rebuilds `fn_sign` FRESH per FN (signingTime
+/// must be current at the wire call for the online Z leg — NEVER cached) and
+/// routes through the UNCONDITIONAL [`App::auto_z_close_over_limit_for_fn`] with
+/// the production [`SystemClock`]. A per-FN `fn_sign` build failure or tick error
+/// is logged and skipped — one bad FN never stops the others or kills the loop.
+/// Mirror of [`convergence_tick`].
+async fn auto_z_tick(
+    app: &App,
+    registry: &BindingsRegistry,
+    fn_ids: &[String],
+    shutdown: &watch::Receiver<bool>,
+) {
+    let clock = crate::services::time_budget::SystemClock;
+    for fn_id in fn_ids {
+        // F2: bail BETWEEN FNs so a shutdown during a long multi-FN pass is
+        // honored promptly.
+        if *shutdown.borrow() {
+            return;
+        }
+        let Some(b) = registry.get(fn_id) else {
+            continue;
+        };
+        let fn_sign = match build_fn_sign(&b.sign_ctx.session, fn_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "prro::runtime::supervisor",
+                    fiscal_number = fn_id,
+                    error = ?e,
+                    "auto-z tick: fn_sign build failed; FN skipped this tick"
+                );
+                continue;
+            }
+        };
+        let view = RuntimeView {
+            dps: b.dps.as_ref(),
+            signing_ctx: &b.sign_ctx,
+            fn_sign: &fn_sign,
+        };
+        match app
+            .auto_z_close_over_limit_for_fn(fn_id, &clock, &view)
+            .await
+        {
+            Ok(outcome) => {
+                use crate::services::write_path::AutoZOutcome;
+                // Emit a durable audit ONLY when the ticker actually acted (Issued
+                // / Escalated) — a NotDue tick is silent (the common case).
+                match &outcome {
+                    AutoZOutcome::NotDue => {}
+                    AutoZOutcome::Issued => {
+                        tracing::info!(
+                            target: "prro::runtime::supervisor",
+                            fiscal_number = fn_id,
+                            "auto-z tick: shift closed durably at the 24h boundary"
+                        );
+                        emit_auto_z_audit(app, fn_id, "AUTO_Z_SHIFT_LIMIT_CLOSED", None).await;
+                    }
+                    AutoZOutcome::Escalated { code } => {
+                        tracing::warn!(
+                            target: "prro::runtime::supervisor",
+                            fiscal_number = fn_id,
+                            code = %code,
+                            "auto-z tick: 24h Z attempt did not succeed — handled via \
+                             the existing Z failure route (retry / RMR), never silent"
+                        );
+                        emit_auto_z_audit(app, fn_id, "AUTO_Z_SHIFT_LIMIT_ESCALATED", Some(code))
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "prro::runtime::supervisor",
+                    fiscal_number = fn_id,
+                    error = ?e,
+                    "auto-z tick failed"
+                );
+            }
+        }
+    }
+}
+
+/// Best-effort durable audit for an auto-Z action (Issued / Escalated). A failed
+/// audit insert is logged, never fatal (mirrors the probe-tick audit contract).
+async fn emit_auto_z_audit(app: &App, fn_id: &str, event: &str, code: Option<&str>) {
+    let payload = serde_json::json!({ "fiscal_number": fn_id, "code": code }).to_string();
+    let severity = if code.is_some() {
+        Severity::Critical
+    } else {
+        Severity::Info
+    };
+    if let Err(e) = audit_log::append(
+        app.db(),
+        "shift",
+        fn_id,
+        event,
+        severity,
+        None,
+        Some(&payload),
+    )
+    .await
+    {
+        tracing::error!(
+            target: "prro::runtime::supervisor",
+            fiscal_number = fn_id,
+            audit_error = %e,
+            "auto-z tick: audit insert failed (non-fatal)"
+        );
     }
 }
 

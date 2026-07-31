@@ -83,6 +83,14 @@ pub struct ScriptedDps {
     /// (same over-call discipline as the other queues).
     ask_codes_q: Mutex<VecDeque<Result<OfflineCodesResponse, DpsError>>>,
     calls: Mutex<Vec<DpsCall>>,
+    /// CS-3 Slice E oracle: OPTIONAL per-send observation OVERRIDE. When non-empty, the next
+    /// `send_chk_observed` returns this REAL-decode `RawSendObservation` (from
+    /// `scripted_raw_observation(gen::CheckResponse{status})`) instead of the faithful-from-legacy
+    /// reconstruction — the ONLY way the fuzzer can drive an `UnknownStatus(-4/-17)` leaf (a legacy
+    /// `Indeterminate` degrades to `NoResponse` in `observe_faithful_from_legacy`, losing the
+    /// `ProbeRequired` classification). The wire STILL happens (send_chk counts/spies/hangs); only
+    /// the OBSERVATION is overridden. Enqueued IN LOCKSTEP with a matching `push_send` legacy.
+    send_obs_override_q: Mutex<VecDeque<prro::transports::dps::raw_reply::RawSendObservation>>,
 }
 
 impl ScriptedDps {
@@ -101,11 +109,23 @@ impl ScriptedDps {
             status_q: Mutex::new(VecDeque::new()),
             ask_codes_q: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
+            send_obs_override_q: Mutex::new(VecDeque::new()),
         }
     }
 
     pub fn push_send(&self, r: Result<CheckAck, DpsError>) {
         self.send_q.lock().unwrap().push_back(r);
+    }
+
+    /// CS-3 Slice E: enqueue a REAL-decode observation OVERRIDE for the next `send_chk_observed`
+    /// (used with an in-lockstep `push_send` legacy). Lets the fuzzer drive the `UnknownStatus` leaf
+    /// through the production decode (`scripted_raw_observation`) instead of the degrading
+    /// faithful-from-legacy path. The `send_chk` half still counts the wire + honours the hang hook.
+    pub fn push_send_obs_override(
+        &self,
+        obs: prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        self.send_obs_override_q.lock().unwrap().push_back(obs);
     }
 
     pub fn push_last(&self, r: Result<CheckAck, DpsError>) {
@@ -164,6 +184,26 @@ impl DpsChannel for ScriptedDps {
                     .to_string(),
             ))
         })
+    }
+
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        // The wire happens HERE: `send_chk` counts the call, records the spy entry, honours the
+        // hang hook (crash drop-injection), and pops the legacy result.
+        let legacy = self.send_chk(envelope).await;
+        // CS-3 Slice E: if a REAL-decode observation override is queued (an `UnknownStatus` leaf),
+        // return it instead of the degrading `observe_faithful_from_legacy` reconstruction. The
+        // `legacy` is the production decode's OWN legacy (pushed in lockstep), so the pair is
+        // consistent — the wire is still counted, only the OBSERVATION is the real-decode one.
+        if let Some(obs) = self.send_obs_override_q.lock().unwrap().pop_front() {
+            return (legacy, obs);
+        }
+        prro::transports::dps::dto::scripted_observation(legacy)
     }
 
     async fn last_chk(&self, fn_sign: &CheckSignBlob) -> Result<CheckAck, DpsError> {

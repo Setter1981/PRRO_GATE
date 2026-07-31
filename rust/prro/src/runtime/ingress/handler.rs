@@ -58,10 +58,11 @@
 //! [`convert`]: super::convert
 //! [`convert::convert_to_signer_payload`]: super::convert::convert_to_signer_payload
 
-use super::convert::{convert_to_signer_payload, ConvertError};
+use super::convert::{aggregate_z_payload, convert_to_signer_payload, ConvertError};
 use super::dto::{
     request_id_to_string, to_canonical_fiscal_command_with_context, CanonicalCommand,
-    CanonicalErrorResponse, CanonicalResponse, CommandType, MappingError, Totals, SCHEMA_VERSION,
+    CanonicalErrorResponse, CanonicalResponse, CommandType, MappingError, Totals, XReportPayload,
+    SCHEMA_VERSION,
 };
 use super::policy::{classify_command, CommandClass};
 use super::replay::{conflict_response, resolve_replay, ReplayResolution};
@@ -81,12 +82,15 @@ pub struct IngressResponse {
     pub body: IngressBody,
 }
 
-/// Either a success envelope ([`CanonicalResponse`], `ok:true`) or a typed
-/// error envelope ([`CanonicalErrorResponse`], `ok:false`).
+/// Either a success envelope ([`CanonicalResponse`], `ok:true`), a typed error
+/// envelope ([`CanonicalErrorResponse`], `ok:false`), or the L6 X-report
+/// snapshot ([`XReportPayload`], `ok:true`) — a read-only body that is NOT a
+/// fiscal `CanonicalResponse` (it carries no `document_id` / chain fields).
 #[derive(Debug, Clone, PartialEq)]
 pub enum IngressBody {
     Success(CanonicalResponse),
     Error(CanonicalErrorResponse),
+    XReport(XReportPayload),
 }
 
 /// Single source of truth: a stable machine `error_code` → HTTP status.
@@ -142,7 +146,20 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // RS-3 A2 (Q-A) — the true signer-vs-opening-cashier mismatch is
         // client/operator-fixable (reissue with the correct cashier), pre-wire,
         // no fiscal commitment → 422, carried by ShiftGuardRefused.
-        | "SIGNER_CASHIER_MISMATCH" => 422,
+        | "SIGNER_CASHIER_MISMATCH"
+        // L1 INV-21 — RETURN would drive cash below zero; pre-inbox, row-less.
+        | "CASH_INSUFFICIENT"
+        // HOLE 2 — in-lease re-check (closes the TOCTOU after concurrent RETURNs).
+        // Same 422 class as CASH_INSUFFICIENT: the RETURN is refused fail-closed.
+        | "CASH_INSUFFICIENT_IN_LEASE"
+        // EPZ — client-payload faults (paymentid<2 / malformed card leg).
+        | "EPZ_PAYMENT_ID_TOO_LOW"
+        | "EPZ_MALFORMED_CARD_LEG"
+        // L5 — fail-closed pre-inbox input guards (row-less client-payload faults).
+        | "CASH_CAP_EXCEEDED"
+        | "ZERO_PRICE_LINE"
+        | "ZERO_PAYMENT_AMOUNT"
+        | "UNDERPAYMENT_REFUSED" => 422,
         "INVALID_CASHIER_ID" | "MALFORMED_JSON" => 400,
         // Adapter-shell codes (server.rs `adapter_error`) carry their own
         // hard-coded status; listed here so the map stays TOTAL over the
@@ -170,6 +187,24 @@ pub fn http_status_for_error_code(code: &str) -> u16 {
         // transient RETRYABLE refusal (the online_convergence resolver
         // re-drives the blocker, then the client retries), NOT a 5xx breach.
         | "WRITE_GATE_SIBLING_PENDING"
+        // B10 — an offline business doc arrived while this session's lazy
+        // DocType=9 (OFFLINE_SESSION_BEGIN) is still below OFFLINE_LOCAL_ACK
+        // (crashed mid-sign).  RETRYABLE 503: boot-resume drives the BEGIN to
+        // OLA, then the client retries.
+        | "OFFLINE_SESSION_BEGIN_PENDING"
+        // T2 (RULING 3.5) — an ordinary offline SELL/RETURN was refused pre-mint
+        // to preserve the legal close-reserve (BEGIN + offline Z must stay
+        // reachable so the shift is never wedged un-closable for lack of a code).
+        // RETRYABLE 503: the operator seeds codes and the SAME op retries.
+        | "OFFLINE_CODE_RESERVE_HELD"
+        // T3 (RULING 3.3) — a NEW ordinary op refused because a document-derived
+        // TIME budget is over-limit AND that budget's enforcement toggle is ON.
+        // RETRYABLE 503: the legal CLOSE path (Z / session END / drain) is never
+        // blocked, so the operator resolves the condition (close the shift /
+        // return online / wait for month rollover) and retries.
+        | "SHIFT_DURATION_LIMIT_EXCEEDED"
+        | "OFFLINE_SESSION_LIMIT_EXCEEDED"
+        | "OFFLINE_MONTH_LIMIT_EXCEEDED"
         // PR-Z2 (STOP-S6 ruling B) — a live Z hit C10 quiescence-pending: the
         // shift still has in-flight receipts.  RETRYABLE 503; the operator
         // retries the close with a NEW idempotency key after the blockers drain.
@@ -212,6 +247,7 @@ fn command_type_wire(ct: CommandType) -> &'static str {
         CommandType::ServiceIn => "SERVICE_IN",
         CommandType::ServiceOut => "SERVICE_OUT",
         CommandType::CashWithdrawal => "CASH_WITHDRAWAL",
+        CommandType::CashAdvanceEpz => "CASH_ADVANCE_EPZ",
         CommandType::PeriodicReport => "PERIODIC_REPORT",
     }
 }
@@ -276,6 +312,16 @@ fn convert_error_code(e: &ConvertError) -> &'static str {
         ConvertError::PaymentSlotKindMismatch { .. } => "PAYMENT_SLOT_KIND_MISMATCH",
         ConvertError::AcquirerSlipMappingDeferred { .. } => "ACQUIRER_SLIP_DEFERRED",
         ConvertError::ReturnCheckNumberNotSupported => "RETURN_CHECK_NUMBER_NOT_SUPPORTED",
+        // L1 INV-21 — pre-inbox refuse, row-less.
+        ConvertError::CashInsufficient { .. } => "CASH_INSUFFICIENT",
+        // EPZ — client-payload faults (paymentid<2 / malformed card leg).
+        ConvertError::EpzPaymentIdTooLow { .. } => "EPZ_PAYMENT_ID_TOO_LOW",
+        ConvertError::EpzMalformedCardLeg { .. } => "EPZ_MALFORMED_CARD_LEG",
+        // L5 — fail-closed pre-inbox input guards (all row-less 422 client faults).
+        ConvertError::CashCapExceeded { .. } => "CASH_CAP_EXCEEDED",
+        ConvertError::ZeroPriceLine { .. } => "ZERO_PRICE_LINE",
+        ConvertError::ZeroPaymentAmount { .. } => "ZERO_PAYMENT_AMOUNT",
+        ConvertError::UnderpaymentRefused { .. } => "UNDERPAYMENT_REFUSED",
         ConvertError::NoOpenShiftForZReport { .. } => "NO_OPEN_SHIFT",
         ConvertError::NegativeStoredPaymentSum { .. } => "LEDGER_CORRUPTION",
         ConvertError::ZReportSumOverflow { .. } => "LEDGER_CORRUPTION",
@@ -375,6 +421,119 @@ fn build_success(
     }
 }
 
+/// L6 — build the X-report (поточний звіт) snapshot: a local-only,
+/// SIDE-EFFECT-FREE read of the current open shift's turnover.
+///
+/// **Side-effect-free (the whole point):** this is a pure SELECT.  It does NOT
+/// enter `ingress_inbox`, create a `fiscal_documents` row, consume an lnd,
+/// advance the MAC seed, transition shift state, sign anything (no
+/// sidecar/crypto), or call DPS (no network).  Invariant #1 is held VACUOUSLY —
+/// there is no write transaction at all.
+///
+/// **SSOT:** turnover is [`aggregate_z_payload`] (the same ledger aggregation a
+/// live Z uses — payforms / `<IO>` / `<EPZ>` / `<TXS>` / `<NC>`), reused
+/// verbatim, NOT re-implemented.  It resolves the open shift itself (via
+/// `node_state.current_shift_id`); a `NoOpenShiftForZReport` error is the
+/// NO_OPEN_SHIFT gate → 422, row-less.  Cash-on-hand comes from
+/// [`cash_on_hand_for_fn`](crate::services::cash_ledger::cash_on_hand_for_fn)
+/// (0 when no open shift, but the aggregate has already gated that case).
+///
+/// **Bimodal for free:** the aggregation reads the durable ledger
+/// (`ACK` + `OFFLINE_LOCAL_ACK`), so an `OpenedLocalPendingDrain` (offline)
+/// shift returns the same turnover with no special-casing.
+async fn handle_x_report(
+    request_id_hex: &str,
+    fiscal_number: &str,
+    main_pool: &SqlitePool,
+) -> IngressResponse {
+    // Open-shift gate — the X-report is valid ONLY on a genuinely OPEN shift.
+    // A normal Z-close PINS `node_state.current_shift_id` at the now-`Closed`
+    // shift (it is NOT cleared — `terminal_close_pins_current_shift_id_behavior`
+    // in shift/transition.rs), so `aggregate_z_payload` (which resolves via
+    // `current_shift_id`, state-agnostic) would happily aggregate a CLOSED
+    // shift's turnover — while `cash_on_hand_for_fn` (which JOINs on an OPEN
+    // shift state) returns 0, an internally-INCONSISTENT snapshot.  Gate on the
+    // SAME open-shift definition `cash_on_hand_for_fn` uses (exclude CLOSED /
+    // RMR / ERROR / CREATED) so both halves of the snapshot agree, and a
+    // closed/no-shift FN gets the row-less NO_OPEN_SHIFT the contract mandates.
+    let shift_state = match crate::db::repositories::node_state::get(main_pool, fiscal_number).await
+    {
+        Ok(Some(ns)) => ns.shift_state,
+        Ok(None) => {
+            return err(
+                request_id_hex,
+                "NO_OPEN_SHIFT",
+                format!("x-report: no node_state for fn {fiscal_number} (no open shift)"),
+            )
+        }
+        Err(_) => {
+            return err(
+                request_id_hex,
+                "LEDGER_READ_FAILED",
+                "x-report: node_state read failed".to_string(),
+            )
+        }
+    };
+    use crate::db::models::enums::ShiftState;
+    let shift_is_open = !matches!(
+        shift_state,
+        ShiftState::Created
+            | ShiftState::Closed
+            | ShiftState::RequiresManualReconciliation
+            | ShiftState::Error
+    );
+    if !shift_is_open {
+        return err(
+            request_id_hex,
+            "NO_OPEN_SHIFT",
+            format!("x-report: shift is {shift_state:?}, not open"),
+        );
+    }
+
+    // SSOT aggregation — resolves the open shift + reads the durable ledger.
+    // A NoOpenShiftForZReport is the row-less NO_OPEN_SHIFT refusal (422).
+    let converted = match aggregate_z_payload(main_pool, fiscal_number).await {
+        Ok(cp) => cp,
+        Err(e) => return err(request_id_hex, convert_error_code(&e), e.to_string()),
+    };
+    // Parse the aggregated turnover into a JSON value for the flat response body
+    // (aggregate_z_payload serialises the ZReportOut shape).  A parse failure is
+    // an internal fault (the aggregator always emits valid JSON).
+    let turnover: serde_json::Value = match serde_json::from_str(&converted.payload_json) {
+        Ok(v) => v,
+        Err(_) => {
+            return err(
+                request_id_hex,
+                "INTERNAL",
+                "x-report: aggregated turnover was not valid JSON".to_string(),
+            )
+        }
+    };
+    // Running cash-on-hand for the open shift (the drawer balance).
+    let cash_on_hand_kop =
+        match crate::services::cash_ledger::cash_on_hand_for_fn(main_pool, fiscal_number).await {
+            Ok(c) => c,
+            Err(_) => {
+                return err(
+                    request_id_hex,
+                    "LEDGER_READ_FAILED",
+                    "x-report: cash-on-hand read failed".to_string(),
+                )
+            }
+        };
+    IngressResponse {
+        http_status: 200,
+        body: IngressBody::XReport(XReportPayload {
+            ok: true,
+            request_id: request_id_hex.to_string(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            fiscal_number: fiscal_number.to_string(),
+            turnover,
+            cash_on_hand_kop,
+        }),
+    }
+}
+
 /// Handle one ingress command end-to-end (accept → seam → response).
 ///
 /// `listener_fn` / `listener_driver_id` / `protocol` are the per-listener
@@ -403,6 +562,15 @@ pub async fn handle_command(
     match classify_command(cmd.command_type) {
         CommandClass::Signable => {}
         CommandClass::ReadOnly => {
+            // L6 — X-report (поточний звіт) is the ONE read-only command with a
+            // real read path: a local-only, SIDE-EFFECT-FREE snapshot of the
+            // open shift's turnover.  It is dispatched HERE (before any inbox
+            // write) so it never mints a row / lnd / seed / shift transition.
+            // Any OTHER read-only command (none today; classify_command maps
+            // only XReport to ReadOnly) keeps the hard 422 fallback.
+            if cmd.command_type == CommandType::XReport {
+                return handle_x_report(&rid_hex, listener_fn, main_pool).await;
+            }
             return err(
                 &rid_hex,
                 "READ_ONLY_COMMAND",
@@ -837,6 +1005,15 @@ mod tests {
     fn service_in_cmd(idem: &str) -> CanonicalCommand {
         parse(format!(
             r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"SERVICE_IN",
+                "idempotency_key":"{idem}","cashier_id":null,"department":null,
+                "return_check_number":null,
+                "payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+        ))
+    }
+
+    fn cash_withdrawal_cmd(idem: &str) -> CanonicalCommand {
+        parse(format!(
+            r#"{{"schema_version":"1.0","fiscal_number":"{FN}","command_type":"CASH_WITHDRAWAL",
                 "idempotency_key":"{idem}","cashier_id":null,"department":null,
                 "return_check_number":null,
                 "payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
@@ -1375,10 +1552,14 @@ mod tests {
         }
     }
 
-    /// A read-only command (`X_REPORT`) is rejected 422 and NEVER enters
-    /// the fiscal inbox.
+    /// L6 — the read-only command (`X_REPORT`) is now DISPATCHED to the
+    /// side-effect-free read path, NOT hard-refused.  With no open shift (the
+    /// `fresh_pools` fixture has no `node_state.current_shift_id`) it returns a
+    /// row-less 422 `NO_OPEN_SHIFT` and STILL never enters the fiscal inbox.
+    /// (The positive / turnover / bimodal pins live in `tests/l6_xreport.rs`,
+    /// which seeds an open shift + receipts.)
     #[tokio::test]
-    async fn read_only_command_is_rejected_422() {
+    async fn x_report_no_open_shift_is_422_row_less() {
         let (_d, main, secure) = fresh_pools().await;
         let wp = UnimplementedWritePath;
         let r = handle_command(
@@ -1393,8 +1574,8 @@ mod tests {
         .await;
         assert_eq!(r.http_status, 422);
         match r.body {
-            IngressBody::Error(e) => assert_eq!(e.error_code, "READ_ONLY_COMMAND"),
-            other => panic!("expected Error, got {other:?}"),
+            IngressBody::Error(e) => assert_eq!(e.error_code, "NO_OPEN_SHIFT"),
+            other => panic!("expected NO_OPEN_SHIFT error, got {other:?}"),
         }
         let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
             .fetch_one(&main)
@@ -1403,16 +1584,19 @@ mod tests {
         assert_eq!(c, 0, "read-only command must not enter the inbox");
     }
 
-    /// An unsupported cash-movement command (`SERVICE_IN`) is rejected 422
-    /// UNSUPPORTED_COMMAND at the boundary and NEVER enters the inbox (the
+    /// An unsupported cash-movement command (`CASH_WITHDRAWAL` / EPZ) is rejected
+    /// 422 UNSUPPORTED_COMMAND at the boundary and NEVER enters the inbox (the
     /// "before any inbox write" claim, asserted at the HANDLER level — piece-7
     /// review Low; complements the policy-level classify test).
+    /// NOTE (L3): `SERVICE_IN` / `SERVICE_OUT` are now `Signable` (not Unsupported)
+    /// and reach the write path; this test uses `CASH_WITHDRAWAL` which remains
+    /// permanently `Unsupported` (STOP-S2, EPZ fail-closed).
     #[tokio::test]
     async fn unsupported_command_is_rejected_422_without_inbox_row() {
         let (_d, main, secure) = fresh_pools().await;
         let wp = UnimplementedWritePath;
         let r = handle_command(
-            &service_in_cmd("idem-svc"),
+            &cash_withdrawal_cmd("idem-epz"),
             FN,
             drv(),
             Protocol::Rest,
@@ -1433,23 +1617,39 @@ mod tests {
         assert_eq!(c, 0, "an unsupported command must not enter the inbox");
     }
 
-    /// **PR-Z2 (STOP-S2) coupling-pin — the `FULL_Z_SURFACE_READY = true` flip is
-    /// COUPLED to the two ingress guards that make IO/EPZ legitimately absent.**
-    /// If either is relaxed WITHOUT building its IO/EPZ Z-half, a live close-shift
-    /// would sign an UNDER-REPORTING Z — so this pin asserts both still hold and
-    /// MUST break loudly if one is dropped: (1) `SERVICE_IN/OUT` stay
-    /// ingress-rejected (422 `UNSUPPORTED_COMMAND`, never minted → no service/IO
-    /// turnover to report); (2) an `acquirer_slip`-carrying payment stays
-    /// fail-closed (422 `ACQUIRER_SLIP_DEFERRED`, never minted → no card/EPZ
-    /// turnover to report).  Flag-independent (guards, not the flag) — it stays
-    /// GREEN under a flag revert.  See the `FULL_Z_SURFACE_READY` doc-comment.
+    /// **L3 + PR-Z2 (STOP-S2) coupling-pin — Z `<IO>` surface is coherent with
+    /// ingress classification.**
+    ///
+    /// After L3: `SERVICE_IN/OUT` are **Signable** (reach the write path and mint
+    /// docs that contribute to `<IO>` in the Z report) — the Z surface is now
+    /// COMPLETE for service-io.  The pin has two legs:
+    ///
+    /// (1) `SERVICE_IN` reaches the write path (NOT rejected 422 UNSUPPORTED) —
+    ///     verifying the policy gate is open and IO turnover IS reported.
+    ///     `UnimplementedWritePath` returns `NotImplemented`, so the handler
+    ///     returns a non-422 error, but crucially the inbox row IS written
+    ///     (the command passed the policy gate and entered the inbox).
+    ///
+    /// (2) An `acquirer_slip`-carrying CASHLESS payment stays fail-closed
+    ///     (422 `ACQUIRER_SLIP_DEFERRED`, never minted → no EPZ turnover to
+    ///     report) — EPZ remains STOP-S2 closed.
+    ///
+    /// `CASH_WITHDRAWAL` (EPZ) also stays `UNSUPPORTED_COMMAND` (verified by
+    /// `unsupported_command_is_rejected_422_without_inbox_row`).
+    ///
+    /// Flag-independent (guards, not the flag) — GREEN under a flag revert.
     #[tokio::test]
     async fn z_surface_flip_is_coupled_to_ingress_guards() {
         let (_d, main, secure) = fresh_pools().await;
         let wp = UnimplementedWritePath;
 
-        // (1) SERVICE_IN → 422 UNSUPPORTED (the IO-half premise: no service doc
-        // ever mints, so IO turnover is legitimately zero).
+        // (1) SERVICE_IN now reaches the write path (Signable, IO Z-half is built).
+        // `UnimplementedWritePath` returns `NotImplemented` (501), releasing the
+        // inbox row — but the command DID pass the policy gate (not rejected as
+        // UNSUPPORTED_COMMAND at 422).  The coupling assertion is: NOT a 422
+        // UNSUPPORTED_COMMAND.  The inbox row is released by NotImplemented (by
+        // design — see `retry_after_not_implemented_reattempts_not_stuck`), so
+        // inbox_count=0 is correct here.
         let r = handle_command(
             &service_in_cmd("idem-svc-couple"),
             FN,
@@ -1460,10 +1660,18 @@ mod tests {
             &wp,
         )
         .await;
-        assert_eq!(r.http_status, 422, "SERVICE_IN must stay ingress-rejected");
-        match r.body {
-            IngressBody::Error(e) => assert_eq!(e.error_code, "UNSUPPORTED_COMMAND"),
-            other => panic!("expected UNSUPPORTED_COMMAND, got {other:?}"),
+        // Must NOT be 422 UNSUPPORTED_COMMAND — SERVICE_IN is now Signable (L3).
+        assert_eq!(
+            r.http_status, 501,
+            "SERVICE_IN must reach the write path (501 NOT_IMPLEMENTED from stub, \
+             not 422 UNSUPPORTED_COMMAND)"
+        );
+        match &r.body {
+            IngressBody::Error(e) => assert_eq!(
+                e.error_code, "NOT_IMPLEMENTED",
+                "SERVICE_IN reaches write path — not policy-rejected"
+            ),
+            other => panic!("expected Error(NOT_IMPLEMENTED), got {other:?}"),
         }
 
         // (2) An acquirer_slip-carrying CASHLESS payment → 422 ACQUIRER_SLIP_DEFERRED
@@ -1505,11 +1713,16 @@ mod tests {
             IngressBody::Error(e) => assert_eq!(e.error_code, "ACQUIRER_SLIP_DEFERRED"),
             other => panic!("expected ACQUIRER_SLIP_DEFERRED, got {other:?}"),
         }
+        // Neither the acquirer_slip SELL nor the SERVICE_IN (which was released
+        // by NotImplemented) leaves a row in the inbox at rest.
         let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingress_inbox")
             .fetch_one(&main)
             .await
             .unwrap();
-        assert_eq!(c, 0, "neither coupled guard may mint an inbox row");
+        assert_eq!(
+            c, 0,
+            "acquirer_slip guard must not mint an inbox row; SERVICE_IN row was released by NotImplemented"
+        );
     }
 
     /// A convert failure (SELL with empty goods → `EMPTY_GOODS`) is rejected

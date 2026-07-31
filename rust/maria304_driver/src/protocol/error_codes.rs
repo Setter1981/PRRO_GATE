@@ -178,10 +178,20 @@ mod tests {
     #[test]
     fn wire_identifiers_are_all_distinct() {
         let all = [
-            "SOFTBLOCK", "SOFTBADCS", "SOFTUPAS", "SOFTBADART",
-            "SOFTDIFART", "SOFTREGIST", "SOFTCHECK", "SOFTPRNERR",
-            "SOFTNODOC", "SOFTKEY", "SOFTSVC", "SOFTOFFLBF",
-            "SOFTOFFLDP", "SOFTLOCKED",
+            "SOFTBLOCK",
+            "SOFTBADCS",
+            "SOFTUPAS",
+            "SOFTBADART",
+            "SOFTDIFART",
+            "SOFTREGIST",
+            "SOFTCHECK",
+            "SOFTPRNERR",
+            "SOFTNODOC",
+            "SOFTKEY",
+            "SOFTSVC",
+            "SOFTOFFLBF",
+            "SOFTOFFLDP",
+            "SOFTLOCKED",
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

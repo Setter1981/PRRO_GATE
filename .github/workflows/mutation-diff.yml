@@ -1,0 +1,98 @@
+name: mutation-diff
+
+# Per-PR mutation ratchet (the FW-1 discipline in CLAUDE.md → "Mutation-testing
+# discipline"). Runs cargo-mutants `--in-diff` on the changed prro/src lines vs
+# the committed baseline and FAILS on a NEW survivor that the PR did not account
+# for — either killed by a teeth test, or consciously accepted in
+# docs/mutation/baseline/survivors.txt / rust/.cargo/mutants.toml `exclude_re`.
+# Keeps test coverage from silently eroding; survivors do not accumulate.
+#
+# CS-1R R1.3 — REQUIRED-CHECK SAFETY. This workflow was previously path-FILTERED
+# at the `on:` trigger (`rust/prro/src/**` + mutants config). A path-filtered
+# workflow whose check is made REQUIRED in branch protection HANGS an out-of-path
+# PR forever on a never-reported status ("Expected — waiting"). So — exactly like
+# `rust-prro.yml` — the trigger is now UNFILTERED and an in-workflow `changes`
+# detector diffs the PR: the heavy `mutation-diff` job is SKIPPED when no in-path
+# file changed (GitHub treats a skipped required check as satisfied), so the
+# `mutation diff-gate` status ALWAYS reports on every PR and can safely be made a
+# required check. NOTE: making it required is a repo-admin BRANCH-PROTECTION
+# action — it cannot be done from this YAML and MUST be performed by the operator.
+
+on:
+  push:
+    branches: [main, rust-gateway]
+    paths:
+      - 'rust/prro/src/**'
+      - 'rust/.cargo/mutants.toml'
+      - 'docs/mutation/baseline/survivors.txt'
+      - 'scripts/mutation/**'
+      - '.github/workflows/mutation-diff.yml'
+  # UNFILTERED on pull_request so the required `mutation diff-gate` context
+  # reports on EVERY PR (the `changes` job below decides whether to run the
+  # heavy leg or skip it as satisfied).
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-diff-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Detect whether the PR touches mutation-relevant paths. The pattern list MUST
+  # mirror the push-trigger `paths` above. On push events this reports true
+  # unconditionally (pushes are already path-filtered).
+  changes:
+    name: detect mutation-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      inpath: ${{ steps.filter.outputs.inpath }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - id: filter
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "inpath=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags --depth=1 origin "$base"
+          files=$(git diff --name-only "$base" HEAD)
+          echo "changed files:"; echo "$files"
+          if echo "$files" | grep -qE '^(rust/prro/src/|rust/\.cargo/mutants\.toml$|docs/mutation/baseline/survivors\.txt$|scripts/mutation/|\.github/workflows/mutation-diff\.yml$)'; then
+            echo "inpath=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "inpath=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  mutation-diff:
+    # The REQUIRED-context job. SKIPPED (→ satisfied) on out-of-path PRs, so
+    # this single named check reports on every PR without a duplicate-name
+    # skip-companion workflow (the pattern rust-prro.yml's `build` job uses).
+    needs: changes
+    if: needs.changes.outputs.inpath == 'true'
+    name: mutation diff-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # run.sh diffs the PR against origin/main — need its history.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rust
+      # CS-1R R1.2: pin cargo-nextest to 0.9.137 (was `@nextest` = latest) so the
+      # runner matches the inventory-gate manifest baseline across all workflows.
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: nextest@0.9.137
+      - name: install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: mutation diff-gate (scripts/mutation/run.sh diff)
+        # Exits non-zero on a NEW survivor vs docs/mutation/baseline/survivors.txt.
+        # A no-op (no prro/src diff) exits 0.
+        run: scripts/mutation/run.sh diff

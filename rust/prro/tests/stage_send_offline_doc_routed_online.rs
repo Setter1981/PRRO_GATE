@@ -15,6 +15,7 @@
 use sqlx::SqlitePool;
 
 use prro::db::models::ids::DocumentId;
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::stage_send::{self, StageSendError};
 use prro::transports::dps::dto::CheckAck;
 
@@ -101,7 +102,7 @@ async fn seed_signed(pool: &SqlitePool, doc_byte: u8, fs_mode: &str) -> Document
 
 async fn read_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()

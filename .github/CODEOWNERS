@@ -1,0 +1,65 @@
+# CODEOWNERS — CS-1R4: independent review for the WHOLE root-of-trust.
+#
+# WHY. The CS-1 integrity gates prove fiscal-neutrality by comparing against PINNED
+# data (fingerprints, approved blob SHAs, a graph closure lock, inventory manifests)
+# AND by an UNCONDITIONAL required CI job (rust-prro.yml) that runs build+test for
+# every workspace member. That trust chain is only as strong as its weakest
+# un-reviewed link. CS-1R4 moved the trust boundary OUT of PR-code and INTO merge
+# rules: the CODE is fail-closed and un-dispatchable, and every file that DEFINES the
+# gate — the workflows, the oracles/engines, the pins, the inventory, the toolchain
+# pin, the .sqlx describe cache, and this file — is code-owner-gated so weakening any
+# of them is a reviewed, owner-gated event, never a silent self-edit.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# OPERATOR ACTION REQUIRED (cannot be set from code — the ACTUAL trust root):
+#   1. Enable branch protection on `main`:  Settings → Branches → main →
+#      "Require a pull request before merging" → "Require review from Code Owners"
+#      AND "Require status checks to pass" with the REQUIRED contexts:
+#        - x86_64-unknown-linux-gnu   (rust-prro.yml — the integrity job)
+#        - fmt + clippy (gnu)         (fmt-clippy.yml)
+#        - mutation diff-gate         (mutation-diff.yml)
+#      Also enable "Do not allow bypassing the above settings" and disallow force-push.
+#      Without these flags, CODEOWNERS + the required jobs are ADVISORY only:
+#        - a skipped/green-without-running required check counts as satisfied;
+#        - self-disabling a workflow (e.g. deleting a step, `if: false`) is a
+#          workflow-file diff that ONLY the CODEOWNERS + required-review rule gates.
+#      THE CODE CANNOT enforce these — they are the trust root and live in repo rules.
+#   2. Set an INDEPENDENT owner. GitHub does NOT count the PR author as a satisfying
+#      code-owner reviewer, so `@Setter1981` below already forces a second party for
+#      any PR that party did not author. For genuine two-person integrity on
+#      solo-authored PRs, add a second maintainer or a review team here (e.g.
+#      `@your-org/cs1r-gate-reviewers`) and require it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── CI workflows — the required-job DEFINITIONS (the structural gate surface). ──
+# A change that weakens a required job (removes a step, adds `if:`/`continue-on-error`,
+# changes a `checkout` ref, un-pins an action, drops `--locked`) is owner-reviewed.
+/.github/workflows/**                           @Setter1981
+
+# ── The CS-1 test-provenance gate — oracle + engine + the coverage assertion. ──
+/rust/prro/tests/cs1_test_provenance.rs         @Setter1981
+/rust/prro/tests/support/cs1_provenance.rs      @Setter1981
+/rust/prro/tests/cs1r4_integrity_job_coverage.rs @Setter1981
+
+# ── prro-domain purity gate — oracle + engine + the committed closure lock. ──
+/rust/prro-domain/tests/purity_gate.rs          @Setter1981
+/rust/prro-domain/tests/support/metadata_graph.rs @Setter1981
+/rust/prro-domain/purity-closure.lock           @Setter1981
+
+# ── CS-1R docs, pins, and inventory (the whole docs/cs1r surface). ──
+# Covers the pins the gates LOAD, the forward inventory baseline, and the honest
+# artifact/claim docs. `/docs/cs1r/**` subsumes pins/ and inventory/.
+/docs/cs1r/**                                   @Setter1981
+
+# ── CS-1R gate scripts (the inventory gate + mint + this surface). ──
+/scripts/cs1r/**                                @Setter1981
+
+# ── The toolchain pin (channel/components/targets the whole gate builds under). ──
+/rust/rust-toolchain.toml                       @Setter1981
+
+# ── The committed sqlx describe cache (the offline SQL the build resolves against;
+#    a change here changes what SQL the gates compile without a live DB). ──
+/rust/**/.sqlx/**                               @Setter1981
+
+# ── This ownership file itself (a change to who reviews the gates is itself gated). ──
+/.github/CODEOWNERS                             @Setter1981

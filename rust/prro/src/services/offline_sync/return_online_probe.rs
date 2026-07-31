@@ -80,6 +80,15 @@ use crate::transports::dps::error::{AuthorizationKind, DpsError};
 fn dps_error_class(err: &DpsError) -> &'static str {
     match err {
         DpsError::Transport(_) => "Transport",
+        // CS-3 Slice A′: distinct per-variant audit class (this fn is a forensic string
+        // key, not routing/CHECK-constrained — the doc invites extension). Behaviour is
+        // unaffected; probe-failure audit payloads gain an accurate "RemoteStatus" label
+        // distinguishing gRPC auth-rejection from genuine transport absence.
+        DpsError::RemoteStatus { .. } => "RemoteStatus",
+        // CS-3 Slice A: distinct per-variant audit class (this fn is a forensic string
+        // key, not routing/CHECK-constrained — the doc invites extension). Behaviour is
+        // unaffected; only the probe-failure audit payload gains an accurate `-4` label.
+        DpsError::Indeterminate { .. } => "Indeterminate",
         DpsError::Authorization { .. } => "Authorization",
         DpsError::Decode(_) => "Decode",
         DpsError::Server { .. } => "Server",
@@ -536,4 +545,35 @@ pub fn spawn_probe_loop(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod ra_tests {
+    use super::*;
+    use crate::transports::dps::error::DpsError;
+
+    #[test]
+    fn dps_error_class_labels_remote_status_and_indeterminate_ra() {
+        // RA all-consumers pin: the taxonomy string is DISTINCT for the CS-3 variants
+        // (NOT collapsed to "Transport") — this is exactly why slice A/A′ was never
+        // behaviour-neutral. Pinned so the taxonomy cannot silently regress.
+        assert_eq!(
+            dps_error_class(&DpsError::RemoteStatus {
+                code: "Unauthenticated".into(),
+                message: "x".into(),
+                digest: prro_domain::delivery::GrpcStatusDigest::from_transport_digest([0xAB; 32]),
+            }),
+            "RemoteStatus"
+        );
+        assert_eq!(
+            dps_error_class(&DpsError::Indeterminate {
+                code: -4,
+                message: "y".into(),
+                digest: prro_domain::delivery::DecodedResponseDigest::from_transport_digest(
+                    [0xAB; 32]
+                ),
+            }),
+            "Indeterminate"
+        );
+    }
 }

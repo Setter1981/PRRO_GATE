@@ -28,7 +28,7 @@ use prro_sidecar::{
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let config_path   = args.next().unwrap_or_else(|| usage());
+    let config_path = args.next().unwrap_or_else(|| usage());
     let fiscal_number = args.next().unwrap_or_else(|| usage());
 
     let config = SidecarConfig::from_toml_file(&config_path).unwrap_or_else(|e| {
@@ -46,26 +46,31 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let operator = repo.load_active_operator(&fiscal_number).unwrap_or_else(|e| {
-        eprintln!("active operator: {e}");
-        std::process::exit(1);
-    });
+    let operator = repo
+        .load_active_operator(&fiscal_number)
+        .unwrap_or_else(|e| {
+            eprintln!("active operator: {e}");
+            std::process::exit(1);
+        });
 
     // Decode password using the same logic as the signing server.
     let raw_pw = match config.security.credentials_mode {
         CredentialsMode::Plain => operator.jks_password.clone(),
         CredentialsMode::XorSoft => {
-            let cert_meta = repo.load_operator_cert_metadata(&fiscal_number).unwrap_or_else(|e| {
-                eprintln!("cert metadata: {e}");
-                std::process::exit(1);
-            });
-            let valid_to = cert_meta.valid_to.as_deref().unwrap_or("");
-            let op_name  = operator.operator_name.as_deref().unwrap_or("");
-            credentials::decode_password(&operator.jks_password, valid_to, op_name)
+            let cert_meta = repo
+                .load_operator_cert_metadata(&fiscal_number)
                 .unwrap_or_else(|e| {
+                    eprintln!("cert metadata: {e}");
+                    std::process::exit(1);
+                });
+            let valid_to = cert_meta.valid_to.as_deref().unwrap_or("");
+            let op_name = operator.operator_name.as_deref().unwrap_or("");
+            credentials::decode_password(&operator.jks_password, valid_to, op_name).unwrap_or_else(
+                |e| {
                     eprintln!("decode password: {e}");
                     std::process::exit(1);
-                })
+                },
+            )
         }
     };
 
@@ -83,30 +88,37 @@ async fn main() {
     let cert_der: Vec<u8> = if !extracted.certs.is_empty() {
         extracted.certs[0].clone()
     } else {
-        repo.load_cert_der_for_fn(&fiscal_number).unwrap_or_else(|e| {
-            eprintln!("cert DER from DB: {e}");
-            std::process::exit(1);
-        })
+        repo.load_cert_der_for_fn(&fiscal_number)
+            .unwrap_or_else(|e| {
+                eprintln!("cert DER from DB: {e}");
+                std::process::exit(1);
+            })
     };
 
     println!("── Key container ─────────────────────────────────");
     println!("  format:    {:?}", extracted.format);
     println!("  certs:     {} embedded", extracted.certs.len());
-    println!("  operator:  {}", operator.operator_name.as_deref().unwrap_or("-"));
+    println!(
+        "  operator:  {}",
+        operator.operator_name.as_deref().unwrap_or("-")
+    );
     println!("  INN:       {}", operator.operator_inn);
     println!("  fiscal_fn: {fiscal_number}");
     println!("  mode:      {:?}", fn_config.fiscal_mode);
 
     // Build the CMS-signed rro_fn_sign per DPS infoRro protocol.
     // The signature input is the fiscal_number string as UTF-8 bytes.
-    let d           = FieldEl::from_le_bytes(&extracted.param_d[..], 9);
+    let d = FieldEl::from_le_bytes(&extracted.param_d[..], 9);
     let dstu_signer = DstuInProcessSigner::new(d);
-    let cms_signer  = CmsSigner {
+    let cms_signer = CmsSigner {
         cert_der: &cert_der,
-        signer:   &dstu_signer as &dyn RawSigner,
-        profile:  CmsProfile::default(),
+        signer: &dstu_signer as &dyn RawSigner,
+        profile: CmsProfile::default(),
     };
-    let opts = CmsBuildOptions { attached: false, signing_time: None };
+    let opts = CmsBuildOptions {
+        attached: false,
+        signing_time: None,
+    };
     let sig = cms_signer
         .sign_with(fiscal_number.as_bytes(), opts)
         .unwrap_or_else(|e| {
@@ -114,7 +126,9 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let req = CheckRequest { rro_fn_sign: sig.cms_der };
+    let req = CheckRequest {
+        rro_fn_sign: sig.cms_der,
+    };
 
     // gRPC pool with lazy connect — construction never fails due to network.
     let pool = DpsGrpcPool::new(&config.dps.prod, &config.dps.test).unwrap_or_else(|e| {
@@ -122,7 +136,10 @@ async fn main() {
         std::process::exit(1);
     });
 
-    print!("\ncalling DPS infoRro({fiscal_number}, mode={:?}) ... ", fn_config.fiscal_mode);
+    print!(
+        "\ncalling DPS infoRro({fiscal_number}, mode={:?}) ... ",
+        fn_config.fiscal_mode
+    );
     match pool.info_rro(&fn_config.fiscal_mode, req).await {
         Ok(info) => {
             println!("OK");

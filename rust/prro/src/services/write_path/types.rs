@@ -6,62 +6,21 @@
 //! scope) and are NOT carried in the context — they are wired in at
 //! stage boundaries by the dispatcher.
 
-use crate::db::models::enums::{DocType, ShiftState};
-use crate::db::models::ids::CashierId;
+use crate::db::models::enums::ShiftState;
 use crate::db::repositories::fiscal_documents::DocumentRow;
 use crate::db::repositories::ingress_inbox::InboxRow;
 use crate::db::repositories::node_state::NodeStateRow;
 use crate::db::repositories::shifts::ShiftRow;
 
-/// Minimal canonical envelope view used by W5 guards and stage 1
-/// INSERT.  Full canonicalisation / XML build happens in stage 3
-/// (W6); W5 only needs enough to drive doc_type-shaped guards and
-/// build a `NewDocument`.
-#[derive(Debug, Clone)]
-pub struct CanonicalFiscalCommand {
-    pub doc_type: DocType,
-    pub business_ts: String,
-    pub total_sum_kop: Option<i64>,
-    pub payload_json: String,
-    pub payload_sha256_canonical: [u8; 32],
-    /// RS-3 D5 — the SOURCE hash: the sha256 of the inbox payload that
-    /// produced this command, carried so `stage_acquire` can cross-check
-    /// it against `ingress_inbox.payload_sha256_canonical` (the idempotency
-    /// + crash-recovery anchor, invariant #4).
-    ///
-    /// For NON-Z documents this COINCIDES with `payload_sha256_canonical`
-    /// (one payload, one hash). The A1Z Z path makes them DIVERGE:
-    /// `source_sha256` stays the inbox wire-intent hash while
-    /// `payload_sha256_canonical` becomes the hash of the *aggregated* Z
-    /// report body. Keep the two distinct so a future reader never assumes
-    /// the canonical (possibly-aggregated) hash equals the inbox hash.
-    pub source_sha256: [u8; 32],
-    /// W14a-2b §1.4 — operator/cashier id that will sign this document.
-    /// Carries through stage 1 (PREPARED insert) → stage 3 (sign) →
-    /// stage 4 (send envelope) and is consumed by `signer_guard` at
-    /// stage_send 4-pre (see spec §1.4 + §2.3).  `None` whenever
-    /// operator attribution is unavailable: system-context paths
-    /// (e.g. boot-phase snapshot reconstruction), test fixtures that
-    /// don't exercise signer enforcement, and current ingress
-    /// adapters that have not yet been plumbed.
-    ///
-    /// **Operator-resolved (spec §8 OQ #1):** `CanonicalFiscalCommand`
-    /// is not currently `Deserialize`, so adding a field is a Rust-
-    /// struct-literal breakage only (all callers updated in this
-    /// commit).  No serde concern.
-    pub signed_by_cashier_id: Option<CashierId>,
-
-    /// W4-Z0 piece 9 — listener-stamped driver vendor identifier.
-    /// `Some` whenever the ingress listener supplies it from
-    /// `ops/config.yaml` per-port `driver_id` config.  `None` for
-    /// system-context paths (boot reconcile, test fixtures, etc.).
-    ///
-    /// Used by the W4-Z1 conversion layer to look up
-    /// `driver_tax_mapping` for the vendor's letter→canonical
-    /// translation table.  NEVER appears in W3 wire DTO — runtime
-    /// context only.
-    pub driver_id: Option<crate::db::models::ids::DriverId>,
-}
+/// **CS-1c (contract §3 / §5):** `CanonicalFiscalCommand` moved to the pure
+/// `prro-domain` crate under the SAME name. This explicit per-symbol re-export
+/// keeps the legacy path `prro::services::write_path::types::CanonicalFiscalCommand`
+/// resolving **unchanged** — every consumer (11 src + 9 test) imports via this
+/// facade path and constructs with struct literals, untouched by the move. The
+/// struct is a pure in-memory command (`#[derive(Debug, Clone)]` only, never
+/// persisted); its field doc-comments now live with the definition in
+/// `prro_domain::command`.
+pub use prro_domain::CanonicalFiscalCommand;
 
 /// Snapshot handed from stage 1 to subsequent stages.  Contains
 /// everything stages 3-5 need to build wire artifacts and persist
@@ -262,6 +221,19 @@ pub enum RejectionReason {
     /// re-drives the blocker, then the client retries.  Audit shape:
     /// `write_gate_sibling_pending`.
     WriteGateSiblingPending,
+    /// INV-21 TOCTOU close — in-lease cash-floor re-check (HOLE 2).
+    ///
+    /// A RETURN for `fiscal_number` was admitted by the pre-inbox L1 guard
+    /// (`convert.rs`), but by the time stage_acquire holds the FN write lease,
+    /// a concurrent RETURN has already consumed the cash, leaving
+    /// `cash_on_hand < return_cash`.  Fail-closed PRE-MINT (no lnd, no
+    /// fiscal_documents row; audit-only — same persistence class as
+    /// `WriteGateSiblingPending`).  Seed NOT advanced, doc NOT issued.
+    /// Audit shape: `inv21_cash_insufficient_in_lease`.
+    CashInsufficientInLease {
+        cash_on_hand_kop: i64,
+        return_cash_kop: i64,
+    },
 }
 
 /// W14a-2b Commit 4 — channel derived from node mode at stage_acquire

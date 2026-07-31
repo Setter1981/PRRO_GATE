@@ -38,7 +38,7 @@ use crate::db::models::{
     ids::DocumentId,
 };
 use crate::db::repositories::{
-    audit_log, document_files,
+    audit_log, delivery_reservation, document_files,
     document_files::DocumentFileKind,
     fiscal_documents::{self as fd, DocumentRow, TransitionOutcome},
     fiscal_number_config as fn_config, node_state, offline_sessions,
@@ -47,7 +47,8 @@ use crate::db::tx::with_immediate;
 use crate::xml::{
     build_canonical_xml, AdjustmentMode, CanonicalDoc, CheckItem, CheckLevelAdjustment,
     CheckLevelAdjustmentKind, CheckPayload, CheckPayment, DocumentHeader, LineAdjustment,
-    LineAdjustmentKind, ZReportCheckCount, ZReportPayload, ZReportPaymentSum, ZReportTaxSummary,
+    LineAdjustmentKind, ServiceCheckPayload, ZReportCheckCount, ZReportPayload, ZReportPaymentSum,
+    ZReportServiceSum, ZReportTaxSummary,
 };
 
 use super::tax_summary::{derive_check_tax_summaries, TaxResolutionSnapshot};
@@ -61,6 +62,18 @@ pub enum WireArtifactKind {
     Sell,
     Return,
     ZReport,
+    /// B10 — offline-session BEGIN (`<C T="109">`) service receipt.
+    OfflineSessionBegin,
+    /// B10 — offline-session END (`<C T="110">`) service receipt.
+    OfflineSessionEnd,
+    /// L3 — service cash-in (`<C T="2">…<I N='1' T='0' SM=…/>`).
+    /// WebCheck `DealCheck` / `SubmitCheck` code 3.
+    ServiceIn,
+    /// L3 — service cash-out (`<C T="2">…<O N='1' T='0' SM=…/>`).
+    /// WebCheck `DealCheck` / `SubmitCheck` code 3 (shared type with ServiceIn).
+    ServiceOut,
+    /// EPZ — видача готівки за ЕПЗ (`<C T="8">` + good + card `<M>`).
+    CashAdvanceEpz,
 }
 
 pub struct SigningContext {
@@ -153,10 +166,18 @@ pub fn derive_wire_artifact_kind(doc_type: DocType) -> Result<WireArtifactKind, 
         DocType::Sell => Ok(WireArtifactKind::Sell),
         DocType::Return => Ok(WireArtifactKind::Return),
         DocType::ShiftClose | DocType::ZReport => Ok(WireArtifactKind::ZReport),
-        // W4 builder ships ShiftOpen/Sell/Return/ZReport only.  Other
-        // op-types are not signable in W6: fail-closed BEFORE any
-        // pin / Z allocation / state mutation occurs.
-        DocType::ServiceIn | DocType::ServiceOut | DocType::CashWithdrawal | DocType::XReport => {
+        // B10 — offline-session boundary docs are signable service receipts
+        // (empty `<C T="109">` / `<C T="110">`).  They ride the same offline
+        // sign path (code acquire + `<MAC ID>` stamp) as any offline doc.
+        DocType::OfflineSessionBegin => Ok(WireArtifactKind::OfflineSessionBegin),
+        DocType::OfflineSessionEnd => Ok(WireArtifactKind::OfflineSessionEnd),
+        // L3 — service cash-in/out wired:
+        DocType::ServiceIn => Ok(WireArtifactKind::ServiceIn),
+        DocType::ServiceOut => Ok(WireArtifactKind::ServiceOut),
+        // EPZ — видача готівки за ЕПЗ wired (`<C T='8'>`):
+        DocType::CashAdvanceEpz => Ok(WireArtifactKind::CashAdvanceEpz),
+        // CashWithdrawal is the fail-closed placeholder; XReport is read-only.
+        DocType::CashWithdrawal | DocType::XReport => {
             Err(SignError::UnsupportedDocType { doc_type })
         }
     }
@@ -914,10 +935,22 @@ async fn resolve_offline_dps_code(
     }
 
     // (4) Idempotency: already stamped (re-entry / boot re-drive)? Read back the
-    // code — do NOT acquire a second one.
+    // code — do NOT acquire a second one.  (Runs BEFORE the doc-type dispatch so
+    // a re-driven END reuses its code without re-acquiring — INV-5.)
     if let Some(stamp) = fd::read_offline_stamp_tx(tx, doc_id).await? {
         return Ok(OfflineResolve::Stamped(stamp.dps_code));
     }
+
+    // B10 END-online fix — the DocType=10 (OFFLINE_SESSION_END) is minted
+    // `fs_mode='ONLINE'` at DRAIN finalize (it is a real online issuance — the
+    // node is GOING online), so step (1) above (`is_online_origin_tx`) already
+    // returned `OnlineShaped` and this fn never reaches here for the END.  It
+    // therefore signs a BARE `<MAC>` (no forced offline code), which is the
+    // DPS-accepted shape for a drain-to-online close (WebCheck `CloseOfflineDoc`;
+    // proven live).  The earlier forced-offline-code path (`resolve_offline_dps_
+    // code_forced`) was built on the WRONG premise that the END needs an offline
+    // code — it does not — and is removed.  SELL/RETURN keep the strict node-mode
+    // + OPEN-session gates below verbatim (no leak, W7 criterion 6 intact).
 
     // (2) FRESH node-mode read: only Offline / GoingOffline stamp at sign.  A
     // node that has since flipped Online (GO_ONLINE race) signs online-shaped.
@@ -956,6 +989,14 @@ async fn resolve_offline_dps_code(
     // the fuzzer proved violates #192: a PREPARED doc resting on an empty pool
     // is a `StuckNonTerminalDoc` because nothing re-drives it before the next
     // quiescent scan.)
+    // CS-3 S7-2 — fail-closed FN fence: refuse consuming an offline code (which
+    // stamps offline issuance + advances the chain) while a delivery reservation
+    // is in-flight (INACTIVE today).
+    if delivery_reservation::fn_fence_active_tx(tx, fn_id).await? {
+        return Err(anyhow::anyhow!(
+            "stage_sign offline-code refused: FN {fn_id} has an active delivery reservation (S7-2 fence)"
+        ));
+    }
     let acquired = match offline_sessions::acquire_code_tx(tx, fn_id, doc_id).await {
         Ok(a) => a,
         Err(offline_sessions::OfflineSessionError::CodePoolExhausted { .. }) => {
@@ -1143,6 +1184,17 @@ struct CheckPaymentJson {
     smp: Option<i64>,
 }
 
+/// L3 — one service-io `<IO>` row in the Z JSON.
+/// Mirrors `xml::ZReportServiceSum` MINUS the split by direction
+/// (direction is encoded in `sum_in_kop` vs `sum_out_kop`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ZReportServiceIoJson {
+    name: String,
+    sum_in_kop: i64,
+    sum_out_kop: i64,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct ZReportJson {
@@ -1151,8 +1203,25 @@ struct ZReportJson {
     /// so a pre-W4-Z2 minimal Z payload (no `tax_summaries` key) still parses.
     #[serde(default)]
     tax_summaries: Vec<ZReportTaxSumJson>,
+    /// L3 — aggregated `<IO>` service cash-in/out rows.  `#[serde(default)]`
+    /// so pre-L3 Z payloads (no `service_sums` key) still parse.
+    #[serde(default)]
+    service_sums: Vec<ZReportServiceIoJson>,
+    /// EPZ — aggregated `<EPZ EPC EPCS EPSM>` card-advance totals.
+    /// `#[serde(default)]` so pre-EPZ Z payloads (no `epz` key) still parse.
+    #[serde(default)]
+    epz: Option<ZReportEpzJson>,
     sell_count: u32,
     return_count: u32,
+}
+
+/// EPZ Z-section totals in the Z JSON.  Mirrors `xml::ZReportEpzTotals`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ZReportEpzJson {
+    epc: i64,
+    epcs: i64,
+    epsm: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1182,10 +1251,59 @@ struct ZReportTaxSumJson {
     txo: i64,
 }
 
+/// L3 — service cash-in/out payload.
+/// Produced by `convert.rs` ServiceIn/Out arm.  Carries `schema_version`
+/// (invariant #7).  `name` is the service-op label stored in Z `<IO NM>`.
+/// The fields are deserialized for `deny_unknown_fields` validation;
+/// only `amount_kop` is read structurally in `build_canonical_doc`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ServiceIoJson {
+    #[allow(dead_code)]
+    schema_version: String,
+    amount_kop: i64,
+    #[allow(dead_code)]
+    name: String,
+}
+
+/// EPZ — видача готівки за ЕПЗ signer payload.  Produced by `convert.rs`
+/// CashAdvanceEpz arm.  Carries the cash-out `sum_kop`, the fixed good
+/// (`code`/`name`), and the card requisites (`paymentid`/`pay_name`/`pa..rrn`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct EpzJson {
+    #[allow(dead_code)]
+    schema_version: String,
+    sum_kop: i64,
+    code: String,
+    name: String,
+    paymentid: i64,
+    pay_name: String,
+    pa: String,
+    pb: String,
+    pc: String,
+    pd: String,
+    pe: String,
+    psnm: String,
+    rrn: String,
+}
+
 enum TypedPayload {
     ShiftOpen(ShiftOpenJson),
-    Check { body: CheckJson, total_sum_kop: i64 },
+    Check {
+        body: CheckJson,
+        total_sum_kop: i64,
+    },
     ZReport(ZReportJson),
+    /// B10 — offline-session boundary (BEGIN/END).  Carries no body: the
+    /// wire doc is an EMPTY `<C T="109">`/`<C T="110">` service receipt
+    /// (header + `<TS>` + `<MAC>` only).  The payload_json is an inert
+    /// marker (`{}`), so no fields are parsed.
+    OfflineBoundary,
+    /// L3 — service cash-in/out.
+    ServiceIo(ServiceIoJson),
+    /// EPZ — видача готівки за ЕПЗ.
+    Epz(EpzJson),
 }
 
 fn parse_payload(
@@ -1217,6 +1335,24 @@ fn parse_payload(
             .map_err(|e| SignError::PayloadSchema {
                 detail: format!("ZReport: {e}"),
             }),
+        // B10 — boundary docs carry no body; the JSON is an inert marker.
+        WireArtifactKind::OfflineSessionBegin | WireArtifactKind::OfflineSessionEnd => {
+            Ok(TypedPayload::OfflineBoundary)
+        }
+        // L3 — service cash-in/out.
+        WireArtifactKind::ServiceIn | WireArtifactKind::ServiceOut => {
+            serde_json::from_str::<ServiceIoJson>(payload_json)
+                .map(TypedPayload::ServiceIo)
+                .map_err(|e| SignError::PayloadSchema {
+                    detail: format!("ServiceIo: {e}"),
+                })
+        }
+        // EPZ — видача готівки за ЕПЗ.
+        WireArtifactKind::CashAdvanceEpz => serde_json::from_str::<EpzJson>(payload_json)
+            .map(TypedPayload::Epz)
+            .map_err(|e| SignError::PayloadSchema {
+                detail: format!("Epz: {e}"),
+            }),
     }
 }
 
@@ -1234,6 +1370,20 @@ fn build_canonical_doc(
                 opening_sum: p.opening_sum_kop,
             }))
         }
+        // B10 — offline-session boundary docs: empty service receipt, DI =
+        // the doc's local number.  BEGIN → `<C T="109">`, END → `<C T="110">`.
+        (WireArtifactKind::OfflineSessionBegin, TypedPayload::OfflineBoundary) => Ok(
+            CanonicalDoc::OfflineSessionBegin(crate::xml::OfflineSessionBoundaryPayload {
+                header,
+                local_number,
+            }),
+        ),
+        (WireArtifactKind::OfflineSessionEnd, TypedPayload::OfflineBoundary) => Ok(
+            CanonicalDoc::OfflineSessionEnd(crate::xml::OfflineSessionBoundaryPayload {
+                header,
+                local_number,
+            }),
+        ),
         (
             WireArtifactKind::Sell,
             TypedPayload::Check {
@@ -1303,12 +1453,67 @@ fn build_canonical_doc(
                         type_code: m.type_code,
                     })
                     .collect(),
-                service_sums: Vec::new(),
+                // ★ L3 — ZReportJson handoff: thread service_sums through to ZReportPayload
+                // so the existing xml/mod.rs IO emitter at :1313 sees the data.
+                // `#[serde(default)]` on ZReportJson.service_sums ensures pre-L3
+                // payloads (no `service_sums` key) continue to parse correctly.
+                service_sums: p
+                    .service_sums
+                    .into_iter()
+                    .map(|s| ZReportServiceSum {
+                        name: s.name,
+                        sum_in: s.sum_in_kop,
+                        sum_out: s.sum_out_kop,
+                    })
+                    .collect(),
                 check_count: ZReportCheckCount {
                     sell_count: p.sell_count,
                     return_count: p.return_count,
                 },
-                epz: None,
+                // EPZ — thread the aggregated <EPZ> totals through so the
+                // xml/mod.rs emitter sees the card-advance turnover (STOP-S2).
+                // `#[serde(default)]` on ZReportJson.epz keeps pre-EPZ payloads
+                // (no `epz` key) parsing to None.
+                epz: p.epz.map(|e| crate::xml::ZReportEpzTotals {
+                    epc: e.epc,
+                    epcs: e.epcs,
+                    epsm: e.epsm,
+                }),
+            }))
+        }
+        // L3 — service cash-in: <C T='2'><I N='1' T='0' SM=…/><E N='2'/></C>
+        (WireArtifactKind::ServiceIn, TypedPayload::ServiceIo(p)) => {
+            Ok(CanonicalDoc::ServiceIn(ServiceCheckPayload {
+                header,
+                local_number,
+                amount_kop: p.amount_kop,
+            }))
+        }
+        // L3 — service cash-out: <C T='2'><O N='1' T='0' SM=…/><E N='2'/></C>
+        (WireArtifactKind::ServiceOut, TypedPayload::ServiceIo(p)) => {
+            Ok(CanonicalDoc::ServiceOut(ServiceCheckPayload {
+                header,
+                local_number,
+                amount_kop: p.amount_kop,
+            }))
+        }
+        // EPZ — видача готівки за ЕПЗ: <C T='8'> + good + card <M> + <E>.
+        (WireArtifactKind::CashAdvanceEpz, TypedPayload::Epz(p)) => {
+            Ok(CanonicalDoc::CashAdvanceEpz(crate::xml::EpzCheckPayload {
+                header,
+                local_number,
+                sum_kop: p.sum_kop,
+                code: p.code,
+                name: p.name,
+                paymentid: p.paymentid,
+                pay_name: p.pay_name,
+                pa: p.pa,
+                pb: p.pb,
+                pc: p.pc,
+                pd: p.pd,
+                pe: p.pe,
+                psnm: p.psnm,
+                rrn: p.rrn,
             }))
         }
         // (kind, payload) mismatch is unreachable: parse_payload
@@ -1408,6 +1613,32 @@ pub fn z_report_xml_from_json_for_testing(
         parse_payload(WireArtifactKind::ZReport, payload_json, None).map_err(|e| e.to_string())?;
     let doc = build_canonical_doc(
         WireArtifactKind::ZReport,
+        header,
+        local_number,
+        payload,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    build_canonical_xml(&doc).map_err(|e| e.to_string())
+}
+
+/// EPZ — test seam: drive a converted EPZ `payload_json` through the SAME
+/// private `parse_payload` + `build_canonical_doc` the signer uses, then emit
+/// the unsigned canonical XML (`<C T='8'>` + good + card `<M>`).  Lets the EPZ
+/// wire pin assert the full `convert → build_canonical_doc → XML` path WITHOUT
+/// CMS signing.  `parse_payload` / `build_canonical_doc` stay private.
+///
+/// **Use**: tests / `test-support` only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn epz_check_xml_from_json_for_testing(
+    header: DocumentHeader,
+    local_number: u32,
+    payload_json: &str,
+) -> Result<Vec<u8>, String> {
+    let payload = parse_payload(WireArtifactKind::CashAdvanceEpz, payload_json, None)
+        .map_err(|e| e.to_string())?;
+    let doc = build_canonical_doc(
+        WireArtifactKind::CashAdvanceEpz,
         header,
         local_number,
         payload,

@@ -1,0 +1,5 @@
+error[E0463]: can't find crate for `sqlx`
+  --> tests/purity_compile_fail/forbidden_sqlx_extern.rs:10:1
+   |
+10 | extern crate sqlx;
+   | ^^^^^^^^^^^^^^^^^^ can't find crate

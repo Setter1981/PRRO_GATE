@@ -24,6 +24,7 @@ use prro::db::repositories::{
     fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig, ingress_inbox as inbox,
     ingress_inbox::NewInboxEntry,
 };
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::write_path::{
     stage_acquire,
@@ -85,9 +86,9 @@ async fn seed_node_state(
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
-    .bind(current_shift_id)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
+    .bind(current_shift_id.map(DbShiftId))
     .execute(pool)
     .await
     .unwrap();
@@ -99,9 +100,9 @@ async fn seed_shift(pool: &sqlx::SqlitePool, shift_id: ShiftId, state: ShiftStat
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, ?, 'ONLINE', 0, 'seed-cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
-    .bind(state)
+    .bind(state.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -204,21 +205,21 @@ async fn node_current_shift_id(pool: &sqlx::SqlitePool) -> Option<Vec<u8>> {
 }
 async fn shift_state_by_id(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> Option<String> {
     sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_optional(pool)
         .await
         .unwrap()
 }
 async fn doc_shift_id(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT shift_id FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
 }
 async fn shift_opener_by_id(pool: &sqlx::SqlitePool, shift_id: ShiftId) -> String {
     sqlx::query_scalar("SELECT opened_by_cashier_id FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -752,7 +753,9 @@ async fn seed_offline_session_open(pool: &sqlx::SqlitePool) {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-07-07T00:00:00Z')",
     )
-    .bind(prro::db::models::ids::OfflineSessionId::new())
+    .bind(DbOfflineSessionId(
+        prro::db::models::ids::OfflineSessionId::new(),
+    ))
     .bind(FN)
     .execute(pool)
     .await

@@ -14,11 +14,11 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::bridge::dto::{classify_response, DocumentOutcome};
 use crate::bridge::{
     Bridge, BridgeError, CanonicalCommand, CanonicalResponse, CommandType, RawFrame,
     ReceiptDirection, ReceiptPayload,
 };
-use crate::bridge::dto::{classify_response, DocumentOutcome};
 use crate::protocol::{
     error_codes::ErrorCode, Command, CompBuilder, ConfBuilder, ConfMode, Response, SysKey,
 };
@@ -116,7 +116,10 @@ pub fn dispatch(
             session.mark_command_ok("SYNC");
             ok(None)
         }
-        Command::Upas { password, cashier_id } => {
+        Command::Upas {
+            password,
+            cashier_id,
+        } => {
             if password != identity.cashier_password {
                 // Protocol §5.1 — a failed UPAS clears the cashier
                 // registration flag, requiring the caller to retry
@@ -158,10 +161,7 @@ pub fn dispatch(
         }
         Command::Glcn => {
             // Zero-number stub — replaced in M4/M5 with live counters.
-            let payload = format!(
-                "GLCN{:0>10}{:0>10}{:0>10}0000",
-                0, 0, 0
-            );
+            let payload = format!("GLCN{:0>10}{:0>10}{:0>10}0000", 0, 0, 0);
             let data = Response::data(payload).expect("GLCN payload ≥ 4 chars");
             ok(Some(data))
         }
@@ -217,17 +217,28 @@ pub fn dispatch(
         }
         // Receipt-building commands — accumulated into OpenReceipt.raw_frames
         // so the Python adapter (M7) can do the rich parse at COMP time.
-        Command::Fisc(ref body) | Command::Bfis(ref body) | Command::Arfi(ref body)
-        | Command::Arbf(ref body) | Command::Ficd(ref body) | Command::Bfcd(ref body)
-        | Command::Finf(ref body) | Command::Tgcd(ref body) | Command::Grbg(ref body)
-        | Command::Acld(ref body) | Command::Psdt(ref body) | Command::Cshg(ref body)
+        Command::Fisc(ref body)
+        | Command::Bfis(ref body)
+        | Command::Arfi(ref body)
+        | Command::Arbf(ref body)
+        | Command::Ficd(ref body)
+        | Command::Bfcd(ref body)
+        | Command::Finf(ref body)
+        | Command::Tgcd(ref body)
+        | Command::Grbg(ref body)
+        | Command::Acld(ref body)
+        | Command::Psdt(ref body)
+        | Command::Cshg(ref body)
         | Command::Cvar(ref body) => {
             if !session.receipt_open() {
                 return err(ErrorCode::SoftNoDoc);
             }
             let opcode = command_opcode(&command);
             append_receipt_frame(session, &opcode, body.clone());
-            if matches!(command, Command::Bfis(_) | Command::Arbf(_) | Command::Bfcd(_)) {
+            if matches!(
+                command,
+                Command::Bfis(_) | Command::Arbf(_) | Command::Bfcd(_)
+            ) {
                 if let SessionState::ReceiptOpen(ref mut r) = session.state {
                     r.direction = ReceiptDirection::Return;
                 }
@@ -241,7 +252,10 @@ pub fn dispatch(
             session.mark_command_ok(&opcode);
             ok(None)
         }
-        Command::Gren { ref discount_name, ref upcount_name } => {
+        Command::Gren {
+            ref discount_name,
+            ref upcount_name,
+        } => {
             if !session.receipt_open() {
                 return err(ErrorCode::SoftNoDoc);
             }
@@ -254,7 +268,10 @@ pub fn dispatch(
             session.mark_command_ok("GREN");
             ok(None)
         }
-        Command::Nlpr { tax1_char, tax2_char } => {
+        Command::Nlpr {
+            tax1_char,
+            tax2_char,
+        } => {
             if !session.receipt_open() {
                 return err(ErrorCode::SoftNoDoc);
             }
@@ -283,7 +300,11 @@ pub fn dispatch(
             let envelope = build_canonical(session, identity);
             match bridge.submit(&envelope) {
                 Ok(resp) => match classify_response(&resp) {
-                    DocumentOutcome::Accepted { fiscal_id, sale, ret } => {
+                    DocumentOutcome::Accepted {
+                        fiscal_id,
+                        sale,
+                        ret,
+                    } => {
                         let comp_payload = CompBuilder::new(fiscal_id, sale, ret).to_wire_payload();
                         session.state = SessionState::Authenticated;
                         session.psdt_sequence = 0;
@@ -318,29 +339,48 @@ pub fn dispatch(
 
         // ── Fiscal reports (M5 — submit via bridge) ──────────────
         Command::Zrep => submit_report(
-            session, identity, bridge, correlation,
-            CommandType::XReport, "ZREP", String::new(),
+            session,
+            identity,
+            bridge,
+            correlation,
+            CommandType::XReport,
+            "ZREP",
+            String::new(),
         ),
         Command::Nrep => {
             if session.receipt_open() {
                 return err(ErrorCode::SoftCheck);
             }
             submit_report(
-                session, identity, bridge, correlation,
-                CommandType::ZReport, "NREP", String::new(),
+                session,
+                identity,
+                bridge,
+                correlation,
+                CommandType::ZReport,
+                "NREP",
+                String::new(),
             )
         }
         Command::NrepLowercase => submit_report(
-            session, identity, bridge, correlation,
-            CommandType::ShiftOpen, "nrep", String::new(),
+            session,
+            identity,
+            bridge,
+            correlation,
+            CommandType::ShiftOpen,
+            "nrep",
+            String::new(),
         ),
         Command::Firn { first, last } => {
             if session.receipt_open() {
                 return err(ErrorCode::SoftCheck);
             }
             submit_report(
-                session, identity, bridge, correlation,
-                CommandType::PeriodicReport, "FIRN",
+                session,
+                identity,
+                bridge,
+                correlation,
+                CommandType::PeriodicReport,
+                "FIRN",
                 format!("{first:04}{last:04}"),
             )
         }
@@ -349,8 +389,12 @@ pub fn dispatch(
                 return err(ErrorCode::SoftCheck);
             }
             submit_report(
-                session, identity, bridge, correlation,
-                CommandType::PeriodicReport, "IREN",
+                session,
+                identity,
+                bridge,
+                correlation,
+                CommandType::PeriodicReport,
+                "IREN",
                 format!("{first:04}{last:04}"),
             )
         }
@@ -359,8 +403,12 @@ pub fn dispatch(
                 return err(ErrorCode::SoftCheck);
             }
             submit_report(
-                session, identity, bridge, correlation,
-                CommandType::PeriodicReport, "FIRP",
+                session,
+                identity,
+                bridge,
+                correlation,
+                CommandType::PeriodicReport,
+                "FIRP",
                 format!("{from}{to}"),
             )
         }
@@ -369,8 +417,12 @@ pub fn dispatch(
                 return err(ErrorCode::SoftCheck);
             }
             submit_report(
-                session, identity, bridge, correlation,
-                CommandType::PeriodicReport, "IREP",
+                session,
+                identity,
+                bridge,
+                correlation,
+                CommandType::PeriodicReport,
+                "IREP",
                 format!("{from}{to}"),
             )
         }
@@ -388,24 +440,40 @@ pub fn dispatch(
         // preserved verbatim into raw_frames so the Python adapter can
         // parse the sum (see adapters/maria304_native.py::
         // _enrich_service_payload).
-        Command::Caioi { sum_kopecks, description } => {
+        Command::Caioi {
+            sum_kopecks,
+            description,
+        } => {
             if session.receipt_open() {
                 return err(ErrorCode::SoftCheck);
             }
             let body = format!("{sum_kopecks:010}{description}");
             submit_report(
-                session, identity, bridge, correlation,
-                CommandType::ServiceIn, "CAIOI", body,
+                session,
+                identity,
+                bridge,
+                correlation,
+                CommandType::ServiceIn,
+                "CAIOI",
+                body,
             )
         }
-        Command::Caioo { sum_kopecks, description } => {
+        Command::Caioo {
+            sum_kopecks,
+            description,
+        } => {
             if session.receipt_open() {
                 return err(ErrorCode::SoftCheck);
             }
             let body = format!("{sum_kopecks:010}{description}");
             submit_report(
-                session, identity, bridge, correlation,
-                CommandType::ServiceOut, "CAIOO", body,
+                session,
+                identity,
+                bridge,
+                correlation,
+                CommandType::ServiceOut,
+                "CAIOO",
+                body,
             )
         }
 
@@ -413,13 +481,28 @@ pub fn dispatch(
         // All of these simply acknowledge — the opcode is reflected
         // into `last_command_id` so CONF surfaces it, but no other
         // state mutation happens here.
-        Command::Armo(_) | Command::Dept(_) | Command::Head(_) | Command::Botm(_)
-        | Command::BotmIdx(_) | Command::Npdi(_) | Command::Zdnm(_) | Command::Ctim(_)
-        | Command::Szkr(_) | Command::Pzkr(_) | Command::Stfl | Command::Cutr(_)
-        | Command::Nalg(_) | Command::Nnam(_) | Command::Blfi(_) | Command::Ncdc(_)
+        Command::Armo(_)
+        | Command::Dept(_)
+        | Command::Head(_)
+        | Command::Botm(_)
+        | Command::BotmIdx(_)
+        | Command::Npdi(_)
+        | Command::Zdnm(_)
+        | Command::Ctim(_)
+        | Command::Szkr(_)
+        | Command::Pzkr(_)
+        | Command::Stfl
+        | Command::Cutr(_)
+        | Command::Nalg(_)
+        | Command::Nnam(_)
+        | Command::Blfi(_)
+        | Command::Ncdc(_)
         | Command::Dstr(_)
-        | Command::Disp(_) | Command::DispLower(_) | Command::DispX(_)
-        | Command::Mdmd(_) | Command::Tses => done(&command_opcode(&command), session),
+        | Command::Disp(_)
+        | Command::DispLower(_)
+        | Command::DispX(_)
+        | Command::Mdmd(_)
+        | Command::Tses => done(&command_opcode(&command), session),
 
         // ── Defensive defaults ───────────────────────────────────
         Command::Unknown { ref opcode, .. } => {
@@ -596,10 +679,7 @@ fn report_fingerprint(opcode: &str, body: &str) -> String {
     hex::encode(Sha256::digest(&bytes))
 }
 
-fn build_canonical(
-    session: &Session,
-    identity: &Identity,
-) -> CanonicalCommand {
+fn build_canonical(session: &Session, identity: &Identity) -> CanonicalCommand {
     let (department, return_check_number, direction, raw_frames_orig, dual_tax_mode, totals) =
         match session.state {
             SessionState::ReceiptOpen(ref r) => (
@@ -658,7 +738,11 @@ fn build_canonical(
         // F3: content-stable key (hash of payload) so TCP reconnects don't generate
         // a new key for the same receipt, preventing bypass of the sidecar's
         // idempotency journal.
-        idempotency_key: format!("maria304:{}:{}", identity.fiscal_number, receipt_fingerprint(&payload)),
+        idempotency_key: format!(
+            "maria304:{}:{}",
+            identity.fiscal_number,
+            receipt_fingerprint(&payload)
+        ),
         cashier_id: session.cashier_id.clone(),
         department,
         return_check_number,
@@ -692,10 +776,17 @@ fn submit_report(
             identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
         )
     } else {
-        format!("maria304:{}:{}", identity.fiscal_number, report_fingerprint(opcode, &body))
+        format!(
+            "maria304:{}:{}",
+            identity.fiscal_number,
+            report_fingerprint(opcode, &body)
+        )
     };
     let report_payload = ReceiptPayload {
-        raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
+        raw_frames: vec![RawFrame {
+            opcode: opcode.to_string(),
+            body,
+        }],
         ..Default::default()
     };
     let envelope = CanonicalCommand {
@@ -808,6 +899,8 @@ pub enum DispatchPrepared {
 /// performing any I/O and returns [`DispatchPrepared::NeedsBridge`].  All other
 /// commands are dispatched immediately and the responses returned as
 /// [`DispatchPrepared::Done`].
+// Cohesive protocol dispatcher: a single command-match seam kept in one place.
+#[allow(clippy::too_many_lines)]
 pub fn dispatch_prepare(
     session: &mut Session,
     command: &Command,
@@ -826,73 +919,124 @@ pub fn dispatch_prepare(
             append_receipt_frame(session, "COMP", body.clone());
             DispatchPrepared::NeedsBridge(build_canonical(session, identity))
         }
-        Command::Zrep => DispatchPrepared::NeedsBridge(
-            build_report_envelope(session, identity, correlation, CommandType::XReport, "ZREP", String::new()),
-        ),
+        Command::Zrep => DispatchPrepared::NeedsBridge(build_report_envelope(
+            session,
+            identity,
+            correlation,
+            CommandType::XReport,
+            "ZREP",
+            String::new(),
+        )),
         Command::Nrep => {
             if session.receipt_open() {
                 return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
             }
-            DispatchPrepared::NeedsBridge(
-                build_report_envelope(session, identity, correlation, CommandType::ZReport, "NREP", String::new()),
-            )
+            DispatchPrepared::NeedsBridge(build_report_envelope(
+                session,
+                identity,
+                correlation,
+                CommandType::ZReport,
+                "NREP",
+                String::new(),
+            ))
         }
-        Command::NrepLowercase => DispatchPrepared::NeedsBridge(
-            build_report_envelope(session, identity, correlation, CommandType::ShiftOpen, "nrep", String::new()),
-        ),
+        Command::NrepLowercase => DispatchPrepared::NeedsBridge(build_report_envelope(
+            session,
+            identity,
+            correlation,
+            CommandType::ShiftOpen,
+            "nrep",
+            String::new(),
+        )),
         Command::Firn { first, last } => {
             if session.receipt_open() {
                 return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
             }
             let (f, l) = (*first, *last);
-            DispatchPrepared::NeedsBridge(
-                build_report_envelope(session, identity, correlation, CommandType::PeriodicReport, "FIRN", format!("{f:04}{l:04}")),
-            )
+            DispatchPrepared::NeedsBridge(build_report_envelope(
+                session,
+                identity,
+                correlation,
+                CommandType::PeriodicReport,
+                "FIRN",
+                format!("{f:04}{l:04}"),
+            ))
         }
         Command::Iren { first, last } => {
             if session.receipt_open() {
                 return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
             }
             let (f, l) = (*first, *last);
-            DispatchPrepared::NeedsBridge(
-                build_report_envelope(session, identity, correlation, CommandType::PeriodicReport, "IREN", format!("{f:04}{l:04}")),
-            )
+            DispatchPrepared::NeedsBridge(build_report_envelope(
+                session,
+                identity,
+                correlation,
+                CommandType::PeriodicReport,
+                "IREN",
+                format!("{f:04}{l:04}"),
+            ))
         }
         Command::Firp { ref from, ref to } => {
             if session.receipt_open() {
                 return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
             }
             let (from, to) = (from.clone(), to.clone());
-            DispatchPrepared::NeedsBridge(
-                build_report_envelope(session, identity, correlation, CommandType::PeriodicReport, "FIRP", format!("{from}{to}")),
-            )
+            DispatchPrepared::NeedsBridge(build_report_envelope(
+                session,
+                identity,
+                correlation,
+                CommandType::PeriodicReport,
+                "FIRP",
+                format!("{from}{to}"),
+            ))
         }
         Command::Irep { ref from, ref to } => {
             if session.receipt_open() {
                 return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
             }
             let (from, to) = (from.clone(), to.clone());
-            DispatchPrepared::NeedsBridge(
-                build_report_envelope(session, identity, correlation, CommandType::PeriodicReport, "IREP", format!("{from}{to}")),
-            )
+            DispatchPrepared::NeedsBridge(build_report_envelope(
+                session,
+                identity,
+                correlation,
+                CommandType::PeriodicReport,
+                "IREP",
+                format!("{from}{to}"),
+            ))
         }
-        Command::Caioi { sum_kopecks, description } => {
+        Command::Caioi {
+            sum_kopecks,
+            description,
+        } => {
             if session.receipt_open() {
                 return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
             }
             let body = format!("{sum_kopecks:010}{description}");
-            DispatchPrepared::NeedsBridge(
-                build_report_envelope(session, identity, correlation, CommandType::ServiceIn, "CAIOI", body),
-            )
+            DispatchPrepared::NeedsBridge(build_report_envelope(
+                session,
+                identity,
+                correlation,
+                CommandType::ServiceIn,
+                "CAIOI",
+                body,
+            ))
         }
-        Command::Caioo { sum_kopecks, description } => {
+        Command::Caioo {
+            sum_kopecks,
+            description,
+        } => {
             if session.receipt_open() {
                 return DispatchPrepared::Done(err(ErrorCode::SoftCheck));
             }
             let body = format!("{sum_kopecks:010}{description}");
-            DispatchPrepared::NeedsBridge(
-                build_report_envelope(session, identity, correlation, CommandType::ServiceOut, "CAIOO", body),
-            )
+            DispatchPrepared::NeedsBridge(build_report_envelope(
+                session,
+                identity,
+                correlation,
+                CommandType::ServiceOut,
+                "CAIOO",
+                body,
+            ))
         }
         _ => {
             struct NeverBridge;
@@ -901,7 +1045,14 @@ pub fn dispatch_prepare(
                     unreachable!("NeverBridge::submit — bridge command slipped into dispatch_prepare non-bridge arm")
                 }
             }
-            DispatchPrepared::Done(dispatch(session, command.clone(), identity, clock, &NeverBridge, correlation))
+            DispatchPrepared::Done(dispatch(
+                session,
+                command.clone(),
+                identity,
+                clock,
+                &NeverBridge,
+                correlation,
+            ))
         }
     }
 }
@@ -924,14 +1075,20 @@ pub fn dispatch_with_result(
     match command {
         Command::Comp(_) => match bridge_result {
             Ok(ref resp) => match classify_response(resp) {
-                DocumentOutcome::Accepted { fiscal_id, sale, ret } => {
+                DocumentOutcome::Accepted {
+                    fiscal_id,
+                    sale,
+                    ret,
+                } => {
                     let comp_payload = CompBuilder::new(fiscal_id, sale, ret).to_wire_payload();
                     session.state = SessionState::Authenticated;
                     session.psdt_sequence = 0;
                     session.pending_return_check_number = None;
                     correlation.receipt_seq = correlation.receipt_seq.saturating_add(1);
                     session.mark_command_ok("COMP");
-                    ok(Some(Response::data(comp_payload).expect("COMP payload is 94 chars")))
+                    ok(Some(
+                        Response::data(comp_payload).expect("COMP payload is 94 chars"),
+                    ))
                 }
                 DocumentOutcome::Terminal(code) => {
                     session.state = SessionState::Authenticated;
@@ -946,8 +1103,8 @@ pub fn dispatch_with_result(
             Err(e) => err(map_bridge_error(&e)),
         },
         cmd => {
-            let opcode = report_opcode(cmd)
-                .expect("dispatch_with_result called for non-bridge command");
+            let opcode =
+                report_opcode(cmd).expect("dispatch_with_result called for non-bridge command");
             match bridge_result {
                 Ok(resp) if resp.ok => {
                     session.mark_command_ok(opcode);
@@ -986,7 +1143,11 @@ fn build_report_envelope(
             identity.fiscal_number, correlation.session_uuid, correlation.receipt_seq, opcode,
         )
     } else {
-        format!("maria304:{}:{}", identity.fiscal_number, report_fingerprint(opcode, &body))
+        format!(
+            "maria304:{}:{}",
+            identity.fiscal_number,
+            report_fingerprint(opcode, &body)
+        )
     };
     CanonicalCommand {
         schema_version: "1.0".to_string(),
@@ -997,7 +1158,10 @@ fn build_report_envelope(
         department: None,
         return_check_number: None,
         payload: ReceiptPayload {
-            raw_frames: vec![RawFrame { opcode: opcode.to_string(), body }],
+            raw_frames: vec![RawFrame {
+                opcode: opcode.to_string(),
+                body,
+            }],
             ..Default::default()
         },
     }
@@ -1022,11 +1186,21 @@ fn report_opcode(command: &Command) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    fn mock() -> crate::bridge::MockBridge { crate::bridge::MockBridge::new() }
-    fn corr() -> Correlation { Correlation { session_uuid: "sess".to_string(), receipt_seq: 0 } }
+    fn mock() -> crate::bridge::MockBridge {
+        crate::bridge::MockBridge::new()
+    }
+    fn corr() -> Correlation {
+        Correlation {
+            session_uuid: "sess".to_string(),
+            receipt_seq: 0,
+        }
+    }
 
-        fn clock() -> Clock<'static> {
-        Clock { date: "20260420", time: "101530" }
+    fn clock() -> Clock<'static> {
+        Clock {
+            date: "20260420",
+            time: "101530",
+        }
     }
 
     fn logged_in() -> Session {
@@ -1043,7 +1217,14 @@ mod tests {
             password: "1111111111".to_string(),
             cashier_id: "Casher1".to_string(),
         };
-        let out = dispatch(&mut s, cmd, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            cmd,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Done, Response::Ready]);
         assert_eq!(s.state, SessionState::Authenticated);
         assert_eq!(s.cashier_id.as_deref(), Some("Casher1"));
@@ -1056,7 +1237,14 @@ mod tests {
             password: "0000000000".to_string(),
             cashier_id: "x".to_string(),
         };
-        let out = dispatch(&mut s, cmd, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            cmd,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftUpas)]);
         assert_eq!(s.state, SessionState::Connected);
         assert!(s.cashier_id.is_none());
@@ -1065,7 +1253,14 @@ mod tests {
     #[test]
     fn fiscal_command_before_login_emits_softupas() {
         let mut s = Session::new();
-        let out = dispatch(&mut s, Command::Prep("1".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Prep("1".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftUpas)]);
         assert!(!s.receipt_open());
     }
@@ -1073,18 +1268,39 @@ mod tests {
     #[test]
     fn csin_and_sync_work_before_login() {
         let mut s = Session::new();
-        let out1 = dispatch(&mut s, Command::Csin(true), &Identity::default(), clock(), &mock(), &mut corr());
+        let out1 = dispatch(
+            &mut s,
+            Command::Csin(true),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out1, vec![Response::Done, Response::Ready]);
         assert!(s.crc_enabled);
 
-        let out2 = dispatch(&mut s, Command::Sync, &Identity::default(), clock(), &mock(), &mut corr());
+        let out2 = dispatch(
+            &mut s,
+            Command::Sync,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out2, vec![Response::Done, Response::Ready]);
     }
 
     #[test]
     fn conf_works_before_login_and_returns_a_data_frame() {
         let mut s = Session::new();
-        let out = dispatch(&mut s, Command::ConfLower, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::ConfLower,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out.len(), 3);
         match &out[0] {
             Response::Data(payload) => {
@@ -1102,7 +1318,14 @@ mod tests {
     fn prep_opens_receipt_and_clears_pending_return_number() {
         let mut s = logged_in();
         s.pending_return_check_number = Some("42".to_string());
-        let out = dispatch(&mut s, Command::Prep("Bar".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Prep("Bar".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Done, Response::Ready]);
         assert!(s.receipt_open());
         assert!(s.pending_return_check_number.is_none());
@@ -1120,7 +1343,14 @@ mod tests {
     fn prep_while_receipt_open_emits_softcheck() {
         let mut s = logged_in();
         s.state = SessionState::ReceiptOpen(OpenReceipt::default());
-        let out = dispatch(&mut s, Command::Prep("x".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Prep("x".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftCheck)]);
     }
 
@@ -1128,7 +1358,14 @@ mod tests {
     fn canc_closes_receipt_without_emitting_comp() {
         let mut s = logged_in();
         s.state = SessionState::ReceiptOpen(OpenReceipt::default());
-        let out = dispatch(&mut s, Command::Cnac, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Cnac,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Done, Response::Ready]);
         assert!(!s.receipt_open());
     }
@@ -1136,7 +1373,14 @@ mod tests {
     #[test]
     fn comp_without_open_receipt_emits_softnodoc() {
         let mut s = logged_in();
-        let out = dispatch(&mut s, Command::Comp(String::new()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Comp(String::new()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftNoDoc)]);
     }
 
@@ -1144,7 +1388,14 @@ mod tests {
     fn comp_emits_data_frame_then_done_ready_and_closes_receipt() {
         let mut s = logged_in();
         s.state = SessionState::ReceiptOpen(OpenReceipt::default());
-        let out = dispatch(&mut s, Command::Comp(String::new()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Comp(String::new()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out.len(), 3);
         match &out[0] {
             Response::Data(p) => assert!(p.starts_with("COMP")),
@@ -1158,7 +1409,14 @@ mod tests {
     #[test]
     fn fiscal_line_without_receipt_emits_softnodoc() {
         let mut s = logged_in();
-        let out = dispatch(&mut s, Command::Fisc("x".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Fisc("x".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftNoDoc)]);
     }
 
@@ -1167,10 +1425,24 @@ mod tests {
         let mut s = logged_in();
         s.state = SessionState::ReceiptOpen(OpenReceipt::default());
         for expected in 1..=3 {
-            dispatch(&mut s, Command::Psdt("x".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+            dispatch(
+                &mut s,
+                Command::Psdt("x".to_string()),
+                &Identity::default(),
+                clock(),
+                &mock(),
+                &mut corr(),
+            );
             assert_eq!(s.psdt_sequence, expected);
         }
-        dispatch(&mut s, Command::Comp(String::new()), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Comp(String::new()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.psdt_sequence, 0);
     }
 
@@ -1181,7 +1453,14 @@ mod tests {
             opcode: "ZZZZ".to_string(),
             body: String::new(),
         };
-        let out = dispatch(&mut s, cmd, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            cmd,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Done, Response::Ready]);
     }
 
@@ -1192,21 +1471,48 @@ mod tests {
             opcode: "UPAS".to_string(),
             body: "short".to_string(),
         };
-        let out = dispatch(&mut s, cmd, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            cmd,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftCheck)]);
     }
 
     #[test]
     fn svsl_updates_sys_key_position() {
         let mut s = logged_in();
-        dispatch(&mut s, Command::Svsl { mode: '2', password: None }, &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Svsl {
+                mode: '2',
+                password: None,
+            },
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.sys_key, SysKey::XReport);
     }
 
     #[test]
     fn svsl_with_unknown_mode_emits_softkey() {
         let mut s = logged_in();
-        let out = dispatch(&mut s, Command::Svsl { mode: 'X', password: None }, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Svsl {
+                mode: 'X',
+                password: None,
+            },
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftKey)]);
     }
 
@@ -1216,7 +1522,17 @@ mod tests {
     fn svsl_before_login_is_rejected_with_softupas() {
         // SVSL is not a handshake command — requires logged-in cashier.
         let mut s = Session::new();
-        let out = dispatch(&mut s, Command::Svsl { mode: '2', password: None }, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Svsl {
+                mode: '2',
+                password: None,
+            },
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftUpas)]);
         // State unchanged.
         assert_eq!(s.sys_key, SysKey::Work);
@@ -1229,7 +1545,10 @@ mod tests {
             &mut s,
             Command::Getd,
             &Identity::default(),
-            Clock { date: "20261231", time: "235959" },
+            Clock {
+                date: "20261231",
+                time: "235959",
+            },
             &mock(),
             &mut corr(),
         );
@@ -1248,22 +1567,50 @@ mod tests {
     #[test]
     fn csin_toggle_persists_across_later_commands() {
         let mut s = Session::new();
-        dispatch(&mut s, Command::Csin(true), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Csin(true),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert!(s.crc_enabled);
 
         // Further commands should not touch the CRC flag.
-        dispatch(&mut s, Command::Sync, &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Sync,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert!(s.crc_enabled);
 
         let login = Command::Upas {
             password: "1111111111".to_string(),
             cashier_id: "x".to_string(),
         };
-        dispatch(&mut s, login, &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            login,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert!(s.crc_enabled);
 
         // CSIN0 clears it.
-        dispatch(&mut s, Command::Csin(false), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Csin(false),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert!(!s.crc_enabled);
     }
 
@@ -1271,11 +1618,25 @@ mod tests {
     fn two_receipts_in_sequence_both_close_cleanly() {
         let mut s = logged_in();
         for i in 0..2 {
-            let out = dispatch(&mut s, Command::Prep(format!("Dept{i}")), &Identity::default(), clock(), &mock(), &mut corr());
+            let out = dispatch(
+                &mut s,
+                Command::Prep(format!("Dept{i}")),
+                &Identity::default(),
+                clock(),
+                &mock(),
+                &mut corr(),
+            );
             assert_eq!(out, vec![Response::Done, Response::Ready]);
             assert!(s.receipt_open());
 
-            let out = dispatch(&mut s, Command::Comp(String::new()), &Identity::default(), clock(), &mock(), &mut corr());
+            let out = dispatch(
+                &mut s,
+                Command::Comp(String::new()),
+                &Identity::default(),
+                clock(),
+                &mock(),
+                &mut corr(),
+            );
             assert_eq!(out.len(), 3);
             assert!(!s.receipt_open());
         }
@@ -1285,7 +1646,14 @@ mod tests {
     fn setup_commands_stub_to_done_without_touching_state() {
         let mut s = logged_in();
         let before = s.clone();
-        let out = dispatch(&mut s, Command::Head("TOV Приклад".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Head("TOV Приклад".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Done, Response::Ready]);
         // Only last_command_id should have changed.
         assert_eq!(s.state, before.state);
@@ -1297,7 +1665,17 @@ mod tests {
     #[test]
     fn unknown_opcode_still_marks_last_command_id() {
         let mut s = logged_in();
-        dispatch(&mut s, Command::Unknown { opcode: "ZZZZ".to_string(), body: String::new() }, &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Unknown {
+                opcode: "ZZZZ".to_string(),
+                body: String::new(),
+            },
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         // Unknown opcode is reflected verbatim in last_command_id —
         // CONF then surfaces it for caller diagnostics.
         assert_eq!(s.last_command_id, "ZZZZ");
@@ -1309,7 +1687,10 @@ mod tests {
         let cmds = [
             Command::Csin(true),
             Command::Sync,
-            Command::Svsl { mode: '1', password: None },
+            Command::Svsl {
+                mode: '1',
+                password: None,
+            },
             Command::Conf,
             Command::ConfLower,
             Command::Getd,
@@ -1320,7 +1701,14 @@ mod tests {
             Command::Artz,
         ];
         for cmd in cmds {
-            let out = dispatch(&mut s, cmd.clone(), &Identity::default(), clock(), &mock(), &mut corr());
+            let out = dispatch(
+                &mut s,
+                cmd.clone(),
+                &Identity::default(),
+                clock(),
+                &mock(),
+                &mut corr(),
+            );
             assert_eq!(
                 out.last(),
                 Some(&Response::Ready),
@@ -1334,7 +1722,14 @@ mod tests {
         // Invariant: firmware only frees the channel after success.
         // Failure paths stop at the SOFT frame.
         let mut s = Session::new();
-        let out = dispatch(&mut s, Command::Fisc("x".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Fisc("x".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert!(!matches!(out.last(), Some(Response::Ready)));
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftUpas)]);
     }
@@ -1343,12 +1738,26 @@ mod tests {
     fn fisc_accumulates_state_only_while_receipt_open() {
         let mut s = logged_in();
         // Without receipt — rejected.
-        let out = dispatch(&mut s, Command::Fisc("x".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Fisc("x".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftNoDoc)]);
 
         // Open receipt — now fisc accepts.
         s.state = SessionState::ReceiptOpen(OpenReceipt::default());
-        let out = dispatch(&mut s, Command::Fisc("y".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Fisc("y".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Done, Response::Ready]);
         assert_eq!(s.last_command_id, "FISC");
     }
@@ -1360,23 +1769,58 @@ mod tests {
         let mut s = logged_in();
         s.state = SessionState::ReceiptOpen(OpenReceipt::default());
 
-        dispatch(&mut s, Command::Fisc("x".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Fisc("x".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.psdt_sequence, 0);
 
-        dispatch(&mut s, Command::Psdt("x".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Psdt("x".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.psdt_sequence, 1);
 
-        dispatch(&mut s, Command::Acld("x".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Acld("x".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.psdt_sequence, 1);
     }
 
     #[test]
     fn pending_return_check_is_consumed_by_prep_exactly_once() {
         let mut s = logged_in();
-        dispatch(&mut s, Command::Bchn("999".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Bchn("999".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.pending_return_check_number.as_deref(), Some("999"));
 
-        dispatch(&mut s, Command::Prep("dep".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Prep("dep".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert!(s.pending_return_check_number.is_none());
         match &s.state {
             SessionState::ReceiptOpen(r) => {
@@ -1391,8 +1835,22 @@ mod tests {
     fn conf_reflects_last_successful_command() {
         let mut s = logged_in();
         // Do a handshake to set last_command_id.
-        dispatch(&mut s, Command::Sync, &Identity::default(), clock(), &mock(), &mut corr());
-        let out = dispatch(&mut s, Command::ConfLower, &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Sync,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
+        let out = dispatch(
+            &mut s,
+            Command::ConfLower,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         match &out[0] {
             Response::Data(p) => {
                 // "SYNC" must appear at the last-command-id slot
@@ -1415,7 +1873,14 @@ mod tests {
             opcode: "PREPOSTEROUS".to_string(),
             body: String::new(),
         };
-        dispatch(&mut s, cmd, &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            cmd,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.last_command_id, "PREP");
     }
 
@@ -1430,17 +1895,31 @@ mod tests {
         let mut s = logged_in();
         assert!(s.cashier_registered());
 
-        let out = dispatch(&mut s, Command::Upas {
+        let out = dispatch(
+            &mut s,
+            Command::Upas {
                 password: "WRONGPWDXX".to_string(),
                 cashier_id: "x".to_string(),
-            }, &Identity::default(), clock(), &mock(), &mut corr());
+            },
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftUpas)]);
         assert!(!s.cashier_registered(), "failed UPAS must clear cashier_id");
         assert_eq!(s.state, SessionState::Connected);
 
         // Subsequent fiscal command now fails because session is
         // effectively unauthenticated.
-        let out = dispatch(&mut s, Command::Prep("d".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Prep("d".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Error(ErrorCode::SoftUpas)]);
     }
 
@@ -1459,7 +1938,14 @@ mod tests {
         s.psdt_sequence = 2;
         s.pending_return_check_number = None;
 
-        let out = dispatch(&mut s, Command::Ctxt, &Identity::default(), clock(), &mock(), &mut corr());
+        let out = dispatch(
+            &mut s,
+            Command::Ctxt,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(out, vec![Response::Done, Response::Ready]);
         assert!(s.receipt_open(), "CTXT must not close the receipt");
         assert_eq!(s.psdt_sequence, 2, "CTXT must not reset psdt_sequence");
@@ -1475,7 +1961,14 @@ mod tests {
         s.psdt_sequence = 3;
         s.pending_return_check_number = Some("99".to_string());
 
-        dispatch(&mut s, Command::Cnac, &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Cnac,
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert!(!s.receipt_open());
         assert_eq!(s.psdt_sequence, 0);
         assert!(s.pending_return_check_number.is_none());
@@ -1487,10 +1980,17 @@ mod tests {
         // cashier_id mid-shift), state must stay Authenticated.
         let mut s = logged_in();
         s.state = SessionState::Authenticated;
-        dispatch(&mut s, Command::Upas {
+        dispatch(
+            &mut s,
+            Command::Upas {
                 password: "1111111111".to_string(),
                 cashier_id: "csh2".to_string(),
-            }, &Identity::default(), clock(), &mock(), &mut corr());
+            },
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.state, SessionState::Authenticated);
         assert_eq!(s.cashier_id.as_deref(), Some("csh2"));
     }
@@ -1508,12 +2008,22 @@ mod tests {
             Command::Prep("d".to_string()),
             Command::Cnac,
             Command::Head("h".to_string()),
-            Command::Unknown { opcode: "ZZZZ".to_string(), body: String::new() },
+            Command::Unknown {
+                opcode: "ZZZZ".to_string(),
+                body: String::new(),
+            },
         ];
         for cmd in sample_cmds {
             let mut s = logged_in();
             let _ = dispatch(&mut s, cmd, &identity, clock(), &mock(), &mut corr());
-            let out = dispatch(&mut s, Command::ConfLower, &identity, clock(), &mock(), &mut corr());
+            let out = dispatch(
+                &mut s,
+                Command::ConfLower,
+                &identity,
+                clock(),
+                &mock(),
+                &mut corr(),
+            );
             match &out[0] {
                 Response::Data(p) => {
                     assert!(p.starts_with("CONf"));
@@ -1529,7 +2039,14 @@ mod tests {
         // BCHN just stages the return-check number for the next PREP
         // — it must not change state or affect an in-flight receipt.
         let mut s = logged_in();
-        dispatch(&mut s, Command::Bchn("42".to_string()), &Identity::default(), clock(), &mock(), &mut corr());
+        dispatch(
+            &mut s,
+            Command::Bchn("42".to_string()),
+            &Identity::default(),
+            clock(),
+            &mock(),
+            &mut corr(),
+        );
         assert_eq!(s.state, SessionState::Authenticated);
         assert_eq!(s.pending_return_check_number.as_deref(), Some("42"));
     }

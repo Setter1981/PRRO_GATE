@@ -37,6 +37,7 @@ use prro::db::repositories::ingress_inbox::{
     self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
 };
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
+use prro::db::types::DbShiftId;
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
 use prro::runtime::ingress::inline_binding::{production_write_path, InlineWritePath};
@@ -228,9 +229,9 @@ async fn seed_shift(pool: &SqlitePool, state: ShiftState) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, ?, 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
-    .bind(state)
+    .bind(state.as_str())
     .bind(CASHIER)
     .execute(pool)
     .await
@@ -251,9 +252,9 @@ async fn seed_node_state(
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
-    .bind(shift_id)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
+    .bind(shift_id.map(DbShiftId))
     .execute(pool)
     .await
     .unwrap();
@@ -319,7 +320,7 @@ fn kvt1_ack() -> CheckAck {
     CheckAck {
         id: SFN.into(),
         id_sign: vec![],
-        data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        data_sign: vec![0xDE; 64],
     }
 }
 

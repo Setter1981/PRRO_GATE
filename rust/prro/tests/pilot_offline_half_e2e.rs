@@ -48,7 +48,7 @@ use prro::db::repositories::{fiscal_number_config as fn_cfg, node_state, operato
 use prro::db::tx::with_immediate;
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
-use prro::runtime::ingress::inline_binding::production_write_path;
+use prro::runtime::ingress::inline_binding::production_write_path_with_clock;
 use prro::runtime::ingress::seam::{FiscalOutcome, WritePathEntry};
 use prro::services::offline_session::OfflineSessionService;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -157,8 +157,8 @@ async fn seed_boot_baseline(pool: &SqlitePool) {
          VALUES (?, ?, ?, NULL, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Closed)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Closed.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -169,7 +169,7 @@ fn kvt1(sfn: &str) -> CheckAck {
     CheckAck {
         id: sfn.into(),
         id_sign: vec![],
-        data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        data_sign: vec![0xDE; 64],
     }
 }
 
@@ -274,7 +274,13 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     // ─── 1) ONLINE SHIFT_OPEN — pre-open the shift (edge 3, live) ──────────
     let open = drive(
@@ -335,8 +341,9 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
     );
     assert_eq!(
         consumed_codes_count(app.db()).await,
-        1,
-        "SELL consumed one code"
+        2,
+        "B10: the lazy DocType=9 BEGIN (minted at the first offline SELL) + the \
+         SELL consumed two codes"
     );
 
     let ret = drive(
@@ -353,15 +360,15 @@ async fn pilot_offline_sell_and_return_reachable_via_live_binding() {
     );
     assert_eq!(
         consumed_codes_count(app.db()).await,
-        2,
-        "RETURN consumed a second code"
+        3,
+        "B10: RETURN consumed a third code (BEGIN + SELL + RETURN)"
     );
 
     // ─── 4) O1 boundary: OLA-resting docs + OPEN session, shift STILL Opened ─
     assert_eq!(
         ola_doc_count(app.db()).await,
-        2,
-        "SELL + RETURN both rest at OLA"
+        3,
+        "B10: BEGIN + SELL + RETURN all rest at OLA"
     );
     let (mode, shift) = node_row(app.db()).await;
     assert_eq!(mode, "OFFLINE");

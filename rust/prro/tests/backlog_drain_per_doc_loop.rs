@@ -29,7 +29,7 @@
 //! Tests (10):
 //!
 //!   1. `c4_happy_path_two_docs_advance_to_ack_via_w12` (renamed)
-//!   2. `c4_routed_terminal_reject_records_wire_routing_failure_class`
+//!   2. `c4_offline_minus_8_is_terminal_and_escalates_manual`
 //!   3. `c4_signer_refused_records_signer_refused_class_and_escalates_manual`
 //!   4. `c4_processes_backlog_in_lnd_asc_order`
 //!   5. `c4_accounting_advanced_plus_failures_equals_backlog`
@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -89,8 +90,8 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift: ShiftState) {
          VALUES (?, ?, ?, 100)",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift)
+    .bind(mode.as_str())
+    .bind(shift.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -110,7 +111,7 @@ async fn seed_shift_with_state(pool: &SqlitePool, cashier_id: &str, state: &str)
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, ?, 'OFFLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(state)
     .bind(cashier_id)
@@ -125,7 +126,7 @@ async fn seed_shift_with_state(pool: &SqlitePool, cashier_id: &str, state: &str)
 /// the halt path need to backfill this column after seeding the shift.
 async fn set_node_current_shift(pool: &SqlitePool, shift_id: ShiftId) {
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(pool)
         .await
@@ -134,7 +135,7 @@ async fn set_node_current_shift(pool: &SqlitePool, shift_id: ShiftId) {
 
 async fn read_shift_state(pool: &SqlitePool, shift_id: ShiftId) -> String {
     sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -154,7 +155,7 @@ async fn seed_offline_session(pool: &SqlitePool, state: OfflineSessionState) -> 
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-20T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(state.as_str())
     .execute(pool)
@@ -196,14 +197,14 @@ async fn seed_complete_offline_local_ack(
             ?, ?, '2026-05-20T00:00:00Z', ? \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(&sha)
     .bind(signer_cashier)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(code_lnd)
     .bind(&dps_code)
     .execute(pool)
@@ -215,7 +216,7 @@ async fn seed_complete_offline_local_ack(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(b"FAKE-CMS-SIGNED-PAYLOAD".to_vec())
     .execute(pool)
     .await
@@ -230,7 +231,7 @@ async fn seed_complete_offline_local_ack(
     )
     .bind(FN)
     .bind(code_lnd)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -240,7 +241,7 @@ async fn seed_complete_offline_local_ack(
 
 async fn read_doc_state(pool: &SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -297,7 +298,7 @@ fn last_chk_ack(id: &str, data_sign: Vec<u8>) -> CheckAck {
 }
 
 /// **M3b W12 Commit 4b.3 (2026-05-22)** — deterministic non-empty
-/// KVT1_RAW evidence bytes for lastChk Acked path tests.  Length 32
+/// KVT1_RAW evidence bytes for lastChk Acked path tests.  Length 64
 /// matches real DPS protobuf KVT1_RAW shape closely enough for
 /// SHA256 digest assertions in `OFFLINE_DRAIN_KVT2_ADVANCED`
 /// audit payload.
@@ -306,7 +307,7 @@ fn kvt1_raw_bytes_for(server_fiscal_no: &str) -> Vec<u8> {
     // server_fiscal_no hash-like seed, rest 0xAB padding.  Each FN
     // gets distinguishable bytes so dashboards can cross-correlate
     // `kvt1_raw_sha256_hex` per-doc.
-    let mut bytes = vec![0xABu8; 32];
+    let mut bytes = vec![0xABu8; 64];
     for (i, b) in server_fiscal_no.bytes().take(4).enumerate() {
         bytes[i] = b;
     }
@@ -481,10 +482,10 @@ async fn c4_happy_path_two_docs_advance_to_ack_via_w12() {
     assert_eq!(advanced_payloads[1]["attempt_no"], 1);
 }
 
-// ─── Test 2: routed terminal reject ──────────────────────────────────
+// ─── Test 2: offline `-8` is terminal ─────────────────────────────────
 
 #[tokio::test]
-async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
+async fn c4_offline_minus_8_is_terminal_and_escalates_manual() {
     let (_d, pool) = fresh_pool().await;
     seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
     let shift_id = seed_open_shift(&pool, CASHIER_OK).await;
@@ -494,15 +495,13 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     // node_state.current_shift_id, so backfill it after seeding the shift.
     set_node_current_shift(&pool, shift_id).await;
     let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
-    let _doc =
+    let doc =
         seed_complete_offline_local_ack(&pool, 1, 100, session_id, shift_id, CASHIER_OK).await;
 
-    // Authorization{DocumentReject} → RetryClass::TerminalReject →
-    // FailureClass::WireRoutingTerminalReject.
-    let carriers = carriers_with_responses(vec![Err(DpsError::Authorization {
-        code: -1,
-        kind: AuthorizationKind::DocumentReject,
-        message: "signature_invalid".into(),
+    // ERROR_XML_DATE (-8) is a terminal wire-format rejection, not a retry.
+    let carriers = carriers_with_responses(vec![Err(DpsError::Server {
+        code: -8,
+        message: "ERROR_XML_DATE".into(),
     })]);
     let view = view_for(&carriers);
 
@@ -517,7 +516,7 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
     assert_eq!(
         summary.per_doc_failures()[0].1,
         "wire_routing_terminal_reject",
-        "Authorization{{DocumentReject}} must map via RetryClass::TerminalReject"
+        "offline -8 must map via RetryClass::TerminalReject"
     );
 
     assert_eq!(audit_count(&pool, "OFFLINE_DRAIN_DOC_ADVANCED").await, 0);
@@ -529,6 +528,33 @@ async fn c4_routed_terminal_reject_records_wire_routing_failure_class() {
         "wire_routing_terminal_reject"
     );
     assert_eq!(failed_payloads[0]["retry_class"], "TerminalReject");
+
+    // CS-3 S7-1 cutover: offline-origin (drain) terminal reject is HOLD by construction
+    // (ApplyPlan §row 5 — apply_outcome `if !online → HeldNotAutoRelease`). The receipt was
+    // already issued to the customer offline, so it CANNOT be rolled back to REJECTED; it rests
+    // SENDING-held (PENDING_APPLY + STOP) while the FN shift escalates to RMR (outcome-driven,
+    // asserted below). "Not retryable" is preserved: SENDING is not in the {Signed, OfflineLocalAck}
+    // source allowlist, so it never re-wires.
+    assert_eq!(
+        read_doc_state(&pool, doc).await,
+        "SENDING",
+        "terminal -8 offline-origin reject rests SENDING-held (STOP), never REJECTED (no rollback)"
+    );
+    assert_eq!(
+        carriers.dps.call_count(),
+        1,
+        "-8 must perform exactly one send, never a re-drive"
+    );
+    let trace_code: Option<i64> = sqlx::query_scalar(
+        "SELECT server_status_code FROM transport_trace \
+         WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
+    )
+    .bind(DbDocumentId(doc))
+    .fetch_optional(&pool)
+    .await
+    .unwrap()
+    .flatten();
+    assert_eq!(trace_code, Some(-8));
 
     // Strict-sequential: terminal reject HALTS + escalates the FN shift to
     // RequiresManualReconciliation even on a plain Opened shift (edge 15), and
@@ -799,7 +825,7 @@ async fn strict_sequential_terminal_reject_halts_chain_and_escalates_manual() {
     // invariant_scan walk's first row matches its `None` start (the inbox row +
     // unsigned hash from seed_w12_finalize_prereqs are kept for the ACK advance).
     sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
-        .bind(doc_a)
+        .bind(DbDocumentId(doc_a))
         .execute(&pool)
         .await
         .unwrap();
@@ -854,7 +880,10 @@ async fn strict_sequential_terminal_reject_halts_chain_and_escalates_manual() {
 
     // Strict-sequential: A acked, B rejected (terminal) → HALT, C NOT sent.
     assert_eq!(read_doc_state(&pool, doc_a).await, "ACK");
-    assert_eq!(read_doc_state(&pool, doc_b).await, "REJECTED");
+    // CS-3 S7-1 cutover: offline-origin terminal reject is HOLD by construction (ApplyPlan §row 5) —
+    // doc_b rests SENDING-held (PENDING_APPLY + STOP), never rolled back to REJECTED. The shift still
+    // escalates to RMR (outcome-driven, asserted below), and the strict chain still halts at B.
+    assert_eq!(read_doc_state(&pool, doc_b).await, "SENDING");
     assert_eq!(
         read_doc_state(&pool, doc_c).await,
         "OFFLINE_LOCAL_ACK",
@@ -980,7 +1009,10 @@ async fn c4_pending_drain_shift_reject_halts_and_transitions_shift_to_manual() {
 
     // Per-doc DB states.
     assert_eq!(read_doc_state(&pool, doc_a).await, "ACK");
-    assert_eq!(read_doc_state(&pool, doc_b).await, "REJECTED");
+    // CS-3 S7-1 cutover: offline-origin terminal reject is HOLD by construction (ApplyPlan §row 5) —
+    // doc_b rests SENDING-held (PENDING_APPLY + STOP), never rolled back to REJECTED. The shift still
+    // transitions to RMR via edge 6 (outcome-driven, asserted below).
+    assert_eq!(read_doc_state(&pool, doc_b).await, "SENDING");
     assert_eq!(
         read_doc_state(&pool, doc_c).await,
         "OFFLINE_LOCAL_ACK",
@@ -1137,7 +1169,11 @@ async fn c4_pending_drain_shift_transient_retry_halts_chain_this_tick_no_manual(
 
     // DB states.
     assert_eq!(read_doc_state(&pool, doc_a).await, "ACK");
-    assert_eq!(read_doc_state(&pool, doc_b).await, "ERROR_RETRYABLE");
+    // CS-3 S7-1 cutover: a TRANSIENT (Transport / SubmittedUnknown) drain outcome is now HELD, not
+    // auto-redriven — the ER-redrive edge was retired (R1/R2). doc_b rests SENDING-held
+    // (PENDING_APPLY + STOP) awaiting operator/probe resolution, NOT ERROR_RETRYABLE. The chain
+    // still halts this tick and the shift stays OpenedLocalPendingDrain (no manual escalation).
+    assert_eq!(read_doc_state(&pool, doc_b).await, "SENDING");
     assert_eq!(
         read_doc_state(&pool, doc_c).await,
         "OFFLINE_LOCAL_ACK",
@@ -1296,7 +1332,7 @@ async fn w12_sent_fresh_mismatch_emits_drift_audit_and_halts_via_boot_error() {
     // classify_check_result → StructuralDrift::LastChkIdMismatch.
     let carriers = carriers_with_responses_and_last_chk(
         vec![Ok(ack("EXPECTED-A"))],
-        vec![Ok(last_chk_ack("DIFFERENT-B", vec![0xAAu8; 32]))],
+        vec![Ok(last_chk_ack("DIFFERENT-B", vec![0xAAu8; 64]))],
     );
     let view = view_for(&carriers);
 
@@ -1415,14 +1451,22 @@ async fn w12_sent_fresh_dps_transport_holds_drain_and_projects_held_at_sent() {
     assert_eq!(audit_count(&pool, "KVT2_CONFIRM_STRUCTURAL_DRIFT").await, 0);
 }
 
-/// **M2-N1 / ruling B (architect, 2026-06-13)** — a TRANSIENT failure on an
-/// offline-origin predecessor HALTS the chain for THIS tick (does NOT escalate
-/// Manual, does NOT send the successor), and the NEXT tick RETRIES it and drains
-/// the chain.  The ruling-B pin distinguishing transient (retry-budget
-/// preserved, no premature Manual) from terminal (escalate).  Two-tick test:
-///   - tick 1: doc_a send → Transport error → ERROR_RETRYABLE → HALT; doc_b NOT
-///     sent; shift stays Opened; NO escalation audit.
-///   - tick 2: doc_a re-drives (ER class-guard) → ACK; doc_b then → ACK.
+/// **CS-3 S7-1 cutover — SEMANTIC REGRESSION (the retry-next-tick premise is RETIRED).**
+///
+/// `legacy inventory-stable name`: the name is preserved ONLY so the test-inventory gate stays
+/// stable; the pre-cutover "transient → retry next tick → ACK" contract it used to assert is now
+/// DELIBERATELY RETIRED.  Under the composed HOLD contract a `DpsError::Transport` outcome
+/// classifies `SubmittedUnknown` — a wire that MAY have reached DPS.  `CALL_STARTED` is durable
+/// BEFORE the transport call, so a connect / timeout error does NOT prove non-delivery; blindly
+/// re-driving it would be a second wire = the exact double-issue class CS-3 closes.  R1/R2 removed
+/// the ER-redrive edge, so the doc is HELD (`SENDING` + reservation `OUTCOME_OBSERVED` /
+/// `PENDING_APPLY` + node `STOP_MODE`), never auto-redriven.  This test now PINS that a second
+/// drain tick makes NO new wire call and does NOT release the held doc — the only exit is a
+/// probe / operator resolution (deferred to CS-8, see `project_backlog_classify_send_outcome`).
+/// This is a CONSCIOUS loss of automatic liveness in exchange for P2 (at-most-one-wire), NOT a
+/// hidden regression.  Two-tick test:
+///   - tick 1: doc_a send → Transport (`SubmittedUnknown`) → HELD `SENDING` + STOP; doc_b NOT sent.
+///   - tick 2: node is `STOP_MODE`, so drain SKIPS — no new wire, doc stays held, gen preserved.
 #[tokio::test]
 async fn strict_sequential_transient_halts_this_tick_then_retries_next_tick() {
     let (_d, pool) = fresh_pool().await;
@@ -1447,7 +1491,7 @@ async fn strict_sequential_transient_halts_this_tick_then_retries_next_tick() {
     .await
     .unwrap();
     sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
-        .bind(doc_a)
+        .bind(DbDocumentId(doc_a))
         .execute(&pool)
         .await
         .unwrap();
@@ -1461,7 +1505,7 @@ async fn strict_sequential_transient_halts_this_tick_then_retries_next_tick() {
     .await
     .unwrap();
 
-    // ── Tick 1: doc_a send → Transport error → ERROR_RETRYABLE → HALT. ──
+    // ── Tick 1: doc_a send → Transport (SubmittedUnknown) → HELD SENDING + STOP. ──
     let c1 = carriers_with_responses_and_last_chk(
         vec![Err(DpsError::Transport("tick1 link flap".into()))],
         vec![],
@@ -1471,33 +1515,57 @@ async fn strict_sequential_transient_halts_this_tick_then_retries_next_tick() {
         .await
         .unwrap();
 
-    assert_eq!(
-        read_doc_state(&pool, doc_a).await,
-        "ERROR_RETRYABLE",
-        "transient send failure parks doc_a in ERROR_RETRYABLE"
-    );
-    assert_eq!(
-        read_doc_state(&pool, doc_b).await,
-        "OFFLINE_LOCAL_ACK",
-        "doc_b NOT sent — chain halts at the transient predecessor"
-    );
+    // Exactly one wire call this tick.
     assert_eq!(
         c1.dps.call_count(),
         1,
-        "only doc_a reached the wire on tick 1"
+        "doc_a made exactly one wire call on tick 1"
+    );
+    // Held doc: SENDING (NOT ERROR_RETRYABLE — the ER-redrive edge is retired).
+    assert_eq!(
+        read_doc_state(&pool, doc_a).await,
+        "SENDING",
+        "transient (SubmittedUnknown) parks doc_a SENDING-held, never ERROR_RETRYABLE"
+    );
+    // The reservation records the durable operator HOLD.
+    let (res_state, res_apply): (String, Option<String>) =
+        sqlx::query_as("SELECT state, apply_state FROM delivery_reservation WHERE document_id = ?")
+            .bind(DbDocumentId(doc_a))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(res_state, "OUTCOME_OBSERVED");
+    assert_eq!(res_apply.as_deref(), Some("PENDING_APPLY"));
+    // Node halted (STOP_MODE) pending operator completion — this is what gates tick 2.
+    let mode1: String = sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(mode1, "STOP_MODE", "SubmittedUnknown halts the node");
+    // Successor untouched; no premature Manual escalation.
+    assert_eq!(
+        read_doc_state(&pool, doc_b).await,
+        "OFFLINE_LOCAL_ACK",
+        "doc_b NOT sent — chain halts at the held predecessor"
     );
     assert_eq!(
         audit_count(&pool, "OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL").await,
         0,
-        "transient halt does NOT escalate to Manual"
-    );
-    assert_eq!(
-        read_shift_state(&pool, shift_id).await,
-        "OPENED",
-        "shift stays Opened on a transient halt (no escalation)"
+        "transient HOLD does NOT escalate to Manual"
     );
 
-    // ── Tick 2: doc_a re-drives → ACK, then doc_b → ACK. ──
+    // Snapshot generation + active-reservation pointer to prove tick 2 preserves them.
+    let (gen1, active1): (i64, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT delivery_generation, active_delivery_reservation_id \
+         FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // ── Tick 2: NO auto-redrive.  Node is STOP_MODE → drain SKIPS; nothing progresses. ──
     let c2 = carriers_with_responses_and_last_chk(
         vec![Ok(ack("OK-A")), Ok(ack("OK-B"))],
         vec![
@@ -1510,16 +1578,42 @@ async fn strict_sequential_transient_halts_this_tick_then_retries_next_tick() {
         .await
         .unwrap();
 
+    // No new wire call — the held doc is NOT auto-redriven (P2: at-most-one-wire).
+    assert_eq!(
+        c2.dps.call_count(),
+        0,
+        "tick 2 makes NO new wire call — the held doc is not auto-redriven"
+    );
+    // The doc is NOT released to ACK; it stays SENDING-held (exit is probe/operator only).
     assert_eq!(
         read_doc_state(&pool, doc_a).await,
-        "ACK",
-        "next tick retries doc_a → ACK"
+        "SENDING",
+        "the held doc does NOT become ACK on a later tick"
     );
     assert_eq!(
         read_doc_state(&pool, doc_b).await,
-        "ACK",
-        "the chain drains past the now-acked predecessor on the retry tick"
+        "OFFLINE_LOCAL_ACK",
+        "the successor stays blocked behind the held predecessor"
     );
+    // Reservation + generation preserved across the held tick (no silent re-mint / supersede).
+    let (gen2, active2): (i64, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT delivery_generation, active_delivery_reservation_id \
+         FROM node_state WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        gen2, gen1,
+        "delivery generation preserved across the held tick"
+    );
+    assert_eq!(
+        active2, active1,
+        "active reservation pointer preserved (no re-mint)"
+    );
+    // Ledger clean: the held pair is a legitimate exemption, NOT an orphan StuckSending.
+    prro::db::invariant_scan::assert_clean(&pool).await;
 }
 
 /// **H-M2-1 (architect ruling, 2026-06-13) — DPS ERROR_BAD_HASH_PREV cascade
@@ -1562,7 +1656,7 @@ async fn h_m2_1_rejected_predecessor_never_wires_successor_bad_hash_prev_moot() 
     .await
     .unwrap();
     sqlx::query("UPDATE fiscal_documents SET previous_hash = NULL WHERE document_id = ?")
-        .bind(doc_a)
+        .bind(DbDocumentId(doc_a))
         .execute(&pool)
         .await
         .unwrap();
@@ -1595,7 +1689,10 @@ async fn h_m2_1_rejected_predecessor_never_wires_successor_bad_hash_prev_moot() 
         .await
         .unwrap();
 
-    assert_eq!(read_doc_state(&pool, doc_a).await, "REJECTED");
+    // CS-3 S7-1 cutover: offline-origin terminal reject is HOLD by construction (ApplyPlan §row 5) —
+    // doc_a rests SENDING-held (PENDING_APPLY + STOP), never rolled back to REJECTED. The
+    // load-bearing H-M2-1 pin (successor never wired) + shift→RMR + ledger-clean are unchanged.
+    assert_eq!(read_doc_state(&pool, doc_a).await, "SENDING");
     // The load-bearing H-M2-1 pin: B (successor of the rejected predecessor) is
     // NEVER wired, so DPS never sees a bad-hash-prev chain.
     assert_eq!(

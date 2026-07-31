@@ -42,7 +42,7 @@ jobs:
     # A hang fails loudly instead of burning the CI budget.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Audit MED#2: FUZZ_CASES is the capstone knob, but the `proptest!` macro
       # runs `contextualize_config()` which lets the global `PROPTEST_CASES`
@@ -57,13 +57,13 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: rust
 
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@b265f9a422509a38f0c716115e5f17af22dfc631 # nextest
 
       # Per-case temp DBs are cleaned by U1's RAII fix, so a large-N run does not
       # exhaust disk. Keep TMPDIR on the runner's REAL disk (RUNNER_TEMP), NOT a
@@ -72,6 +72,17 @@ jobs:
         run: |
           mkdir -p "${RUNNER_TEMP}/fuzz-tmp"
           echo "TMPDIR=${RUNNER_TEMP}/fuzz-tmp" >> "$GITHUB_ENV"
+
+      - name: Purity gate — prro-domain (RP-CS1-1 / RP-CS1-4)
+        working-directory: rust
+        # CS-1a (contract §8 / RP-CS1-6): keep the cargo-metadata purity gate +
+        # testkit graph-absence check enforced on the nightly leg too, so a
+        # forbidden-dep / testkit-in-prod regression is caught even on a
+        # docs-heavy day the PR path-detector might route around. CS-1d adds the
+        # three `*-contract` members so the contract-crate DAG gate
+        # (rp_cs1_4_contract_dag.rs) runs and the empty crates are compiled here
+        # too, never SKIPPED.
+        run: cargo nextest run -p prro-domain -p prro-testkit -p prro-ingress-contract -p prro-dps-contract -p prro-fleet-contract --locked
 
       - name: Capstone large-N (both online + offline)
         working-directory: rust
@@ -88,7 +99,7 @@ jobs:
       # uploads nothing and stays quiet.
       - name: Upload regression seed (if any)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: invariant-fuzzer-regressions
           path: rust/prro/tests/invariant_fuzzer.regressions

@@ -94,7 +94,11 @@ mod tests {
         // 1 * 1 = 1, unreduced layout: low word == 1, rest zero.
         assert_eq!(out.0[0], 1);
         for i in 1..out.0.len() {
-            assert_eq!(out.0[i], 0, "warm_up left backend in bad state at limb {}", i);
+            assert_eq!(
+                out.0[i], 0,
+                "warm_up left backend in bad state at limb {}",
+                i
+            );
         }
     }
 }

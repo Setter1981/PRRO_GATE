@@ -1,0 +1,22 @@
+# CS-1R3 A2 — POST-CS1 carve-out approved blob SHAs (DATA, code-owner-gated).
+#
+# Files whose WORKING-TREE content legitimately differs from the CS-1 head blob
+# (f2628ba) due to a specific APPROVED post-CS-1 change. Each carries the EXACT
+# approved git blob SHA (`git rev-parse <commit>:<path>`). The provenance live-drift
+# leg asserts the worktree blob == this SHA (any FURTHER drift → RED) and runs the
+# AST/sqlx compare on the frozen CS-1 endpoint (base ↔ f2628ba), NOT the carve-out
+# blob.
+#
+# This lives in a DATA file (not next to the oracle) so a re-pin is a visible,
+# CODEOWNER-gated data diff. A future legitimate change re-pins the SHA here with an
+# artifact note.
+#
+# Format (tab-separated, one row per carve-out; `#` comments + blank lines ignored):
+#   <repo-relative-path>	<approved-git-blob-sha>	<provenance-note>
+#
+# EMPTY after the CS-3 S7-1 cutover live-drift re-baseline (LIVE_DRIFT_BASE_SHA -> the cutover
+# commit): the live-drift leg's frozen endpoint is now the cutover itself, so every frozen file —
+# including the four former carve-outs (fuzzer oracle fix 32166cc, CS-3 Slice-5 operator-completion
+# 86648df, gap-4a/4b shift-whitelist edges) — is covered by the re-anchored AST-neutral leg (base
+# == worktree) directly; no per-file blob-pin needed. The immutable leg (f2c17b1..f2628ba) never
+# used carve-outs. A future post-cutover approved change re-pins here again with an artifact note.

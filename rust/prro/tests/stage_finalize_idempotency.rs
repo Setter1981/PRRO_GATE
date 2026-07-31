@@ -23,6 +23,7 @@ mod common;
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::services::write_path::stage_finalize::{self, StageFinalizeOutcome};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -52,8 +53,8 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift: ShiftState) {
          VALUES (?, ?, ?, 100)",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift)
+    .bind(mode.as_str())
+    .bind(shift.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -66,7 +67,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(pool)
@@ -81,7 +82,7 @@ async fn seed_offline_session(pool: &SqlitePool, state: OfflineSessionState) -> 
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-21T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(state.as_str())
     .execute(pool)
@@ -115,13 +116,13 @@ async fn seed_kvt2_doc(
             'DPS-FN-IDEMP', ?, ?, '2026-05-21T00:00:00Z' \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(&payload_sha)
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(&common::chain_anchor(0x01)[..])
     .bind(&common::chain_anchor(0x00)[..])
     .execute(pool)
@@ -131,7 +132,7 @@ async fn seed_kvt2_doc(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(b"FAKE-CMS".to_vec())
     .execute(pool)
     .await
@@ -140,7 +141,7 @@ async fn seed_kvt2_doc(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'KVT1_RAW', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(vec![0xAAu8; 32])
     .execute(pool)
     .await
@@ -150,7 +151,7 @@ async fn seed_kvt2_doc(
          VALUES (?, 100, '2026-05-21T00:00:01Z', ?)",
     )
     .bind(FN)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -183,7 +184,7 @@ async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
 
 async fn read_doc_state(pool: &SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -205,7 +206,7 @@ async fn read_inbox_status(pool: &SqlitePool, doc_id: DocumentId) -> String {
          JOIN fiscal_documents d ON d.request_id = s.request_id \
          WHERE d.document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(pool)
     .await
     .unwrap()
@@ -213,7 +214,7 @@ async fn read_inbox_status(pool: &SqlitePool, doc_id: DocumentId) -> String {
 
 async fn outbox_row_count(pool: &SqlitePool, doc_id: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()

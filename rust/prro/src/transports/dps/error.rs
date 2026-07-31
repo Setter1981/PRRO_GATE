@@ -1,6 +1,6 @@
 //! Typed error surface for the DPS gRPC transport.
 //!
-//! Eight variants cover the failure modes a `DpsChannel` caller has
+//! Ten variants cover the failure modes a `DpsChannel` caller has
 //! to make routing decisions on (retry now, fall back, mark FN
 //! broken, escalate to operator, classify by-id-lookup outcome,
 //! reject unsupported queries).  The categories are protocol-shape,
@@ -8,6 +8,7 @@
 //! and a TCP connect-refused both surface as `Transport`, because
 //! the caller's response is the same — back off + retry.
 
+use prro_domain::delivery::{DecodedResponseDigest, GrpcStatusDigest};
 use thiserror::Error;
 
 /// Errors returned by every `DpsChannel` method.
@@ -16,8 +17,77 @@ pub enum DpsError {
     /// Transport-level failure (TCP / TLS / DNS / per-call deadline /
     /// gRPC `Unavailable` / `DeadlineExceeded`).  Caller should back
     /// off and retry; the FN is not necessarily broken.
+    ///
+    /// Distinct from [`DpsError::Indeterminate`]: `Transport` means
+    /// **no DPS envelope was received at all** — the channel itself
+    /// failed before any application-level status could be decoded.
+    ///
+    /// **R1 — this also covers a reply with no *proven authenticated-peer
+    /// provenance*.** A gRPC `Unauthenticated` / `PermissionDenied` over an
+    /// UNPROVEN (plaintext) channel is routed here, NOT to
+    /// [`DpsError::RemoteStatus`]: without a proven TLS peer the status could be
+    /// forged, so no `AuthenticatedPeer` provenance may be claimed.  Only a
+    /// TLS-proven channel promotes those two codes to `RemoteStatus`.
     #[error("DPS transport: {0}")]
     Transport(String),
+
+    /// The DPS peer responded over an established TLS session, but NOT
+    /// with a DPS application envelope — e.g. a gRPC `Unauthenticated`
+    /// or `PermissionDenied` status emitted by the WAF / gateway before
+    /// any fiscal application logic ran.
+    ///
+    /// Distinct from [`DpsError::Transport`] (no response reached the
+    /// peer at all — TCP / TLS / DNS / deadline) and from
+    /// [`DpsError::Indeterminate`] (a parsed DPS envelope was received).
+    ///
+    /// `code` is the tonic `Code` debug string (e.g. `"Unauthenticated"`,
+    /// `"PermissionDenied"`).  `message` carries the gRPC status message.
+    ///
+    /// **Routing — compatibility projection:** currently routes
+    /// identically to `Transport` — `ErrorRetryable / TransientRetry`.
+    /// This routing arm is a compatibility projection kept identical to
+    /// `Transport`, but the slice is NOT behaviour-neutral overall: R1
+    /// gated emission on proven TLS (a plaintext `Unauthenticated` now
+    /// routes as `Transport`) and consumers (`last_chk_probe` /
+    /// `kvt2_confirm` / `dps_error_class`) observe the distinct type.
+    /// Slice E (classifier) will differentiate it into `ProbeRequired`
+    /// once the full CS-3 surface is wired.  A separate match arm in
+    /// `route_dps_error` ensures slice E can change it without touching
+    /// the `Transport` arm.
+    #[error("DPS remote status ({code}): {message}")]
+    RemoteStatus {
+        code: String,
+        message: String,
+        /// Digest of the raw gRPC status reply (code + message + details). The
+        /// lossless raw-reply evidence (R3): a later Bridge maps this to
+        /// `RemoteStatusEvidence` carrying the SAME digest, never a fabricated one.
+        digest: GrpcStatusDigest,
+    },
+
+    /// A DPS response envelope was successfully decoded but the status
+    /// code does not settle submission certainty — forward progress
+    /// was observed on the wire yet the outcome (accepted / rejected)
+    /// is unknown.  The canonical case is `ERROR_UNKNOWN (-4)` from
+    /// `CheckResponse` / `StatusResponse` / `RroInfoResponse`.
+    ///
+    /// Distinct from [`DpsError::Transport`] (no envelope received)
+    /// and [`DpsError::Server`] (a definitive non-OK server status).
+    /// Slice A re-types `-4` here so later slices can distinguish
+    /// "possibly submitted" from "definitely not sent" without parsing
+    /// error message strings.
+    ///
+    /// `code` is the raw DPS status integer (`-4` for `ERROR_UNKNOWN`).
+    /// `message` carries the server's textual explanation when present.
+    #[error("DPS indeterminate (code={code}): {message}")]
+    Indeterminate {
+        code: i32,
+        message: String,
+        /// Digest of the parsed DPS response envelope. The lossless raw-reply
+        /// evidence (R3): a later Bridge maps this to
+        /// `SendIndeterminate::UnknownStatus` carrying the SAME digest, never a
+        /// fabricated one.
+        digest: DecodedResponseDigest,
+    },
 
     /// Authorization-class server response, split by the application-
     /// level DPS status code so callers can route per-doc rejects
@@ -32,9 +102,10 @@ pub enum DpsError {
     /// StatusResponse / RroInfoResponse status codes for which an
     /// authorization-class destination is documented.  Transport-level
     /// authentication failures (gRPC `Unauthenticated` /
-    /// `PermissionDenied`) are mapped to [`DpsError::Transport`] in
-    /// `grpc.rs::map_tonic_status` — they have no DPS status code and
-    /// would force a synthetic `code = 0` here.
+    /// `PermissionDenied`) map to [`DpsError::RemoteStatus`] over a
+    /// TLS-proven channel, or [`DpsError::Transport`] over a plaintext
+    /// one (R1 trust boundary) — never `Authorization` (they have no
+    /// DPS status code and would force a synthetic `code = 0` here).
     #[error("DPS authorization {kind:?} (code={code}): {message}")]
     Authorization {
         code: i32,

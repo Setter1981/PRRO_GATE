@@ -1,0 +1,2153 @@
+//! SHIFT-LIFE MATRIX — full-stack scenario harness through the REAL INGRESS.
+//!
+//! Operator's directive (2026-07-12): stop verifying the online↔offline
+//! transition matrix cell-by-cell with isolated unit tests. Instead **stand the
+//! product up**, feed it GENERATED packets of receipts under different shift
+//! variants, run each through the WHOLE real path with legible logging, and
+//! **halt on the first divergence**. The only thing faked is the network
+//! (`MatrixDps` — a stateful, fault-injectable `DpsChannel` whose `online` flag
+//! models a real net drop).
+//!
+//! INGRESS IS UNDER TEST (Increment 2): scenarios drive WIRE-shape
+//! `CanonicalCommand`s (the `maria304`/WebCheck wire dialect — `price_kopecks`,
+//! `quantity_milli`, `type:"CASH"`) through the REAL ingress core
+//! `handler::handle_command` → command-class classify → wire→signer `convert`
+//! → idempotent inbox insert → the live `production_write_path` binding →
+//! staged pipeline. So convert + classify + inbox are exercised, not bypassed.
+//! (`handle_command` is the axum-free core the REST `/v1/ingress/webcheck` route
+//! wraps — the same seam a future WebCheck-XML adapter will feed.)
+//!
+//! WHAT IS REAL: `App::boot` (real SQLite + migrations), the real per-FN signing
+//! context, the real registry, the real ingress core, the real staged pipeline,
+//! the real offline lane, the real live GO_OFFLINE / GO_ONLINE doors, and the
+//! real drain. ONLY the DPS transport is a stub.
+//!
+//! WHY in-process (not a spawned OS process over HTTP): the transition-matrix
+//! goal is state correctness across online↔offline↔drain — faster, determin-
+//! istic, and directly assertable in-process. The axum HTTP wire (routing +
+//! source-allowlist + JSON deser) is thin and already unit-tested in `server.rs`;
+//! a full-socket harness is a candidate follow-up, not this one.
+//!
+//! HOW IT DIFFERS from the pilot e2e tests: those replay THREE hardcoded
+//! receipts. This harness GENERATES varied packets (`gen_line_and_pay` — varied
+//! item counts, prices, cash/card payforms). "Они без новых документов" — this
+//! one is not.
+//!
+//! HALT-ON-ERROR: `invariant_scan::assert_clean` runs after EVERY step; any
+//! illegal non-terminal doc at a quiescent boundary (the #192 / P1 ledger-pin)
+//! panics the scenario with the full per-step log printed above it.
+
+mod common;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use async_trait::async_trait;
+
+use prro::app::App;
+use prro::config::AppConfig;
+use prro::crypto::session::SigningSession;
+use prro::db::models::enums::{DocState, FiscalMode, NodeMode, Protocol, ShiftState};
+use prro::db::models::ids::DriverId;
+use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
+use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
+use prro::runtime::coding::Coding;
+use prro::runtime::ingress::dto::CanonicalCommand;
+use prro::runtime::ingress::handler::{handle_command, IngressBody};
+use prro::runtime::ingress::inline_binding::production_write_path;
+use prro::runtime::ingress::seam::WritePathEntry;
+use prro::services::reconciliation::runtime::RuntimeView;
+use prro::services::write_path::stage_sign::SigningContext;
+use prro::transports::dps::channel::DpsChannel;
+use prro::transports::dps::dto::{
+    CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse, RroInfo, StatusSnapshot,
+};
+use prro::transports::dps::error::DpsError;
+use prro::ScheduledDrainOutcome;
+use sqlx::SqlitePool;
+
+use common::{det_signing_ctx, det_signing_ctx_for};
+
+const FN_A: &str = "4000000042";
+const FN_B: &str = "4000000099";
+/// Alias so single-FN scenarios continue to compile unchanged.
+const FN: &str = FN_A;
+const FIXTURE_CERT_DER: &[u8] = include_bytes!("fixtures/SELF_SIGNED_ENC_6929.cer");
+
+// ════════════════════════════════════════════════════════════════════════
+// MatrixDps — the fault-injectable "network"
+// ════════════════════════════════════════════════════════════════════════
+
+/// A stateful, generative `DpsChannel` stub whose `online` flag models the
+/// physical network. Unlike the queue-based `ScriptedDps` / `StubDpsChannel`
+/// (which require the caller to know the exact number of wire calls up front),
+/// this one answers ANY number of `send_chk` / `last_chk` calls generatively —
+/// so a scenario can drop and restore the network without recomputing queues.
+///
+///   * `online == true`  → `send_chk` returns a fresh Sent ack, `last_chk`
+///     returns KVT1 evidence (non-empty `data_sign`).
+///   * `online == false` → every wire call returns `DpsError::Transport`
+///     ("connection refused") — a real net drop.
+///   * `reject_next(code)` → the NEXT `send_chk` returns `DpsError::Server`
+///     (a DPS terminal reject), then reverts to normal.
+///
+/// The per-call log (`drain_calls`) is the "envelope spy" the step logger
+/// prints, so a human reads exactly what the product asked the network for.
+struct MatrixDps {
+    online: AtomicBool,
+    /// All three fault injections are keyed by `fiscal_number` (`CheckEnvelope.rro_fn`)
+    /// so arming a fault on FN-A only hits FN-A's send, never an interleaved FN-B send
+    /// (MF4 per-FN fault isolation). `send_ctr` stays GLOBAL — `last_chk` carries no FN
+    /// (`CheckSignBlob` has no FN field) so its sfn stream can't be per-FN; MF4 asserts
+    /// via schema-keyed state (doc state / node mode), never the stub's sfn.
+    reject_next: Mutex<HashMap<String, i32>>,
+    send_ctr: AtomicUsize,
+    open_shift: AtomicBool,
+    calls: Mutex<Vec<String>>,
+    /// Byzantine injection (per-FN): FN's NEXT `send_chk` returns Ok with this NON-EMPTY
+    /// but garbage/malformed `id` (server fiscal number) instead of a clean one.
+    garbage_sfn: Mutex<HashMap<String, String>>,
+    /// MAC-recovery injection (per-FN): FN's NEXT `send_chk` returns `Err(Server{-12})`
+    /// with a `"store {64hex}"` message (ERROR_BAD_HASH_PREV) carrying this recovered
+    /// chain hash, then reverts to normal Ok — so the inline W10.4 recovery re-signs
+    /// with the DPS-supplied hash and the re-sent attempt #2 succeeds.
+    mac_recovery_hash: Mutex<HashMap<String, String>>,
+}
+
+impl MatrixDps {
+    fn new() -> Self {
+        Self {
+            online: AtomicBool::new(true),
+            reject_next: Mutex::new(HashMap::new()),
+            send_ctr: AtomicUsize::new(0),
+            open_shift: AtomicBool::new(false),
+            calls: Mutex::new(Vec::new()),
+            garbage_sfn: Mutex::new(HashMap::new()),
+            mac_recovery_hash: Mutex::new(HashMap::new()),
+        }
+    }
+    /// Byzantine: make `fiscal_number`'s NEXT `send_chk` answer Ok with a non-empty
+    /// but garbage server fiscal number (a live-but-lying DPS), not a transport failure.
+    fn inject_garbage_sfn(&self, fiscal_number: &str, s: &str) {
+        self.garbage_sfn
+            .lock()
+            .unwrap()
+            .insert(fiscal_number.to_string(), s.to_string());
+    }
+    /// Arm `fiscal_number`'s NEXT `send_chk` to return the `-12` ERROR_BAD_HASH_PREV
+    /// reject with a `store {hash_hex}` message (the DPS telling us the real chain
+    /// head). One-shot: after it fires, that FN's following `send_chk` (recovery
+    /// attempt #2) is a normal Ok. `hash_hex` must be exactly 64 hex chars.
+    fn inject_mac_recovery(&self, fiscal_number: &str, hash_hex: &str) {
+        self.mac_recovery_hash
+            .lock()
+            .unwrap()
+            .insert(fiscal_number.to_string(), hash_hex.to_string());
+    }
+    fn set_online(&self, up: bool) {
+        self.online.store(up, Ordering::SeqCst);
+    }
+    /// Arm `fiscal_number`'s NEXT `send_chk` to return a scripted `Server{code}` reject.
+    fn reject_next(&self, fiscal_number: &str, code: i32) {
+        self.reject_next
+            .lock()
+            .unwrap()
+            .insert(fiscal_number.to_string(), code);
+    }
+    #[allow(dead_code)]
+    fn set_open_shift(&self, o: bool) {
+        self.open_shift.store(o, Ordering::SeqCst);
+    }
+    fn log(&self, s: String) {
+        self.calls.lock().unwrap().push(s);
+    }
+    /// Take-and-clear the wire-call log accumulated since the last drain — the
+    /// per-step delta the logger prints.
+    fn drain_calls(&self) -> Vec<String> {
+        std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+}
+
+#[async_trait]
+impl DpsChannel for MatrixDps {
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
+
+    async fn send_chk(&self, e: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        // Per-FN fault dispatch: every injection is keyed by the sender's fiscal
+        // number, so a fault armed on FN-A never fires for an interleaved FN-B send.
+        let fn_key = e.rro_fn.as_str();
+        if !self.online.load(Ordering::SeqCst) {
+            self.log("send_chk→NET_DOWN".into());
+            return Err(DpsError::Transport("matrix: network down".into()));
+        }
+        if let Some(code) = self.reject_next.lock().unwrap().remove(fn_key) {
+            self.log(format!("send_chk[{fn_key}]→REJECT({code})"));
+            return Err(DpsError::Server {
+                code,
+                message: "matrix: scripted DPS reject".into(),
+            });
+        }
+        if let Some(g) = self.garbage_sfn.lock().unwrap().remove(fn_key) {
+            // Byzantine-but-alive DPS: Ok, but a non-empty garbage fiscal number.
+            self.send_ctr.fetch_add(1, Ordering::SeqCst);
+            self.log(format!("send_chk[{fn_key}]→BYZANTINE_SFN({g})"));
+            return Ok(CheckAck {
+                id: g,
+                id_sign: vec![],
+                data_sign: vec![],
+            });
+        }
+        if let Some(h) = self.mac_recovery_hash.lock().unwrap().remove(fn_key) {
+            // One-shot ERROR_BAD_HASH_PREV: DPS rejects with the real chain head so
+            // the inline W10.4 recovery re-signs; the NEXT send (attempt #2) is Ok.
+            self.log(format!("send_chk[{fn_key}]→REJECT(-12 store {}…)", &h[..8]));
+            return Err(DpsError::Server {
+                code: -12,
+                message: format!("ERROR_BAD_HASH_PREV: store {h}"),
+            });
+        }
+        let n = self.send_ctr.fetch_add(1, Ordering::SeqCst);
+        let sfn = format!("DPS-SFN-{n}");
+        self.log(format!("send_chk→SENT({sfn})"));
+        // Sent ack = empty data_sign (KVT1 evidence comes from last_chk).
+        Ok(CheckAck {
+            id: sfn,
+            id_sign: vec![],
+            data_sign: vec![],
+        })
+    }
+
+    async fn last_chk(&self, _f: &CheckSignBlob) -> Result<CheckAck, DpsError> {
+        if !self.online.load(Ordering::SeqCst) {
+            self.log("last_chk→NET_DOWN".into());
+            return Err(DpsError::Transport("matrix: network down".into()));
+        }
+        let n = self.send_ctr.load(Ordering::SeqCst);
+        self.log("last_chk→KVT1".into());
+        Ok(CheckAck {
+            id: format!("DPS-SFN-{}", n.saturating_sub(1)),
+            id_sign: vec![],
+            // ≥ MIN_KVT1_DATA_SIGN_LEN (64): a plausibly-sized fake KVT1 quittance.
+            data_sign: vec![0xA0u8.wrapping_add(n as u8); 64],
+        })
+    }
+
+    async fn ping(&self, _e: CheckEnvelope) -> Result<CheckAck, DpsError> {
+        if !self.online.load(Ordering::SeqCst) {
+            return Err(DpsError::Transport("matrix: network down".into()));
+        }
+        Ok(CheckAck {
+            id: "PING".into(),
+            id_sign: vec![],
+            data_sign: vec![],
+        })
+    }
+
+    async fn status_rro(&self, _f: &CheckSignBlob) -> Result<StatusSnapshot, DpsError> {
+        if !self.online.load(Ordering::SeqCst) {
+            return Err(DpsError::Transport("matrix: network down".into()));
+        }
+        Ok(StatusSnapshot {
+            open_shift: self.open_shift.load(Ordering::SeqCst),
+            online: true,
+            last_signer: "matrix".into(),
+        })
+    }
+
+    async fn info_rro(&self, _f: &CheckSignBlob) -> Result<RroInfo, DpsError> {
+        Err(DpsError::Internal("matrix: info_rro not scripted".into()))
+    }
+
+    async fn ask_offline_codes(&self, _e: CheckEnvelope) -> Result<OfflineCodesResponse, DpsError> {
+        Err(DpsError::Internal(
+            "matrix: ask_offline_codes not scripted (codes are pre-seeded)".into(),
+        ))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Packet generator — varied WIRE-shape receipts (NOT one canned check)
+// ════════════════════════════════════════════════════════════════════════
+
+/// Deterministic-from-`seed` line + payment set: varied item count (1–3),
+/// varied per-item prices, alternating cash/card payform. Returns the WIRE
+/// `goods` + `payments` JSON fragments and the total. Reproducible.
+fn gen_line_and_pay(seed: u64) -> (String, String, i64) {
+    let n_items = 1 + (seed % 3) as usize;
+    let mut goods = String::new();
+    let mut total: i64 = 0;
+    for k in 0..n_items {
+        let price = 1000 + (((seed >> (k * 3)) % 90) as i64 + 1) * 100; // 1100..=10000
+        total += price;
+        if k > 0 {
+            goods.push(',');
+        }
+        goods.push_str(&format!(
+            r#"{{"name":"Item {k}","quantity_milli":1000,"price_kopecks":{price},"tax_group_1":1,"tax_group_2":0,"article_code":{}}}"#,
+            k + 1
+        ));
+    }
+    let kind = if seed.is_multiple_of(2) {
+        "CASH"
+    } else {
+        "CASHLESS_1"
+    };
+    let payments = format!(r#"[{{"type":"{kind}","amount_kopecks":{total}}}]"#);
+    (goods, payments, total)
+}
+
+/// A wire `CanonicalCommand` for a SELL keyed by `seed`.
+fn sell_body(fiscal_number: &str, seed: u64, idem: &str) -> (String, i64) {
+    let (goods, payments, total) = gen_line_and_pay(seed);
+    let body = format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"SELL","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[{goods}],"payments":{payments},"totals":{{"sale_kopecks":{total},"return_kopecks":0}}}}}}"#
+    );
+    (body, total)
+}
+
+/// A wire `CanonicalCommand` for a RETURN keyed by `seed`.
+fn return_body(fiscal_number: &str, seed: u64, idem: &str) -> (String, i64) {
+    let (goods, payments, total) = gen_line_and_pay(seed);
+    let body = format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"RETURN","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"RETURN","goods":[{goods}],"payments":{payments},"totals":{{"sale_kopecks":0,"return_kopecks":{total}}}}}}}"#
+    );
+    (body, total)
+}
+
+/// A wire `CanonicalCommand` for a SERVICE_IN (службове внесення — cash INTO the
+/// drawer). Amount rides on `totals.sale_kopecks`; goods/payments empty.
+fn service_in_body(fiscal_number: &str, kop: i64, idem: &str) -> String {
+    format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"SERVICE_IN","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[],"totals":{{"sale_kopecks":{kop},"return_kopecks":0}}}}}}"#
+    )
+}
+
+/// A wire `CanonicalCommand` for a SERVICE_OUT (службова видача — cash OUT of the
+/// drawer). Amount rides on `totals.return_kopecks` (ASYMMETRIC vs SERVICE_IN).
+fn service_out_body(fiscal_number: &str, kop: i64, idem: &str) -> String {
+    format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"SERVICE_OUT","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[],"totals":{{"sale_kopecks":0,"return_kopecks":{kop}}}}}}}"#
+    )
+}
+
+/// A wire `CanonicalCommand` for an EPZ cash advance (видача готівки за ЕПЗ —
+/// card-funded cash handed to the cardholder). One CASHLESS card leg with an
+/// acquirer slip at `pay_form_index` (must be ≥ 2 = a card slot); amount rides on
+/// `payments[0].amount_kopecks`; totals zero, goods empty.
+fn epz_body(fiscal_number: &str, kop: i64, pay_form_index: i64, idem: &str) -> String {
+    format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"CASH_ADVANCE_EPZ","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","goods":[],"payments":[{{"type":"CASHLESS_1","amount_kopecks":{kop},"acquirer_slip":{{"payment_form_index":{pay_form_index},"merchant_id":"M-1","terminal_id":"T-1","operation_type":"PURCHASE","pan":"**** 4242","approval_code":"APPR1","payment_system":"Visa","transaction_code":"RRN-1","fee_kopecks":0,"cashier_signature_placeholder":false,"cardholder_signature_placeholder":false}}}}],"totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+    )
+}
+
+/// A wire `CanonicalCommand` for a payload-less op (SHIFT_OPEN / Z_REPORT).
+fn simple_body(fiscal_number: &str, command_type: &str, idem: &str) -> String {
+    format!(
+        r#"{{"schema_version":"1.0","fiscal_number":"{fiscal_number}","command_type":"{command_type}","idempotency_key":"{idem}","cashier_id":"test-cashier","department":null,"return_check_number":null,"payload":{{"direction":"SALE","totals":{{"sale_kopecks":0,"return_kopecks":0}}}}}}"#
+    )
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// App boot + registry (mirrors the pilot scaffolding; offline_enabled=true)
+// ════════════════════════════════════════════════════════════════════════
+
+fn cfg_toml(db_path: &str) -> String {
+    format!(
+        r#"
+app_name = "prro"
+version  = "0.1.0"
+
+[database]
+db_path = "{db_path}"
+secure_db_path = "{db_path}_secure"
+
+[admin_ui]
+enabled = false
+listen  = "127.0.0.1:8444"
+"#
+    )
+}
+
+async fn boot_app() -> App {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("matrix.db");
+    std::mem::forget(dir);
+    let toml_text = cfg_toml(&db_path.display().to_string().replace('\\', "/"));
+    let cfg = AppConfig::from_toml(&toml_text).unwrap();
+    App::boot(cfg).await.unwrap()
+}
+
+struct FixtureLoader;
+#[async_trait]
+impl OperatorKeyLoader for FixtureLoader {
+    async fn load(
+        &self,
+        operator_id: &str,
+        _key_path: &Path,
+        _password: &[u8],
+    ) -> Result<SigningContext, KeyLoadFailure> {
+        let mut ctx = det_signing_ctx_for(operator_id);
+        ctx.session = SigningSession::new_for_test(
+            operator_id.to_string(),
+            [7u8; 32],
+            FIXTURE_CERT_DER.to_vec(),
+        );
+        Ok(ctx)
+    }
+}
+
+fn fn_config_for(fiscal_number: &str) -> fn_cfg::NewFnConfig {
+    fn_cfg::NewFnConfig {
+        fiscal_number: fiscal_number.into(),
+        tax_number: "12345678".into(),
+        vat_payer_inn: None,
+        fiscal_mode: FiscalMode::Test,
+        org_name: None,
+        point_name: None,
+        org_address: None,
+        tsp_enabled: false,
+        offline_enabled: true,
+        national_check_enabled: false,
+        min_offline_codes: 0,
+        max_offline_codes: 0,
+    }
+}
+
+async fn build_registry(app: &App, fns: &[&str], dps: Arc<dyn DpsChannel>) -> BindingsRegistry {
+    for fn_num in fns {
+        fn_cfg::insert(app.db(), &fn_config_for(fn_num))
+            .await
+            .expect("seed FN config");
+        ops_repo::insert(
+            app.db_secure(),
+            &ops_repo::NewOperator {
+                operator_id: format!("OP-{fn_num}"),
+                fiscal_number: (*fn_num).into(),
+                name: "Cashier".into(),
+                key_path: format!("/tmp/k-{fn_num}.dat"),
+                key_pass_enc: Coding::encode(b"secret1").expect("encode test password"),
+            },
+        )
+        .await
+        .expect("seed operator");
+        // Real per-FN default provisioning (tax_groups 1..11 + payment_methods
+        // cash=1/card=2 + outgress profile + integration flags) — the SAME
+        // production path `admin::register_fn` runs. The ingress `convert` needs
+        // these (tax-group + payment-method lookups) or it breaches / rejects.
+        prro::runtime::bootstrap::bootstrap_fn_defaults(app.db_secure(), fn_num)
+            .await
+            .expect("bootstrap FN defaults");
+    }
+    BindingsRegistry::build_from_db(app.db_secure(), app.db(), dps, &FixtureLoader)
+        .await
+        .expect("build_from_db")
+}
+
+async fn seed_boot_baseline(pool: &SqlitePool, fiscal_number: &str) {
+    sqlx::query(
+        "INSERT INTO node_state \
+         (fiscal_number, mode, shift_state, current_shift_id, next_lnd, \
+          backend_profile_id, transport_profile_id) \
+         VALUES (?, ?, ?, NULL, 1, 'b', 't')",
+    )
+    .bind(fiscal_number)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Closed.as_str())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Ingress driver (through the REAL ingress core) + probes
+// ════════════════════════════════════════════════════════════════════════
+
+/// Drive one wire `CanonicalCommand` (JSON body) through the REAL ingress core:
+/// `handle_command` → classify → convert → inbox → live binding → pipeline.
+/// Returns `(http_status, document_state | "ERR:<code>")`.
+async fn drive_ingress(
+    app: &App,
+    wp: &dyn WritePathEntry,
+    fiscal_number: &str,
+    body: &str,
+) -> (u16, String) {
+    let cmd: CanonicalCommand = serde_json::from_str(body).expect("parse wire CanonicalCommand");
+    let resp = handle_command(
+        &cmd,
+        fiscal_number,
+        DriverId::new("drv-test").unwrap(),
+        Protocol::Rest,
+        app.db(),
+        app.db_secure(),
+        wp,
+    )
+    .await;
+    match resp.body {
+        IngressBody::Success(cr) => (resp.http_status, cr.document_state),
+        IngressBody::Error(er) => (
+            resp.http_status,
+            format!("ERR:{} ({})", er.error_code, er.error_message),
+        ),
+        // The matrix harness has no `Action::XReport`, so the ingress core never
+        // returns an X-report body here. If an X-report action is ever added,
+        // this panic forces the driver to grow a real arm rather than silently
+        // mis-mapping the read snapshot to a "document_state".
+        IngressBody::XReport(_) => {
+            unreachable!("matrix harness issues no X-report; add an Action::XReport arm first")
+        }
+    }
+}
+
+async fn node_row(pool: &SqlitePool, fiscal_number: &str) -> (String, String) {
+    sqlx::query_as("SELECT mode, shift_state FROM node_state WHERE fiscal_number = ?")
+        .bind(fiscal_number)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn shift_state(pool: &SqlitePool, fiscal_number: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT state FROM shifts WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .unwrap_or_else(|| "<none>".into())
+}
+
+async fn doc_count_in_state(pool: &SqlitePool, fiscal_number: &str, state: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND state = ?",
+    )
+    .bind(fiscal_number)
+    .bind(state)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn cash_on_hand(pool: &SqlitePool, fiscal_number: &str) -> i64 {
+    prro::services::cash_ledger::cash_on_hand_for_fn(pool, fiscal_number)
+        .await
+        .unwrap_or(-1)
+}
+
+/// Count docs NOT in a terminal-rest state — the z-quiescence surface. A Z can
+/// only close when this is 0 (else `Z_QUIESCENCE_PENDING` / 503).
+#[allow(dead_code)]
+async fn non_terminal_doc_count(pool: &SqlitePool, fiscal_number: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? \
+         AND state NOT IN ('ACK','REJECTED','OFFLINE_LOCAL_ACK')",
+    )
+    .bind(fiscal_number)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The durable DB state of the most-recently-minted fiscal document — the doc
+/// under test after a scripted DPS reject.
+async fn last_doc_state(pool: &SqlitePool, fiscal_number: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The `server_fiscal_no` stamped on the most-recently-minted doc — the fiscal
+/// number the product accepted from the DPS `send_chk` ack (None if unstamped).
+async fn last_doc_sfn(pool: &SqlitePool, fiscal_number: &str) -> Option<String> {
+    let row: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT server_fiscal_no FROM fiscal_documents WHERE fiscal_number = ? \
+         ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.flatten()
+}
+
+/// The `mac_recovery_attempts` counter of the most-recently-minted doc (single-bit
+/// budget: 0 = never recovered, 1 = W10.4 recovery claimed + re-signed).
+async fn last_doc_mac_recovery_attempts(pool: &SqlitePool, fiscal_number: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT mac_recovery_attempts FROM fiscal_documents WHERE fiscal_number = ? \
+         ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The current online chain seed (`node_state.last_known_unsigned_xml_sha256`) as
+/// 64 lowercase hex chars — the hash the NEXT signed doc must chain from, i.e. what
+/// a REALISTIC DPS `-12` returns in its `store {hex}` message (DPS and local agree
+/// on the tip; the -12 is a transient MAC glitch on this doc's signing).
+async fn chain_seed_hex(pool: &SqlitePool, fiscal_number: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT lower(hex(last_known_unsigned_xml_sha256)) FROM node_state \
+         WHERE fiscal_number = ?",
+    )
+    .bind(fiscal_number)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Drain wiring (mirrors pilot_offline_full_drill_e2e)
+// ════════════════════════════════════════════════════════════════════════
+
+struct DrainCarriers {
+    dps: Arc<dyn DpsChannel>,
+    signing_ctx: SigningContext,
+    fn_sign: CheckSignBlob,
+}
+
+fn drain_carriers(dps: Arc<dyn DpsChannel>) -> DrainCarriers {
+    DrainCarriers {
+        dps,
+        signing_ctx: det_signing_ctx(),
+        fn_sign: CheckSignBlob(vec![0xAB, 0xCD]),
+    }
+}
+
+fn drain_view(c: &DrainCarriers) -> RuntimeView<'_> {
+    RuntimeView {
+        dps: c.dps.as_ref(),
+        signing_ctx: &c.signing_ctx,
+        fn_sign: &c.fn_sign,
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// The scenario interpreter
+// ════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Debug)]
+enum Action {
+    /// Online SHIFT_OPEN (net must be up).
+    Open,
+    /// A generated SELL packet keyed by `seed` (varied items/price/payform).
+    Sell(u64),
+    /// A generated RETURN packet keyed by `seed`.
+    Return(u64),
+    /// Z_REPORT — close the shift.
+    ZClose,
+    /// Physical network drop (DPS unreachable) — mode is NOT touched.
+    NetDown,
+    /// Physical network restore.
+    NetUp,
+    /// Node reacts to the drop: GO_OFFLINE via the live door + seed codes.
+    GoOffline,
+    /// Net restored: GO_ONLINE via the live door + one drain tick.
+    GoOnlineDrain,
+    /// SELL while the net is DOWN but mode is STILL ONLINE → CS-3 S7-1: the wire
+    /// failure after CALL_STARTED is a recorded HOLD (SENDING + STOP), online-origin,
+    /// NOT OLA/lost and NOT auto-retryable ErrorRetryable.
+    SellRetryable(u64),
+    /// Службове внесення — cash INTO the drawer, `kop` kopecks.
+    ServiceIn(i64),
+    /// Службова видача — cash OUT of the drawer, `kop` kopecks. The drawer must
+    /// hold ≥ `kop` (guard-3b), else the op refuses (use a bespoke test for that).
+    ServiceOut(i64),
+    /// EPZ cash advance (видача готівки за ЕПЗ) — `kop` kopecks, card-funded (pay
+    /// form index 2). Drawer must hold ≥ `kop` (guard-3c).
+    Epz(i64),
+}
+
+/// Execute one Action for a given fiscal_number, returning the step outcome string.
+/// Used by both `run` (single-FN) and `run_interleaved` (multi-FN).
+async fn apply_action(
+    name: &str,
+    i: usize,
+    fiscal_number: &str,
+    act: &Action,
+    app: &App,
+    wp: &dyn WritePathEntry,
+    dps: &Arc<MatrixDps>,
+) -> String {
+    match act {
+        Action::Open => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &simple_body(
+                    fiscal_number,
+                    "SHIFT_OPEN",
+                    &format!("mx-{name}-{fiscal_number}-OPEN-{i}"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                state,
+                DocState::Ack.as_str(),
+                "SHIFT_OPEN → ACK [{status}] (fn={fiscal_number})"
+            );
+            assert_eq!(
+                shift_state(app.db(), fiscal_number).await,
+                "OPENED",
+                "shift OPENED after open (fn={fiscal_number})"
+            );
+            format!("SHIFT_OPEN → {state} [{status}]")
+        }
+        Action::Sell(seed) => {
+            let (body, total) = sell_body(
+                fiscal_number,
+                *seed,
+                &format!("mx-{name}-{fiscal_number}-SELL-{i}"),
+            );
+            let (status, state) = drive_ingress(app, wp, fiscal_number, &body).await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "SELL step {i}: fn={fiscal_number} mode={mode} status={status}"
+            );
+            format!("SELL(seed={seed},total={total}) → {state} [{status}]")
+        }
+        Action::Return(seed) => {
+            let (body, total) = return_body(
+                fiscal_number,
+                *seed,
+                &format!("mx-{name}-{fiscal_number}-RET-{i}"),
+            );
+            let (status, state) = drive_ingress(app, wp, fiscal_number, &body).await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "RETURN step {i}: fn={fiscal_number} mode={mode} status={status}"
+            );
+            format!("RETURN(seed={seed},total={total}) → {state} [{status}]")
+        }
+        Action::ZClose => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &simple_body(
+                    fiscal_number,
+                    "Z_REPORT",
+                    &format!("mx-{name}-{fiscal_number}-Z-{i}"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                state,
+                DocState::Ack.as_str(),
+                "Z → ACK [{status}] (fn={fiscal_number})"
+            );
+            assert_eq!(
+                shift_state(app.db(), fiscal_number).await,
+                "CLOSED",
+                "shift CLOSED after Z (fn={fiscal_number})"
+            );
+            format!("Z_REPORT → {state} [{status}] (shift CLOSED)")
+        }
+        Action::NetDown => {
+            dps.set_online(false);
+            "NET_DOWN (DPS unreachable)".into()
+        }
+        Action::NetUp => {
+            dps.set_online(true);
+            "NET_UP (DPS restored)".into()
+        }
+        Action::GoOffline => {
+            prro::admin::go_offline(app.db(), fiscal_number, "matrix: net down")
+                .await
+                .expect("live door: GO_OFFLINE");
+            let codes: Vec<String> = (0..20)
+                .map(|j| format!("MX-{name}-{fiscal_number}-{i}-{j}"))
+                .collect();
+            prro::admin::seed_dps_offline_codes(app.db(), fiscal_number, &codes)
+                .await
+                .expect("seed offline codes");
+            assert_eq!(
+                node_row(app.db(), fiscal_number).await.0,
+                "OFFLINE",
+                "mode OFFLINE after GO_OFFLINE (fn={fiscal_number})"
+            );
+            "GO_OFFLINE (live door) + 20 codes seeded".into()
+        }
+        Action::GoOnlineDrain => {
+            prro::admin::go_online(app.db(), fiscal_number, "matrix: net restored")
+                .await
+                .expect("live door: GO_ONLINE");
+            assert_eq!(
+                node_row(app.db(), fiscal_number).await.0,
+                "GOING_ONLINE",
+                "mode GOING_ONLINE (fn={fiscal_number})"
+            );
+            let carriers = drain_carriers(dps.clone());
+            let view = drain_view(&carriers);
+            let outcome = app
+                .drain_offline_backlog_scheduled(fiscal_number, &view)
+                .await
+                .expect("drain must run for GOING_ONLINE FN");
+            match outcome {
+                ScheduledDrainOutcome::Ran(_) => {}
+                ScheduledDrainOutcome::SkippedBackoff { .. } => {
+                    panic!("drain must run, not skip-backoff (fn={fiscal_number})")
+                }
+            }
+            assert_eq!(
+                doc_count_in_state(app.db(), fiscal_number, "OFFLINE_LOCAL_ACK").await,
+                0,
+                "all OLA docs drained to terminal after GO_ONLINE+drain (fn={fiscal_number})"
+            );
+            assert_eq!(
+                node_row(app.db(), fiscal_number).await.0,
+                "ONLINE",
+                "mode ONLINE after drain converge (fn={fiscal_number})"
+            );
+            "GO_ONLINE (live door) + drain → converged".into()
+        }
+        Action::SellRetryable(seed) => {
+            let (body, total) = sell_body(
+                fiscal_number,
+                *seed,
+                &format!("mx-{name}-{fiscal_number}-SELLR-{i}"),
+            );
+            let (status, _resp) = drive_ingress(app, wp, fiscal_number, &body).await;
+            let doc = last_doc_state(app.db(), fiscal_number).await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            // CS-3 S7-1: a net-drop mid-online SELL is a wire failure AFTER CALL_STARTED —
+            // ambiguous (the send may have reached DPS), so it is a recorded HOLD
+            // (SubmittedUnknown), NOT auto-retryable ErrorRetryable. The receipt rests SENDING
+            // (online-origin: NOT OLA, NOT lost) and the node halts to STOP_MODE (not OFFLINE)
+            // pending operator / boot resolution — a conscious liveness trade for P2.
+            assert_eq!(
+                doc,
+                DocState::Sending.as_str(),
+                "net-down online SELL step {i}: doc HELD (SENDING), stays online-origin \
+                 — NOT OLA, NOT lost (fn={fiscal_number})"
+            );
+            assert_eq!(
+                mode, "STOP_MODE",
+                "net-down SELL after CALL_STARTED halts the node (ambiguous hold, NOT OFFLINE) \
+                 (fn={fiscal_number})"
+            );
+            format!(
+                "SELL(seed={seed},total={total}) NET-DOWN → HELD doc={doc} mode={mode} [{status}]"
+            )
+        }
+        // CS-3 S7-1: `Action::Reconcile` (re-drive ErrorRetryable → KVT1) and
+        // `Action::OnlineConverge` (KVT1 → ACK) were RETIRED with the auto-recovery arc.
+        // R6 makes a stuck ErrorRetryable escalate to RequiresManualReconciliation (no
+        // re-drive), and transport failures are now a HOLD (SubmittedUnknown) resolved by
+        // the operator seam — so the old net-drop → re-drive → converge → ACK path no
+        // longer exists. Removed here (were used only by the pre-cutover S5).
+        Action::ServiceIn(kop) => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &service_in_body(
+                    fiscal_number,
+                    *kop,
+                    &format!("mx-{name}-{fiscal_number}-SVCIN-{i}"),
+                ),
+            )
+            .await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "SERVICE_IN step {i}: fn={fiscal_number} mode={mode} status={status}"
+            );
+            format!("SERVICE_IN(+{kop}) → {state} [{status}]")
+        }
+        Action::ServiceOut(kop) => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &service_out_body(
+                    fiscal_number,
+                    *kop,
+                    &format!("mx-{name}-{fiscal_number}-SVCOUT-{i}"),
+                ),
+            )
+            .await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "SERVICE_OUT step {i}: fn={fiscal_number} mode={mode} status={status} (drawer must cover {kop})"
+            );
+            format!("SERVICE_OUT(-{kop}) → {state} [{status}]")
+        }
+        Action::Epz(kop) => {
+            let (status, state) = drive_ingress(
+                app,
+                wp,
+                fiscal_number,
+                &epz_body(
+                    fiscal_number,
+                    *kop,
+                    2,
+                    &format!("mx-{name}-{fiscal_number}-EPZ-{i}"),
+                ),
+            )
+            .await;
+            let mode = node_row(app.db(), fiscal_number).await.0;
+            let want = if mode == "OFFLINE" {
+                DocState::OfflineLocalAck.as_str()
+            } else {
+                DocState::Ack.as_str()
+            };
+            assert_eq!(
+                state, want,
+                "EPZ step {i}: fn={fiscal_number} mode={mode} status={status} (drawer must cover {kop})"
+            );
+            format!("EPZ(-{kop} card-funded) → {state} [{status}]")
+        }
+    }
+}
+
+/// Run a single-FN scenario end-to-end through the real ingress, logging every
+/// step and asserting the ledger invariant scan after each. HALTS (panics with
+/// the log printed above) on the first divergence.
+async fn run(
+    name: &str,
+    steps: &[Action],
+    app: &App,
+    wp: &dyn WritePathEntry,
+    dps: &Arc<MatrixDps>,
+) {
+    run_for_fn(name, FN, steps, app, wp, dps).await;
+}
+
+/// Like `run` but for an explicit fiscal_number (used when S1-S15/B1 pass FN_A
+/// explicitly, or for single-FN slices of multi-FN scenarios).
+async fn run_for_fn(
+    name: &str,
+    fiscal_number: &str,
+    steps: &[Action],
+    app: &App,
+    wp: &dyn WritePathEntry,
+    dps: &Arc<MatrixDps>,
+) {
+    eprintln!("\n════════ SCENARIO: {name} (fn={fiscal_number}) ════════");
+    for (i, act) in steps.iter().enumerate() {
+        let t0 = Instant::now();
+        let outcome = apply_action(name, i, fiscal_number, act, app, wp, dps).await;
+        let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let (mode, node_shift) = node_row(app.db(), fiscal_number).await;
+        let wire = dps.drain_calls();
+        eprintln!(
+            "[{name}][step {i:>2}] {outcome:<48} {dt_ms:>6.1}ms | mode={mode:<12} shift={:<10} node_shift={node_shift:<10} cash={} | dps{:?}",
+            shift_state(app.db(), fiscal_number).await,
+            cash_on_hand(app.db(), fiscal_number).await,
+            wire,
+        );
+        // HALT-ON-ERROR: whole-DB universal oracle (covers all FNs in this App).
+        prro::db::invariant_scan::assert_clean(app.db()).await;
+    }
+    eprintln!("════════ {name}: PASS ════════\n");
+}
+
+/// Run a multi-FN interleaved scenario. Each step is `(fiscal_number, Action)`.
+/// The whole-DB `assert_clean` runs after every step.
+async fn run_interleaved(
+    name: &str,
+    steps: &[(&str, Action)],
+    app: &App,
+    wp: &dyn WritePathEntry,
+    dps: &Arc<MatrixDps>,
+) {
+    eprintln!("\n════════ SCENARIO (interleaved): {name} ════════");
+    for (i, (fn_num, act)) in steps.iter().enumerate() {
+        let t0 = Instant::now();
+        let outcome = apply_action(name, i, fn_num, act, app, wp, dps).await;
+        let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let (mode_a, _) = node_row(app.db(), FN_A).await;
+        let (mode_b, _) = node_row(app.db(), FN_B).await;
+        let wire = dps.drain_calls();
+        eprintln!(
+            "[{name}][step {i:>2}][fn={fn_num}] {outcome:<44} {dt_ms:>6.1}ms | A={mode_a} B={mode_b} | dps{:?}",
+            wire,
+        );
+        // HALT-ON-ERROR: whole-DB oracle — covers BOTH FN_A and FN_B in one scan.
+        prro::db::invariant_scan::assert_clean(app.db()).await;
+    }
+    eprintln!("════════ {name}: PASS ════════\n");
+}
+
+async fn fresh_harness(fns: &[&str]) -> (App, Arc<MatrixDps>, Arc<dyn WritePathEntry>) {
+    let app = boot_app().await;
+    let dps = Arc::new(MatrixDps::new());
+    let registry = build_registry(&app, fns, dps.clone()).await;
+    for fn_num in fns {
+        seed_boot_baseline(app.db(), fn_num).await;
+    }
+    let wp = production_write_path(app.clone(), Arc::new(registry));
+    (app, dps, wp)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Increment 1/2 scenarios — harness self-proof on KNOWN-GREEN paths
+// ════════════════════════════════════════════════════════════════════════
+
+/// S1 — online happy life: open, three VARIED sells, one return, close.
+/// Proves the harness drives varied generated packets through the REAL ingress
+/// to terminal ACK on a clean scan at every step.
+#[tokio::test]
+async fn matrix_s1_online_happy_varied_packets() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let steps = vec![
+        Action::Open,
+        Action::Sell(1),
+        Action::Sell(2),
+        Action::Sell(7),
+        Action::Return(2),
+        Action::ZClose,
+    ];
+    run("S1-online-happy", &steps, &app, &*wp, &dps).await;
+}
+
+/// S2 — offline lifecycle: open online, sell online, DROP the net, go offline,
+/// sell/return offline (OLA), restore the net, go online + drain (converge),
+/// then close with a Z. This is the core online↔offline↔drain transition the
+/// operator flagged as "only think it works" — now watched end-to-end through
+/// the real ingress.
+#[tokio::test]
+async fn matrix_s2_offline_lifecycle_drain_close() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let steps = vec![
+        Action::Open,
+        Action::Sell(3),
+        Action::NetDown,
+        Action::GoOffline,
+        Action::Sell(4),
+        Action::Sell(5),
+        Action::Return(4),
+        Action::NetUp,
+        Action::GoOnlineDrain,
+        Action::ZClose,
+    ];
+    run("S2-offline-lifecycle", &steps, &app, &*wp, &dps).await;
+}
+
+/// S3 — DPS REJECT CORPUS ("соберём ошибки ДПС"). For a representative DPS
+/// reject code per routing class (`error_routing.rs`), inject it at the SELL's
+/// send, then record the product's END-TO-END reaction (ingress response + the
+/// durable doc state + node mode) and ASSERT it matches the routing spec. This
+/// is the byzantine-DPS empirical groundwork + the transition matrix UNDER
+/// DPS-reject, proven through the real ingress. `assert_clean` is the universal
+/// oracle after every reject. Each code runs on a FRESH harness (a `-11` BLOCK
+/// would poison a shared node).
+#[tokio::test]
+async fn matrix_s3_dps_reject_corpus() {
+    // (DPS code, meaning, expected durable doc state, expected node mode after)
+    let corpus: &[(i32, &str, DocState, &str)] = &[
+        (
+            -2,
+            "ERROR_CHECK (terminal reject)",
+            DocState::Rejected,
+            "ONLINE",
+        ),
+        (
+            // CS-3 S7-1: a transient reject after CALL_STARTED is a recorded HOLD
+            // (SubmittedUnknown), not an auto-retryable ErrorRetryable.
+            -3,
+            "ERROR_SAVE (transient → HELD)",
+            DocState::Sending,
+            "STOP_MODE",
+        ),
+        (
+            -5,
+            "ERROR_TYPE (builder-bug reject)",
+            DocState::Rejected,
+            "ONLINE",
+        ),
+        (
+            // CS-3 S7-1: the operator-escalation reject is now a recorded HOLD (node STOP).
+            -6,
+            "ERROR_NOT_PREV_ZREPORT (escalate → HELD)",
+            DocState::Sending,
+            "STOP_MODE",
+        ),
+        (
+            -11,
+            "ERROR_OFFLINE_168 (reject + BLOCK)",
+            DocState::Rejected,
+            "BLOCKED",
+        ),
+        // NOTE: -12 (ERROR_BAD_HASH_PREV) is intentionally NOT in this simple-reject
+        // corpus. CS-3 S7-1 (R3) retired the inline MAC-recovery loop: a -12 is now a
+        // recorded HOLD (MacReseedPending → SENDING + STOP), covered by the dedicated
+        // matrix_s14/s15 pins and write_path_stage4_send::minus_12_*. Including it here
+        // would just duplicate the transient→HELD row above.
+        (
+            -15,
+            "ERROR_NOT_OPEN_SHIFT (reject)",
+            DocState::Rejected,
+            "ONLINE",
+        ),
+        (
+            -16,
+            "ERROR_OFFLINE_ID (reject)",
+            DocState::Rejected,
+            "ONLINE",
+        ),
+        (
+            // CS-3 S7-1: an unknown code (byzantine fallback) is held, not auto-retried.
+            -99,
+            "unknown code (byzantine → HELD)",
+            DocState::Sending,
+            "STOP_MODE",
+        ),
+    ];
+    eprintln!("\n════════ DPS REJECT CORPUS ════════");
+    for (code, meaning, exp_state, exp_mode) in corpus {
+        let (app, dps, wp) = fresh_harness(&[FN]).await;
+        // Open a shift online (this send succeeds).
+        let (st, _) = drive_ingress(
+            &app,
+            &*wp,
+            FN,
+            &simple_body(FN, "SHIFT_OPEN", "corpus-OPEN"),
+        )
+        .await;
+        assert_eq!(
+            st, 200,
+            "corpus setup: SHIFT_OPEN must ACK before the reject (code {code})"
+        );
+        // Inject the DPS reject onto the SELL's send.
+        dps.reject_next(FN, *code);
+        let (body, _total) = sell_body(FN, 1, "corpus-SELL");
+        let (status, resp) = drive_ingress(&app, &*wp, FN, &body).await;
+        let doc = last_doc_state(app.db(), FN).await;
+        let mode = node_row(app.db(), FN).await.0;
+        eprintln!(
+            "[corpus] DPS {code:>4} {meaning:<38} → ingress[{status} {resp:<34.34}] doc={doc:<15} node={mode}"
+        );
+        assert_eq!(
+            doc,
+            exp_state.as_str(),
+            "DPS {code}: durable doc state must match routing spec"
+        );
+        assert_eq!(mode, *exp_mode, "DPS {code}: node mode after reject");
+        prro::db::invariant_scan::assert_clean(app.db()).await;
+    }
+    eprintln!("════════ DPS REJECT CORPUS: PASS ════════\n");
+}
+
+/// (fiscal_documents count for `fiscal_number`, sqlite page_count) — coarse DB-growth probe.
+async fn db_stats(pool: &SqlitePool, fiscal_number: &str) -> (i64, i64) {
+    let docs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ?")
+            .bind(fiscal_number)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(-1);
+    (docs, pages)
+}
+
+/// S4 — THROUGHPUT + DB behavior ("посмотрим как база работает, померяем
+/// скорості full-end"). Drive a large batch of VARIED SELLs through the real
+/// ingress on one open shift, then a Z, measuring per-op latency + throughput +
+/// DB growth. CAVEAT: signing here is the DetCrypto STUB (constant CMS), so this
+/// measures the DB + ingress + staged-pipeline + orchestration cost per receipt,
+/// NOT real DSTU-4145 crypto cost (that is a separate live/bench concern).
+#[tokio::test]
+async fn matrix_s4_throughput_and_db() {
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "perf-OPEN")).await;
+    assert_eq!(st, 200, "perf setup: SHIFT_OPEN must ACK");
+
+    let n: u64 = 200;
+    let t0 = Instant::now();
+    for i in 0..n {
+        let (body, _) = sell_body(FN, i, &format!("perf-SELL-{i}"));
+        let (status, _state) = drive_ingress(&app, &*wp, FN, &body).await;
+        assert_eq!(status, 200, "SELL {i} must ACK");
+    }
+    let elapsed = t0.elapsed();
+    let (dz, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "Z_REPORT", "perf-Z")).await;
+    assert_eq!(dz, 200, "perf: Z must close the shift");
+
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let per_ms = total_ms / n as f64;
+    let ops = n as f64 / elapsed.as_secs_f64();
+    let (docs, pages) = db_stats(app.db(), FN).await;
+    eprintln!("\n════════ THROUGHPUT (sign=STUB) ════════");
+    eprintln!(
+        "  {n} SELLs in {total_ms:.0}ms  →  {per_ms:.2} ms/sell, {ops:.0} sells/sec  (pipeline+DB, crypto stubbed)"
+    );
+    eprintln!("  DB after Z: fiscal_documents={docs}, sqlite page_count={pages}");
+    eprintln!("════════════════════════════════════════\n");
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+}
+
+/// S5 — net-drop MID-ONLINE (the least-verified transition cell). The network
+/// drops while the node is STILL ONLINE (no operator GO_OFFLINE). CS-3 S7-1: a
+/// wire failure AFTER CALL_STARTED is AMBIGUOUS (the send may have reached DPS),
+/// so the SELL is a recorded HOLD (SubmittedUnknown), NOT auto-retryable — the
+/// receipt rests SENDING (online-origin: neither lost nor turned into an
+/// offline-local-ack) and the node halts to STOP_MODE (NOT flipped to OFFLINE),
+/// on a CLEAN scan. Recovery is operator/boot-driven, not an auto re-drive — a
+/// conscious liveness trade for P2 double-issue safety, so the old
+/// reconcile→KVT1→converge→ACK→Z arc no longer applies to this cell. Whole path:
+/// real ingress → write-path → stage_send (wire fails) → composed record/apply →
+/// HELD (SENDING + STOP); only the network (MatrixDps) is faked.
+#[tokio::test]
+async fn matrix_s5_net_drop_mid_online_holds_stop() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let steps = vec![
+        Action::Open,             // online SHIFT_OPEN → ACK
+        Action::Sell(6),          // online SELL → ACK
+        Action::NetDown,          // physical net drop; mode STAYS online until the wire fails
+        Action::SellRetryable(8), // SELL → transport HOLD (SENDING + STOP), online-origin
+    ];
+    // Net-drop-mid-online: NET_DOWN online SELL → HELD (SENDING, online-origin, NOT
+    // OLA, NOT lost) + node STOP_MODE, on a clean scan. The `SellRetryable` step
+    // asserts the HELD contract; `run` scans clean after each step (the held pair is
+    // exempt under STOP + PENDING_APPLY). Operator/boot resolution of the hold and
+    // shift closure are out of this cell's scope (they are separate operator seams).
+    run("S5-net-drop-online", &steps, &app, &*wp, &dps).await;
+}
+
+/// S6 — MIXED ONLINE↔OFFLINE DAY (the realistic degraded day). ONE shift lives
+/// through the whole arc: online sells → net drop → operator GO_OFFLINE →
+/// offline sells + a return (OLA) → net restore → GO_ONLINE + drain (backlog
+/// converges) → MORE online sells AFTER the drain, same shift → Z. This is the
+/// online→offline→online-WITHIN-ONE-SHIFT path the operator flagged as
+/// "only think it works": selling on BOTH sides of an offline window and closing
+/// clean. Every step scanned (`assert_clean`); a stuck non-terminal doc halts.
+#[tokio::test]
+async fn matrix_s6_mixed_online_offline_day() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let steps = vec![
+        Action::Open,
+        Action::Sell(11),
+        Action::Sell(12),
+        Action::NetDown,
+        Action::GoOffline,
+        Action::Sell(13),
+        Action::Return(12),
+        Action::Sell(14),
+        Action::NetUp,
+        Action::GoOnlineDrain,
+        Action::Sell(15), // online SELL AFTER the drain, SAME shift
+        Action::Return(11),
+        Action::ZClose,
+    ];
+    run("S6-mixed-day", &steps, &app, &*wp, &dps).await;
+}
+
+/// S7 — MULTI-SHIFT SEQUENCE (reopen after close). Three shifts back-to-back on
+/// the SAME FN: Open→sells→Z, Open→sell→Z, Open→sell→return→Z. Proves the shift
+/// machine REOPENS cleanly after a Z (a Z closes the SHIFT, not the node) and
+/// that chain / seed / lnd continuity holds ACROSS shift boundaries — the fiscal
+/// chain must not fork or reset at a Z. Each Z leaves a clean scan; each reopen
+/// mints a fresh OPENED shift. Return-after-sell keeps drawer cash ≥ 0.
+#[tokio::test]
+async fn matrix_s7_multi_shift_reopen_sequence() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let steps = vec![
+        // ── shift 1 ──
+        Action::Open,
+        Action::Sell(21),
+        Action::Sell(22),
+        Action::ZClose,
+        // ── shift 2 ──
+        Action::Open,
+        Action::Sell(23),
+        Action::ZClose,
+        // ── shift 3 ──
+        Action::Open,
+        Action::Sell(24),
+        Action::Return(21),
+        Action::ZClose,
+    ];
+    run("S7-multi-shift", &steps, &app, &*wp, &dps).await;
+}
+
+/// S8 — CROSS-SHIFT CASH CARRY-OVER (pins the behavior S7's log surfaced). A Z
+/// does NOT empty the physical drawer: the залишок готівки carries to the next
+/// shift as its opening anchor (Ukrainian fiscal reality — cash stays in the till
+/// across shifts until a службова видача). S7's log showed cash oscillating
+/// `4600 → 0 (at Z) → 4600 (at reopen)`, which reads alarming but is correct.
+/// This turns that observation into teeth by pinning three facts:
+///   (1) during the CLOSED window `cash_on_hand_for_fn` returns the DOCUMENTED
+///       no-open-shift sentinel (0) — an out-of-contract read; the drawer is not
+///       emptied, just unattributed (X-report is gated to open shifts, so prod
+///       never reads cash here);
+///   (2) the next shift OPENS with an opening drawer == the prior shift's CLOSE
+///       drawer — carry-over is wired, not reset to 0;
+///   (3) the carried cash is strictly > 0 (non-vacuous pin).
+/// Even seeds are CASH payform (`gen_line_and_pay`: `seed.is_multiple_of(2)`), so
+/// the drawer provably moves. A regression that resets the drawer at Z, or that
+/// leaks drawer cash during the closed window, goes RED here.
+#[tokio::test]
+async fn matrix_s8_cross_shift_cash_carryover() {
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+
+    // ── shift 1: open + two CASH sells (even seeds) → drawer accumulates ──
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s8-OPEN-1")).await;
+    assert_eq!(st, 200, "S8 setup: shift 1 SHIFT_OPEN must ACK");
+    for (idx, seed) in [2u64, 6u64].into_iter().enumerate() {
+        let (body, _t) = sell_body(FN, seed, &format!("s8-SELL1-{idx}"));
+        let (s, state) = drive_ingress(&app, &*wp, FN, &body).await;
+        assert_eq!(
+            state,
+            DocState::Ack.as_str(),
+            "S8 shift-1 CASH sell {idx} (seed={seed}) → ACK [{s}]"
+        );
+    }
+    // Drawer at the END of shift 1 — still OPEN, so this is an IN-contract read.
+    let close_drawer_1 = cash_on_hand(app.db(), FN).await;
+    assert!(
+        close_drawer_1 > 0,
+        "S8 precondition: shift 1 must accumulate CASH to carry (got {close_drawer_1})"
+    );
+
+    // ── Z closes shift 1 ──
+    let (zs, zstate) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "Z_REPORT", "s8-Z-1")).await;
+    assert_eq!(zstate, DocState::Ack.as_str(), "S8 Z-1 → ACK [{zs}]");
+    assert_eq!(
+        shift_state(app.db(), FN).await,
+        "CLOSED",
+        "S8 shift 1 CLOSED after Z"
+    );
+
+    // (1) Closed-window read → documented no-open-shift sentinel (0), NOT the drawer.
+    let sentinel = cash_on_hand(app.db(), FN).await;
+    assert_eq!(
+        sentinel, 0,
+        "S8: cash_on_hand during the CLOSED window is the no-open-shift sentinel (0), \
+         not the drawer ({close_drawer_1}) — the drawer is not emptied, just unattributed"
+    );
+
+    // ── shift 2: reopen ──
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s8-OPEN-2")).await;
+    assert_eq!(os, 200, "S8: shift 2 SHIFT_OPEN must ACK");
+    assert_eq!(
+        shift_state(app.db(), FN).await,
+        "OPENED",
+        "S8 shift 2 OPENED"
+    );
+
+    // (2)+(3) Opening drawer of shift 2 == closing drawer of shift 1 (carry-over).
+    let open_drawer_2 = cash_on_hand(app.db(), FN).await;
+    assert_eq!(
+        open_drawer_2, close_drawer_1,
+        "S8: drawer cash must CARRY across the Z — shift-2 opening anchor ({open_drawer_2}) \
+         must equal shift-1 closing drawer ({close_drawer_1}), not reset to 0"
+    );
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S8-carryover: PASS — drawer {close_drawer_1} carried across Z \
+         (sentinel 0 during closed window) ════════"
+    );
+}
+
+/// S9 — SERVICE-IO LIFECYCLE (службові внесення/видача through the real path).
+/// Open → внесення (+50.00) → a CASH sell → видача (−20.00, covered) → Z. Proves
+/// the drawer tracks service cash-in/out and that a shift holding service-io docs
+/// still reaches a CLEAN Z (the `<IO>` aggregation + z-quiescence include
+/// service-io — the #192 z-quiescence class L3 fixed). The per-step log shows the
+/// drawer move.
+#[tokio::test]
+async fn matrix_s9_service_io_lifecycle() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let steps = vec![
+        Action::Open,
+        Action::ServiceIn(5000),  // +50.00 into the drawer
+        Action::Sell(2),          // even seed = CASH sell → drawer grows
+        Action::ServiceOut(2000), // -20.00 out of the drawer (covered)
+        Action::ZClose,
+    ];
+    run("S9-service-io", &steps, &app, &*wp, &dps).await;
+}
+
+/// S10 — SERVICE-OUT guard-3b teeth (fail-closed видача over an empty drawer). A
+/// службова видача larger than the drawer must be REFUSED at the canonical
+/// boundary (CASH_INSUFFICIENT / HTTP 422) and mint ZERO fiscal rows — the drawer
+/// can never go negative (INV-21). Then a видача of EXACTLY the funded drawer
+/// proceeds to ACK and drains it to 0, proving the guard is a floor, not a wall.
+#[tokio::test]
+async fn matrix_s10_service_out_guard_3b() {
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s10-OPEN")).await;
+    assert_eq!(st, 200, "S10 setup: SHIFT_OPEN must ACK");
+    let rows_before = db_stats(app.db(), FN).await.0;
+
+    // over-drawer видача on an EMPTY drawer → fail-closed, row-less
+    let (status, state) = drive_ingress(
+        &app,
+        &*wp,
+        FN,
+        &service_out_body(FN, 5000, "s10-SVCOUT-over"),
+    )
+    .await;
+    assert_eq!(
+        status, 422,
+        "S10: over-drawer SERVICE_OUT must be HTTP 422 (got {status}: {state})"
+    );
+    assert!(
+        state.contains("CASH_INSUFFICIENT"),
+        "S10: refusal must be CASH_INSUFFICIENT, got {state}"
+    );
+    assert_eq!(
+        db_stats(app.db(), FN).await.0,
+        rows_before,
+        "S10: refused SERVICE_OUT must mint ZERO fiscal rows (row-less guard)"
+    );
+
+    // fund with a CASH sell, then видача the FULL drawer → ACK, cash 0
+    let (body, _t) = sell_body(FN, 2, "s10-SELL"); // even = cash
+    let (ss, sstate) = drive_ingress(&app, &*wp, FN, &body).await;
+    assert_eq!(sstate, DocState::Ack.as_str(), "S10 fund sell → ACK [{ss}]");
+    let drawer = cash_on_hand(app.db(), FN).await;
+    assert!(drawer > 0, "S10: drawer funded (got {drawer})");
+    let (cs, cstate) = drive_ingress(
+        &app,
+        &*wp,
+        FN,
+        &service_out_body(FN, drawer, "s10-SVCOUT-covered"),
+    )
+    .await;
+    assert_eq!(
+        cstate,
+        DocState::Ack.as_str(),
+        "S10: covered SERVICE_OUT (exactly the drawer) → ACK [{cs}]"
+    );
+    assert_eq!(
+        cash_on_hand(app.db(), FN).await,
+        0,
+        "S10: видача of the full drawer → cash 0"
+    );
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S10-guard-3b: PASS — over-drawer видача refused row-less; covered видача drains drawer to 0 ════════"
+    );
+}
+
+/// S11 — EPZ LEDGER (видача готівки за ЕПЗ subtracts the drawer). Fund the drawer
+/// with a службове внесення, read it, then an EPZ cash advance ≤ drawer, and
+/// assert the drawer dropped by EXACTLY the EPZ sum (card-funded cash handed out).
+/// Close with a Z (the `<EPZ>` aggregation + z-quiescence include EPZ).
+#[tokio::test]
+async fn matrix_s11_epz_cash_advance_ledger() {
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s11-OPEN")).await;
+    assert_eq!(st, 200, "S11 setup: SHIFT_OPEN must ACK");
+    // fund the drawer (+80.00)
+    let (fi, fstate) = drive_ingress(&app, &*wp, FN, &service_in_body(FN, 8000, "s11-SVCIN")).await;
+    assert_eq!(
+        fstate,
+        DocState::Ack.as_str(),
+        "S11 fund внесення → ACK [{fi}]"
+    );
+    let before = cash_on_hand(app.db(), FN).await;
+    assert!(before >= 3000, "S11: drawer funded ≥ 30.00 (got {before})");
+
+    // EPZ cash advance of 30.00 (card-funded) → drawer -= 30.00
+    let (es, estate) = drive_ingress(&app, &*wp, FN, &epz_body(FN, 3000, 2, "s11-EPZ")).await;
+    assert_eq!(estate, DocState::Ack.as_str(), "S11: EPZ → ACK [{es}]");
+    let after = cash_on_hand(app.db(), FN).await;
+    assert_eq!(
+        after,
+        before - 3000,
+        "S11: EPZ must subtract 30.00 from the drawer ({before} → {after})"
+    );
+
+    let (zs, zstate) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "Z_REPORT", "s11-Z")).await;
+    assert_eq!(zstate, DocState::Ack.as_str(), "S11: Z → ACK [{zs}]");
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S11-epz: PASS — EPZ 30.00 subtracted drawer {before}→{after}, Z clean ════════"
+    );
+}
+
+/// S12 — EPZ guard teeth (two fail-closed refusals, both row-less / HTTP 422).
+/// (a) EPZ over an EMPTY drawer → CASH_INSUFFICIENT (guard-3c, WebCheck errCode-47
+/// analog). (b) EPZ with payment_form_index < 2 (a cash slot) → EPZ_PAYMENT_ID_
+/// TOO_LOW (WebCheck «paymentid не может быть меньше 2»). Neither mints a row.
+#[tokio::test]
+async fn matrix_s12_epz_guards() {
+    let (app, _dps, wp) = fresh_harness(&[FN]).await;
+    let (st, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s12-OPEN")).await;
+    assert_eq!(st, 200, "S12 setup: SHIFT_OPEN must ACK");
+    let rows0 = db_stats(app.db(), FN).await.0;
+
+    // (a) over-drawer EPZ on an empty drawer → guard-3c
+    let (s1, st1) = drive_ingress(&app, &*wp, FN, &epz_body(FN, 5000, 2, "s12-EPZ-over")).await;
+    assert_eq!(
+        s1, 422,
+        "S12(a): over-drawer EPZ must be 422 (got {s1}: {st1})"
+    );
+    assert!(
+        st1.contains("CASH_INSUFFICIENT"),
+        "S12(a): must be CASH_INSUFFICIENT, got {st1}"
+    );
+
+    // (b) paymentid < 2 (cash slot) → EPZ_PAYMENT_ID_TOO_LOW (checked before the
+    // cash guard, so it fires even on an empty drawer)
+    let (s2, st2) = drive_ingress(&app, &*wp, FN, &epz_body(FN, 1000, 1, "s12-EPZ-payid")).await;
+    assert_eq!(
+        s2, 422,
+        "S12(b): paymentid<2 EPZ must be 422 (got {s2}: {st2})"
+    );
+    assert!(
+        st2.contains("EPZ_PAYMENT_ID_TOO_LOW"),
+        "S12(b): must be EPZ_PAYMENT_ID_TOO_LOW, got {st2}"
+    );
+
+    assert_eq!(
+        db_stats(app.db(), FN).await.0,
+        rows0,
+        "S12: both refused EPZ mint ZERO fiscal rows"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S12-epz-guards: PASS — over-drawer→CASH_INSUFFICIENT, paymentid<2→EPZ_PAYMENT_ID_TOO_LOW, row-less ════════"
+    );
+}
+
+/// S13 — OFFLINE BIMODAL service-io + EPZ (the path the L3/EPZ unit suites do NOT
+/// drive — researcher-flagged gap: внесення/видача/EPZ through the OFFLINE lane →
+/// OFFLINE_LOCAL_ACK → drain). Fund the drawer online, drop the net, GO_OFFLINE,
+/// then run внесення / видача / EPZ OFFLINE (each must land OFFLINE_LOCAL_ACK, the
+/// guards reading the OLA-inclusive drawer), restore + drain (all converge to
+/// terminal), then Z. End-to-end coverage of the offline branch for all three ops.
+#[tokio::test]
+async fn matrix_s13_offline_service_io_epz_bimodal() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let steps = vec![
+        Action::Open,
+        Action::Sell(4),          // even = CASH sell → fund the drawer online
+        Action::ServiceIn(10000), // +100.00 online (headroom for offline out/epz)
+        Action::NetDown,
+        Action::GoOffline,
+        Action::ServiceIn(3000),  // offline внесення → OLA
+        Action::ServiceOut(2000), // offline видача → OLA (drawer covers)
+        Action::Epz(1000),        // offline EPZ → OLA (drawer covers)
+        Action::NetUp,
+        Action::GoOnlineDrain, // all OLA docs drain to terminal
+        Action::ZClose,
+    ];
+    run("S13-offline-svc-epz", &steps, &app, &*wp, &dps).await;
+}
+
+/// B1 (BYZANTINE, CHARACTERIZATION — NOT a green blessing). A byzantine-but-ALIVE
+/// DPS answers `send_chk` with `Ok(CheckAck)` carrying a NON-EMPTY but garbage /
+/// malformed `id` (not a real fiscal number). The product's ONLY guard is
+/// `is_empty()` (`stage_send.rs:1570`), so it stamps the garbage VERBATIM as
+/// `server_fiscal_no` and advances the chain seed — the receipt is "issued" with a
+/// bogus fiscal number (irreversible). This test CHARACTERIZES the current
+/// fail-open so the log shows it empirically; it does NOT bless it. If we rule
+/// "harden", flip the asserts to DEMAND a format-reject (RED-first for the fix).
+///
+/// KNOWN GAP (audit-integrity, requires DPS itself to malfunction; TLS blocks
+/// MITM): no format/length validation of the DPS-returned fiscal number.
+#[tokio::test]
+async fn matrix_b1_byzantine_garbage_server_fiscal_no() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "b1-OPEN")).await;
+    assert_eq!(os, 200, "B1 setup: SHIFT_OPEN must ACK");
+
+    // Byzantine-but-alive DPS: the NEXT send returns a non-empty GARBAGE fiscal no.
+    let garbage = "☠GARBAGE-NOT-A-REAL-SFN☠";
+    dps.inject_garbage_sfn(FN, garbage);
+    let (body, _) = sell_body(FN, 3, "b1-garbage");
+    let (status, state) = drive_ingress(&app, &*wp, FN, &body).await;
+    let doc = last_doc_state(app.db(), FN).await;
+    let sfn = last_doc_sfn(app.db(), FN).await;
+    eprintln!(
+        "\n⚠ BYZANTINE garbage-SFN → ingress[{status} {state}] durable_doc={doc} server_fiscal_no={sfn:?}\n"
+    );
+
+    assert_ne!(
+        status, 200,
+        "B1: a garbage fiscal number must NOT yield a 200 success (got {status}: {state})"
+    );
+    assert_ne!(
+        doc,
+        DocState::Ack.as_str(),
+        "B1: garbage SFN must not reach terminal ACK (durable={doc})"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+
+    let carriers = drain_carriers(dps.clone());
+    for _ in 0..8 {
+        let view = drain_view(&carriers);
+        let _ = app.converge_online_for_fn(FN, &view).await;
+        if last_doc_state(app.db(), FN).await != DocState::Sent.as_str() {
+            break;
+        }
+    }
+    let final_state = last_doc_state(app.db(), FN).await;
+    let final_sfn = last_doc_sfn(app.db(), FN).await;
+    assert_ne!(
+        final_state,
+        DocState::Ack.as_str(),
+        "B1: a garbage fiscal number must NEVER converge to a confirmed ACK (got {final_state})"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ B1-byzantine-garbage-sfn: initial durable={doc} → after converge={final_state}, \
+         sfn={final_sfn:?}; fail-closed at issuance (500 REPLAY_LEDGER_DRIFT) + converge→RMR, never ACK ════════"
+    );
+}
+
+/// S14 — MAC divergence, EXTRACTABLE-hash message (DPS -12 ERROR_BAD_HASH_PREV
+/// carrying the REAL chain head `store {64hex}`). CS-3 S7-1 (R3) RETIRED the inline
+/// W10.4 re-sign loop: a `-12` is now a recorded HOLD. The SELL fires exactly ONE
+/// wire and rests `SENDING` under a `PENDING_APPLY` reservation (`MacReseedPending`);
+/// the node halts to `STOP_MODE`; NO re-sign, NO 2nd wire, `mac_recovery_attempts`
+/// never claimed. S14-UNIQUE tooth: the HOLD does NOT advance the shift — it freezes
+/// exactly where SHIFT_OPEN left it (the halt gates the shift, not closes it). The
+/// extractable-hash message is now irrelevant to the outcome (S15 = plain-message twin).
+#[tokio::test]
+async fn matrix_s14_mac_recovery_minus12_holds_shift_frozen() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s14-OPEN")).await;
+    assert_eq!(os, 200, "S14 setup: SHIFT_OPEN must ACK");
+    let shift_before = shift_state(app.db(), FN).await;
+
+    let recovered_hash = chain_seed_hex(app.db(), FN).await;
+    dps.inject_mac_recovery(FN, &recovered_hash); // -12 WITH extractable store {hex}
+    let _ = dps.drain_calls(); // clear the OPEN wire log
+
+    let (body, total) = sell_body(FN, 2, "s14-SELL");
+    let (status, _resp) = drive_ingress(&app, &*wp, FN, &body).await;
+    let doc = last_doc_state(app.db(), FN).await;
+    let (mode, _) = node_row(app.db(), FN).await;
+    let shift_after = shift_state(app.db(), FN).await;
+    let attempts = last_doc_mac_recovery_attempts(app.db(), FN).await;
+    let wire = dps.drain_calls();
+    eprintln!(
+        "\n[S14] SELL(total={total}) with -12 injected → ingress[{status}] durable={doc} \
+         mode={mode} shift={shift_before}->{shift_after} attempts={attempts}\n  wire={wire:?}\n"
+    );
+
+    // -12 → recorded HOLD (no inline re-sign): doc rests SENDING, node halted.
+    assert_eq!(
+        doc,
+        DocState::Sending.as_str(),
+        "S14: -12 → HELD, the SELL rests SENDING (durable={doc}, ingress {status})"
+    );
+    assert_eq!(
+        mode, "STOP_MODE",
+        "S14: -12 halts the node pending MAC reseed"
+    );
+    // S14-UNIQUE: a held -12 must NOT advance the shift — it freezes where OPEN left it.
+    assert_eq!(
+        shift_after, shift_before,
+        "S14: a held -12 must NOT advance the shift ({shift_before} -> {shift_after})"
+    );
+    assert_eq!(
+        attempts, 0,
+        "S14: the re-sign loop is retired → the single-bit budget is NOT claimed"
+    );
+    // Exactly ONE wire (the -12) — the retired loop would have fired a 2nd re-send.
+    assert_eq!(
+        wire.len(),
+        1,
+        "S14: exactly one wire (the -12), no 2nd re-send: {wire:?}"
+    );
+    assert!(
+        wire[0].contains("-12"),
+        "S14: the one wire is the -12 reject, got {wire:?}"
+    );
+    assert!(
+        !wire.iter().any(|c| c.contains("SENT(")),
+        "S14: no successful re-send may appear, got {wire:?}"
+    );
+    // Reservation held: PENDING_APPLY carrying the MacReseedPending node-effect.
+    let (apply_state, node_effect): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT apply_state, node_effect FROM delivery_reservation \
+         WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        apply_state.as_deref(),
+        Some("PENDING_APPLY"),
+        "S14: SELL reservation held"
+    );
+    assert_eq!(
+        node_effect.as_deref(),
+        Some("MacReseedPending"),
+        "S14: -12 node-effect"
+    );
+    // The held SENDING is a LEGITIMATE quiescent hold (STOP_MODE + PENDING_APPLY witness).
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S14-mac-divergence: PASS — -12 → HELD (SENDING+STOP+PENDING_APPLY), shift frozen, 1 wire ════════"
+    );
+}
+
+/// S15 — MAC divergence, PLAIN message (DPS -12 with NO `store {64hex}` fragment).
+/// Under the retired W10.4 loop this was a distinct fail-closed leaf (HashNotExtractable
+/// → terminal `Rejected`). CS-3 S7-1 (R3) deleted the re-sign path, so there is no
+/// hash-extraction step anymore: a `-12` is a recorded HOLD REGARDLESS of the message.
+/// S15-UNIQUE tooth: the plain-message `-12` is IDENTICAL to S14's extractable one —
+/// the outcome is message-independent (HELD, node STOP_MODE, shift frozen, one wire),
+/// NOT the old terminal `Rejected`. Uses the plain `reject_next(-12)` (no `store {hex}`).
+#[tokio::test]
+async fn matrix_s15_mac_recovery_minus12_plain_message_still_holds() {
+    let (app, dps, wp) = fresh_harness(&[FN]).await;
+    let (os, _) = drive_ingress(&app, &*wp, FN, &simple_body(FN, "SHIFT_OPEN", "s15-OPEN")).await;
+    assert_eq!(os, 200, "S15 setup: SHIFT_OPEN must ACK");
+    let shift_before = shift_state(app.db(), FN).await;
+
+    dps.reject_next(FN, -12); // -12 with a plain scripted message — NO store {hex}
+    let _ = dps.drain_calls(); // clear the OPEN wire log (so wire-count pins the SELL only)
+    let (body, _t) = sell_body(FN, 2, "s15-SELL");
+    let (status, _resp) = drive_ingress(&app, &*wp, FN, &body).await;
+    let doc = last_doc_state(app.db(), FN).await;
+    let (mode, _) = node_row(app.db(), FN).await;
+    let shift_after = shift_state(app.db(), FN).await;
+    let attempts = last_doc_mac_recovery_attempts(app.db(), FN).await;
+    let wire = dps.drain_calls();
+    eprintln!(
+        "\n[S15] SELL with plain -12 (no extractable hash) → ingress[{status}] durable={doc} \
+         mode={mode} shift={shift_before}->{shift_after} attempts={attempts}\n  wire={wire:?}\n"
+    );
+
+    // Message-independent: a plain -12 holds identically to the extractable-hash S14.
+    assert_eq!(
+        doc,
+        DocState::Sending.as_str(),
+        "S15: a plain -12 → HELD (SENDING), NOT the old terminal Rejected (durable={doc})"
+    );
+    assert_eq!(
+        mode, "STOP_MODE",
+        "S15: -12 halts the node regardless of message"
+    );
+    assert_eq!(
+        shift_after, shift_before,
+        "S15: a held -12 must NOT advance the shift ({shift_before} -> {shift_after})"
+    );
+    assert_eq!(attempts, 0, "S15: no re-sign path → budget never claimed");
+    assert_eq!(wire.len(), 1, "S15: exactly one wire (the -12): {wire:?}");
+    assert!(
+        wire[0].contains("-12"),
+        "S15: the one wire is the -12 reject, got {wire:?}"
+    );
+    let (apply_state, node_effect): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT apply_state, node_effect FROM delivery_reservation \
+         WHERE fiscal_number = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(FN)
+    .fetch_one(app.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        apply_state.as_deref(),
+        Some("PENDING_APPLY"),
+        "S15: SELL reservation held"
+    );
+    assert_eq!(
+        node_effect.as_deref(),
+        Some("MacReseedPending"),
+        "S15: -12 node-effect"
+    );
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!(
+        "════════ S15-mac-divergence: PASS — plain -12 → HELD (message-independent), NOT Rejected ════════"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Multi-FN cross-isolation scenarios (MF1, MF2, MF3)
+// ════════════════════════════════════════════════════════════════════════
+
+/// MF1 — interleaved open/sell/Z on two FNs (core isolation proof).
+/// FN-A and FN-B run concurrent shifts. A's Z must not close B's shift.
+/// FN-B ops must not mutate FN-A's chain seed.
+#[tokio::test]
+async fn matrix_mf1_interleaved_two_fn_isolation() {
+    let (app, dps, wp) = fresh_harness(&[FN_A, FN_B]).await;
+
+    // Interleaved open + sells on both FNs.
+    let steps: &[(&str, Action)] = &[
+        (FN_A, Action::Open),
+        (FN_B, Action::Open),
+        (FN_A, Action::Sell(1)),
+        (FN_B, Action::Sell(7)),
+        (FN_A, Action::Sell(2)),
+        (FN_B, Action::Sell(8)),
+        (FN_B, Action::Sell(9)),
+    ];
+    run_interleaved("MF1-interleave", steps, &app, &*wp, &dps).await;
+
+    // A closes its shift.
+    run_interleaved(
+        "MF1-interleave",
+        &[(FN_A, Action::ZClose)],
+        &app,
+        &*wp,
+        &dps,
+    )
+    .await;
+
+    // Snapshot A's chain seed AFTER A's Z (stable post-Z value).
+    let seed_a_after_z = chain_seed_hex(app.db(), FN_A).await;
+
+    // B does one more sell after A's Z — must not touch A's seed.
+    run_interleaved(
+        "MF1-interleave",
+        &[(FN_B, Action::Sell(10))],
+        &app,
+        &*wp,
+        &dps,
+    )
+    .await;
+
+    // ISOLATION: FN-B sell must not mutate FN-A's chain seed.
+    assert_eq!(
+        seed_a_after_z,
+        chain_seed_hex(app.db(), FN_A).await,
+        "cross-FN BLEED: FN-B ops mutated FN-A's chain seed"
+    );
+
+    // A's shift is CLOSED; B's is still OPENED.
+    assert_eq!(
+        shift_state(app.db(), FN_A).await,
+        "CLOSED",
+        "MF1: FN-A shift must be CLOSED after A's Z"
+    );
+    assert_eq!(
+        shift_state(app.db(), FN_B).await,
+        "OPENED",
+        "MF1: FN-B shift must still be OPENED after A's Z (A's Z must not close B)"
+    );
+
+    // B closes its own shift.
+    run_interleaved(
+        "MF1-interleave",
+        &[(FN_B, Action::ZClose)],
+        &app,
+        &*wp,
+        &dps,
+    )
+    .await;
+    assert_eq!(
+        shift_state(app.db(), FN_B).await,
+        "CLOSED",
+        "MF1: FN-B CLOSED after B's Z"
+    );
+
+    // Seeds must diverge: each FN has its own independent chain.
+    assert_ne!(
+        chain_seed_hex(app.db(), FN_A).await,
+        chain_seed_hex(app.db(), FN_B).await,
+        "cross-FN BLEED: FN-A and FN-B share one chain seed"
+    );
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!("════════ MF1-isolation: PASS ════════");
+}
+
+/// MF2 — mode isolation: FN-A goes OFFLINE while FN-B stays ONLINE.
+/// Does NOT use NetDown (MatrixDps.online is a shared global — would drop both FNs).
+/// Uses the live GO_OFFLINE door on A only.
+#[tokio::test]
+async fn matrix_mf2_offline_a_while_online_b() {
+    let (app, dps, wp) = fresh_harness(&[FN_A, FN_B]).await;
+
+    // Open both FNs online.
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_A,
+        &simple_body(FN_A, "SHIFT_OPEN", "mf2-A-OPEN"),
+    )
+    .await;
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_B,
+        &simple_body(FN_B, "SHIFT_OPEN", "mf2-B-OPEN"),
+    )
+    .await;
+
+    // Flip A to OFFLINE via the live door (leaves B untouched).
+    prro::admin::go_offline(app.db(), FN_A, "mf2: test offline A")
+        .await
+        .expect("GO_OFFLINE FN_A");
+    let codes_a: Vec<String> = (0..20).map(|j| format!("MF2-A-{j}")).collect();
+    prro::admin::seed_dps_offline_codes(app.db(), FN_A, &codes_a)
+        .await
+        .expect("seed offline codes FN_A");
+
+    // Assert mode isolation: A=OFFLINE, B=ONLINE simultaneously.
+    assert_eq!(
+        node_row(app.db(), FN_A).await.0,
+        "OFFLINE",
+        "MF2: FN-A must be OFFLINE"
+    );
+    assert_eq!(
+        node_row(app.db(), FN_B).await.0,
+        "ONLINE",
+        "MF2: FN-B must remain ONLINE while A is offline"
+    );
+
+    // Interleaved sells: A lands OFFLINE_LOCAL_ACK, B lands ACK.
+    let (body_a, _) = sell_body(FN_A, 3, "mf2-A-SELL-1");
+    let (_, state_a) = drive_ingress(&app, &*wp, FN_A, &body_a).await;
+    assert_eq!(
+        state_a,
+        DocState::OfflineLocalAck.as_str(),
+        "MF2: offline A sell must land OFFLINE_LOCAL_ACK"
+    );
+
+    let (body_b, _) = sell_body(FN_B, 5, "mf2-B-SELL-1");
+    let (_, state_b) = drive_ingress(&app, &*wp, FN_B, &body_b).await;
+    assert_eq!(
+        state_b,
+        DocState::Ack.as_str(),
+        "MF2: online B sell must land ACK"
+    );
+
+    let (body_a2, _) = sell_body(FN_A, 4, "mf2-A-SELL-2");
+    let (_, state_a2) = drive_ingress(&app, &*wp, FN_A, &body_a2).await;
+    assert_eq!(
+        state_a2,
+        DocState::OfflineLocalAck.as_str(),
+        "MF2: second offline A sell must land OFFLINE_LOCAL_ACK"
+    );
+
+    let (body_b2, _) = sell_body(FN_B, 6, "mf2-B-SELL-2");
+    let (_, state_b2) = drive_ingress(&app, &*wp, FN_B, &body_b2).await;
+    assert_eq!(
+        state_b2,
+        DocState::Ack.as_str(),
+        "MF2: second online B sell must land ACK"
+    );
+
+    // Modes still isolated mid-sequence.
+    assert_eq!(node_row(app.db(), FN_A).await.0, "OFFLINE");
+    assert_eq!(node_row(app.db(), FN_B).await.0, "ONLINE");
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+
+    // Drain A → online, then Z both.
+    prro::admin::go_online(app.db(), FN_A, "mf2: drain A")
+        .await
+        .expect("GO_ONLINE FN_A");
+    let carriers = drain_carriers(dps.clone());
+    let view = drain_view(&carriers);
+    app.drain_offline_backlog_scheduled(FN_A, &view)
+        .await
+        .expect("drain FN_A");
+    assert_eq!(
+        doc_count_in_state(app.db(), FN_A, "OFFLINE_LOCAL_ACK").await,
+        0,
+        "MF2: all A OLA docs drained"
+    );
+    assert_eq!(
+        node_row(app.db(), FN_A).await.0,
+        "ONLINE",
+        "MF2: A ONLINE after drain"
+    );
+
+    drive_ingress(&app, &*wp, FN_A, &simple_body(FN_A, "Z_REPORT", "mf2-A-Z")).await;
+    drive_ingress(&app, &*wp, FN_B, &simple_body(FN_B, "Z_REPORT", "mf2-B-Z")).await;
+
+    assert_eq!(shift_state(app.db(), FN_A).await, "CLOSED", "MF2: A CLOSED");
+    assert_eq!(shift_state(app.db(), FN_B).await, "CLOSED", "MF2: B CLOSED");
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!("════════ MF2-mode-isolation: PASS ════════");
+}
+
+/// MF3 — cash-ledger isolation: each FN's drawer is keyed by fiscal_number.
+/// ServiceIn/Sell/ServiceOut on A and B must not bleed into each other's ledger.
+#[tokio::test]
+async fn matrix_mf3_cash_ledger_isolation() {
+    let (app, _dps, wp) = fresh_harness(&[FN_A, FN_B]).await;
+
+    // Open both shifts.
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_A,
+        &simple_body(FN_A, "SHIFT_OPEN", "mf3-A-OPEN"),
+    )
+    .await;
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_B,
+        &simple_body(FN_B, "SHIFT_OPEN", "mf3-B-OPEN"),
+    )
+    .await;
+
+    // A: ServiceIn 500.00; B: ServiceIn 100.00
+    drive_ingress(&app, &*wp, FN_A, &service_in_body(FN_A, 50000, "mf3-A-SIN")).await;
+    drive_ingress(&app, &*wp, FN_B, &service_in_body(FN_B, 10000, "mf3-B-SIN")).await;
+
+    // A: CASH sell (even seed=2); B: ServiceOut 50.00
+    let (body_a, _) = sell_body(FN_A, 2, "mf3-A-SELL");
+    drive_ingress(&app, &*wp, FN_A, &body_a).await;
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_B,
+        &service_out_body(FN_B, 5000, "mf3-B-SOUT"),
+    )
+    .await;
+
+    let cash_a = cash_on_hand(app.db(), FN_A).await;
+    let cash_b = cash_on_hand(app.db(), FN_B).await;
+
+    // Ledgers must differ: each FN tracks only its own cash legs.
+    assert_ne!(
+        cash_a, cash_b,
+        "MF3: FN-A and FN-B cash ledgers must be independent (got A={cash_a} B={cash_b})"
+    );
+    // A: 500.00 in + sell cash > 500.00; B: 100.00 in - 50.00 out = 50.00
+    assert_eq!(
+        cash_b, 5000,
+        "MF3: FN-B cash must be 50.00 (100.00 in - 50.00 out), got {cash_b}"
+    );
+    assert!(
+        cash_a > 50000,
+        "MF3: FN-A cash must be > 500.00 (500.00 in + CASH sell), got {cash_a}"
+    );
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+
+    // Z both.
+    drive_ingress(&app, &*wp, FN_A, &simple_body(FN_A, "Z_REPORT", "mf3-A-Z")).await;
+    drive_ingress(&app, &*wp, FN_B, &simple_body(FN_B, "Z_REPORT", "mf3-B-Z")).await;
+
+    assert_eq!(shift_state(app.db(), FN_A).await, "CLOSED", "MF3: A CLOSED");
+    assert_eq!(shift_state(app.db(), FN_B).await, "CLOSED", "MF3: B CLOSED");
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!("════════ MF3-cash-isolation: PASS — A={cash_a} B={cash_b} independent ════════");
+}
+
+/// MF4 — per-FN FAULT isolation. A DPS fault armed on FN-A must fire ONLY for
+/// FN-A's send, never for an interleaved FN-B send — the `MatrixDps` injections are
+/// keyed by `CheckEnvelope.rro_fn`. Arm a `-2` terminal reject on FN-A; a FN-B sell
+/// fired WHILE A's fault is armed must still reach ACK (B untouched); then FN-A's
+/// sell takes the `-2` → Rejected; the fault is one-shot (A's next sell is clean).
+/// Built-in teeth: if the injection were GLOBAL (not FN-keyed) the interleaved B
+/// sell would consume A's armed `-2` → B Rejected → the B-ACK assert goes RED.
+#[tokio::test]
+async fn matrix_mf4_per_fn_fault_isolation() {
+    let (app, dps, wp) = fresh_harness(&[FN_A, FN_B]).await;
+
+    // Open both online.
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_A,
+        &simple_body(FN_A, "SHIFT_OPEN", "mf4-A-OPEN"),
+    )
+    .await;
+    drive_ingress(
+        &app,
+        &*wp,
+        FN_B,
+        &simple_body(FN_B, "SHIFT_OPEN", "mf4-B-OPEN"),
+    )
+    .await;
+
+    // Arm a terminal reject on FN-A's NEXT send only.
+    dps.reject_next(FN_A, -2);
+
+    // FN-B sells FIRST (interleaved, while A's fault is armed) → must be ACK.
+    // A GLOBAL injection would let B consume A's -2 here → this is the isolation teeth.
+    let (body_b, _) = sell_body(FN_B, 5, "mf4-B-SELL");
+    drive_ingress(&app, &*wp, FN_B, &body_b).await;
+    assert_eq!(
+        last_doc_state(app.db(), FN_B).await,
+        DocState::Ack.as_str(),
+        "MF4: FN-B interleaved sell must reach ACK — A's armed fault must NOT leak to B"
+    );
+
+    // Now FN-A sells → takes the armed -2 → Rejected.
+    let (body_a, _) = sell_body(FN_A, 1, "mf4-A-SELL");
+    drive_ingress(&app, &*wp, FN_A, &body_a).await;
+    assert_eq!(
+        last_doc_state(app.db(), FN_A).await,
+        DocState::Rejected.as_str(),
+        "MF4: FN-A sell must take the armed -2 reject → Rejected"
+    );
+
+    // Both nodes stayed ONLINE (a -2 reject doesn't flip mode); B's shift intact.
+    assert_eq!(
+        node_row(app.db(), FN_A).await.0,
+        "ONLINE",
+        "MF4: A stays ONLINE after -2"
+    );
+    assert_eq!(node_row(app.db(), FN_B).await.0, "ONLINE", "MF4: B ONLINE");
+    assert_eq!(
+        shift_state(app.db(), FN_B).await,
+        "OPENED",
+        "MF4: B shift unaffected by A's fault"
+    );
+
+    // The fault was one-shot for A: A's NEXT sell (no fault armed) is a clean ACK.
+    let (body_a2, _) = sell_body(FN_A, 2, "mf4-A-SELL-2");
+    drive_ingress(&app, &*wp, FN_A, &body_a2).await;
+    assert_eq!(
+        last_doc_state(app.db(), FN_A).await,
+        DocState::Ack.as_str(),
+        "MF4: FN-A recovers — the armed fault was one-shot, next A sell is clean ACK"
+    );
+
+    // Z both (Rejected is terminal — doesn't block A's z-quiescence).
+    drive_ingress(&app, &*wp, FN_A, &simple_body(FN_A, "Z_REPORT", "mf4-A-Z")).await;
+    drive_ingress(&app, &*wp, FN_B, &simple_body(FN_B, "Z_REPORT", "mf4-B-Z")).await;
+    assert_eq!(shift_state(app.db(), FN_A).await, "CLOSED", "MF4: A CLOSED");
+    assert_eq!(shift_state(app.db(), FN_B).await, "CLOSED", "MF4: B CLOSED");
+
+    prro::db::invariant_scan::assert_clean(app.db()).await;
+    eprintln!("════════ MF4-per-fn-fault-isolation: PASS ════════");
+}

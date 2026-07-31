@@ -14,6 +14,7 @@
 
 use crate::db::models::enums::Severity;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::DbSeverity;
 use sqlx::SqlitePool;
 
 /// Hard cap on `list_for_entity` to prevent unbounded queries from admin UI /
@@ -51,7 +52,7 @@ pub async fn append(
     .bind(entity_type)
     .bind(entity_id)
     .bind(event_type)
-    .bind(severity)
+    .bind(severity.as_str())
     .bind(actor)
     .bind(payload_json)
     .execute(pool)
@@ -80,7 +81,7 @@ pub async fn append_tx(
     .bind(entity_type)
     .bind(entity_id)
     .bind(event_type)
-    .bind(severity)
+    .bind(severity.as_str())
     .bind(actor)
     .bind(payload_json)
     .execute(&mut **tx)
@@ -98,7 +99,7 @@ pub async fn list_for_entity(
     let rows = sqlx::query!(
         r#"SELECT audit_id           as "audit_id!",
                   entity_type, entity_id, event_type,
-                  severity            as "severity: Severity",
+                  severity            as "severity: DbSeverity",
                   actor, event_payload_json, created_at
            FROM audit_log
            WHERE entity_type = ? AND entity_id = ?
@@ -117,7 +118,7 @@ pub async fn list_for_entity(
             entity_type: r.entity_type,
             entity_id: r.entity_id,
             event_type: r.event_type,
-            severity: r.severity,
+            severity: r.severity.0,
             actor: r.actor,
             event_payload_json: r.event_payload_json,
             created_at: r.created_at,

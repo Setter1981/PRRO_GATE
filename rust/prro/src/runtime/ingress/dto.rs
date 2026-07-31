@@ -115,6 +115,37 @@ pub struct CanonicalResponse {
     pub report_xml: Option<String>,
 }
 
+/// L6 — X-report (поточний звіт) response body: a local-only, SIDE-EFFECT-FREE
+/// snapshot of the current open shift's turnover.
+///
+/// It is NOT a fiscal document: it is never sent to DPS, consumes no fiscal
+/// number, advances no chain, writes no row.  It mirrors the Z-report turnover
+/// (`aggregate_z_payload` — payforms / `<IO>` service-io / `<EPZ>` / `<TXS>` tax
+/// / `<NC>` counts) MINUS the chain fields a Z carries (`local_number` /
+/// z-number / MAC — those are stamped at SIGN time, which an X-report never
+/// reaches), PLUS the running cash-on-hand (the drawer balance a mid-shift check
+/// exists to show).
+///
+/// `turnover` is the parsed aggregated payload from
+/// [`convert::aggregate_z_payload`](crate::runtime::ingress::convert::aggregate_z_payload)
+/// — reused verbatim (SSOT), NOT re-implemented.  It is a JSON object with
+/// `payments` / `service_sums` / `epz` / `tax_summaries` / `sell_count` /
+/// `return_count`.  Serialised inline so the WebCheck shim / operator UI reads
+/// one flat body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct XReportPayload {
+    /// Always `true` — an X-report response is a success (the read succeeded).
+    pub ok: bool,
+    pub request_id: String,
+    pub schema_version: String,
+    pub fiscal_number: String,
+    /// The aggregated shift turnover (payforms / service-io / EPZ / tax /
+    /// counts).  Reused from `aggregate_z_payload` — the SSOT.
+    pub turnover: serde_json::Value,
+    /// Running cash-on-hand for the open shift (kopecks) — the drawer balance.
+    pub cash_on_hand_kop: i64,
+}
+
 /// Format an internal `request_id` (`[u8; 16]`, uuid-v7 bytes) as the
 /// canonical wire/log string: **lowercase 32-char hex, no separators**.
 /// Pinned here (piece-4a) so the piece-5 handler + every other surface
@@ -227,6 +258,10 @@ pub enum CommandType {
     ServiceIn,
     ServiceOut,
     CashWithdrawal,
+    /// EPZ — видача готівки за ЕПЗ (cash advance against a card).  Maps to
+    /// `DocType::CashAdvanceEpz` (distinct from the fail-closed
+    /// `CashWithdrawal` placeholder).
+    CashAdvanceEpz,
     PeriodicReport,
 }
 
@@ -384,6 +419,7 @@ pub fn to_canonical_fiscal_command(
         CommandType::ServiceIn => DocType::ServiceIn,
         CommandType::ServiceOut => DocType::ServiceOut,
         CommandType::CashWithdrawal => DocType::CashWithdrawal,
+        CommandType::CashAdvanceEpz => DocType::CashAdvanceEpz,
         CommandType::PeriodicReport => {
             return Err(MappingError::UnsupportedCommandType(
                 CommandType::PeriodicReport,
@@ -409,6 +445,9 @@ pub fn to_canonical_fiscal_command(
         CommandType::Sell => Some(cmd.payload.totals.sale_kopecks as i64),
         CommandType::Return => Some(cmd.payload.totals.return_kopecks as i64),
         CommandType::ServiceIn | CommandType::ServiceOut | CommandType::CashWithdrawal => None, // M5: parse from raw_frames
+        // EPZ carries its cash-out sum in the card payment leg, not `Totals`;
+        // the amount is derived in `convert.rs` (like service-io).  None here.
+        CommandType::CashAdvanceEpz => None,
         CommandType::ShiftOpen
         | CommandType::ShiftClose
         | CommandType::XReport

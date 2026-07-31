@@ -47,6 +47,7 @@ use prro::db::repositories::{
     fiscal_documents as fd, fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig,
     ingress_inbox as inbox, ingress_inbox::NewInboxEntry,
 };
+use prro::db::types::{DbDocumentId, DbRequestId, DbShiftId};
 use prro::services::write_path::stage_sign::{self, test_hook, SignError, SigningContext};
 use prro::services::write_path::types::{CanonicalFiscalCommand, WorkerContext};
 
@@ -182,7 +183,7 @@ async fn seed_open_shift(pool: &sqlx::SqlitePool) -> ShiftId {
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .execute(pool)
     .await
@@ -202,12 +203,15 @@ async fn seed_node_state(
          VALUES (?, 'ONLINE', ?, ?, 1, 'b', 't', ?)",
     )
     .bind(FN)
-    .bind(if current_shift_id.is_some() {
-        ShiftState::Opened
-    } else {
-        ShiftState::Closed
-    })
-    .bind(current_shift_id)
+    .bind(
+        if current_shift_id.is_some() {
+            ShiftState::Opened
+        } else {
+            ShiftState::Closed
+        }
+        .as_str(),
+    )
+    .bind(current_shift_id.map(DbShiftId))
     .bind(last_known.map(|h| &h[..]))
     .execute(pool)
     .await
@@ -234,11 +238,11 @@ async fn seed_prepared_doc(
              total_sum_kop, payload_json, payload_sha256_canonical
          ) VALUES (?, ?, ?, ?, ?, 'PREPARED', 'b', 't', 'ONLINE', '2026-04-22T12:00:00Z', 15000, ?, ?)",
     )
-    .bind(doc_id)
-    .bind(req_id)
+    .bind(DbDocumentId(doc_id))
+    .bind(DbRequestId(req_id))
     .bind(FN)
     .bind(lnd)
-    .bind(doc_type)
+    .bind(doc_type.as_str())
     .bind(payload_json)
     .bind(&payload_sha256[..])
     .execute(pool)
@@ -386,11 +390,14 @@ fn make_worker_context(
 // ─── DB probe helpers ────────────────────────────────────────────────
 
 async fn doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> DocState {
-    sqlx::query_scalar::<_, DocState>("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, prro::db::types::DbDocState>(
+        "SELECT state FROM fiscal_documents WHERE document_id = ?",
+    )
+    .bind(DbDocumentId(doc_id))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .0
 }
 
 async fn doc_signing_inputs(
@@ -414,7 +421,7 @@ async fn doc_signing_inputs(
         "SELECT previous_hash, z_report_number, signing_inputs_pinned_at, unsigned_xml_sha256 \
          FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(pool)
     .await
     .unwrap();
@@ -431,7 +438,7 @@ async fn next_z_report_number(pool: &sqlx::SqlitePool) -> i64 {
 
 async fn document_files_count(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM document_files WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -469,7 +476,7 @@ async fn stage3_stale_workercontext_returns_state_conflict_no_pin_no_z_alloc() {
     // Force fd.state PREPARED → SIGNED directly (simulating a concurrent
     // finalize / external transition between W5 stage 1 and W6 stage 3).
     sqlx::query("UPDATE fiscal_documents SET state = 'SIGNED' WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -540,9 +547,11 @@ async fn stage3_unsupported_doc_type_rejects_before_pin_no_z_no_sign() {
     seed_fn(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state(&pool, Some(shift_id), None).await;
+    // NOTE (L3): ServiceIn/Out are now wired (Signable). Use CashWithdrawal
+    // which remains permanently UnsupportedDocType in stage_sign (STOP-S2 EPZ).
     let (doc_id, req_bytes) = seed_prepared_doc(
         &pool,
-        DocType::ServiceIn,
+        DocType::CashWithdrawal,
         r#"{"x":1}"#,
         dummy_payload_sha256(),
         1,
@@ -554,7 +563,7 @@ async fn stage3_unsupported_doc_type_rejects_before_pin_no_z_no_sign() {
     let stale_ctx = make_worker_context(
         doc_id,
         req_bytes,
-        DocType::ServiceIn,
+        DocType::CashWithdrawal,
         DocState::Prepared,
         r#"{"x":1}"#,
         None,
@@ -565,9 +574,9 @@ async fn stage3_unsupported_doc_type_rejects_before_pin_no_z_no_sign() {
 
     match result {
         Err(SignError::UnsupportedDocType { doc_type }) => {
-            assert_eq!(doc_type, DocType::ServiceIn);
+            assert_eq!(doc_type, DocType::CashWithdrawal);
         }
-        other => panic!("expected UnsupportedDocType(ServiceIn), got {other:?}"),
+        other => panic!("expected UnsupportedDocType(CashWithdrawal), got {other:?}"),
     }
 
     // No Z allocator advance.
@@ -877,7 +886,7 @@ async fn stage3_persist_rollback_on_post_sign_db_error() {
     sqlx::query(
         "INSERT INTO document_files (document_id, kind, content) VALUES (?, 'PAYLOAD_XML', X'00')",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(&pool)
     .await
     .unwrap();
@@ -1210,7 +1219,7 @@ async fn stage3_runtime_byte_equiv_zn_zero_for_nonz_artifact() {
         "UPDATE fiscal_documents SET state = 'SENT', server_fiscal_no = 'D-1' \
          WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(&pool)
     .await
     .unwrap();
@@ -1305,7 +1314,7 @@ async fn seed_sibling_doc(
     } else {
         "ONLINE"
     })
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();

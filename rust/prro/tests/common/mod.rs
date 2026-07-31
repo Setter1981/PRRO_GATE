@@ -59,6 +59,7 @@ use prro::crypto::provider::{
 };
 use prro::crypto::session::SigningSession;
 use prro::db::models::ids::DocumentId;
+use prro::db::types::DbDocumentId;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{
@@ -166,6 +167,22 @@ impl DpsChannel for StubDpsChannel {
             .unwrap()
             .pop_front()
             .expect("StubDpsChannel response queue empty (caller forgot to enqueue)")
+    }
+
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::RawSendObservation,
+    ) {
+        // CS-3 S7-1: the cutover derives the record/apply evidence from `observation.evidence()`. The
+        // trait DEFAULT degrades server-status rejects to `NoResponse` (mock-only), which would
+        // mis-drive the composed path. Build the SAME faithful observation the production
+        // `GrpcDpsChannel` mints (`observe_faithful_from_legacy`) so this mock mirrors prod fidelity.
+        let legacy = self.send_chk(envelope).await;
+        let observation = prro::transports::dps::dto::observe_faithful_from_legacy(&legacy);
+        (legacy, observation)
     }
 
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
@@ -366,12 +383,12 @@ pub async fn seed_w12_finalize_prereqs(
     )
     .bind(&unsigned_xml_sha[..])
     .bind(&prev_hash[..])
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await?;
     let request_id: Vec<u8> =
         sqlx::query_scalar("SELECT request_id FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(pool)
             .await?;
     let payload_sha = vec![0u8; 32];

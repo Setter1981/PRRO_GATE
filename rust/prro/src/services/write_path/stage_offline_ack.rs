@@ -74,6 +74,7 @@
 use crate::db::models::enums::{DocState, DocType, NodeMode, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, OfflineSessionId};
 use crate::db::repositories::audit_log;
+use crate::db::repositories::delivery_reservation;
 use crate::db::repositories::fiscal_documents::{self as fd, TransitionOutcome};
 use crate::db::repositories::node_state;
 use crate::db::repositories::offline_sessions;
@@ -195,6 +196,14 @@ pub async fn run(
     with_immediate(pool, move |tx| {
         let fn_id = fn_id_for_envelope;
         Box::pin(async move {
+            // CS-3 S7-2 — fail-closed FN fence: refuse the offline-ack issuance
+            // (Signed→OfflineLocalAck CAS + chain-seed advance) while a delivery
+            // reservation is in-flight (INACTIVE today; guards the chain tip).
+            if delivery_reservation::fn_fence_active_tx(tx, &fn_id).await? {
+                return Err(anyhow::anyhow!(
+                    "stage_offline_ack refused: FN {fn_id} has an active delivery reservation (S7-2 fence)"
+                ));
+            }
             // ─── Step 1: re-read node_state (fresh snapshot) ────────
             let ns = match node_state::get_tx(tx, &fn_id).await? {
                 Some(ns) => ns,
@@ -296,6 +305,9 @@ pub async fn run(
                 | DocType::ServiceIn
                 | DocType::ServiceOut
                 | DocType::CashWithdrawal
+                // EPZ — видача готівки за ЕПЗ rides the regular-fiscal offline
+                // shift-state surface (Opened | OpenedLocalPendingDrain).
+                | DocType::CashAdvanceEpz
                 | DocType::XReport => matches!(
                     ns.shift_state,
                     ShiftState::Opened | ShiftState::OpenedLocalPendingDrain,
@@ -312,7 +324,30 @@ pub async fn run(
                 DocType::ShiftClose | DocType::ZReport => {
                     ns.shift_state == ShiftState::ClosingLocalPendingDrain
                 }
-                // All 9 DocType variants are now explicitly matched — a NEW
+                // B10 — offline-session BEGIN is minted lazily as the FIRST
+                // offline doc of a session, BEFORE that doc.  For a SELL/RETURN
+                // first-doc the shift is `Opened`/`OpenedLocalPendingDrain`; for a
+                // Pattern-C offline SHIFT_OPEN first-doc the shift is still
+                // `Closed` (the SHIFT_OPEN has not opened it yet) — so the BEGIN
+                // local-acks in `Closed` too (review Finding B).
+                DocType::OfflineSessionBegin => matches!(
+                    ns.shift_state,
+                    ShiftState::Closed
+                        | ShiftState::Opened
+                        | ShiftState::OpenedLocalPendingDrain,
+                ),
+                // B10 — offline-session END is minted at drain finalize; the
+                // shift may be any live-offline pending-drain / opened state
+                // depending on whether it was a mid-day return-online (Opened
+                // / OpenedLocalPendingDrain) or a full offline close
+                // (ClosingLocalPendingDrain).  Accept all three.
+                DocType::OfflineSessionEnd => matches!(
+                    ns.shift_state,
+                    ShiftState::Opened
+                        | ShiftState::OpenedLocalPendingDrain
+                        | ShiftState::ClosingLocalPendingDrain,
+                ),
+                // All DocType variants are now explicitly matched — a NEW
                 // doc type fails to compile here, forcing a deliberate
                 // offline-ack shift-state decision (drift-guard by
                 // exhaustiveness; the pre-O3 `_ => Opened` fallback is gone).

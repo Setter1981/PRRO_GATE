@@ -1,14 +1,6 @@
 # Finding: `resolve_operator_pending` does not validate the operator's MacReseed seed
 
-**Status:** RESOLVED — prod hardening landed in **PR #338** (branch `prod-macreseed-seed-validation`,
-commit `d2a05f18`). Two fail-closed guards in `complete_operator_pending` BEFORE any mutation:
-(A) hold-type gate (`node_effect == "MacReseedPending"`) and (B) expected-tip gate (seed must equal
-`fiscal_documents::last_issued_unsigned_xml_sha256` — the shared `is_issued` projection
-`invariant_scan` walks to). Teeth: `operator_completion::oc23` (guard A = this repro), `oc24`
-(guard B). Verified: nextest `-p prro --features test-support` 2262 passed / 7 skipped; clippy `-D`
-clean. **Follow-up (deferred to `fuzzer-cs3-oracle` post-merge):** the fuzzer maps `MacReseed` to an
-arbitrary seed and the model predicts success — reconcile model/interp to the hardened refusal +
-add a directed regression tooth (folds into task #18 / step 6).
+**Status:** OPEN — candidate `bd`-task (potential prod hardening)
 **Severity:** MEDIUM (operator-error chain-corruption risk; no fail-closed; caught only by a later
 `invariant_scan`, not at the point of the mutation)
 **Discovered-from:** CS-3 fuzzer-oracle Increment 1b (generative `OperatorComplete`), branch

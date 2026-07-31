@@ -36,6 +36,7 @@ use prro::db::repositories::ingress_inbox::{
     self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
 };
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
 use prro::runtime::ingress::inline_binding::production_write_path;
@@ -149,8 +150,8 @@ async fn seed_boot_baseline(pool: &SqlitePool) {
          VALUES (?, ?, ?, NULL, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Closed)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Closed.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -276,10 +277,19 @@ async fn fix_a_empty_pool_offline_shift_open_refused_premint_no_orphan() {
         "CLOSED",
         "the shift stays Closed — no orphan, no RMR (retry after seed-codes)"
     );
+    // B10 (Finding B): an offline SHIFT_OPEN is now bracketed by the lazy
+    // DocType=9 BEGIN, which is ensured BEFORE the SHIFT_OPEN mints.  On an EMPTY
+    // pool the `ensure_offline_session_begin` pre-mint guard fail-closes the whole
+    // op RETRYABLE (503 `OFFLINE_SESSION_BEGIN_PENDING`) WITHOUT minting either a
+    // BEGIN or the SHIFT_OPEN — so the DOUBLE ABSENCE (no doc, no shift) is
+    // preserved, but the refusal no longer flows through stage_acquire's
+    // per-op-type `OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED` audit (that audit is
+    // for the SHIFT_OPEN's own acquire, which is never reached).  There is no
+    // aborted-BEGIN churn (the guard refuses PRE-mint).
     assert_eq!(
-        audit_count(app.db(), "OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED").await,
-        1,
-        "fix (a) pre-mint refusal audit"
+        doc_states(app.db(), "OFFLINE_SESSION_BEGIN").await,
+        Vec::<String>::new(),
+        "B10: no BEGIN doc minted either — the empty-pool guard refuses pre-mint"
     );
     // No fix-(b) escalation happened — there was nothing to escalate.
     assert_eq!(
@@ -320,7 +330,7 @@ async fn boot_escalates_pre_existing_olpd_orphan_with_terminal_lifecycle_doc() {
                 cash_balance_kop, opened_by_cashier_id) \
              VALUES (?, ?, 1, 'OPENED_LOCAL_PENDING_DRAIN', 'OFFLINE', 0, 'csh')",
         )
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -332,7 +342,7 @@ async fn boot_escalates_pre_existing_olpd_orphan_with_terminal_lifecycle_doc() {
              VALUES (?, 'OFFLINE', 'OPENED_LOCAL_PENDING_DRAIN', ?, 2, 'b', 't')",
         )
         .bind(FN)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -341,7 +351,7 @@ async fn boot_escalates_pre_existing_olpd_orphan_with_terminal_lifecycle_doc() {
             "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
              VALUES (?, ?, 'OPEN', '2026-07-07T00:00:00Z')",
         )
-        .bind(session_id)
+        .bind(DbOfflineSessionId(session_id))
         .bind(FN)
         .execute(&pool)
         .await
@@ -356,10 +366,10 @@ async fn boot_escalates_pre_existing_olpd_orphan_with_terminal_lifecycle_doc() {
              VALUES (?, ?, ?, ?, 1, 'SHIFT_OPEN', 'ABORTED', 'b', 't', 'OFFLINE', \
                 '2026-07-07T08:00:00Z', '{}', ?)",
         )
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .bind(&req_id[..])
         .bind(FN)
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(&[0u8; 32][..])
         .execute(&pool)
         .await

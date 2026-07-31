@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT fiscal_number,\n                  tax_number,\n                  vat_payer_inn,\n                  fiscal_mode    as \"fiscal_mode: DbFiscalMode\",\n                  org_name, point_name, org_address,\n                  tsp_enabled            as \"tsp_enabled: i64\",\n                  offline_enabled        as \"offline_enabled: i64\",\n                  national_check_enabled as \"national_check_enabled: i64\",\n                  min_offline_codes      as \"min_offline_codes: i64\",\n                  max_offline_codes      as \"max_offline_codes: i64\"\n           FROM fiscal_number_config WHERE fiscal_number = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "fiscal_number",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "tax_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "vat_payer_inn",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "fiscal_mode: DbFiscalMode",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "org_name",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "point_name",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "org_address",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "tsp_enabled: i64",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "offline_enabled: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "national_check_enabled: i64",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "min_offline_codes: i64",
+        "ordinal": 10,
+        "type_info": "Integer"
+      },
+      {
+        "name": "max_offline_codes: i64",
+        "ordinal": 11,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "6bdf9953ef55b03675008b0598a8a5fd919ec62db14172d7920e38b095bc5365"
+}

@@ -40,7 +40,10 @@ struct AppState {
 /// # Errors
 /// Propagates TCP bind / axum serve errors.
 pub async fn serve_admin(cfg: AdminConfig, registry: Arc<Registry>) -> Result<(), std::io::Error> {
-    let state = AppState { registry, token: cfg.auth_token };
+    let state = AppState {
+        registry,
+        token: cfg.auth_token,
+    };
     let app = Router::new()
         .route("/admin/health", get(health))
         .route("/admin/fns", get(list_fns))

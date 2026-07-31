@@ -24,6 +24,7 @@ use crate::db::models::enums::ShiftState;
 use crate::db::models::ids::ShiftId;
 use crate::db::repositories::shifts::{self, TransitionOutcome};
 use crate::db::tx::WriteTxConn;
+use crate::db::types::DbShiftId;
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 
 /// Apply a whitelisted 9-state shift transition AND mirror the
@@ -91,7 +92,7 @@ pub async fn force_orphan_shift_to_error(
     shift_id: ShiftId,
 ) -> anyhow::Result<()> {
     sqlx::query("UPDATE shifts SET state = 'ERROR' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -140,10 +141,10 @@ async fn mirror_projection_tx(
         "UPDATE node_state SET shift_state = ? \
          WHERE fiscal_number = ? AND shift_state = ? AND current_shift_id = ?",
     )
-    .bind(to)
+    .bind(to.as_str())
     .bind(fiscal_number)
-    .bind(from)
-    .bind(shift_id)
+    .bind(from.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(&mut **tx)
     .await?
     .rows_affected();
@@ -182,18 +183,30 @@ async fn mirror_projection_tx(
 /// back the whole envelope (including the shifts INSERT).  This bare
 /// `node_state` projection write lives HERE (the sole-writer allowlist) by
 /// design — no other module may raw-write the projection.
+/// `opening_cash_kop` — carry-over opening balance for the new shift
+/// (prior shift's `cash_balance_kop`; 0 for the FN's first shift).
+/// Stored atomically with the shift-row INSERT in this envelope (invariant #2).
 pub async fn create_shift_tx(
     tx: &mut WriteTxConn<'_>,
     fiscal_number: &str,
     shift_id: ShiftId,
     open_mode: &str,
     opened_by_cashier_id: &str,
+    opening_cash_kop: i64,
 ) -> anyhow::Result<()> {
     // (i) Mint the shifts row as CREATED.  An idempotent re-create of the
     //     SAME SHIFT_OPEN collides on the PK (deterministic shift_id); the
     //     partial-unique index `ux_shifts_one_open_per_fn` backstops a
     //     second open shift for the FN at the schema level.
-    shifts::insert_created_tx(tx, shift_id, fiscal_number, open_mode, opened_by_cashier_id).await?;
+    shifts::insert_created_tx(
+        tx,
+        shift_id,
+        fiscal_number,
+        open_mode,
+        opened_by_cashier_id,
+        opening_cash_kop,
+    )
+    .await?;
 
     // (ii) CAS the node_state projection CLOSED → CREATED and SET the
     //      pointer.  Keyed on `shift_state='CLOSED'` with pointer OVERWRITE
@@ -208,7 +221,7 @@ pub async fn create_shift_tx(
         "UPDATE node_state SET current_shift_id = ?, shift_state = 'CREATED' \
          WHERE fiscal_number = ? AND shift_state = 'CLOSED'",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(fiscal_number)
     .execute(&mut **tx)
     .await?

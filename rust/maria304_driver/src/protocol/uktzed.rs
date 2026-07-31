@@ -31,10 +31,16 @@ pub fn split_uktzed_prefix(raw: &str) -> UktzedSplit<'_> {
     // Fast path: first 11 bytes must be ASCII digits followed by '#'.
     let bytes = raw.as_bytes();
     if bytes.len() < 11 || bytes[10] != b'#' {
-        return UktzedSplit { uktzed: None, name: raw };
+        return UktzedSplit {
+            uktzed: None,
+            name: raw,
+        };
     }
     if !bytes[..10].iter().all(u8::is_ascii_digit) {
-        return UktzedSplit { uktzed: None, name: raw };
+        return UktzedSplit {
+            uktzed: None,
+            name: raw,
+        };
     }
     UktzedSplit {
         uktzed: Some(&raw[..10]),

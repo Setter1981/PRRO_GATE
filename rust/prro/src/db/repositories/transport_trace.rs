@@ -28,6 +28,7 @@
 
 use crate::db::models::ids::DocumentId;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::DbDocumentId;
 
 /// Closed set of W7-frozen + W10.4 extension outcome classifications.
 /// Mirrors the CHECK list in migration 010 + 013.
@@ -143,7 +144,7 @@ pub async fn allocate_and_insert_tx(
         "SELECT COALESCE(MAX(attempt_no), 0) + 1 \
          FROM transport_trace WHERE document_id = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(&mut **tx)
     .await?;
     let next_i32: i32 = next.try_into().map_err(|_| {
@@ -158,7 +159,7 @@ pub async fn allocate_and_insert_tx(
             request_envelope_sha256, is_probe \
          ) VALUES (?, ?, ?, ?, ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(next_i32)
     .bind(&init.backend_profile_id)
     .bind(&init.transport_profile_id)
@@ -218,7 +219,7 @@ pub async fn complete_tx(
     .bind(completion.error_kind.as_deref())
     .bind(completion.error_message.as_deref())
     .bind(completion.retry_class.as_deref())
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(attempt_no)
     .execute(&mut **tx)
     .await?;
@@ -282,7 +283,7 @@ pub async fn list_for_document(
                 server_status_code, error_kind, error_message, retry_class \
          FROM transport_trace WHERE document_id = ? ORDER BY attempt_no",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_all(pool)
     .await?;
     rows.into_iter()
@@ -359,7 +360,7 @@ pub async fn list_for_document(
 ///     auto-retry".
 ///   - `Ok(Some(rc))` — latest attempt's retry class.  Caller
 ///     filters per the docstring contract: only `TransientRetry` is
-///     auto-retryable; the other six classes need higher-layer
+///     auto-retryable; all other classes need higher-layer
 ///     orchestration.
 ///
 /// Reads outside any tx — pool-bound; safe to call from the dispatcher
@@ -373,11 +374,16 @@ pub async fn last_attempt_retry_class_for(
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<crate::services::write_path::error_routing::RetryClass>> {
     let opt: Option<Option<String>> = sqlx::query_scalar(
+        // ordering-justified: `attempt_no` is allocated `COALESCE(MAX(attempt_no),0)+1` per
+        // `document_id` inside the BEGIN IMMEDIATE envelope (transport_trace.rs), so it is
+        // unique per document by the ALLOCATOR. NOTE: the index
+        // `transport_trace(document_id, attempt_no DESC, retry_class)` is NOT unique — the
+        // guarantee rests on the allocator + write lease, not on the schema.
         "SELECT retry_class FROM transport_trace \
          WHERE document_id = ? \
          ORDER BY attempt_no DESC LIMIT 1",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_optional(pool)
     .await?;
     Ok(opt
@@ -414,7 +420,7 @@ pub async fn attempts_used(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> sqlx:
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM transport_trace WHERE document_id = ? AND is_probe = 0",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(pool)
     .await?;
     Ok(n)
@@ -497,7 +503,7 @@ pub async fn complete_via_recovery_tx(
     .bind(server_fiscal_no)
     .bind(wire_call_started_at)
     .bind(wire_call_finished_at)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(attempt_no)
     .execute(&mut **tx)
     .await?;

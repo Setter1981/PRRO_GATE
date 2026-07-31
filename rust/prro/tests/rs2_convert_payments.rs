@@ -14,6 +14,7 @@ use prro::db::repositories::node_state;
 use prro::db::repositories::payment_methods::{insert, soft_delete, NewPaymentMethod};
 use prro::db::repositories::shifts;
 use prro::db::repositories::signing_config_snapshots;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::convert::{
     aggregate_z_payload_for_shift, convert_to_signer_payload, ConvertError,
@@ -374,8 +375,8 @@ async fn seed_issued_receipt(
         .await
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(state)
-        .bind(id)
+        .bind(state.as_str())
+        .bind(DbDocumentId(id))
         .execute(main)
         .await
         .expect("set terminal state");
@@ -469,8 +470,8 @@ async fn seed_issued_receipt_with_items_opt(
         .await
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(state)
-        .bind(id)
+        .bind(state.as_str())
+        .bind(DbDocumentId(id))
         .execute(main)
         .await
         .expect("set terminal state");
@@ -519,8 +520,8 @@ async fn seed_issued_receipt_full(
         .await
         .expect("insert_prepared receipt");
     sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ?")
-        .bind(state)
-        .bind(id)
+        .bind(state.as_str())
+        .bind(DbDocumentId(id))
         .execute(main)
         .await
         .expect("set terminal state");
@@ -542,14 +543,14 @@ async fn zreport_aggregates_only_issued_shift_receipts() {
     seed_fn_config(&main).await;
     let shift = ShiftId::new();
     // fiscal_documents.shift_id FKs shifts(shift_id) — seed the shift row.
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     node_state::upsert_initial(&main, FN, NodeMode::Online, ShiftState::Opened, 1)
         .await
         .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift)
+        .bind(DbShiftId(shift))
         .bind(FN)
         .execute(&main)
         .await
@@ -617,14 +618,14 @@ async fn zreport_txs_aggregates_tax_group_turnover_from_items() {
     seed_fn_config(&main).await;
     let snap = seed_tax_snapshot(&main).await;
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     node_state::upsert_initial(&main, FN, NodeMode::Online, ShiftState::Opened, 1)
         .await
         .unwrap();
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift)
+        .bind(DbShiftId(shift))
         .bind(FN)
         .execute(&main)
         .await
@@ -671,7 +672,7 @@ async fn zreport_txs_seam_emits_txs_xml_with_header_ts_and_omits_io_epz() {
     seed_fn_config(&main).await;
     let snap = seed_tax_snapshot(&main).await;
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     seed_issued_receipt_with_items(
@@ -722,7 +723,7 @@ async fn zreport_txs_unresolved_group_falls_back_to_short_form() {
     seed_fn_config(&main).await;
     let snap = seed_tax_snapshot(&main).await; // configures tx=1,2 only
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     seed_issued_receipt_with_items(
@@ -760,7 +761,7 @@ async fn zreport_txs_routes_sell_to_smi_and_return_to_smo() {
     seed_fn_config(&main).await;
     let snap = seed_tax_snapshot(&main).await;
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     seed_issued_receipt_with_items(
@@ -808,7 +809,7 @@ async fn e2e_sell_and_return_shift_routes_return_to_smo_and_sum_out() {
     seed_fn_config(&main).await;
     let snap = seed_tax_snapshot(&main).await;
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     // SELL: item 12000 @ tx=1 + cash payment 12000.
@@ -863,7 +864,7 @@ async fn zreport_txs_conflicting_rates_for_same_group_fail_closed() {
     let (_dir, main, _secure) = fresh_pools().await;
     seed_fn_config(&main).await;
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     // snap_a: tx=1 @ 20%; snap_b: tx=1 @ 21% (a mid-shift rate change).
@@ -940,7 +941,7 @@ async fn zreport_txs_null_snapshot_mixed_with_pinned_fails_closed() {
     seed_fn_config(&main).await;
     let snap = seed_tax_snapshot(&main).await; // tx=1 @ 20%
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     // Receipt A: pinned snapshot → tx=1 resolves to 20%.
@@ -984,7 +985,7 @@ async fn zreport_txs_turnover_overflow_fails_closed() {
     seed_fn_config(&main).await;
     let snap = seed_tax_snapshot(&main).await;
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     // Two items in the same tax group whose sums overflow i64 when added.
@@ -1031,7 +1032,7 @@ async fn zreport_txs_calc_tax_failure_fails_closed() {
     .await
     .unwrap();
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     seed_issued_receipt_with_items(
@@ -1076,7 +1077,7 @@ async fn zreport_txs_identical_config_does_not_false_trip_drift() {
         "identical config must dedup to one content-addressed id"
     );
     let shift = ShiftId::new();
-    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1")
+    shifts::insert_created(&main, shift, FN, "ONLINE", "cashier-1", 0)
         .await
         .expect("seed shift");
     seed_issued_receipt_with_items(

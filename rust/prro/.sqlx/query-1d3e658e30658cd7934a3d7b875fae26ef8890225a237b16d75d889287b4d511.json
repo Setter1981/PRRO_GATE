@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT shift_id      as \"shift_id: DbShiftId\",\n                  fiscal_number,\n                  serial,\n                  state          as \"state: DbShiftState\",\n                  cash_balance_kop,\n                  opened_by_cashier_id as \"opened_by_cashier_id: DbCashierId\"\n           FROM shifts WHERE shift_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "shift_id: DbShiftId",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "fiscal_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "serial",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "state: DbShiftState",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "cash_balance_kop",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "opened_by_cashier_id: DbCashierId",
+        "ordinal": 5,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1d3e658e30658cd7934a3d7b875fae26ef8890225a237b16d75d889287b4d511"
+}

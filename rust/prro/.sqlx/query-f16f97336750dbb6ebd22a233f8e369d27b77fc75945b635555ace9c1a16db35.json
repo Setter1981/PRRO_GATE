@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT state                       as \"state: DbDocState\",\n                  previous_hash               as \"previous_hash: Vec<u8>\",\n                  z_report_number,\n                  signing_inputs_pinned_at,\n                  signing_config_snapshot_id\n           FROM fiscal_documents WHERE document_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "state: DbDocState",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "previous_hash: Vec<u8>",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "z_report_number",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "signing_inputs_pinned_at",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "signing_config_snapshot_id",
+        "ordinal": 4,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "f16f97336750dbb6ebd22a233f8e369d27b77fc75945b635555ace9c1a16db35"
+}

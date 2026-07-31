@@ -12,7 +12,10 @@ use maria304_driver::session::dispatcher::Correlation;
 use maria304_driver::session::{dispatch, Clock, Identity, Session};
 
 fn clock() -> Clock<'static> {
-    Clock { date: "20260420", time: "193000" }
+    Clock {
+        date: "20260420",
+        time: "193000",
+    }
 }
 
 fn run(session: &mut Session, bridge: &MockBridge, corr: &mut Correlation, cmd: Command) {
@@ -23,7 +26,10 @@ fn run(session: &mut Session, bridge: &MockBridge, corr: &mut Correlation, cmd: 
 fn full_restaurant_receipt_with_alcohol_cigarettes_and_card_slip() {
     let mut session = Session::new();
     let bridge = MockBridge::new();
-    let mut corr = Correlation { session_uuid: "pilot".to_string(), receipt_seq: 0 };
+    let mut corr = Correlation {
+        session_uuid: "pilot".to_string(),
+        receipt_seq: 0,
+    };
 
     // 1. Handshake.
     run(&mut session, &bridge, &mut corr, Command::Csin(true));
@@ -39,7 +45,12 @@ fn full_restaurant_receipt_with_alcohol_cigarettes_and_card_slip() {
     );
 
     // 2. Open sale receipt in "1" (main department).
-    run(&mut session, &bridge, &mut corr, Command::Prep("1".to_string()));
+    run(
+        &mut session,
+        &bridge,
+        &mut corr,
+        Command::Prep("1".to_string()),
+    );
 
     // 3. Alcohol — dual tax mode + excise stamp + FiscalLineEX body.
     //    Per pilot code: SetDoubledTaxCalcMode(2,1) → NLPRБА.
@@ -47,7 +58,10 @@ fn full_restaurant_receipt_with_alcohol_cigarettes_and_card_slip() {
         &mut session,
         &bridge,
         &mut corr,
-        Command::Nlpr { tax1_char: 'Б', tax2_char: 'А' },
+        Command::Nlpr {
+            tax1_char: 'Б',
+            tax2_char: 'А',
+        },
     );
     run(
         &mut session,
@@ -79,7 +93,12 @@ fn full_restaurant_receipt_with_alcohol_cigarettes_and_card_slip() {
     );
 
     // 6. Close receipt.
-    run(&mut session, &bridge, &mut corr, Command::Comp(String::new()));
+    run(
+        &mut session,
+        &bridge,
+        &mut corr,
+        Command::Comp(String::new()),
+    );
 
     // Bridge received exactly one envelope.
     assert_eq!(bridge.call_count(), 1);
@@ -91,7 +110,10 @@ fn full_restaurant_receipt_with_alcohol_cigarettes_and_card_slip() {
     assert_eq!(env.cashier_id.as_deref(), Some("csh1"));
 
     // Dual-tax mode correctly decoded from Cyrillic А/Б to 1/2.
-    let dual = env.payload.dual_tax_mode.expect("NLPR should populate dual-tax");
+    let dual = env
+        .payload
+        .dual_tax_mode
+        .expect("NLPR should populate dual-tax");
     assert_eq!(dual.tax_group_1, 2); // Б
     assert_eq!(dual.tax_group_2, 1); // А
 
@@ -130,7 +152,10 @@ fn alcohol_receipt_uses_cyrillic_dual_tax_codes_correctly() {
     // carry the numeric group values, not the raw chars.
     let mut session = Session::new();
     let bridge = MockBridge::new();
-    let mut corr = Correlation { session_uuid: "alcohol".to_string(), receipt_seq: 0 };
+    let mut corr = Correlation {
+        session_uuid: "alcohol".to_string(),
+        receipt_seq: 0,
+    };
 
     run(
         &mut session,
@@ -141,14 +166,27 @@ fn alcohol_receipt_uses_cyrillic_dual_tax_codes_correctly() {
             cashier_id: "csh".to_string(),
         },
     );
-    run(&mut session, &bridge, &mut corr, Command::Prep("X".to_string()));
     run(
         &mut session,
         &bridge,
         &mut corr,
-        Command::Nlpr { tax1_char: 'Б', tax2_char: 'А' },
+        Command::Prep("X".to_string()),
     );
-    run(&mut session, &bridge, &mut corr, Command::Comp(String::new()));
+    run(
+        &mut session,
+        &bridge,
+        &mut corr,
+        Command::Nlpr {
+            tax1_char: 'Б',
+            tax2_char: 'А',
+        },
+    );
+    run(
+        &mut session,
+        &bridge,
+        &mut corr,
+        Command::Comp(String::new()),
+    );
 
     let env = bridge.last().unwrap();
     let dual = env.payload.dual_tax_mode.unwrap();
@@ -163,7 +201,10 @@ fn cigarettes_dual_tax_mode_uses_group_four() {
     // carry 'Г' + first-zero-group representation.
     let mut session = Session::new();
     let bridge = MockBridge::new();
-    let mut corr = Correlation { session_uuid: "cig".to_string(), receipt_seq: 0 };
+    let mut corr = Correlation {
+        session_uuid: "cig".to_string(),
+        receipt_seq: 0,
+    };
 
     run(
         &mut session,
@@ -174,14 +215,27 @@ fn cigarettes_dual_tax_mode_uses_group_four() {
             cashier_id: "csh".to_string(),
         },
     );
-    run(&mut session, &bridge, &mut corr, Command::Prep("X".to_string()));
     run(
         &mut session,
         &bridge,
         &mut corr,
-        Command::Nlpr { tax1_char: 'Г', tax2_char: 'А' }, // tax Г + base
+        Command::Prep("X".to_string()),
     );
-    run(&mut session, &bridge, &mut corr, Command::Comp(String::new()));
+    run(
+        &mut session,
+        &bridge,
+        &mut corr,
+        Command::Nlpr {
+            tax1_char: 'Г',
+            tax2_char: 'А',
+        }, // tax Г + base
+    );
+    run(
+        &mut session,
+        &bridge,
+        &mut corr,
+        Command::Comp(String::new()),
+    );
 
     let env = bridge.last().unwrap();
     let dual = env.payload.dual_tax_mode.unwrap();

@@ -1,0 +1,22 @@
+# CS-1R R1.2 — SUPERSESSION registry (adjudicated retire-and-replace).
+#
+# The forward inventory gate (scripts/cs1r/inventory_gate.sh, control 2) forbids
+# ANY test-identity removal vs the PR base. The SOLE exception is an adjudicated
+# retire-and-replace recorded here, EXACTLY (no glob):
+#   * every removal vs base MUST appear here as (removed_module, removed_test);
+#   * every row's replacement test MUST exist in the current manifest;
+#   * the registry MUST NOT be stale (a row with no real removal vs base is RED);
+#   * any UNregistered future removal is RED.
+#
+# TAB-separated columns:
+#   removed_module <TAB> removed_test <TAB> repl_module <TAB> repl_test <TAB> reason
+# (module in manifest form, e.g. `prro::write_path_dps_error_routing`).
+#
+# NOTE: the per-base-exact rule (control 2) means this registry lists ONLY removals that are real
+# vs the CURRENT PR base (origin/main). A row is PRUNED here once its PR merges into main — a merged
+# removal is no longer a removal-vs-base and would read STALE. Pruned so far:
+#   * 15 CS-3 S7-1 (#336) rows — record in commit 224ad46;
+#   * 3 CS-3 Slice E Pin 2 (#337) rows — record in the #337 merge (origin/main 5360ecf4).
+# Their supersession records live in those commits + this file's git history. The registry is
+# currently EMPTY (no removals pending vs origin/main); the gate handles that (see the
+# empty-registry guard in inventory_gate.sh + the teeth in inventory_gate_teeth.sh).

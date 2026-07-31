@@ -1,5 +1,6 @@
 use prro::db::models::enums::FiscalMode;
 use prro::db::tx::with_immediate;
+use prro::db::types::DbShiftId;
 use prro::db::{
     models::{enums::ShiftState, ids::ShiftId},
     open_pool,
@@ -51,7 +52,7 @@ async fn fresh_with_fn() -> (sqlx::SqlitePool, String) {
 async fn insert_created_then_get() {
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier", 0)
         .await
         .unwrap();
     let row = shifts::get(&pool, id).await.unwrap().unwrap();
@@ -66,7 +67,7 @@ async fn insert_created_then_get() {
 async fn allowed_transitions_succeed() {
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier", 0)
         .await
         .unwrap();
     assert!(
@@ -90,7 +91,7 @@ async fn forbidden_transitions_blocked_in_code() {
     // Code-level whitelist must short-circuit BEFORE touching the DB.
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier", 0)
         .await
         .unwrap();
     let did_it = tx_shift_transition(&pool, id, ShiftState::Created, ShiftState::Closed)
@@ -109,7 +110,7 @@ async fn cas_blocks_when_state_diverged() {
     // Allowed transition Opening → Opened, but row is in Created — CAS must reject.
     let (pool, fn_id) = fresh_with_fn().await;
     let id = ShiftId::new();
-    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier")
+    shifts::insert_created(&pool, id, &fn_id, "ONLINE", "test-cashier", 0)
         .await
         .unwrap();
     let did_it = tx_shift_transition(&pool, id, ShiftState::Opening, ShiftState::Opened)
@@ -125,8 +126,8 @@ async fn cas_blocks_when_state_diverged() {
 #[tokio::test]
 async fn allowed_transition_table_matrix() {
     use ShiftState::*;
-    // M3b W14a-2a: 14-edge whitelist per spec §4.1.
-    // Allowed (must be true) — 14 edges.
+    // M3b W14a-2a: whitelist per spec §4.1 — now 18 edges (M2-N2a #15; CS-3 gap 4a #16; gap 4b #17,#18).
+    // Allowed (must be true) — 14 base edges + 4 later additions.
     assert!(shifts::allowed_transition(Created, Opening)); // 1
     assert!(shifts::allowed_transition(Created, OpenedLocalPendingDrain)); // 2
     assert!(shifts::allowed_transition(Opening, Opened)); // 3
@@ -156,6 +157,17 @@ async fn allowed_transition_table_matrix() {
         ClosingLocalPendingDrain,
         RequiresManualReconciliation
     )); // 14
+        // Later additions (operator/M2-N2a rollback edges):
+    assert!(shifts::allowed_transition(
+        Opened,
+        RequiresManualReconciliation
+    )); // 15 (M2-N2a)
+    assert!(shifts::allowed_transition(Opening, Closed)); // 16 (gap 4a operator rollback)
+    assert!(shifts::allowed_transition(OpenedLocalPendingDrain, Closed)); // 17 (gap 4b operator rollback)
+    assert!(shifts::allowed_transition(
+        ClosingLocalPendingDrain,
+        OpenedLocalPendingDrain
+    )); // 18 (gap 4b operator rollback)
 
     // Forbidden (must be false) — sample of structural violations.
     // Per spec §4.4: Error is reachable ONLY via force_to_error_with_audit seam;
@@ -174,8 +186,7 @@ async fn allowed_transition_table_matrix() {
         ClosingLocalPendingDrain,
         Opened
     ));
-    // Forbidden: OpenedLocalPendingDrain → Closed directly (must route via ClosingLocalPendingDrain)
-    assert!(!shifts::allowed_transition(OpenedLocalPendingDrain, Closed));
+    // (OpenedLocalPendingDrain → Closed is now allowed — gap-4b operator rollback edge 17.)
     // Forbidden: OpenedLocalPendingDrain → Opening (forward-only on open-side)
     assert!(!shifts::allowed_transition(
         OpenedLocalPendingDrain,
@@ -191,10 +202,10 @@ async fn allowed_transition_table_matrix() {
 #[tokio::test]
 async fn second_active_shift_per_fiscal_is_rejected() {
     let (pool, fn_id) = fresh_with_fn().await;
-    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-1")
+    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-1", 0)
         .await
         .expect("first active shift OK");
-    let err = shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2")
+    let err = shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2", 0)
         .await
         .expect_err("a second active shift for the same FN must be rejected by the uq index");
     assert!(
@@ -210,18 +221,18 @@ async fn second_active_shift_per_fiscal_is_rejected() {
 async fn new_shift_allowed_after_prior_left_active_set() {
     let (pool, fn_id) = fresh_with_fn().await;
     let id1 = ShiftId::new();
-    shifts::insert_created(&pool, id1, &fn_id, "ONLINE", "csh-1")
+    shifts::insert_created(&pool, id1, &fn_id, "ONLINE", "csh-1", 0)
         .await
         .unwrap();
     // Drive id1 OUT of the active set (raw UPDATE to terminal CLOSED — the full
     // transition path is exercised elsewhere; here we only set the index
     // precondition).
     sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
-        .bind(id1)
+        .bind(DbShiftId(id1))
         .execute(&pool)
         .await
         .unwrap();
-    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2")
+    shifts::insert_created(&pool, ShiftId::new(), &fn_id, "ONLINE", "csh-2", 0)
         .await
         .expect(
             "a new active shift is allowed once the prior is CLOSED (excluded from the uq index)",

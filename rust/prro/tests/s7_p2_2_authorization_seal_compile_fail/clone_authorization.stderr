@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `prro::db::repositories::delivery_reservation::Authorization` in the current scope
+ --> tests/s7_p2_2_authorization_seal_compile_fail/clone_authorization.rs:8:20
+  |
+8 |     let dup = auth.clone();
+  |                    ^^^^^ method not found in `prro::db::repositories::delivery_reservation::Authorization`

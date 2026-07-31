@@ -476,7 +476,8 @@ impl App {
     ///     that crashed between sign and send in a prior tick).
     ///   - SENT → `dispatch_sent_via_probe` (3-way `last_chk`
     ///     classification: Match → KVT1, Mismatch → RM, NotFound →
-    ///     ER tick-1 of two-tick retry).
+    ///     RMR + node STOP — issuance-ambiguous escalation, CS-3 S7-1 F2;
+    ///     the old two-tick Sent → ErrorRetryable redrive was retired by R6).
     ///   - ERROR_RETRYABLE → `dispatch_error_retryable_by_class`
     ///     reads durable `retry_class` from `transport_trace` and
     ///     routes: TransientRetry → `stage_send::run`;
@@ -564,6 +565,35 @@ impl App {
         // PR-B (RS-4, spec §B-1.4) — boot stale-tip guard master switch.
         let tip_guard_enabled = self.inner.config.backup.tip_guard_enabled;
         let mut summary = ReconciliationSummary::default();
+
+        // CS-3 S7-1 · A3 — boot-first delivery-reservation pass (§7.1/§7.2). GLOBAL and pre-loop:
+        // it normalises crashed `CALL_STARTED` reservations, applies recorded `OUTCOME_OBSERVED +
+        // PENDING_APPLY` ones, and reconstructs any FN whose `node_state` was lost, BEFORE the per-FN
+        // dispatch runs.  No wire I/O (invariant #1); runs under the recon mutex.  INACTIVE until the
+        // Slice-7 cutover mints reservations — the queries are empty today, so this is a no-op.
+        // Ordering is LOAD-BEARING (S7-P4-BOOT order-swap canary): running it after the loop would let
+        // the loop resume a crashed `Sending` doc to `ErrorRetryable` before the STOP flip.
+        let res_pass =
+            crate::services::reconciliation::reservation_boot_pass::run(&_recon_guard, pool)
+                .await
+                .map_err(|e| match e.downcast::<sqlx::Error>() {
+                    Ok(sqlx_err) => BootError::Database(sqlx_err),
+                    Err(other) => BootError::ReconciliationFailed {
+                        fiscal_number: "<boot-reservation-pass>".to_string(),
+                        source: other,
+                    },
+                })?;
+        if res_pass.is_active() {
+            tracing::info!(
+                normalized = res_pass.normalized,
+                applied = res_pass.applied,
+                held = res_pass.held,
+                reconstructed = res_pass.reconstructed,
+                dropped = res_pass.dropped,
+                "boot-first reservation pass resolved crashed/pending delivery reservations"
+            );
+        }
+
         for fn_cfg in &fns {
             // M3a hardening pass 1: resolve per-FN RuntimeView BEFORE
             // dispatching.  `ReconciliationRuntime::resolve` returns
@@ -854,6 +884,44 @@ impl App {
             self.db(),
             view,
             fiscal_number,
+        )
+        .await
+    }
+
+    /// T3 (RULING 3.4) — the UNCONDITIONAL shift-limit auto-Z for one FN.
+    ///
+    /// Reads the 24h shift budget against the injected `clock` (the SAME seam the
+    /// admission gate + all budgets use). When the open shift has reached the
+    /// boundary, makes a DURABLE Z attempt REGARDLESS of any enforcement toggle:
+    /// a synthetic `Z_REPORT` inbox row is minted (deterministic idempotency key
+    /// for crash-safety) and driven through the real write path
+    /// (`inline::run` → `run_z_dispatch`) under the held FN lease — so an ONLINE
+    /// shift gets the normal Z dispatch and an OFFLINE shift gets the Pattern-C
+    /// local Z (the T2 close-reserve guarantees a code), and a Z FAILURE routes
+    /// through the existing Z failure paths (edges 4/12 → RequiresManual
+    /// Reconciliation), NEVER silent continuation (RULING 3.4).
+    ///
+    /// Returns the [`AutoZOutcome`]: `NotDue` (under 24h / no closable shift),
+    /// `Issued` (the Z reached OFFLINE_LOCAL_ACK / ACK), or `Escalated` (the Z
+    /// attempt failed and the FN was escalated / left for recovery — durable, not
+    /// silent). Idempotent: a re-tick after a successful Z sees the shift closed →
+    /// `NotDue`; a re-tick with the Z still resting resolves the existing row.
+    pub async fn auto_z_close_over_limit_for_fn(
+        &self,
+        fiscal_number: &str,
+        clock: &dyn crate::services::time_budget::Clock,
+        view: &crate::services::reconciliation::RuntimeView<'_>,
+    ) -> anyhow::Result<crate::services::write_path::AutoZOutcome> {
+        let gate = self.acquire_fn_gate(fiscal_number).await;
+        crate::services::write_path::run_auto_z_if_over_limit(
+            self.db(),
+            self.db_secure(),
+            view.dps,
+            view.signing_ctx,
+            view.fn_sign,
+            &gate,
+            fiscal_number,
+            clock,
         )
         .await
     }

@@ -14,6 +14,7 @@ use prro::db::repositories::{
     fiscal_documents as fd, fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig,
     ingress_inbox as inbox, ingress_inbox::NewInboxEntry, shifts,
 };
+use prro::db::types::{DbDocumentId, DbRequestId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::write_path::{
     stage_acquire,
@@ -81,9 +82,9 @@ async fn seed_node_state(
          VALUES (?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
-    .bind(current_shift_id)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
+    .bind(current_shift_id.map(DbShiftId))
     .bind(backend)
     .bind(transport)
     .execute(pool)
@@ -119,7 +120,7 @@ async fn seed_open_shift(pool: &sqlx::SqlitePool) -> ShiftId {
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .execute(pool)
     .await
@@ -141,9 +142,9 @@ async fn seed_shift_with_state(
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, ?, 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
-    .bind(state)
+    .bind(state.as_str())
     .bind(opener)
     .execute(pool)
     .await
@@ -293,7 +294,7 @@ async fn stage1_sell_happy_path_with_opened_shift() {
     let snapshot_id_persisted: Option<i64> = sqlx::query_scalar(
         "SELECT signing_config_snapshot_id FROM fiscal_documents WHERE document_id = ?",
     )
-    .bind(ctx.document.document_id)
+    .bind(DbDocumentId(ctx.document.document_id))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1123,7 +1124,7 @@ async fn stage1_offline_sell_on_opened_local_pending_drain_carries_shift_id() {
     // Verify the persisted ledger row carries shift_id (NOT NULL).
     let persisted_shift_id: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT shift_id FROM fiscal_documents WHERE document_id = ?")
-            .bind(ctx.document.document_id)
+            .bind(DbDocumentId(ctx.document.document_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1136,7 +1137,7 @@ async fn stage1_offline_sell_on_opened_local_pending_drain_carries_shift_id() {
     // NOT the pre-fix hardcoded "ONLINE".
     let persisted_fs_mode: String =
         sqlx::query_scalar("SELECT fs_mode FROM fiscal_documents WHERE document_id = ?")
-            .bind(ctx.document.document_id)
+            .bind(DbDocumentId(ctx.document.document_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1442,7 +1443,7 @@ async fn stage1_terminal_existing_doc_rejects_not_resumed() {
              total_sum_kop, payload_json, payload_sha256_canonical
          ) VALUES (?, ?, ?, 999, 'SELL', 'ACK', 'b', 't', 'ONLINE', ?, ?, ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_slice)
     .bind(FN)
     .bind("2026-04-22T11:00:00Z")
@@ -1595,8 +1596,8 @@ async fn seed_online_er_blocker(pool: &sqlx::SqlitePool, lnd: i64) {
          ) VALUES (?, ?, ?, ?, 'SELL', 'ERROR_RETRYABLE', 'b', 't', 'ONLINE', \
                    '2026-04-22T12:00:00Z', 15000, '{}', ?)",
     )
-    .bind(doc_id)
-    .bind(req_id)
+    .bind(DbDocumentId(doc_id))
+    .bind(DbRequestId(req_id))
     .bind(FN)
     .bind(lnd)
     .bind(&[0u8; 32][..])

@@ -196,6 +196,17 @@ pub async fn run(
             None => None,
         };
 
+    // L0 carry anchor — derive BEFORE the write-tx (invariant #1: pure pool read,
+    // no network/crypto).  Only needed for SHIFT_OPEN; 0 for all other doc-types.
+    // `opening_carry_for_fn` reads the most-recently-closed shift's
+    // `cash_balance_kop` (persisted as closing balance at that shift-close)
+    // as the new shift's opening anchor.  First shift (no closed row) → 0.
+    let opening_cash_kop: i64 = if command.doc_type == DocType::ShiftOpen {
+        crate::services::cash_ledger::opening_carry_for_fn(pool, &peeked_fn_id).await?
+    } else {
+        0
+    };
+
     let driver_id_owned = driver_id.to_string();
     let peeked_fn_id_owned = peeked_fn_id.clone();
     let tax_snapshot_for_tx = tax_snapshot.clone();
@@ -713,6 +724,120 @@ pub async fn run(
                 .await;
             }
 
+            // [Step 6b‴‴] INV-21 TOCTOU close — in-lease cash-floor re-check.
+            //
+            // The pre-inbox L1 guard (`convert.rs`) is the FAST row-less UX
+            // refusal.  Two concurrent same-FN cash RETURNs can both pass the
+            // pre-inbox guard reading the same DB snapshot, then race to this
+            // point.  The FN write lease (held since `acquire_lease` above)
+            // serializes them: the second RETURN sees the cash balance AFTER
+            // the first RETURN's doc was committed (or is in-flight under the
+            // lock).  Re-checking here — under the lease, from the tx-snapshot
+            // — closes the TOCTOU.
+            //
+            // **Scoped to Online channel**: offline ops go through the same
+            // FN write-lease (single-writer), so TOCTOU is structurally closed
+            // for offline too.  However, offline ops may have a B10 lazy-BEGIN
+            // interposed (a separate committed doc) BEFORE the RETURN lands here.
+            // The in-lease guard fires after the BEGIN is committed, so the BEGIN
+            // doc is unaffected; the RETURN itself is refused pre-mint (no code
+            // consumed, no RETURN doc).  Modelling this in the fuzzer's RefModel
+            // would require predicting "BEGIN fires, RETURN refused" as a
+            // multi-document outcome — significant complexity for a low-risk
+            // offline edge.  Offline RETURNs are already protected by the
+            // pre-inbox L1 guard (convert.rs) which is always in the offline
+            // ingress path.  Online-only scoping preserves the TOCTOU protection
+            // for the concurrent-online case where it matters most.
+            //
+            // This is a RETURN with a cash leg (type_code "0") only.
+            // SELL is excluded (cash in is always safe for INV-21).
+            //
+            // **Invariant #1**: this is a pure SELECT (no network/crypto),
+            // so running it inside BEGIN IMMEDIATE does NOT violate INV-1.
+            // The serialized section allows DB reads; it forbids I/O.
+            // INV-21 guard-3a (RETURN cash leg) + guard-3b (SERVICE_OUT) +
+            // guard-3c (EPZ / CASH_ADVANCE_EPZ — видача готівки за ЕПЗ).
+            // All ONLINE-only in-lease re-checks.  Offline RETURNs / EPZ are
+            // protected by the pre-inbox L1 / guard-3c (convert.rs).
+            // **Invariant #1**: pure SELECT — no network/crypto inside tx.
+            if channel == Channel::Online
+                && (command.doc_type == DocType::Return
+                    || command.doc_type == DocType::ServiceOut
+                    || command.doc_type == DocType::CashAdvanceEpz)
+            {
+                // Derive the outgoing-cash amount for this doc:
+                // - RETURN: sum of cash legs (type_code "0") from converted payload.
+                // - SERVICE_OUT: amount_kop from the service-io payload.
+                // - EPZ: sum_kop from the EPZ payload (cash-out ledger effect).
+                #[derive(serde::Deserialize)]
+                struct ReturnPayment { type_code: String, sum_kop: i64 }
+                #[derive(serde::Deserialize)]
+                struct ReturnPayload { payments: Vec<ReturnPayment> }
+                #[derive(serde::Deserialize)]
+                struct ServiceIoPayload { amount_kop: i64 }
+                #[derive(serde::Deserialize)]
+                struct EpzPayload { sum_kop: i64 }
+
+                let outgoing_cash_kop: i64 = if command.doc_type == DocType::Return {
+                    if let Ok(rp) = serde_json::from_str::<ReturnPayload>(&command.payload_json) {
+                        rp.payments
+                            .iter()
+                            .filter(|p| p.type_code == "0" && p.sum_kop > 0)
+                            .map(|p| p.sum_kop)
+                            .fold(0i64, |a, b| a.saturating_add(b))
+                    } else {
+                        0
+                    }
+                } else if command.doc_type == DocType::CashAdvanceEpz {
+                    // EPZ — the cash-out sum drives the drawer down.
+                    serde_json::from_str::<EpzPayload>(&command.payload_json)
+                        .map(|p| p.sum_kop.max(0))
+                        .unwrap_or(0)
+                } else {
+                    // SERVICE_OUT
+                    serde_json::from_str::<ServiceIoPayload>(&command.payload_json)
+                        .map(|p| p.amount_kop.max(0))
+                        .unwrap_or(0)
+                };
+
+                if outgoing_cash_kop > 0 {
+                    // Re-derive cash-on-hand under the write-lease tx snapshot.
+                    // active_shift is Some (Opened* verified at Step 5).
+                    let cash_on_hand_kop: i64 = if let Some(ref shift) = active_shift {
+                        let (sell, ret, svc_in, svc_out, epz_out) =
+                            crate::services::cash_ledger::aggregate_shift_cash_tx(
+                                tx, &fn_id, shift.shift_id,
+                            )
+                            .await?;
+                        crate::services::cash_ledger::derive_cash_on_hand(
+                            shift.cash_balance_kop, sell, ret, svc_in, svc_out, epz_out,
+                        )
+                    } else {
+                        0 // no open shift → 0; shift guard (Step 4) handles no-shift refusal
+                    };
+
+                    if cash_on_hand_kop < outgoing_cash_kop {
+                        return reject(
+                            tx,
+                            &request_id,
+                            RejectionReason::CashInsufficientInLease {
+                                cash_on_hand_kop,
+                                return_cash_kop: outgoing_cash_kop,
+                            },
+                            "inv21_cash_insufficient_in_lease",
+                            Severity::Warning,
+                            Some(serde_json::json!({
+                                "fn": fn_id,
+                                "cash_on_hand_kop": cash_on_hand_kop,
+                                "outgoing_cash_kop": outgoing_cash_kop,
+                                "doc_type": format!("{:?}", command.doc_type),
+                            })),
+                        )
+                        .await;
+                    }
+                }
+            }
+
             // [Step 6c] W4-Z2a piece 6b-self-review Important #1 —
             //           insert tax_snapshot ONLY now that we're
             //           definitively on the Proceed path (Resume and
@@ -778,7 +903,7 @@ pub async fn run(
                             .expect("Step 6b′ refuses ShiftOpen with no cashier")
                             .as_str();
                         let shift_id = ShiftId::deterministic_for_shift_open(document_id);
-                        transition::create_shift_tx(tx, &fn_id, shift_id, "ONLINE", opener)
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "ONLINE", opener, opening_cash_kop)
                             .await?;
                         expect_applied(
                             transition::apply_shift_transition(
@@ -845,7 +970,7 @@ pub async fn run(
                             .expect("Step 6b′ refuses ShiftOpen with no cashier")
                             .as_str();
                         let shift_id = ShiftId::deterministic_for_shift_open(document_id);
-                        transition::create_shift_tx(tx, &fn_id, shift_id, "OFFLINE", opener)
+                        transition::create_shift_tx(tx, &fn_id, shift_id, "OFFLINE", opener, opening_cash_kop)
                             .await?;
                         expect_applied(
                             transition::apply_shift_transition(
@@ -1073,6 +1198,7 @@ fn spec_event_for(reason: &RejectionReason) -> Option<&'static str> {
         ZReportBlockedBacklogDrainPending => Some("OFFLINE_Z_REPORT_BACKLOG_DRAIN_PENDING_REFUSED"),
         OfflineLifecycleNoActiveSession => Some("OFFLINE_LIFECYCLE_NO_ACTIVE_SESSION_REFUSED"),
         OfflineLifecycleCodePoolEmpty => Some("OFFLINE_LIFECYCLE_CODE_POOL_EMPTY_REFUSED"),
+        CashInsufficientInLease { .. } => Some("inv21_cash_insufficient_in_lease"),
         _ => None,
     }
 }
@@ -1208,27 +1334,58 @@ fn check_shift_guard(
             current: shift_state,
         }),
 
+        // ── B10 offline-session boundary docs — gateway-INTERNAL, offline
+        //    channel only.  They are minted by the drain-handshake seam, never
+        //    by an operator/ingress request:
+        //      - BEGIN is lazily minted as the FIRST offline doc of a session,
+        //        BEFORE that doc.  When the first offline doc is a SELL/RETURN the
+        //        shift is already `Opened`/`OpenedLocalPendingDrain`; when it is a
+        //        Pattern-C offline SHIFT_OPEN, the shift is still `Closed` (the
+        //        SHIFT_OPEN has not created it yet) — so the BEGIN must be admitted
+        //        in `Closed` too (review Finding B).  `Created`/`Opening`/`Closing`
+        //        stay blocked by the mid-transition arm above.
+        //      - END is minted at drain finalize (shift `Opened` /
+        //        `OpenedLocalPendingDrain` / `ClosingLocalPendingDrain`).
+        //    An online-channel attempt (none in production) or a wrong shift state
+        //    refuses fail-closed with the pending-drain shape.
+        (OfflineSessionBegin, Closed | Opened | OpenedLocalPendingDrain, Offline) => None,
+        (
+            OfflineSessionEnd,
+            Opened | OpenedLocalPendingDrain | ClosingLocalPendingDrain,
+            Offline,
+        ) => None,
+        (OfflineSessionBegin | OfflineSessionEnd, _, _) => {
+            Some(RejectionReason::ShiftOpenPendingDrainOpRefused)
+        }
+
         // ── Regular fiscal ops in Opened — channel-irrelevant happy.
-        (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Opened, _) => None,
+        // EPZ (CashAdvanceEpz) rides the same admission arms as ServiceOut.
+        (
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
+            Opened,
+            _,
+        ) => None,
 
         // ── Regular fiscal ops in Closed — channel-irrelevant refusal.
-        (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Closed, _) => {
-            Some(RejectionReason::ShiftNotOpen {
-                current: shift_state,
-            })
-        }
+        (
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
+            Closed,
+            _,
+        ) => Some(RejectionReason::ShiftNotOpen {
+            current: shift_state,
+        }),
 
         // ── W14a-2b channel-aware OpenedLocalPendingDrain ──
         // Offline channel: Pattern C resilience surface — allowed.
         (
-            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
             OpenedLocalPendingDrain,
             Offline,
         ) => None,
         // Online channel: operator should reissue offline or wait
         // for drain — refused with typed audit shape.
         (
-            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
             OpenedLocalPendingDrain,
             Online,
         ) => Some(RejectionReason::ShiftOpenPendingDrainOpRefused),
@@ -1238,7 +1395,7 @@ fn check_shift_guard(
         // irrelevant — once a Z-report has been locally acked, no
         // further sale-flavour ops accepted regardless of channel.
         (
-            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+            Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
             ClosingLocalPendingDrain,
             _,
         ) => Some(RejectionReason::PostLocalCloseSaleRefused),
@@ -1279,6 +1436,7 @@ mod channel_aware_matrix_tests {
         DocType::ServiceIn,
         DocType::ServiceOut,
         DocType::CashWithdrawal,
+        DocType::CashAdvanceEpz,
         DocType::XReport,
         DocType::ZReport,
     ];
@@ -1339,22 +1497,28 @@ mod channel_aware_matrix_tests {
         }
         // Regular fiscal ops.
         match (doc, state, ch) {
-            (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Opened, _) => None,
-            (Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport, Closed, _) => {
-                Some(RejectionReason::ShiftNotOpen { current: state })
-            }
             (
-                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
+                Opened,
+                _,
+            ) => None,
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
+                Closed,
+                _,
+            ) => Some(RejectionReason::ShiftNotOpen { current: state }),
+            (
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
                 OpenedLocalPendingDrain,
                 Offline,
             ) => None,
             (
-                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
                 OpenedLocalPendingDrain,
                 Online,
             ) => Some(RejectionReason::ShiftOpenPendingDrainOpRefused),
             (
-                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | XReport,
+                Sell | Return | ServiceIn | ServiceOut | CashWithdrawal | CashAdvanceEpz | XReport,
                 ClosingLocalPendingDrain,
                 _,
             ) => Some(RejectionReason::PostLocalCloseSaleRefused),
@@ -1392,8 +1556,8 @@ mod channel_aware_matrix_tests {
             }
         }
         assert_eq!(
-            total, 162,
-            "matrix MUST cover 9 doc_types × 9 shift_states × 2 channels = 162"
+            total, 180,
+            "matrix MUST cover 10 doc_types × 9 shift_states × 2 channels = 180"
         );
         // Drift-guard: pin the absolute None vs Some split to catch
         // accidental matrix widening / narrowing.
@@ -1401,18 +1565,18 @@ mod channel_aware_matrix_tests {
         // - (ShiftOpen, Closed, _) → 2
         // - (ShiftClose, Opened, _) → 2
         // - (ZReport, Opened, _) → 2
-        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, Opened, _) → 6×2 = 12
-        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|XReport, OpenedLocalPendingDrain, Offline) → 6×1 = 6
+        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|CashAdvanceEpz|XReport, Opened, _) → 7×2 = 14
+        // - (Sell|Return|ServiceIn|ServiceOut|CashWithdrawal|CashAdvanceEpz|XReport, OpenedLocalPendingDrain, Offline) → 7×1 = 7
         // - (ShiftClose, OpenedLocalPendingDrain, Offline) → 1  (A′.3 PR-O3 slice 3 edge 7)
         // - (ZReport, OpenedLocalPendingDrain, Offline) → 1     (A′.3 PR-O3 slice 3 edge 7)
-        // Total None = 26; Some = 162 - 26 = 136.
+        // Total None = 29; Some = 180 - 29 = 151.
         assert_eq!(
-            none_count, 26,
-            "spec §3.4 + PR-O3 edge 7: 26 happy-path None cells"
+            none_count, 29,
+            "spec §3.4 + PR-O3 edge 7 + EPZ: 29 happy-path None cells"
         );
         assert_eq!(
-            some_count, 136,
-            "spec §3.4 + PR-O3 edge 7: 136 refusal cells"
+            some_count, 151,
+            "spec §3.4 + PR-O3 edge 7 + EPZ: 151 refusal cells"
         );
     }
 
@@ -1421,7 +1585,7 @@ mod channel_aware_matrix_tests {
         // Drift guard: if a new DocType / ShiftState lands, the
         // matrix above MUST be updated.  Pinning arity here breaks
         // the matrix test loud + early.
-        assert_eq!(ALL_DOC_TYPES.len(), 9, "M3b W14a-1: 9 doc types");
+        assert_eq!(ALL_DOC_TYPES.len(), 10, "M3b W14a-1 + EPZ: 10 doc types");
         assert_eq!(ALL_SHIFT_STATES.len(), 9, "M3b W14a-1: 9 shift states");
         assert_eq!(ALL_CHANNELS.len(), 2, "W14a-2b Commit 4: Online / Offline");
     }

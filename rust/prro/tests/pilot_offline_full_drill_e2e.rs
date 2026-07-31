@@ -40,7 +40,7 @@ use prro::db::repositories::ingress_inbox::{
 use prro::db::repositories::{fiscal_number_config as fn_cfg, operators as ops_repo};
 use prro::runtime::bindings::{BindingsRegistry, KeyLoadFailure, OperatorKeyLoader};
 use prro::runtime::coding::Coding;
-use prro::runtime::ingress::inline_binding::production_write_path;
+use prro::runtime::ingress::inline_binding::production_write_path_with_clock;
 use prro::runtime::ingress::seam::{FiscalOutcome, WritePathEntry};
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -150,8 +150,8 @@ async fn seed_boot_baseline(pool: &SqlitePool) {
          VALUES (?, ?, ?, NULL, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Closed)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Closed.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -161,7 +161,7 @@ fn kvt1(sfn: &str) -> CheckAck {
     CheckAck {
         id: sfn.into(),
         id_sign: vec![],
-        data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        data_sign: vec![0xDE; 64],
     }
 }
 
@@ -223,22 +223,22 @@ struct DrainCarriers {
 }
 
 fn drain_carriers() -> DrainCarriers {
+    // B10: a drained offline session now also carries the two boundary docs
+    // (DocType=9 BEGIN minted at the first offline sell + DocType=10 END minted
+    // at drain finalize).  So the drain wire sequence is up to 4 send_chk +
+    // 4 last_chk (BEGIN + content×N + END).  Provide a generous queue.
+    let sends: Vec<_> = (0..4).map(|i| Ok(ack(&format!("DPS-DRAIN-{i}")))).collect();
+    let lasts: Vec<_> = (0..4)
+        .map(|i| {
+            Ok(CheckAck {
+                id: format!("DPS-DRAIN-{i}"),
+                id_sign: vec![],
+                data_sign: vec![(i as u8).wrapping_add(0xA0); 64],
+            })
+        })
+        .collect();
     DrainCarriers {
-        dps: Arc::new(
-            StubDpsChannel::with_queue(vec![Ok(ack("DPS-DRAIN-1")), Ok(ack("DPS-DRAIN-2"))])
-                .with_last_chk_queue(vec![
-                    Ok(CheckAck {
-                        id: "DPS-DRAIN-1".into(),
-                        id_sign: vec![],
-                        data_sign: vec![0xAAu8; 32],
-                    }),
-                    Ok(CheckAck {
-                        id: "DPS-DRAIN-2".into(),
-                        id_sign: vec![],
-                        data_sign: vec![0xBBu8; 32],
-                    }),
-                ]),
-        ),
+        dps: Arc::new(StubDpsChannel::with_queue(sends).with_last_chk_queue(lasts)),
         signing_ctx: det_signing_ctx(),
         fn_sign: CheckSignBlob(vec![0xAB, 0xCD]),
     }
@@ -300,7 +300,13 @@ async fn pilot_offline_full_drill_go_offline_sell_return_go_online_drain_converg
     let app = boot_app().await;
     let registry = build_registry(&app, shift_open_only_dps()).await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     // ─── 1) online SHIFT_OPEN (edge 3, live) ──────────────────────────────
     let open = drive(
@@ -348,7 +354,9 @@ async fn pilot_offline_full_drill_go_offline_sell_return_go_online_drain_converg
     .await
     .expect("offline RETURN");
     assert_eq!(ret.document_state, DocState::OfflineLocalAck);
-    assert_eq!(doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await, 2);
+    // B10: 3 OLA docs pre-drain — the lazy DocType=9 BEGIN (minted at the first
+    // offline SELL) + the SELL + the RETURN.
+    assert_eq!(doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await, 3);
     prro::db::invariant_scan::assert_clean(app.db()).await;
 
     // ─── 4) GO_ONLINE through the LIVE door (mode → GOING_ONLINE) ─────────
@@ -370,22 +378,26 @@ async fn pilot_offline_full_drill_go_offline_sell_return_go_online_drain_converg
     };
     assert_eq!(
         summary.backlog_size_before(),
-        2,
-        "2 OLA docs in the backlog"
+        3,
+        "B10: 3 OLA docs in the backlog — BEGIN + SELL + RETURN"
     );
     assert_eq!(
         summary.advanced_to_ack(),
-        2,
-        "both offline docs converge to ACK"
+        3,
+        "all 3 content-cohort offline docs converge to ACK (END is a finalize \
+         precondition, not counted in the cohort)"
     );
-    assert!(summary.finalized(), "all docs Acked → finalize Eligible");
+    assert!(
+        summary.finalized(),
+        "all content Acked + END Acked → finalize Eligible"
+    );
     drop(carriers);
 
     // ─── 6) convergence assertions ────────────────────────────────────────
     assert_eq!(
         doc_count_in_state(app.db(), "ACK").await,
-        3,
-        "SHIFT_OPEN + SELL + RETURN all ACK"
+        5,
+        "B10: SHIFT_OPEN + BEGIN + SELL + RETURN + END all ACK"
     );
     assert_eq!(
         doc_count_in_state(app.db(), "OFFLINE_LOCAL_ACK").await,
@@ -453,7 +465,13 @@ async fn combined_pilot_gate_online_and_offline_cohorts_in_one_shift() {
     )
     .await;
     seed_boot_baseline(app.db()).await;
-    let write_path = production_write_path(app.clone(), Arc::new(registry));
+    let write_path = production_write_path_with_clock(
+        app.clone(),
+        Arc::new(registry),
+        std::sync::Arc::new(prro::services::time_budget::FixedClock::from_rfc3339(
+            "2026-07-07T12:30:00Z",
+        )),
+    );
 
     // 1) online SHIFT_OPEN + 2) an ONLINE SELL (issued online → ACK).
     let open = drive(
@@ -521,7 +539,12 @@ async fn combined_pilot_gate_online_and_offline_cohorts_in_one_shift() {
         ScheduledDrainOutcome::Ran(s) => s,
         ScheduledDrainOutcome::SkippedBackoff { .. } => panic!("drain must run"),
     };
-    assert_eq!(summary.advanced_to_ack(), 2, "offline cohort drains to ACK");
+    assert_eq!(
+        summary.advanced_to_ack(),
+        3,
+        "B10: offline cohort (BEGIN + SELL + RETURN) drains to ACK; END is a \
+         finalize precondition (not counted in the cohort)"
+    );
     drop(carriers);
     assert_eq!(node_row(app.db()).await.0, "ONLINE");
     assert_eq!(

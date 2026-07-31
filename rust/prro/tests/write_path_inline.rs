@@ -23,6 +23,7 @@ use prro::db::models::enums::{
 use prro::db::models::ids::{OfflineSessionId, RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::seam::FiscalError;
 use prro::services::write_path::inline;
@@ -78,6 +79,15 @@ impl DpsChannel for DualStub {
             .unwrap()
             .take()
             .expect("DualStub.send_chk: called more than once")
+    }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
     }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_chk
@@ -210,9 +220,9 @@ async fn seed_node_state_online(pool: &SqlitePool, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -225,7 +235,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -286,6 +296,41 @@ async fn seed_inbox_op(pool: &SqlitePool, operation_type: &str) -> InboxRow {
         business_ts: Some("2026-06-09T12:00:00Z".into()),
         total_sum_kop: Some(TOTAL_KOP),
     }
+}
+
+/// Seed a committed ACK SELL row directly into `fiscal_documents` for the given
+/// shift, then advance `node_state.next_lnd` past it.
+///
+/// Used to build cash-on-hand before a RETURN test (the in-lease INV-21
+/// guard reads from `state IN ('ACK','OFFLINE_LOCAL_ACK')`).
+///
+/// The seeded sell takes lnd=1; after inserting it we bump next_lnd to 2 so
+/// the subsequent `inline::run` can allocate lnd=2 without a unique-constraint
+/// conflict.
+async fn seed_committed_sell_ack(pool: &SqlitePool, shift_id: ShiftId) {
+    sqlx::query(
+        "INSERT INTO fiscal_documents( \
+            document_id, request_id, fiscal_number, shift_id, lnd, doc_type, state, \
+            backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+            payload_json, payload_sha256_canonical, server_fiscal_no, first_kvt1_at, \
+            total_sum_kop \
+         ) VALUES (?, randomblob(16), ?, ?, 1, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
+            '2026-06-09T12:00:00Z', ?, randomblob(32), 'DPS-SEED-1', '2026-06-09T12:00:05Z', ?)",
+    )
+    .bind(DbDocumentId(prro::db::models::ids::DocumentId::new()))
+    .bind(FN)
+    .bind(DbShiftId(shift_id))
+    .bind(SELL_PAYLOAD)
+    .bind(TOTAL_KOP)
+    .execute(pool)
+    .await
+    .unwrap();
+    // Advance next_lnd past the seeded doc so inline::run can allocate lnd=2.
+    sqlx::query("UPDATE node_state SET next_lnd = 2 WHERE fiscal_number = ?")
+        .bind(FN)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 /// Seed a NEW SHIFT_OPEN inbox row (the live write-path shape: `ShiftOpenJson`
@@ -432,8 +477,8 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_state: ShiftSt
          VALUES (?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -447,9 +492,9 @@ async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Offline)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(NodeMode::Offline.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -461,7 +506,7 @@ async fn seed_open_offline_session(pool: &SqlitePool) -> OfflineSessionId {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-06-09T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(OfflineSessionState::Open.as_str())
     .execute(pool)
@@ -507,7 +552,7 @@ async fn online_sell_reaches_ack() {
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])), // send_chk: data_sign discarded by stage_send
-        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])), // last_chk: KVT1 evidence
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])), // last_chk: KVT1 evidence
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
@@ -517,9 +562,18 @@ async fn online_sell_reaches_ack() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("online SELL must reach a terminal ACK FiscalOutcome");
+    let outcome = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("online SELL must reach a terminal ACK FiscalOutcome");
 
     assert_eq!(
         outcome.document_state,
@@ -561,26 +615,38 @@ async fn online_sell_transient_send_returns_in_progress() {
     seed_node_state_online(&pool, shift_id).await;
     let row = seed_inbox_sell(&pool).await;
 
-    // send_chk transient failure → stage_send routes to ErrorRetryable.
+    // CS-3 S7-1: a transient send failure (Transport → SubmittedUnknown) is now HELD in SENDING
+    // (PENDING_APPLY + node STOP), NOT routed to ErrorRetryable — the ER-redrive edge is retired
+    // (R1/R2), so there is no auto-redrive; resolution is probe/operator. Still a 202 IN_PROGRESS
+    // (classify_outcome maps SENDING → InProgress, same as the old ErrorRetryable).
     let dps = DualStub::new(
         Err(DpsError::Transport("net blip".into())),
-        Ok(ack(SERVER_FISCAL_NO, vec![0x01])), // unused on this path
+        Ok(ack(SERVER_FISCAL_NO, vec![0x01; 64])), // unused on this path
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("transient send is IN_PROGRESS (202), never a terminal Err");
+    let outcome = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("transient send is IN_PROGRESS (202), never a terminal Err");
 
     assert_eq!(
         outcome.document_state,
-        prro::db::models::enums::DocState::ErrorRetryable
+        prro::db::models::enums::DocState::Sending
     );
     assert_eq!(outcome.fiscal_id, None);
-    assert_eq!(read_doc_state(&pool, FN).await, "ERROR_RETRYABLE");
+    assert_eq!(read_doc_state(&pool, FN).await, "SENDING");
 }
 
 /// **A2.1b-core incr.3 — inline lastChk Hold → 202 Sent.** The wire send
@@ -607,9 +673,18 @@ async fn online_sell_lastchk_hold_returns_sent_in_progress() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("Hold leaves the doc at Sent → 202, never a terminal Err");
+    let outcome = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("Hold leaves the doc at Sent → 202, never a terminal Err");
 
     assert_eq!(
         outcome.document_state,
@@ -642,7 +717,14 @@ async fn offline_sell_is_offline_local_ack_success() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: the FIRST offline SELL lazily mints a DocType=9 BEGIN that consumes
+    // one code BEFORE the SELL — so two codes are needed (BEGIN + SELL).
+    // T2 close-reserve: the first offline sell is only admitted while
+    // `free >= 1 + reserve(BEGIN+Z=2)` = 3, so seed a 3rd code reserved for the
+    // eventual offline Z (BEGIN + SELL still consume just 2, one stays free).
     seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
     let row = seed_inbox_sell(&pool).await;
 
     // DPS is never called on the offline path (dispatch terminates at offline-ack).
@@ -655,16 +737,47 @@ async fn offline_sell_is_offline_local_ack_success() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("offline auto-ack is a SUCCESS (200), never a FiscalError");
+    let outcome = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("offline auto-ack is a SUCCESS (200), never a FiscalError");
 
     assert_eq!(
         outcome.document_state,
         prro::db::models::enums::DocState::OfflineLocalAck
     );
     assert_eq!(outcome.fiscal_id, None);
-    assert_eq!(read_doc_state(&pool, FN).await, "OFFLINE_LOCAL_ACK");
+    // B10: both the lazy BEGIN and the SELL rest at OFFLINE_LOCAL_ACK.
+    let ola_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND state = 'OFFLINE_LOCAL_ACK'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ola_count, 2,
+        "B10: BEGIN + SELL both rest at OFFLINE_LOCAL_ACK"
+    );
+    let begin_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        begin_count, 1,
+        "B10: exactly one lazy DocType=9 BEGIN minted"
+    );
     // Audit pass-2: the scan over a REAL offline-acked ledger (consumed
     // code backing offline_fiscal_no etc.) — zero false positives.
     prro::db::invariant_scan::assert_clean(&pool).await;
@@ -676,26 +789,27 @@ async fn offline_sell_is_offline_local_ack_success() {
     );
 }
 
-/// **Post-sign refusal orphan fix (ledger-only pin).** An offline SELL with NO
-/// available offline code reaches `SIGNED` (acquire+sign) and is then refused at
-/// `stage_offline_ack` (`acquire_code_tx` → CodePoolExhausted).  The refusal MUST
-/// leave the doc in the non-issued TERMINAL `Aborted` (NOT a stuck `SIGNED`
-/// orphan — that violates the ledger-only pin) and return a TYPED refusal
-/// (`OfflineRefused` with `OFFLINE_CODE_POOL_EXHAUSTED`), NOT a catch-all
-/// `DISPATCH_INTERNAL`.
+/// **B10 no-code refusal (re-derived).** With NO offline code seeded, the FIRST
+/// offline SELL of the session lazily tries to mint the DocType=9 BEGIN — but the
+/// BEGIN itself needs a code.  The `ensure_offline_session_begin` **pre-mint
+/// fail-closed guard** sees the empty pool and refuses the whole op RETRYABLE
+/// (503 `OFFLINE_SESSION_BEGIN_PENDING`) **WITHOUT minting a bare BEGIN** that
+/// would only abort — keeping the empty-pool case clean (no aborted-BEGIN doc
+/// churn, matching the pre-B10 offline shift-lifecycle pre-mint refusal spirit).
+/// The operator replenishes the pool (seed-codes / T=112) and retries.  Pre-B10
+/// this test saw the SELL abort with `OFFLINE_UNSTAMPED_BARE_MAC_ABORTED` (500);
+/// B10 moves the empty-pool encounter to the BEGIN pre-mint guard and surfaces it
+/// as the retryable 503 (chain-fork-safe: NEITHER a BEGIN nor a SELL row is minted
+/// on the empty pool).
 #[tokio::test]
-async fn offline_no_code_aborts_doc_and_returns_typed_refusal() {
+async fn offline_no_code_aborts_begin_and_returns_retryable_refusal() {
     let pool = fresh_pool().await;
     let pool_secure = fresh_secure_pool().await;
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
-    // NO offline code seeded → the sell signs ONLINE-SHAPED (unstamped, bare
-    // `<MAC>` — no code at sign to stamp `<MAC ID>`), then B9's stage_offline_ack
-    // sees the doc is UNSTAMPED and aborts it terminally IN-ENVELOPE (it can never
-    // validly drain a bare-MAC doc).  Same ledger-only ABORTED end-state as the
-    // pre-B9 code-pool path, but the precise reason is now the bare-MAC abort.
+    // NO offline code seeded.
     let row = seed_inbox_sell(&pool).await;
 
     let dps = DualStub::new(
@@ -707,27 +821,53 @@ async fn offline_no_code_aborts_doc_and_returns_typed_refusal() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a no-code offline sell must be refused, not issued");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a no-code offline sell must be refused, not issued");
 
-    // (1) ledger-only pin: the doc is the non-issued TERMINAL `Aborted`, NOT a
-    // stuck `SIGNED` orphan and NOT issued (`OFFLINE_LOCAL_ACK`).
+    // (1) The pre-mint guard refuses BEFORE any row is minted: NO BEGIN doc
+    // (the empty pool never produces a bare BEGIN that would only abort — no
+    // aborted-BEGIN churn) and NO SELL row (it never reached acquire — the BEGIN
+    // gate fail-closed first). Chain-fork-safe on both sides.
+    let begin_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        read_doc_state(&pool, FN).await,
-        "ABORTED",
-        "a refused-before-issuance doc must reach the Aborted terminal, not stay SIGNED"
+        begin_rows, 0,
+        "no BEGIN row minted on the empty pool — the guard refuses PRE-mint (no aborted-BEGIN churn)"
     );
-    // (2) typed refusal (not the catch-all DISPATCH_INTERNAL).  B9: the doc is
-    // unstamped (bare `<MAC>`) so it aborts via the precise unstamped-bare-MAC
-    // code (500 Internal — a structural anomaly the operator re-issues past),
-    // NOT the former code-pool code (exhaustion is now handled at SIGN).
+    let sell_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'SELL'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sell_rows, 0,
+        "no SELL row minted against a non-issued BEGIN (chain-fork-safe)"
+    );
+    // (2) RETRYABLE 503 refusal (the operator seeds codes + retries), NOT a
+    // terminal 500 — the BEGIN-pending gate.
     match err {
-        FiscalError::Internal { code, .. } => assert_eq!(
-            code, "OFFLINE_UNSTAMPED_BARE_MAC_ABORTED",
-            "an unstamped bare-MAC offline doc must carry its precise typed abort code"
+        FiscalError::OfflineRefused { code, .. } => assert_eq!(
+            code, "OFFLINE_SESSION_BEGIN_PENDING",
+            "no-code first offline doc fail-closes on the lazy BEGIN (retryable 503)"
         ),
-        other => panic!("expected Internal(OFFLINE_UNSTAMPED_BARE_MAC_ABORTED), got {other:?}"),
+        other => panic!("expected OfflineRefused(OFFLINE_SESSION_BEGIN_PENDING), got {other:?}"),
     }
 }
 
@@ -748,16 +888,25 @@ async fn online_shift_open_reaches_ack() {
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
-        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])),
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("online SHIFT_OPEN must reach a terminal ACK FiscalOutcome");
+    let outcome = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("online SHIFT_OPEN must reach a terminal ACK FiscalOutcome");
 
     assert_eq!(
         outcome.document_state,
@@ -792,9 +941,18 @@ async fn online_shift_open_while_open_is_shift_already_open() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("SHIFT_OPEN on an already-open shift must be guard-refused");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("SHIFT_OPEN on an already-open shift must be guard-refused");
     match err {
         FiscalError::ShiftGuardRefused { code, .. } => assert_eq!(code, "SHIFT_ALREADY_OPEN"),
         other => panic!("expected ShiftGuardRefused{{SHIFT_ALREADY_OPEN}}, got {other:?}"),
@@ -825,16 +983,25 @@ async fn online_z_report_closes_shift_reaches_ack() {
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
-        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])),
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("online Z_REPORT must reach a terminal ACK FiscalOutcome");
+    let outcome = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("online Z_REPORT must reach a terminal ACK FiscalOutcome");
     assert_eq!(
         outcome.document_state,
         prro::db::models::enums::DocState::Ack
@@ -860,7 +1027,8 @@ async fn online_z_report_quiescence_pending_is_503_and_rejects_inbox() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_online(&pool, shift_id).await;
 
-    // A SELL whose send fails transiently rests at ErrorRetryable (in-flight).
+    // A SELL whose send fails transiently is now HELD in SENDING (in-flight, non-quiescent) —
+    // CS-3 S7-1: transient → SubmittedUnknown → held, no ErrorRetryable redrive. Still blocks Z.
     let sell_row = seed_inbox_sell(&pool).await;
     let sell_dps = DualStub::new(
         Err(DpsError::Transport("transient send".into())),
@@ -879,12 +1047,13 @@ async fn online_z_report_quiescence_pending_is_503_and_rejects_inbox() {
             &fn_sign,
             &guard,
             &sell_row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("transient SELL is a 202 in-flight, not an Err");
         assert_eq!(
             sell.document_state,
-            prro::db::models::enums::DocState::ErrorRetryable
+            prro::db::models::enums::DocState::Sending
         );
     }
 
@@ -904,6 +1073,7 @@ async fn online_z_report_quiescence_pending_is_503_and_rejects_inbox() {
         &fn_sign,
         &guard,
         &z_row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect_err("a Z with an in-flight receipt is quiescence-pending (503)");
@@ -947,9 +1117,18 @@ async fn online_z_report_no_open_shift_is_shift_not_open() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a Z with no open shift must be ShiftNotOpen");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a Z with no open shift must be ShiftNotOpen");
     assert!(
         matches!(err, FiscalError::ShiftNotOpen { .. }),
         "expected ShiftNotOpen, got {err:?}"
@@ -986,9 +1165,18 @@ async fn acquire_rejected_maps_only_no_double_terminalise() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a SELL with no open shift is refused");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a SELL with no open shift is refused");
     assert!(matches!(err, FiscalError::ShiftNotOpen { .. }));
     // Inbox terminal (by stage_acquire). No fiscal_documents (guard-refused).
     assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
@@ -1033,9 +1221,18 @@ async fn offline_no_session_is_internal_500_and_terminalises_inbox() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("offline-ack with no session is a structural refusal");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("offline-ack with no session is a structural refusal");
     match err {
         FiscalError::Internal { code, .. } => assert_eq!(code, "OFFLINE_NO_ACTIVE_SESSION"),
         other => panic!("expected Internal{{OFFLINE_NO_ACTIVE_SESSION}}, got {other:?}"),
@@ -1072,9 +1269,18 @@ async fn sign_crypto_failure_is_sign_failure_and_terminalises_inbox() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a crypto sign failure is a terminal refusal");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a crypto sign failure is a terminal refusal");
     assert!(matches!(err, FiscalError::SignFailure { .. }));
     assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
     assert_eq!(audit_count(&pool, "INLINE_SIGN_FAIL").await, 1);
@@ -1111,9 +1317,18 @@ async fn z_report_dps_reject_escalates_shift_to_manual_recon() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a rejected Z escalates the shift to manual recon");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a rejected Z escalates the shift to manual recon");
     assert!(
         matches!(err, FiscalError::Internal { code, .. } if code == "SHIFT_MANUAL_RECON"),
         "a rejected Z must surface SHIFT_MANUAL_RECON, got {err:?}"
@@ -1161,9 +1376,18 @@ async fn sell_dps_reject_does_not_escalate_shift() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a SELL DPS reject is a per-doc terminal");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a SELL DPS reject is a per-doc terminal");
     assert!(
         matches!(err, FiscalError::DpsRejected { .. }),
         "a SELL reject stays DpsRejected (422), NOT a shift escalation, got {err:?}"
@@ -1207,9 +1431,18 @@ async fn dps_hard_reject_is_dps_rejected_and_terminalises_inbox() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a DPS hard reject is a terminal refusal");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a DPS hard reject is a terminal refusal");
     assert!(matches!(err, FiscalError::DpsRejected { .. }));
     assert_eq!(read_inbox_status(&pool, &row.request_id).await, "REJECTED");
     assert_eq!(audit_count(&pool, "INLINE_SEND_REJECT").await, 1);
@@ -1237,9 +1470,9 @@ async fn blocked_node_is_offline_refused_and_inbox_terminal() {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Blocked)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(NodeMode::Blocked.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(&pool)
     .await
     .unwrap();
@@ -1254,9 +1487,18 @@ async fn blocked_node_is_offline_refused_and_inbox_terminal() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a BLOCKED node refuses fiscalization");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a BLOCKED node refuses fiscalization");
     match err {
         FiscalError::OfflineRefused { code, .. } => assert_eq!(code, "NODE_BLOCKED"),
         other => panic!("expected OfflineRefused{{NODE_BLOCKED}}, got {other:?}"),
@@ -1289,15 +1531,27 @@ async fn lastchk_drift_terminalises_inbox_and_leaves_doc_sent() {
     let row = seed_inbox_sell(&pool).await;
 
     // send OK; lastChk returns an EMPTY id → by_server_fiscal_no → NotFound → Drift.
-    let dps = DualStub::new(Ok(ack(SERVER_FISCAL_NO, vec![])), Ok(ack("", vec![0x01])));
+    let dps = DualStub::new(
+        Ok(ack(SERVER_FISCAL_NO, vec![])),
+        Ok(ack("", vec![0x01; 64])),
+    );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a Sent-fresh NotFound is structural drift (500)");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a Sent-fresh NotFound is structural drift (500)");
     match err {
         FiscalError::Internal { code, .. } => assert_eq!(code, "REPLAY_LEDGER_DRIFT"),
         other => panic!("expected Internal{{REPLAY_LEDGER_DRIFT}}, got {other:?}"),
@@ -1338,10 +1592,10 @@ async fn noop_resolves_accepted_truth_from_ledger() {
          ) VALUES (?, ?, ?, ?, 1, 'SELL', 'ACK', 'b', 't', 'ONLINE', \
             '2026-06-09T12:00:00Z', '{}', ?, ?, '2026-06-09T12:00:05Z', ?)",
     )
-    .bind(prro::db::models::ids::DocumentId::new())
+    .bind(DbDocumentId(prro::db::models::ids::DocumentId::new()))
     .bind(&row.request_id[..])
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(vec![0u8; 32])
     .bind(SERVER_FISCAL_NO)
     .bind(TOTAL_KOP)
@@ -1358,9 +1612,18 @@ async fn noop_resolves_accepted_truth_from_ledger() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("Noop must resolve the accepted ledger truth, not fail");
+    let outcome = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("Noop must resolve the accepted ledger truth, not fail");
     assert_eq!(
         outcome.document_state,
         prro::db::models::enums::DocState::Ack
@@ -1433,9 +1696,18 @@ async fn build_reject_terminalises_pre_acquire() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let err = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect_err("a hash-mismatched row is a structural reject");
+    let err = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect_err("a hash-mismatched row is a structural reject");
     match err {
         FiscalError::Internal { code, .. } => assert_eq!(code, "PAYLOAD_HASH_MISMATCH"),
         other => panic!("expected Internal{{PAYLOAD_HASH_MISMATCH}}, got {other:?}"),
@@ -1453,6 +1725,10 @@ async fn build_reject_terminalises_pre_acquire() {
 
 /// **Review A24-4 — RETURN is in the signed scope and flows to ACK** exactly
 /// like SELL (same CheckJson shape, total required).
+///
+/// HOLE 2 update: the in-lease INV-21 guard refuses a RETURN on an empty
+/// drawer.  Seed a committed ACK SELL row first to build 15000 kop cash, then
+/// the RETURN passes the guard (15000 >= 15000).
 #[tokio::test]
 async fn online_return_reaches_ack() {
     let pool = fresh_pool().await;
@@ -1460,20 +1736,31 @@ async fn online_return_reaches_ack() {
     seed_fn_config(&pool).await;
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_online(&pool, shift_id).await;
+    // Build cash: seed a committed ACK SELL so the in-lease guard passes.
+    seed_committed_sell_ack(&pool, shift_id).await;
     let row = seed_inbox_op(&pool, DocType::Return.as_str()).await;
 
     let dps = DualStub::new(
         Ok(ack(SERVER_FISCAL_NO, vec![])),
-        Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD])),
+        Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])),
     );
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
 
-    let outcome = inline::run(&pool, &pool_secure, &dps, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("online RETURN must reach a terminal ACK");
+    let outcome = inline::run(
+        &pool,
+        &pool_secure,
+        &dps,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("online RETURN must reach a terminal ACK");
     assert_eq!(
         outcome.document_state,
         prro::db::models::enums::DocState::Ack

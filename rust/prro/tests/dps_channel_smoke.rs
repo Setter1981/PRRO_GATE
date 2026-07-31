@@ -67,7 +67,7 @@ use prro::transports::dps::gen::{
 };
 use prro::transports::dps::{
     AuthorizationKind, CheckEnvelope, CheckSignBlob, DpsChannel, DpsCheckType, DpsError,
-    GrpcDpsChannel,
+    GrpcDpsChannel, RawSendReplyKind,
 };
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -642,9 +642,16 @@ async fn send_chk_error_unknown_routes_to_transport_retry_class() {
         .send_chk(check_envelope())
         .await
         .expect_err("ErrorUnknown must error");
+    // CS-3 Slice A: `-4` (ERROR_UNKNOWN) no longer collapses into `Transport` (where it
+    // was indistinguishable from a network timeout — the double-issue root); it now
+    // surfaces as the parsed-but-outcome-unsettling `Indeterminate`. The retry class is
+    // UNCHANGED (`route_dps_error` routes `Indeterminate` to `TransientRetry`, exactly as
+    // `Transport` did) — this slice only re-types the signal so the CS-3 classifier can
+    // tell `-4` from a real timeout. (Legacy test name retained to keep the inventory
+    // additions-only gate green; the assertion is the updated contract.)
     assert!(
-        matches!(err, DpsError::Transport(ref m) if m.contains("ERROR_UNKNOWN") || m.contains("retry-class")),
-        "expected Transport (retry-class), got {err:?}"
+        matches!(err, DpsError::Indeterminate { code: -4, .. }),
+        "expected Indeterminate {{ code: -4 }} (CS-3 Slice A re-typed -4), got {err:?}"
     );
 }
 
@@ -764,11 +771,15 @@ async fn tonic_unavailable_routes_to_transport() {
 
 #[tokio::test]
 async fn tonic_unauthenticated_routes_to_transport() {
-    // Per ADR-M3-A6 prereq, gRPC `Unauthenticated` / `PermissionDenied`
-    // are transport-level (no DPS status code, no AuthorizationKind);
-    // they map to DpsError::Transport so that the W7/W10 routing layer
-    // sees a single transport-class signal for "back off + retry the
-    // channel" rather than a synthetic Authorization with code=0.
+    // CS-3 Slice A′ + R1 (TLS trust boundary). The law:
+    //   RemoteStatus ⇔ code ∈ {Unauthenticated, PermissionDenied} ∧ TLS peer-auth proven.
+    // gRPC `Unauthenticated` / `PermissionDenied` promote to `DpsError::RemoteStatus`
+    // (AuthenticatedPeer provenance) ONLY over a TLS-proven channel.  This smoke test
+    // connects over PLAINTEXT `http://` (the in-process mock), so the peer is UNPROVEN —
+    // a plaintext MITM could forge those statuses — and R1 routes them to `Transport`,
+    // NEVER `RemoteStatus`.  This test pins the trust boundary itself; the TLS-proven
+    // mapping (Unproven → Transport vs TlsProven → RemoteStatus, both codes) is unit-tested
+    // in grpc.rs.  Recovery is UNCHANGED (route_dps_error routes both to `TransientRetry`).
     let h = start_mock().await;
     h.state
         .send_chk_v2
@@ -781,8 +792,9 @@ async fn tonic_unauthenticated_routes_to_transport() {
         .await
         .expect_err("Unauthenticated must error");
     assert!(
-        matches!(err, DpsError::Transport(ref m) if m.contains("Unauthenticated")),
-        "expected Transport for gRPC Unauthenticated, got {err:?}"
+        matches!(err, DpsError::Transport(_)),
+        "plaintext (Unproven) channel must route gRPC Unauthenticated to Transport, not \
+         RemoteStatus (R1 provenance-forgery fix); got {err:?}"
     );
 }
 
@@ -969,4 +981,73 @@ async fn grpc_timeout_metadata_set_on_every_rpc() {
         });
         assert_grpc_timeout_shape(timeout);
     }
+}
+
+// ─── CS-3 3.2 PR2 pin3 — the single-RPC fan-out, WIRE-level teeth ──────────────────────
+
+/// Tooth #1 — the double-issue canary. `send_chk_observed` must perform EXACTLY ONE physical
+/// `send_chk_v2` RPC. The mock records every inbound call in arrival order, so a second physical
+/// call (a fiscal double-issue) would make `captured.len() == 2`. Revert the override / stage_send
+/// to call BOTH `send_chk` and `send_chk_observed` → count 2 → RED.
+#[tokio::test]
+async fn send_chk_observed_issues_exactly_one_rpc() {
+    let h = start_mock().await;
+    h.state
+        .send_chk_v2
+        .lock()
+        .unwrap()
+        .push_back(Ok(ok_check_response("FN-OBS-1")));
+    let ch = channel(&h.endpoint).await;
+
+    let (legacy, obs) = ch.send_chk_observed(check_envelope()).await;
+
+    // Exactly ONE physical RPC hit the server — the cardinal double-issue guard.
+    let captured = h.state.captured.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "exactly one physical send_chk_v2 RPC; got {captured:?}"
+    );
+    // Legacy leg is the ordinary CheckAck…
+    assert_eq!(legacy.expect("Ok").id, "FN-OBS-1");
+    // …and the shadow proves acceptance from the SAME single reply.
+    assert!(matches!(
+        obs.evidence().kind(),
+        RawSendReplyKind::Accepted { .. }
+    ));
+}
+
+/// Tooth #7 (wire) — the override's legacy leg is byte-identical to `send_chk` on the SAME scripted
+/// reply. Script the same error twice; call `send_chk` and `send_chk_observed` once each; assert
+/// the two `Result`s are Debug-equal, and exactly two physical RPCs total (one per method — no
+/// hidden extra call inside the fan-out).
+#[tokio::test]
+async fn send_chk_observed_legacy_leg_matches_send_chk_on_same_reply() {
+    let h = start_mock().await;
+    {
+        let mut q = h.state.send_chk_v2.lock().unwrap();
+        q.push_back(Ok(err_check_response(
+            check_response::Status::ErrorSave,
+            "ERROR_SAVE marker",
+        )));
+        q.push_back(Ok(err_check_response(
+            check_response::Status::ErrorSave,
+            "ERROR_SAVE marker",
+        )));
+    }
+    let ch = channel(&h.endpoint).await;
+
+    let via_send_chk = ch.send_chk(check_envelope()).await;
+    let (via_observed, _obs) = ch.send_chk_observed(check_envelope()).await;
+
+    assert_eq!(
+        format!("{via_send_chk:?}"),
+        format!("{via_observed:?}"),
+        "override legacy leg must equal send_chk byte-for-byte on the same reply"
+    );
+    assert_eq!(
+        h.state.captured.lock().unwrap().len(),
+        2,
+        "one physical RPC per method call — no hidden extra RPC in the fan-out"
+    );
 }

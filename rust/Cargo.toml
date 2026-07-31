@@ -8,6 +8,24 @@ members = [
     "prro_escpos",
     "prro_escpos_daemon",
     "prro",
+    # CS-1 architecture-consolidation skeleton (contract §8 item 1). Empty
+    # crates for now; `prro-domain` receives the pure model in CS-1b/b′/c,
+    # `prro-testkit` is dev-only shared test scaffolding (publish = false).
+    "prro-domain",
+    "prro-testkit",
+    # CS-1d (contract §8 item 5): the three EMPTY boundary-contract crates —
+    # crate boundaries only, no ports/traits/types/deps yet (those land in
+    # specs #3–5 / CS-6). RP-CS1-4 (prro-domain/tests/rp_cs1_4_contract_dag.rs)
+    # pins that each reaches no adapter/IO crate and that the three stay
+    # orthogonal (ingress ⊥ dps ⊥ fleet). All `publish = false`.
+    "prro-ingress-contract",
+    "prro-dps-contract",
+    "prro-fleet-contract",
+    # CS-1R R2.2: `cargo xtask update-purity-closure` regenerates
+    # prro-domain/purity-closure.lock. Deliberately depends ONLY on serde_json
+    # (already resolved via `prro`), so it adds NO new crate to the lock and is
+    # NOT in prro-domain's dependency closure (the purity gate is unaffected).
+    "xtask",
 ]
 
 # Profiles apply ONLY from the workspace root — the [profile.release]

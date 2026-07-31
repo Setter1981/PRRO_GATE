@@ -25,6 +25,7 @@ use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEnt
 use prro::db::repositories::node_state;
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::tx::with_immediate;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::reconciliation::online_convergence::run_tick_for_fn;
 use prro::services::reconciliation::RuntimeView;
@@ -102,7 +103,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -119,9 +120,9 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(mode.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -129,7 +130,7 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
 
 async fn set_node_mode(pool: &SqlitePool, mode: NodeMode) {
     sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ?")
-        .bind(mode)
+        .bind(mode.as_str())
         .bind(FN)
         .execute(pool)
         .await
@@ -195,11 +196,14 @@ async fn read_inbox_status(pool: &SqlitePool, request_id: &[u8; 16]) -> String {
 }
 
 async fn read_doc_id(pool: &SqlitePool) -> DocumentId {
-    sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE fiscal_number = ?")
-        .bind(FN)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, DbDocumentId>(
+        "SELECT document_id FROM fiscal_documents WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .map(|w| w.0)
+    .unwrap()
 }
 
 async fn count_doc_rows(pool: &SqlitePool) -> i64 {
@@ -231,7 +235,7 @@ async fn count_audit_events(pool: &SqlitePool, event_type: &str) -> i64 {
 
 async fn read_shift_state(pool: &SqlitePool, shift_id: ShiftId) -> String {
     sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -286,9 +290,18 @@ async fn build_resting_sent(pool: &SqlitePool, pool_secure: &SqlitePool, stub: &
     let fn_sign = fn_sign_blob();
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
-    let outcome = inline::run(pool, pool_secure, stub, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .expect("inline::run with Hold lastChk returns Ok(Sent)");
+    let outcome = inline::run(
+        pool,
+        pool_secure,
+        stub,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .expect("inline::run with Hold lastChk returns Ok(Sent)");
     assert_eq!(outcome.document_state, DocState::Sent);
     assert_eq!(read_doc_state(pool, FN).await, "SENT");
 }
@@ -297,7 +310,7 @@ async fn build_resting_sent(pool: &SqlitePool, pool_secure: &SqlitePool, stub: &
 /// Envelope-1a, stopping at `KVT1`) — state-construction, not a prod call.
 async fn manual_advance_sent_to_kvt1(pool: &SqlitePool) {
     let doc_id = read_doc_id(pool).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(pool, move |tx| {
         Box::pin(async move {
             let o = fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
@@ -335,8 +348,8 @@ async fn tick_converges_resting_sent_to_ack() {
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold
                                                        // Tick cascade: SENT-arm probe Match (→KVT1) + KVT1 confirm Match (→ACK).
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
     assert_eq!(
@@ -400,7 +413,7 @@ async fn tick_converges_resting_kvt1_to_ack() {
     let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1 confirm Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // KVT1 confirm Match
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
     manual_advance_sent_to_kvt1(&pool).await;
@@ -623,6 +636,51 @@ async fn tick_hold_on_empty_data_sign() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Test 5b — KVT1 + lastChk Match with SHORT (sub-signature) data_sign → Hold.
+// RISK 1 harden: a byzantine-but-alive DPS returning a non-empty but implausibly
+// short data_sign (shorter than any real DSTU signature) must NOT be accepted as
+// a KVT1 quittance — those bytes are not evidence. Mirrors the empty-hold guard.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tick_hold_on_short_data_sign() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // construction Hold → SENT
+                                                       // tick confirm: a non-empty but IMPLAUSIBLY SHORT data_sign (4 bytes ≪ any
+                                                       // real DSTU signature) → must Hold, not advance (RISK 1 fail-closed harden).
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+
+    build_resting_sent(&pool, &pool_secure, &stub).await;
+    manual_advance_sent_to_kvt1(&pool).await;
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    let summary = run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+
+    assert_eq!(
+        read_doc_state(&pool, FN).await,
+        "KVT1",
+        "short (sub-signature) data_sign → Hold, stays KVT1 (RISK 1 harden)"
+    );
+    assert_eq!(summary.held_kvt1, 1);
+    assert_eq!(summary.acked_from_kvt1, 0);
+    prro::db::invariant_scan::assert_clean(&pool).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Test 6 — idempotent: a second tick after convergence is a zero-wire no-op.
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -638,8 +696,8 @@ async fn tick_idempotent_after_convergence() {
     let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![])));
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
 
@@ -772,7 +830,7 @@ async fn tick_counts_mismatch_escalation_as_not_converged() {
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold
                                                        // Tick: probe answers a DIFFERENT id → Mismatch → manual escalation.
-    stub.push_last(Ok(ack("DPS-FN-SOMEONE-ELSE", vec![0xDE, 0xAD])));
+    stub.push_last(Ok(ack("DPS-FN-SOMEONE-ELSE", vec![0xDE; 64])));
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
 
@@ -834,7 +892,7 @@ async fn tick_chain_seed_mismatch_escalates_manual() {
     let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
     stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1 confirm Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // KVT1 confirm Match
 
     build_resting_sent(&pool, &pool_secure, &stub).await;
     manual_advance_sent_to_kvt1(&pool).await; // online-origin KVT1 (offline_fiscal_no NULL)
@@ -916,8 +974,8 @@ async fn tick_skips_rmr_but_online_fn_no_reprobe() {
                                                        // probe responses the tick WOULD consume if it (wrongly) ran —
                                                        // enough for the SENT→KVT1→ACK cascade so main fails on the
                                                        // assertion below, NOT on an empty-queue stub panic.
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // SENT-probe Match
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // KVT1-confirm Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // SENT-probe Match
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // KVT1-confirm Match
 
     build_resting_sent(&pool, &pool_secure, &stub).await; // doc rests SENT
     assert_eq!(
@@ -928,7 +986,7 @@ async fn tick_skips_rmr_but_online_fn_no_reprobe() {
 
     // The Batch-C escalation state: shift CAS'd to RMR, mode LEFT at Online.
     sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -1017,8 +1075,14 @@ async fn event_has_severity(pool: &SqlitePool, event_type: &str, severity: &str)
     n > 0
 }
 
-// (g) Redrive: an ER doc (TransientRetry) is driven to Sent by the tick →
-//     the doc becomes issued → the D5 gate opens.
+// (g) CS-3 S7-1 cutover — SEMANTIC REGRESSION (`legacy inventory-stable name`).
+//     The pre-cutover "transient → ERROR_RETRYABLE → tick ER-redrive → Sent → ungate" contract is
+//     RETIRED.  An online transient (`DpsError::Transport`) now classifies `SubmittedUnknown` and is
+//     HELD (`SENDING` + `PENDING_APPLY` + node `STOP_MODE`); R6 removed the convergence ER-redrive
+//     arm, so the tick makes NO new wire and does NOT advance the held doc.  The FN STAYS gated (the
+//     held doc keeps the D5 fence) — exit is probe/operator only (CS-8,
+//     `project_backlog_classify_send_outcome`).  This is a conscious loss of automatic liveness for
+//     P2 (at-most-one-wire), NOT a hidden regression.
 #[tokio::test]
 async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
     let pool = fresh_pool().await;
@@ -1029,10 +1093,10 @@ async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
 
     let (send_calls, last_calls) = seed_counters();
     let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    // Construction: the sell's send fails transiently → the doc lands in
-    // ErrorRetryable with a completed transport_trace(TransientRetry, 1).
+    // Construction: the sell's send fails transiently → SubmittedUnknown → the doc is HELD in
+    // SENDING (PENDING_APPLY) + node STOP_MODE.  (No ERROR_RETRYABLE — the ER edge is retired.)
     stub.push_send(Err(DpsError::Transport("transient-construction".into())));
-    // Tick redrive: stage_send re-sends → Ok → Sent (sfn stamped ⇒ issued).
+    // A spare Ok is queued but NEVER consumed: post-cutover the tick does NOT re-drive the held doc.
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
 
     let row = seed_inbox_sell(&pool).await;
@@ -1049,16 +1113,24 @@ async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("inline::run with a transient send → Ok(InProgress)");
         assert_eq!(
             outcome.document_state,
-            DocState::ErrorRetryable,
-            "construction: transient send lands ErrorRetryable"
+            DocState::Sending,
+            "construction: transient send HOLDS the doc SENDING (SubmittedUnknown), not ErrorRetryable"
         );
     }
-    assert_eq!(read_doc_state(&pool, FN).await, "ERROR_RETRYABLE");
+    assert_eq!(read_doc_state(&pool, FN).await, "SENDING");
+    // The node is halted pending operator completion — this is what gates the tick below.
+    let mode: String = sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+        .bind(FN)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(mode, "STOP_MODE", "SubmittedUnknown halts the node");
 
     let view = RuntimeView {
         dps: &stub,
@@ -1069,13 +1141,13 @@ async fn tick_er_redrive_advances_to_sent_and_ungates_fn() {
 
     assert_eq!(
         read_doc_state(&pool, FN).await,
-        "SENT",
-        "resolver drives ER→Sent (issued) ⇒ the D5 gate opens"
+        "SENDING",
+        "post-cutover the tick does NOT re-drive the held doc — it stays SENDING (FN gated)"
     );
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
-        2,
-        "one construction fail + one redrive send"
+        1,
+        "only the construction wire happened — NO tick redrive (P2: at-most-one-wire)"
     );
 }
 
@@ -1138,5 +1210,372 @@ async fn tick_er_hold_indeterminate_keeps_fn_gated_and_escalates_after_n_ticks()
         send_calls.load(Ordering::SeqCst),
         0,
         "HoldIndeterminate issues zero wire"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// T1 (RULING 1 / PRRO_GATE-eid) — BOUNDED superseded-hold for shift-lifecycle
+// docs → RequiresManualReconciliation.
+//
+// A resting online SHIFT_OPEN / Z_REPORT / SHIFT_CLOSE doc whose KVT1 confirm
+// keeps returning `SupersededHeld` wedges the shift in `Opening`/`Closing`
+// (can neither open nor close, compounds the shift time-limit).  Today the
+// online tick HOLDS it FOREVER (AUD-L5-1: hold + `superseded_held_kvt1` counter,
+// no bound).  T1 gives it a BOUNDED hold: after `SUPERSEDED_SHIFT_HOLD_TICKS`
+// (= 5) consecutive superseded-held ticks for the SAME doc, escalate the FN to
+// `RequiresManualReconciliation` via the EXISTING `escalate_fn_to_manual_recon`
+// CAS (the ChainSeedMismatch seam) — doc state untouched, a dedicated
+// `CONVERGE_SUPERSEDED_SHIFT_BOUND_ESCALATE_MANUAL` audit with {document_id,
+// doc_type, held_ticks}.  Receipt docs (SELL/RETURN) are byte-unchanged: an
+// unbounded benign hold (a held receipt does not wedge the shift).
+//
+// Durability: the tick-count is AUDIT-DERIVED (count the per-doc
+// `CONVERGE_SUPERSEDED_SHIFT_HELD` rows) — crash-safe by construction, no schema
+// churn.  This mirrors the existing `count_converge_indeterminate_audits`.
+//
+// On main (pre-T1) pin 1 / pin 4 / the teeth pin FAIL RED: the shift-doc holds
+// forever (`shift_state` stays Opened, zero bound audits).  Pins 2 / 3 pass on
+// main too (they assert NON-escalation), but they lock the reset rule and the
+// receipt-arm no-op against a future over-broad bound.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Re-type the single resting doc for the FN to a shift-lifecycle `doc_type`
+/// (raw UPDATE).  `confirm_drain_doc` / the superseded verdict do NOT branch on
+/// `doc_type` (verified: zero `doc_type` reads in kvt2_confirm.rs), so flipping
+/// it leaves the `SupersededHeld` outcome identical — only the online-tick
+/// consumer arm (T1) branches on it.  Reuses the proven Test-2b KVT1 fixture
+/// (`build_resting_sent` + `manual_advance_sent_to_kvt1`) verbatim.
+async fn flip_doc_type(pool: &SqlitePool, lnd: i64, doc_type: &str) {
+    sqlx::query("UPDATE fiscal_documents SET doc_type = ? WHERE fiscal_number = ? AND lnd = ?")
+        .bind(doc_type)
+        .bind(FN)
+        .bind(lnd)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Push ONE superseded-tick `last_chk` response (DPS reports a DIFFERENT tip —
+/// the newer submitted doc — so `confirm_drain_doc` returns `SupersededHeld`).
+fn push_superseded_tick(stub: &ScriptedDps) {
+    stub.push_last(Err(DpsError::ServerFiscalIdMismatch {
+        expected_id: SERVER_FISCAL_NO.to_string(),
+        actual_id: NEWER_SERVER_FISCAL_NO.to_string(),
+    }));
+}
+
+/// Build a resting KVT1 doc (Test-2b fixture) re-typed to `doc_type`, plus the
+/// newer submitted ACK doc (lnd=2) that makes the mismatch a benign SUPERSESSION
+/// rather than structural drift.  The construction consumes push_send + one
+/// push_last(Hold); the caller enqueues the per-tick superseded responses.
+async fn build_resting_kvt1_superseded(
+    pool: &SqlitePool,
+    pool_secure: &SqlitePool,
+    stub: &ScriptedDps,
+    shift_id: ShiftId,
+    doc_type: &str,
+) {
+    stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // Hold → SENT
+    build_resting_sent(pool, pool_secure, stub).await;
+    manual_advance_sent_to_kvt1(pool).await; // lnd=1 rests at KVT1
+    flip_doc_type(pool, 1, doc_type).await;
+    // Newer submitted doc (lnd=2) whose sfn is the DPS tip → supersession.
+    seed_newer_submitted_ack(pool, shift_id, 2, NEWER_SERVER_FISCAL_NO).await;
+}
+
+const BOUND_ESCALATE_EVENT: &str = "CONVERGE_SUPERSEDED_SHIFT_BOUND_ESCALATE_MANUAL";
+/// The bound value under test — must equal `SUPERSEDED_SHIFT_HOLD_TICKS`.
+const N: usize = 5;
+
+// ── Pin 1 — SHIFT_OPEN superseded ×N → FN escalated to RMR + dedicated audit.
+//    (RED on main: the shift-doc holds forever, shift stays Opened, 0 audits.)
+#[tokio::test]
+async fn t1_shift_open_superseded_n_ticks_escalates_manual() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    build_resting_kvt1_superseded(&pool, &pool_secure, &stub, shift_id, "SHIFT_OPEN").await;
+    // N superseded ticks.
+    for _ in 0..N {
+        push_superseded_tick(&stub);
+    }
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+
+    // Ticks 1..N-1: still held, NOT yet escalated (below the bound).
+    for i in 1..N {
+        run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+        assert_ne!(
+            read_shift_state(&pool, shift_id).await,
+            "REQUIRES_MANUAL_RECONCILIATION",
+            "must NOT escalate before the bound (tick {i} of {N})"
+        );
+    }
+    // Tick N: the bound fires → FN escalated to RMR.
+    let summary = run_tick_for_fn(&pool, &view, FN).await.expect("tick N ok");
+
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "the Nth (=5) consecutive superseded-held tick escalates the FN to RMR"
+    );
+    assert_eq!(
+        read_doc_state_by_lnd(&pool, 1).await,
+        "KVT1",
+        "the escalation leaves the doc state untouched (rests at KVT1)"
+    );
+    assert_eq!(
+        count_audit_events(&pool, BOUND_ESCALATE_EVENT).await,
+        1,
+        "exactly one dedicated bound-escalate audit"
+    );
+    assert_eq!(
+        summary.superseded_held_kvt1, 1,
+        "the Nth tick still counts the superseded hold (the escalation is on top)"
+    );
+    assert_eq!(send_calls.load(Ordering::SeqCst), 1, "tick does NOT send");
+}
+
+// ── Pin 2 — SHIFT_OPEN superseded ×(N-1) then a confirm-SUCCESS → NO escalation,
+//    the shift converges (doc → ACK).  Locks the RESET rule: recovery obsoletes
+//    the counter (a successful confirm on a later tick must not leave a wedge).
+#[tokio::test]
+async fn t1_shift_open_recovers_before_bound_no_escalation() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    build_resting_kvt1_superseded(&pool, &pool_secure, &stub, shift_id, "SHIFT_OPEN").await;
+    // N-1 superseded ticks, then a confirm Match (KVT1 → ACK).  The success tick
+    // returns the doc's OWN sfn as the DPS tip (+ non-empty data_sign) → the
+    // superseded verdict no longer applies and the confirm ADVANCES to ACK.
+    for _ in 0..(N - 1) {
+        push_superseded_tick(&stub);
+    }
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    // N-1 superseded ticks — held, not escalated.
+    for _ in 0..(N - 1) {
+        run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+    }
+    // The confirm-success tick.
+    run_tick_for_fn(&pool, &view, FN)
+        .await
+        .expect("confirm-success tick ok");
+
+    assert_eq!(
+        read_doc_state_by_lnd(&pool, 1).await,
+        "ACK",
+        "a confirm-success on a later tick converges the shift doc"
+    );
+    assert_ne!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "recovery before the bound must NOT escalate (reset rule)"
+    );
+    assert_eq!(
+        count_audit_events(&pool, BOUND_ESCALATE_EVENT).await,
+        0,
+        "no bound-escalate audit when the doc recovers before N"
+    );
+}
+
+// ── Pin 3 — SELL superseded ×(N+5) → still a benign UNBOUNDED hold: no
+//    escalation, doc stays KVT1, no bound audit.  The receipt arm is byte-
+//    unchanged (AUD-L5-1 stands verbatim for receipts).
+#[tokio::test]
+async fn t1_sell_superseded_unbounded_hold_no_escalation() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    // doc_type stays "SELL" (the default) — the resting doc is a receipt.
+    build_resting_kvt1_superseded(&pool, &pool_secure, &stub, shift_id, "SELL").await;
+    let ticks = N + 5;
+    for _ in 0..ticks {
+        push_superseded_tick(&stub);
+    }
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    for _ in 0..ticks {
+        let summary = run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+        assert_eq!(
+            summary.superseded_held_kvt1, 1,
+            "receipt: benign hold each tick"
+        );
+        assert_eq!(summary.errors, 0, "receipt: supersession is not an error");
+    }
+
+    assert_eq!(
+        read_doc_state_by_lnd(&pool, 1).await,
+        "KVT1",
+        "a superseded RECEIPT holds forever (unbounded), stays KVT1"
+    );
+    assert_ne!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "a held receipt does NOT wedge the shift — never escalate"
+    );
+    assert_eq!(
+        count_audit_events(&pool, BOUND_ESCALATE_EVENT).await,
+        0,
+        "no bound-escalate audit for a receipt (the receipt arm is untouched)"
+    );
+}
+
+// ── Pin 4 — crash/reboot between held ticks: the AUDIT-DERIVED counter survives
+//    (it lives in the DB, not in memory), so the bound still fires at N TOTAL.
+//    "Reboot" = drop the ScriptedDps + RuntimeView (in-memory) and rebuild them
+//    against the SAME pool (the durable store).  The tick is stateless.
+#[tokio::test]
+async fn t1_bound_survives_reboot_fires_at_n_total() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    // ── Pre-crash instance: build the fixture + tick N-2 times, then "crash".
+    {
+        let (send_calls, last_calls) = seed_counters();
+        let stub = ScriptedDps::new(send_calls, last_calls);
+        build_resting_kvt1_superseded(&pool, &pool_secure, &stub, shift_id, "Z_REPORT").await;
+        for _ in 0..(N - 2) {
+            push_superseded_tick(&stub);
+        }
+        let sign_ctx = det_signing_ctx();
+        let fn_sign = fn_sign_blob();
+        let view = RuntimeView {
+            dps: &stub,
+            signing_ctx: &sign_ctx,
+            fn_sign: &fn_sign,
+        };
+        for _ in 0..(N - 2) {
+            run_tick_for_fn(&pool, &view, FN)
+                .await
+                .expect("pre-crash tick ok");
+        }
+        assert_ne!(
+            read_shift_state(&pool, shift_id).await,
+            "REQUIRES_MANUAL_RECONCILIATION",
+            "N-2 ticks: below the bound, not escalated"
+        );
+        // stub + view drop here — the in-memory tick context is gone (the crash).
+    }
+
+    // ── Post-reboot instance: brand-new stub/view, SAME pool.  2 more ticks
+    //    ((N-2) + 2 = N total) must fire the bound — the counter was durable.
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(send_calls, last_calls);
+    for _ in 0..2 {
+        push_superseded_tick(&stub);
+    }
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    // Tick N-1: still below the bound.
+    run_tick_for_fn(&pool, &view, FN)
+        .await
+        .expect("post-reboot tick N-1 ok");
+    assert_ne!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "tick N-1 after reboot: still below the bound"
+    );
+    // Tick N (total): the bound fires despite the reboot.
+    run_tick_for_fn(&pool, &view, FN)
+        .await
+        .expect("post-reboot tick N ok");
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "the bound fires at N TOTAL ticks — the audit-derived counter survived the reboot"
+    );
+    assert_eq!(
+        count_audit_events(&pool, BOUND_ESCALATE_EVENT).await,
+        1,
+        "exactly one bound-escalate audit across the reboot"
+    );
+}
+
+// ── Pin 5 (🦷 teeth) — the canary: byte-identical assertion to pin 1.  Revert
+//    the bound (restore the unbounded hold in online_convergence.rs's
+//    `SupersededHeld` arm) → this pin REDs (the shift-doc holds forever, so it
+//    never reaches RMR).  Kept as a standing test so a future regression that
+//    silently drops the bound is caught by CI.
+#[tokio::test]
+async fn t1_teeth_bound_reverted_would_red() {
+    let pool = fresh_pool().await;
+    let pool_secure = fresh_secure_pool().await;
+    seed_fn_config(&pool).await;
+    let shift_id = seed_open_shift(&pool).await;
+    seed_node_state(&pool, NodeMode::Online, shift_id).await;
+
+    let (send_calls, last_calls) = seed_counters();
+    let stub = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
+    build_resting_kvt1_superseded(&pool, &pool_secure, &stub, shift_id, "SHIFT_CLOSE").await;
+    for _ in 0..N {
+        push_superseded_tick(&stub);
+    }
+
+    let sign_ctx = det_signing_ctx();
+    let fn_sign = fn_sign_blob();
+    let view = RuntimeView {
+        dps: &stub,
+        signing_ctx: &sign_ctx,
+        fn_sign: &fn_sign,
+    };
+    for _ in 0..N {
+        run_tick_for_fn(&pool, &view, FN).await.expect("tick ok");
+    }
+
+    // The teeth assertion: WITH the bound, N ticks escalate.  Reverting the
+    // bound leaves the shift Opened forever → this REDs.
+    assert_eq!(
+        read_shift_state(&pool, shift_id).await,
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "teeth: reverting the bound leaves the shift-doc held forever (this REDs)"
+    );
+    assert_eq!(
+        count_audit_events(&pool, BOUND_ESCALATE_EVENT).await,
+        1,
+        "teeth: the dedicated bound audit is the regression tripwire"
     );
 }

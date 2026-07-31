@@ -1,10 +1,8 @@
 # Architecture Consolidation — Sprint Roadmap (where are we)
 
 **Companion to `docs/ARCHITECTURE_CONSOLIDATION_PLAN.md` (rev 5, LOCKED).** This is the execution
-tracker: each sprint has an **exit criterion** so "where are we" = which exits are met.
-
-**Status ground truth:** `origin/main@806b661` (2026-07-19). The original estimates remain planning
-history; the status markers below reflect merged code and committed oracle state.
+tracker: each sprint has an **exit criterion** so "where are we" = which exits are met. Dual-session:
+architect authors the spec + RED-pins, implementer writes test-first. Baseline `origin/main 8ec99ca`.
 
 > **Naming:** these are **Consolidation Sprints CS-0…CS-9** (distinct from the old feature Sprint
 > 11/12 numbering). CS-0…CS-8 = the architecture program (~10–17 pw + 1–2 pw tests); CS-9+ = the
@@ -14,13 +12,18 @@ history; the status markers below reflect merged code and committed oracle state
 
 ---
 
-## 📍 WHERE WE ARE NOW: CS-3 (final D/E implementation)
+## 📍 WHERE WE ARE NOW: CS-4 (next gate)
+**CS-0 through CS-3 are merged.** Verified on `main` at the time of writing: the plan + specs #1/#2
+are in `docs/` (CS-0); `rust/prro-domain/` carries the behaviour-neutral domain skeleton (CS-1);
+`rust/prro/migrations/032_delivery_reservation.sql` landed the inactive durable state (CS-2); and the
+double-issue keystone shipped end-to-end — production D/E at the S7-1 cutover (`224ad46e`) plus the
+fuzzer-oracle track (`949d7cc1`), with the recovery follow-ups bd `PRRO_GATE-2nk` (`a049e8b5`,
+migration 039), bd `PRRO_GATE-hpc` (`05a9c694`, migration 040) and bd `PRRO_GATE-mcc` (`a918f773`,
+adjudicated SUPERSEDED) all closed (CS-3).
 
-CS-0, CS-1/CS-1R, and CS-2 are complete. CS-3 foundation through the read-only 3.2 engine mapping is
-merged; the corrected remediation oracle rev 3.1 is committed on main. The remaining CS-3 work is the
-load-bearing D/E cutover: lifetime authorization, record-then-apply, whole-FN fence, operator recovery,
-and retirement of every blind-resend edge. CS-3 is not complete until its RED-first exit pins prove the
-real production path.
+**Next concrete move:** author and gate **spec #6** (uniform command lifecycle, admission = f(axes),
+TransitionPlan + fencing, actor execution semantics, anti-god-object budget), then implement the thin
+per-FN coordinator and route exactly ONE command (`fiscalize`) through it.
 
 ---
 
@@ -31,7 +34,6 @@ real production path.
   + reservation FSM) with RED-pins, in `docs/superpowers/specs/`.
 - Decide the Cargo **workspace layout**.
 - **EXIT:** plan on main; specs #1+#2 locked; workspace layout agreed. *(no code behaviour yet)*
-- **STATUS:** complete in PR #285 (`f2c17b1`) and the subsequent locked-spec passes.
 
 ## CS-1 · Behaviour-neutral skeleton (steps 1 + 2a) ✅
 - Create `prro-domain` (move types + pure rules; **not** `CanonicalIngressEnvelope`); facade
@@ -40,8 +42,6 @@ real production path.
 - `prro-testkit` (`publish=false`); CI → workspace + feature-matrix.
 - **EXIT:** workspace compiles **green**, all existing tests pass **through the facade**, **zero
   behaviour change**.
-- **STATUS:** complete through PRs #287–#293; the external-audit remediation CS-1R/R4 closed in
-  PRs #300–#310.
 
 ## CS-2 · Inactive durable state + contract specs (step 2b) ✅
 - Land the **INACTIVE** durable-inbox + reservation schema + persistence tests (wired, not on the
@@ -49,8 +49,6 @@ real production path.
 - Author **spec #3** (canonical ingress contract + `IdempotencyStrategy`), **#4** (DPS contract +
   binding + cross-protocol invariant), **#5** (fleet lifecycle) — in parallel.
 - **EXIT:** schema landed + persistence-tested; contract specs #3–5 locked.
-- **STATUS:** complete: reservation migration 032 + repository/tests in PR #295; specs #3–#5 locked
-  in PRs #296–#299.
 
 ## CS-3 · Double-issue keystone (step 2c — THE semantic PR) ✅
 - Typed DPS outcome `NotSubmitted | SubmittedUnknown | ResponseObserved(...)` + reservation FSM
@@ -59,23 +57,21 @@ real production path.
 - Separate semantic PR with **new regression evidence** + fuzzer op for the ambiguous-timeout.
 - **EXIT:** **double-issue closed** (regression + fuzzer proven); delivery certainty typed
   end-to-end. *(highest-value correctness milestone; valuable independently of the rest)*
-- **MERGED FOUNDATION:** migration 033/034, typed classifier/storage, `-4`/authenticated-peer seams,
-  sealed delivery algebra, single-RPC raw observation, honest digest/provenance ownership, and
-  read-only engine mapping (PRs #313–#329).
-- **ORACLE:** remediation rev 3.1 is committed at PR #331 (`806b661`) with DESIGN GO.
-- **REMAINING EXIT WORK:** implement D/E on the production path and prove lifetime call-once,
-  crash-safe record/apply, offline-reject chain hold, verified operator release, and zero blind resend.
-- **✅ CLOSED (2026-07-25):** production D/E landed (S7-1 cutover PR #336, `224ad46`) — double-issue
-  closed end-to-end. The CS-3 fuzzer-oracle track merged (PR #341, squash `949d7cc1`): independent
-  delivery-axis model, held-witness authority, crash/replay P4, MacReseed directed, offline C-i/ii/iii,
-  **generative NotAcceptedOffline**, **P3 standalone per-op fence-identity**, **P2 RETURN idempotent
-  replay** — FUZZ_CASES=4096 full suite 2317/2317, every tooth RED-canary-proven. The recovery bug the
-  fuzzer surfaced (bd PRRO_GATE-2nk — NotAcceptedOffline seed-rewind durability across NC-03 boot) was
-  fixed + merged (PR #340, `a049e8b5`; `active_chain_tip` direct-`previous_hash` + cohort-aware scan).
-  Remaining as tracked follow-ups (NOT CS-3 blockers): **mcc** re-adjudication (prove valid MacReseed
-  post-#338 is a no-op tip → close as superseded, else a real fix), **2ds→hpc** (T=112 contract →
-  durable non-doc seed witness; must close before CS-8), generative MacReseed, **psv** (P3 dead-cohort
-  hardening — off critical path until reachability is proven). Next: mcc → 2ds+hpc → CS-4.
+- **✅ CLOSED (2026-07-30).** Production D/E landed at the S7-1 cutover (`224ad46e`), and the CS-3
+  fuzzer-oracle track merged (`949d7cc1`): an INDEPENDENT delivery-axis model (zero imports of the
+  prod classifier), held-witness fence AUTHORITY, crash/replay held-survival, MacReseed guard
+  conformance, offline origin-keying, **generative `NotAcceptedOffline`**, a per-op **fence-identity**
+  invariant and **RETURN idempotent-replay** teeth — FUZZ_CASES=4096 full suite green, every tooth
+  revert-canary-proven. The recovery bugs the fuzzer then surfaced are closed too: bd
+  `PRRO_GATE-2nk` (NotAcceptedOffline seed-rewind durability across NC-03 boot — `active_chain_tip`
+  projection + `chain_superseded_at`, migration 039, PR #340), bd `PRRO_GATE-hpc` (durable T=112
+  non-doc seed witness, migration 040, PR #343), bd `PRRO_GATE-x5o` (fuzzer-model cash reversal on a
+  cohort-cancel, PR #344) and bd `PRRO_GATE-mcc` (adjudicated SUPERSEDED with a proof test, PR #342).
+- **Tracked follow-ups (NOT CS-3 blockers):** `PRRO_GATE-2ds` (T=112 ambiguous contract — blocked on a
+  live capture, RULING 2 §4) → `PRRO_GATE-hpc` is closed but the generative `Replenish` symbol is
+  still missing from the fuzzer alphabet; `PRRO_GATE-psv` (dead-cohort sub-chain hardening, P3,
+  reachability unproven); `PRRO_GATE-9xl` (full CS-3-vs-documentation reconciliation — CS-3 outgrew
+  its spec family).
 
 ## CS-4 · The coordinator (spec #6) 🔴
 - Author **spec #6** (coordinator command-lifecycle + `admission = f(axes)` + anti-god-object
@@ -132,8 +128,8 @@ with a clean zone-split ≈ **8–12 calendar weeks**. CS-9+ (operational layer 
 estimated **separately** — no single conflated "to physical register" number until §7 is decomposed.
 
 ## Critical-path notes
-- CS-1 and CS-2 are complete; their crate/schema foundations are already consumed by CS-3.
-- **CS-3 (double-issue) is the current gate.** Finish and prove D/E before starting CS-4; it does not
-  wait for the coordinator.
+- CS-1 and CS-2 (behaviour-neutral) can overlap with spec authoring.
+- **CS-3 (double-issue) is the first real correctness win** and can ship right after CS-2 — it does
+  not wait for the coordinator.
 - CS-4→CS-5 is the actual "consolidation" (the god-object risk lives here — hold the CS-4 gate).
 - CS-8 (B11) only becomes *thin* after CS-3+CS-4+CS-5; do not attempt B11 before them.

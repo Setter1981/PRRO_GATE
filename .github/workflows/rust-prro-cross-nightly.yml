@@ -56,24 +56,29 @@ jobs:
             apt: ''
 
     steps:
-      - uses: actions/checkout@v4
+      # fetch-depth: 0 — this job runs the full `cargo nextest run -p prro` which includes
+      # `cs1_test_provenance`; that test `git show`s pinned CS-1 base/head SHAs (f2c17b1/f2628ba +
+      # the live-drift base), unreachable on a shallow checkout. Mirrors rust-prro.yml.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
 
       - name: Install apt deps (Linux musl)
         if: matrix.apt != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: rust
 
       # Parallel per-binary test runner — ~2× wall-clock vs `cargo test`
       # (measured 300s→150s locally, 2026-06-11).  No crate in the
       # workspace has doc-tests, so nothing is silently skipped.
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@b265f9a422509a38f0c716115e5f17af22dfc631 # nextest
 
       - name: Build
         working-directory: rust
@@ -144,7 +149,7 @@ jobs:
       # failed, so a find is surfaced as THIS guard, not just a raw failure.
       - name: Upload regression seed (if any)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: invariant-fuzzer-regressions-${{ matrix.target }}
           path: rust/prro/tests/invariant_fuzzer.regressions

@@ -12,6 +12,7 @@ use prro::db::models::ids::ShiftId;
 use prro::db::open_pool;
 use prro::db::repositories::shifts::TransitionOutcome;
 use prro::db::tx::with_immediate;
+use prro::db::types::DbShiftId;
 use prro::services::shift::transition as svc;
 
 const FN: &str = "1234567890";
@@ -38,9 +39,9 @@ async fn seed_shift(pool: &sqlx::SqlitePool, id: ShiftId, state: ShiftState) {
             opened_by_cashier_id) \
          VALUES (?, ?, ?, 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(FN)
-    .bind(state)
+    .bind(state.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -57,29 +58,33 @@ async fn seed_node_state(
          VALUES (?, 'ONLINE', ?, ?, 1, 'b1', 't1')",
     )
     .bind(FN)
-    .bind(shift_state)
-    .bind(current)
+    .bind(shift_state.as_str())
+    .bind(current.map(DbShiftId))
     .execute(pool)
     .await
     .unwrap();
 }
 
 async fn read_shift_state(pool: &sqlx::SqlitePool, id: ShiftId) -> ShiftState {
-    sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
-        .bind(id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, prro::db::types::DbShiftState>(
+        r#"SELECT state FROM shifts WHERE shift_id = ?"#,
+    )
+    .bind(DbShiftId(id))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .0
 }
 
 async fn read_node_shift_state(pool: &sqlx::SqlitePool) -> ShiftState {
-    sqlx::query_scalar(
-        r#"SELECT shift_state as "s: ShiftState" FROM node_state WHERE fiscal_number = ?"#,
+    sqlx::query_scalar::<_, prro::db::types::DbShiftState>(
+        r#"SELECT shift_state FROM node_state WHERE fiscal_number = ?"#,
     )
     .bind(FN)
     .fetch_one(pool)
     .await
     .unwrap()
+    .0
 }
 
 async fn read_current_shift_id(pool: &sqlx::SqlitePool) -> Option<Vec<u8>> {
@@ -170,7 +175,7 @@ async fn projection_drift_rolls_back_the_whole_envelope() {
     // Opened — had the failed call left a half-applied `Closing`, this retry
     // would CAS-miss (Conflict), not Applied.
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(FN)
         .execute(&pool)
         .await

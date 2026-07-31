@@ -20,6 +20,7 @@
 //! Exactly the class the runtime detector exists to surface.
 
 use prro::db::models::ids::DocumentId;
+use prro::db::types::DbDocumentId;
 use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::transports::dps::dto::CheckSignBlob;
 use sqlx::SqlitePool;
@@ -134,7 +135,7 @@ async fn seed_signed_sell(pool: &SqlitePool, fn_id: &str, doc_byte: u8) -> Docum
 
 async fn doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -247,7 +248,7 @@ async fn x1_guard_ignores_doc_recovery_advanced() {
         "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? AND code_lnd = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(fn_id)
     .execute(&pool)
     .await
@@ -258,7 +259,7 @@ async fn x1_guard_ignores_doc_recovery_advanced() {
              offline_dps_code = 'DRILL-1' WHERE document_id = ?",
     )
     .bind(&[0xAAu8; 16][..])
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .unwrap();

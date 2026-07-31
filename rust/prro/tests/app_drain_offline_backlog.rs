@@ -39,6 +39,7 @@ use std::sync::Arc;
 use prro::config::AppConfig;
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
 use prro::transports::dps::dto::{CheckAck, CheckSignBlob};
@@ -94,8 +95,8 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift: ShiftState) {
          VALUES (?, ?, ?, 100)",
     )
     .bind(FN)
-    .bind(mode)
-    .bind(shift)
+    .bind(mode.as_str())
+    .bind(shift.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -108,7 +109,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER_OK)
     .execute(pool)
@@ -123,7 +124,7 @@ async fn seed_offline_session(pool: &SqlitePool, state: OfflineSessionState) -> 
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-21T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(state.as_str())
     .execute(pool)
@@ -158,14 +159,14 @@ async fn seed_offline_local_ack(
             ?, ?, '2026-05-21T00:00:00Z', ? \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(&sha)
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(code_lnd)
     .bind(&dps_code)
     .execute(pool)
@@ -175,7 +176,7 @@ async fn seed_offline_local_ack(
         "INSERT INTO document_files(document_id, kind, content) \
          VALUES (?, 'SIGNED_XML', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(b"FAKE-CMS".to_vec())
     .execute(pool)
     .await
@@ -186,7 +187,7 @@ async fn seed_offline_local_ack(
     )
     .bind(FN)
     .bind(code_lnd)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -211,7 +212,7 @@ async fn read_node_mode(pool: &SqlitePool) -> String {
 
 async fn read_session_state(pool: &SqlitePool, session_id: OfflineSessionId) -> String {
     sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
-        .bind(session_id)
+        .bind(DbOfflineSessionId(session_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -352,8 +353,8 @@ async fn app_drain_eligible_path_via_w12_sent_fresh_steady_state() {
     let c = carriers_with_last_chk(
         vec![Ok(ack("DPS-FN-A")), Ok(ack("DPS-FN-B"))],
         vec![
-            Ok(last_chk_ack("DPS-FN-A", vec![0xAAu8; 32])),
-            Ok(last_chk_ack("DPS-FN-B", vec![0xBBu8; 32])),
+            Ok(last_chk_ack("DPS-FN-A", vec![0xAAu8; 64])),
+            Ok(last_chk_ack("DPS-FN-B", vec![0xBBu8; 64])),
         ],
     );
     let view = view_for(&c);
@@ -515,13 +516,13 @@ async fn rec2_scheduled_after_hold_skips_within_backoff_window() {
             'b1', 't1', 'OFFLINE', '2026-05-21T00:00:00Z', \
             '{}', ?, ?, ?, 100, '2026-05-21T00:00:00Z', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(vec![0u8; 32])
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind("DPS-FN-REC2")
     .execute(&pool)
     .await
@@ -577,6 +578,142 @@ async fn rec2_scheduled_after_hold_skips_within_backoff_window() {
         ScheduledDrainOutcome::SkippedBackoff { next_eligible: _ } => {
             // Success: backoff window honored.  next_eligible is
             // ~30s в future (first Hold → 2^1 * 30s = 60s window).
+        }
+    }
+}
+
+/// **FW-1 mutation teeth (2026-07-14)** — TWIN of
+/// `rec2_scheduled_after_hold_skips_within_backoff_window` whose ONLY
+/// hold projection is `HeldAtSent` (NOT `HeldAtKvt1`), so
+/// `summary.held_at_kvt1() == 0` at the post-drain backoff decision.
+///
+/// Kills a cargo-mutants survivor at `app.rs` `drain_offline_backlog_
+/// scheduled`: the `any_hold` expression
+/// ```ignore
+/// any_hold = held_at_kvt1() > 0 || held_at_sent() > 0 || er_redrive_queued() > 0
+/// ```
+/// The survivor rewrites the 2nd/3rd clauses to `held_at_sent() < 0
+/// && er_redrive_queued() < 0`.  Both counters are `usize` (always
+/// `>= 0`), so `< 0` is a constant `false`, collapsing the whole
+/// expression to `any_hold = held_at_kvt1() > 0`.  The existing
+/// KVT1-doc sibling still passes under that mutation (its
+/// `held_at_kvt1() == 1` keeps the surviving first clause `true`), so
+/// only a SENT-only cohort exposes it.
+///
+/// Cohort shape: a single `OFFLINE_LOCAL_ACK` doc that stage_send
+/// advances to `Sent` (`send_chk` → `Ok(ack)`), then the SentFresh
+/// KVT2-confirm lastChk returns a Transport error →
+/// `Kvt2ConfirmOutcome::Hold(DpsTransport)` →
+/// `HoldFnDrain { projection: HeldAtSent }` →
+/// `summary.record_doc_held_at_sent()`.  Thus tick-1 summary has
+/// `held_at_sent() == 1` AND `held_at_kvt1() == 0`.
+///
+///   - Correct code: `held_at_sent() > 0` clause keeps `any_hold ==
+///     true` → `backoff::on_hold` → tick 2 within window =
+///     `SkippedBackoff` (REC-2 backoff engaged).
+///   - Mutated code: `any_hold` collapses to `held_at_kvt1() > 0` ==
+///     `false` → `backoff::on_advance` (reset, immediate eligibility)
+///     → tick 2 `Ran` → the tick-2 assertion below FAILS (teeth fire).
+///
+/// The wire-call storm this guards against: a SENT-only Hold that
+/// never backs off means the supervisor re-hits DPS at full ~60s
+/// cadence forever instead of exponential backoff (REC-2 operational
+/// safety).
+#[tokio::test]
+async fn rec2_scheduled_after_held_at_sent_hold_skips_within_backoff_window() {
+    use prro::ScheduledDrainOutcome;
+    let (_d, app, pool) = boot_app("rec2_hold_sent.db").await;
+    seed_fn_config(&pool).await;
+    seed_node_state(&pool, NodeMode::GoingOnline, ShiftState::Opened).await;
+    let shift_id = seed_open_shift(&pool).await;
+    let session_id = seed_offline_session(&pool, OfflineSessionState::Open).await;
+    // Seed ONE OFFLINE_LOCAL_ACK doc: stage_send advances it to Sent
+    // (send_chk Ok), then the SentFresh lastChk confirm returns a
+    // Transport error → HoldFnDrain { HeldAtSent }.  Crucially this
+    // cohort has NO KVT1 doc, so held_at_kvt1() stays 0.
+    let doc_id = seed_offline_local_ack(&pool, 1, 100, session_id, shift_id).await;
+    common::init_chain_seed(&pool, FN, common::chain_anchor(0x00))
+        .await
+        .unwrap();
+    common::seed_w12_finalize_prereqs(
+        &pool,
+        FN,
+        doc_id,
+        common::chain_anchor(0x00),
+        common::chain_anchor(0x01),
+    )
+    .await
+    .unwrap();
+
+    // Tick 1: send_chk → Ok(ack) (stage_send Sent), last_chk →
+    // Transport err (SentFresh confirm Hold → HeldAtSent).
+    //
+    // Tick-2 spare responses: on CORRECT code tick 2 is SkippedBackoff
+    // and never touches the wire, so these are simply left unconsumed
+    // (harmless).  Under the MUTATION tick 2 RUNS the drain again (the
+    // doc now rests at SENT → process_via_lastchk_replay → last_chk);
+    // the spare Transport err lets that second drain complete and
+    // return `Ran` so the explicit tick-2 `panic!` assertion fires
+    // with a legible mutation-specific message (instead of an
+    // empty-queue stub panic).
+    let c = carriers_with_last_chk(
+        vec![Ok(ack("DPS-FN-SENT"))],
+        vec![
+            Err(DpsError::Transport("simulated".into())),
+            Err(DpsError::Transport("simulated-tick2-spare".into())),
+        ],
+    );
+    let view = view_for(&c);
+
+    // Tick 1: drain runs; SentFresh Hold registers HeldAtSent only.
+    let outcome1 = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("tick 1 scheduled drain");
+    match outcome1 {
+        ScheduledDrainOutcome::Ran(summary) => {
+            assert_eq!(
+                summary.held_at_sent(),
+                1,
+                "tick 1 MUST register a SentFresh HeldAtSent Hold"
+            );
+            assert_eq!(
+                summary.held_at_kvt1(),
+                0,
+                "SENT-only cohort — held_at_kvt1 MUST be 0 so the mutation \
+                 that collapses any_hold to held_at_kvt1()>0 is exposed"
+            );
+            assert_eq!(
+                summary.er_redrive_queued(),
+                0,
+                "no ER redrive in this cohort"
+            );
+        }
+        ScheduledDrainOutcome::SkippedBackoff { .. } => {
+            panic!("tick 1 MUST run drain — no prior backoff state")
+        }
+    }
+
+    // Tick 2 (immediate): correct code engaged backoff::on_hold from
+    // the HeldAtSent Hold → within window = SkippedBackoff.  Under the
+    // mutation any_hold collapsed to held_at_kvt1()>0 == false →
+    // on_advance → this arm RUNS → panic → teeth fire.
+    let outcome2 = app
+        .drain_offline_backlog_scheduled(FN, &view)
+        .await
+        .expect("tick 2 scheduled drain");
+    match outcome2 {
+        ScheduledDrainOutcome::Ran(_) => {
+            panic!(
+                "tick 2 within backoff window MUST be skipped: a SENT-only \
+                 HeldAtSent Hold on tick 1 MUST engage REC-2 backoff \
+                 (any_hold via the held_at_sent()>0 clause). Ran here means \
+                 any_hold collapsed to held_at_kvt1()>0 == false → \
+                 backoff::on_advance → wire-call storm at full cadence."
+            )
+        }
+        ScheduledDrainOutcome::SkippedBackoff { next_eligible: _ } => {
+            // Success: HeldAtSent Hold engaged the backoff window.
         }
     }
 }
@@ -689,13 +826,13 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
             'b1', 't1', 'OFFLINE', '2026-05-21T00:00:00Z', \
             '{}', ?, ?, ?, 100, '2026-05-21T00:00:00Z', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(vec![0u8; 32])
     .bind(CASHIER_OK)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind("DPS-FN-E2E")
     .execute(&pool)
     .await
@@ -732,7 +869,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     // ── Step 3: verify Tier 2 fired ──
     let counter: i64 =
         sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -774,7 +911,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     );
     let counter_post_reset: i64 =
         sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -792,7 +929,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     // only counter + node mode).
     let doc_state_post_reset: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -801,7 +938,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     // ── Step 5-6: switch DPS to Acked + drain ──
     let c_recovery = carriers_with_last_chk(
         vec![],
-        vec![Ok(last_chk_ack("DPS-FN-E2E", vec![0xAAu8; 32]))],
+        vec![Ok(last_chk_ack("DPS-FN-E2E", vec![0xAAu8; 64]))],
     );
     let view_recovery = view_for(&c_recovery);
     let summary_recovery = app
@@ -817,7 +954,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     );
     let doc_state_final: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -834,7 +971,7 @@ async fn polish_tier_degradation_then_admin_reset_then_drain_succeeds_end_to_end
     // atomically з advance per REC-1 6.1.1 contract).
     let counter_final: i64 =
         sqlx::query_scalar("SELECT consecutive_holds FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&pool)
             .await
             .unwrap();

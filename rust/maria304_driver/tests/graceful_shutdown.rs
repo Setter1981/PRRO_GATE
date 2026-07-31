@@ -13,12 +13,9 @@ async fn cancellation_token_stops_waiting_task() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     token.cancel();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        handle,
-    )
-    .await
-    .expect("timeout")
-    .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(200), handle)
+        .await
+        .expect("timeout")
+        .unwrap();
     assert_eq!(result, "cancelled");
 }

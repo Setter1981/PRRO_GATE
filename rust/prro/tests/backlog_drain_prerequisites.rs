@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, ShiftId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::runtime::RuntimeView;
 use prro::services::write_path::stage_sign::SigningContext;
@@ -63,8 +64,8 @@ async fn seed_node_state(pool: &SqlitePool, fn_id: &str, mode: NodeMode, shift: 
          VALUES (?, ?, ?, 1)",
     )
     .bind(fn_id)
-    .bind(mode)
-    .bind(shift)
+    .bind(mode.as_str())
+    .bind(shift.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -83,7 +84,7 @@ async fn seed_open_shift(pool: &SqlitePool, fn_id: &str) -> ShiftId {
             open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'OFFLINE', 0, 'cashier-c3')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(fn_id)
     .execute(pool)
     .await
@@ -96,7 +97,7 @@ async fn seed_open_shift(pool: &SqlitePool, fn_id: &str) -> ShiftId {
 /// shift (the C3 `seed_node_state` helper leaves it NULL).
 async fn set_node_current_shift(pool: &SqlitePool, fn_id: &str, shift_id: ShiftId) {
     sqlx::query("UPDATE node_state SET current_shift_id = ? WHERE fiscal_number = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .bind(fn_id)
         .execute(pool)
         .await
@@ -105,7 +106,7 @@ async fn set_node_current_shift(pool: &SqlitePool, fn_id: &str, shift_id: ShiftI
 
 async fn read_shift_state(pool: &SqlitePool, shift_id: ShiftId) -> String {
     sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -136,7 +137,7 @@ async fn seed_offline_session_with_closed_at(
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at, closed_at) \
          VALUES (?, ?, ?, '2026-05-20T00:00:00Z', ?)",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(fn_id)
     .bind(state.as_str())
     .bind(closed_at)
@@ -171,12 +172,12 @@ async fn seed_offline_local_ack_doc(
             ?, ?, '2026-05-20T00:00:00Z' \
          )",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(fn_id)
     .bind(lnd)
     .bind(&sha)
-    .bind(offline_session_id)
+    .bind(DbOfflineSessionId(offline_session_id))
     .bind(code_lnd)
     .execute(pool)
     .await
@@ -186,7 +187,7 @@ async fn seed_offline_local_ack_doc(
 
 async fn fetch_session_state(pool: &SqlitePool, session_id: OfflineSessionId) -> String {
     sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
-        .bind(session_id)
+        .bind(DbOfflineSessionId(session_id))
         .fetch_one(pool)
         .await
         .unwrap()

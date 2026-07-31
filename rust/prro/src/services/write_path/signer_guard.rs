@@ -191,9 +191,19 @@ pub fn enforce_signer_cashier_match(
     // ShiftOpen: no shift row exists yet at stage_send time; signer
     //   becomes opened_by_cashier_id post-finalize by construction
     //   (MED-C3-2 resolution).
+    // B10 OfflineSessionBegin / OfflineSessionEnd: gateway-INTERNAL service
+    //   receipts with NO cashier attribution (minted by the drain-handshake
+    //   seam, not by a cashier).  They carry `signed_by_cashier_id = None`, so
+    //   the cashier-match check does not apply — bypass, exactly like the other
+    //   service receipts.  Without this arm they would fail-closed with a
+    //   misleading `ShiftMissingForFiscalDoc`.
     if matches!(
         inputs.doc_type,
-        DocType::ShiftClose | DocType::ZReport | DocType::ShiftOpen,
+        DocType::ShiftClose
+            | DocType::ZReport
+            | DocType::ShiftOpen
+            | DocType::OfflineSessionBegin
+            | DocType::OfflineSessionEnd,
     ) {
         return Ok(());
     }

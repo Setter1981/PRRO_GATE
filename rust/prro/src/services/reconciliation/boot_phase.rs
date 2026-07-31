@@ -32,16 +32,17 @@
 //! directly (sites that need supplementary writes ordered between
 //! CAS and audit — see `advance_sent_to_kvt1_from_probe`,
 //! `cas_sent_to_manual_reconciliation_from_probe`,
-//! `cas_sent_to_error_retryable_from_probe`).  Repository layer is
+//! `cas_sent_not_found_to_manual_from_probe`).  Repository layer is
 //! unchanged: no new pub fn on `fiscal_documents`.
 
 use sqlx::SqlitePool;
 
-use crate::db::models::enums::{DocState, NodeMode, Protocol, Severity, ShiftState};
+use crate::db::models::enums::{DocState, NodeMode, Severity, ShiftState};
 use crate::db::models::ids::{DocumentId, ShiftId};
 use crate::db::repositories::fiscal_documents::{self, TransitionOutcome};
 use crate::db::repositories::{audit_log, document_files, transport_trace};
 use crate::db::tx::{with_immediate, WriteTxConn};
+use crate::db::types::{DbDocumentId, DbProtocol, DbShiftId, DbShiftState};
 use crate::services::shift::transition as shift_transition;
 use crate::services::write_path::signer_guard::SignerCashierMismatch as Scm;
 use crate::services::write_path::stage_send;
@@ -228,9 +229,12 @@ pub struct DispatchHistogram {
     /// Counts as an answered wire exchange (the probe got a Mismatch reply).
     pub sent_mismatch_superseded: usize,
     /// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
-    /// Doc transitioned Sent → ErrorRetryable; tick-2 of two-tick
-    /// retry path (ADR-M3-A9 step 3) re-drives via Pattern B.
-    pub sent_not_found_to_error_retryable: usize,
+    /// CS-3 S7-1 F2 (boot): a Sent doc DPS reports NotFound is issuance-
+    /// AMBIGUOUS → `cas_sent_not_found_to_manual_from_probe` escalates it
+    /// Sent → RequiresManualReconciliation + node STOP (NOT the retired
+    /// two-tick Sent → ErrorRetryable Pattern-B redrive — R6 killed the
+    /// blind re-drive of a `CALL_STARTED` doc).
+    pub sent_not_found_to_manual: usize,
     /// W11 PR-2b — SENT crash-recovery probe failure (TransportRetry
     /// / DecodeEscalate / Unexpected).  Doc state left at SENT; next
     /// boot tick re-attempts the probe.  Forensic audit
@@ -358,7 +362,7 @@ impl DispatchHistogram {
             + self.sent_match_to_kvt1
             + self.sent_mismatch_to_manual
             + self.sent_mismatch_superseded
-            + self.sent_not_found_to_error_retryable
+            + self.sent_not_found_to_manual
             + self.sent_probe_failure_deferred
             + self.prepared_dispatched
             + self.offline_local_ack_emitted
@@ -424,7 +428,7 @@ impl DispatchHistogram {
             || self.sent_match_to_kvt1 > 0
             || self.sent_mismatch_to_manual > 0
             || self.sent_mismatch_superseded > 0
-            || self.sent_not_found_to_error_retryable > 0
+            || self.sent_not_found_to_manual > 0
         // NOT counted (no answered DPS exchange):
         //   - sent_probe_failure_deferred — TransportRetry/Decode probe (no answer).
         //   - sending_resumed / encrypted_rerouted — Sending/Encrypted→ER, no DPS.
@@ -455,7 +459,7 @@ impl DispatchHistogram {
         self.sent_match_to_kvt1 += other.sent_match_to_kvt1;
         self.sent_mismatch_to_manual += other.sent_mismatch_to_manual;
         self.sent_mismatch_superseded += other.sent_mismatch_superseded;
-        self.sent_not_found_to_error_retryable += other.sent_not_found_to_error_retryable;
+        self.sent_not_found_to_manual += other.sent_not_found_to_manual;
         self.sent_probe_failure_deferred += other.sent_probe_failure_deferred;
         self.prepared_dispatched += other.prepared_dispatched;
         self.offline_local_ack_emitted += other.offline_local_ack_emitted;
@@ -751,12 +755,15 @@ pub async fn advance_sent_to_kvt1_from_probe(
     // this Err via `emit_dispatch_error` → BOOT_DISPATCH_ERROR, "doc stays in
     // source state") and the next probe tick retries.  No state change, no
     // empty KVT1_RAW row.
-    if ack.data_sign.is_empty() {
+    if ack.data_sign.len() < crate::transports::dps::dto::MIN_KVT1_DATA_SIGN_LEN {
         anyhow::bail!(
             "advance_sent_to_kvt1_from_probe: probe Matched on id but ack.data_sign is \
-             EMPTY for doc {doc_id:?} — empty KVT1 evidence must not advance SENT→KVT1 \
-             (mirrors kvt2_advance::advance_to_ack StructuralDrift-on-empty; NC-01). \
-             Doc holds at SENT for re-probe."
+             {} bytes (< {} min) for doc {doc_id:?} — empty/implausibly-short KVT1 evidence \
+             must not advance SENT→KVT1 (mirrors kvt2_advance::advance_to_ack \
+             StructuralDrift-on-empty; NC-01 + RISK 1 byzantine-garbage harden). Doc holds \
+             at SENT for re-probe.",
+            ack.data_sign.len(),
+            crate::transports::dps::dto::MIN_KVT1_DATA_SIGN_LEN,
         );
     }
 
@@ -931,54 +938,45 @@ pub async fn cas_sent_to_manual_reconciliation_from_probe(
     .await
 }
 
-/// W11 PR-2b — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
+/// W11 PR-2b + S7-1 F2 re-audit — SENT crash-recovery, `ProbeOutcome::NotFound` arm.
 ///
-/// CAS `Sent → ErrorRetryable` + complete the in-flight
-/// `transport_trace` row with `OutcomeKind::RetryableServer` (DPS
-/// has no record — server-side condition, retryable) + audit
-/// `BOOT_SENT_LAST_CHK_NOTFOUND`.
-///
-/// This is the first tick of the two-tick recovery path
-/// (operator-decided 2026-05-12 per W11 design doc §9 Q1).  Second
-/// tick: ERROR_RETRYABLE dispatch via `stage_send::run` re-drives
-/// via Pattern B `ErrorRetryable → Sending → wire send`.  ADR-M3-A9
-/// step 3 forbids the direct `Sent → Sending` edge.
-pub async fn cas_sent_to_error_retryable_from_probe(
+/// A `Sent` doc whose `last_chk` probe returns NotFound is issuance-AMBIGUOUS (DPS may have accepted
+/// it and lost the record, or never saw it), so it escalates ATOMICALLY to
+/// `RequiresManualReconciliation` + node `STOP_MODE` via `sent_not_found_to_manual` — NOT the old
+/// `Sent → ErrorRetryable` auto-redrive. The old path left a reachable window: between the
+/// `Sent → ErrorRetryable` CAS and R6's later escalation the node stayed `Online`, and an online ER
+/// doc with a stamped SFN counts as *issued*, so the sibling-gate let the NEXT document issue as a
+/// chain-fork head (re-audit external-F2 / internal-B4). R6 collapsed the redrive, so the old
+/// `retry_class = TransientRetry` two-tick contract is dead; the recovery trace is now completed with
+/// `retry_class = None`. All writes land in ONE `with_immediate` envelope.
+pub async fn cas_sent_not_found_to_manual_from_probe(
     pool: &SqlitePool,
     doc_id: DocumentId,
+    fiscal_number: &str,
     attempt_no: i32,
     wire_call_started_at: &str,
     wire_call_finished_at: &str,
 ) -> anyhow::Result<bool> {
+    let fscl = fiscal_number.to_string();
     let wire_started = wire_call_started_at.to_string();
     let wire_finished = wire_call_finished_at.to_string();
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            // (1) CAS Sent → ErrorRetryable (whitelisted at base;
-            // M3b W1 routes through repository `transition_state`).
-            // Supplementary writes (transport_trace completion +
-            // audit) land below — same envelope.
-            let cas = fiscal_documents::transition_state(
-                tx,
-                doc_id,
-                DocState::Sent,
-                DocState::ErrorRetryable,
-            )
-            .await?;
-            if !matches!(cas, TransitionOutcome::Applied) {
-                return Ok::<bool, anyhow::Error>(false);
+            // (1) Sent → RequiresManualReconciliation + node STOP_MODE + Critical operator-handoff
+            // audit — the fiscal-critical writes, atomic with the trace completion below.
+            match super::sent_not_found::sent_not_found_to_manual(tx, doc_id, &fscl).await {
+                Ok(()) => {}
+                Err(super::sent_not_found::SentNotFoundError::DocNotSent(_)) => {
+                    // Someone else already moved the doc out of Sent — benign, no partial trail.
+                    return Ok::<bool, anyhow::Error>(false);
+                }
+                Err(e) => return Err(anyhow::Error::new(e)),
             }
 
-            // (2) Complete transport_trace row with RetryableServer
-            // outcome.  M3a hardening pass 1 — `retry_class =
-            // TransientRetry` is the semantically correct durable
-            // label: probe `NotFound` means DPS has no record, so
-            // tick-2 of the ADR-M3-A9 retry path is the canonical
-            // transient retry path.  The new ER dispatcher
-            // (`dispatch_error_retryable_by_class`) routes
-            // TransientRetry rows through `stage_send::run`.  Writing
-            // `None` here would route the doc to the indeterminate-
-            // hold branch and break the two-tick contract.
+            // (2) Complete the recovery trace — server-side condition (DPS has no record). NOT a
+            // retry: `retry_class = None` so no dispatcher re-drives it. R6 retired the two-tick
+            // ErrorRetryable redrive; the doc is now terminal-manual (RMR), not an ER cohort member,
+            // and `sent_not_found_to_manual` already wrote the Critical operator-handoff audit above.
             let n = transport_trace::complete_tx(
                 tx,
                 doc_id,
@@ -991,13 +989,9 @@ pub async fn cas_sent_to_error_retryable_from_probe(
                     server_status_code: None,
                     error_kind: Some("LAST_CHK_NOTFOUND".to_string()),
                     error_message: Some(
-                        "DPS last_chk returned NotFound; tick-2 of two-tick retry path will re-drive via Pattern B".to_string()
+                        "DPS last_chk returned NotFound for a Sent doc; escalated to RequiresManualReconciliation + STOP (issuance-ambiguous, no blind re-drive)".to_string()
                     ),
-                    retry_class: Some(
-                        crate::services::write_path::error_routing::RetryClass::TransientRetry
-                            .as_str()
-                            .to_string(),
-                    ),
+                    retry_class: None,
                 },
             )
             .await?;
@@ -1006,25 +1000,6 @@ pub async fn cas_sent_to_error_retryable_from_probe(
                     "transport_trace notfound completion: rows_affected = {n} (expected 1; doc {doc_id:?}, attempt_no = {attempt_no})"
                 );
             }
-
-            // (3) Audit BOOT_SENT_LAST_CHK_NOTFOUND.
-            let payload = serde_json::json!({
-                "document_id": hex_lower(doc_id.as_bytes()),
-                "branch": "c-sent-notfound",
-                "attempt_no": attempt_no,
-                "rationale":
-                    "last_chk returned NotFound — DPS has no record of doc with this transport_request_id; tick-1 transition Sent → ErrorRetryable (ADR-M3-A9 step 3 two-tick retry path)",
-            });
-            audit_log::append_tx(
-                tx,
-                "fiscal_document",
-                &hex_lower(doc_id.as_bytes()),
-                "BOOT_SENT_LAST_CHK_NOTFOUND",
-                crate::db::models::enums::Severity::Warning,
-                None,
-                Some(&payload.to_string()),
-            )
-            .await?;
             Ok::<bool, anyhow::Error>(true)
         })
     })
@@ -1249,7 +1224,7 @@ pub async fn passive_hold_kvt1(pool: &SqlitePool, doc_id: DocumentId) -> anyhow:
             let (state, first_kvt1_at_text): (String, Option<String>) = sqlx::query_as(
                 "SELECT state, first_kvt1_at FROM fiscal_documents WHERE document_id = ?",
             )
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&mut **tx)
             .await?;
             anyhow::ensure!(
@@ -1613,7 +1588,7 @@ pub async fn close_orphan_transport_traces(
                 .bind(&now_iso_owned)
                 .bind(&started_at_owned)
                 .bind(&now_iso_owned)
-                .bind(doc_id)
+                .bind(DbDocumentId(doc_id))
                 .bind(attempt_no_owned)
                 .execute(&mut **tx)
                 .await?
@@ -1712,103 +1687,96 @@ pub async fn run_stuck_doc_guard(pool: &SqlitePool, fiscal_number: &str) -> anyh
     Ok(stuck.len())
 }
 
-pub async fn run_boot_reconciliation(
-    _guard: &super::ReconcileGuard<'_>,
+/// NC-03 recovery — reconstruct a LOST `node_state` row from the surviving ledger.
+///
+/// (external-critic FT, adjudicated 2026-06-11; AUD-L6-1 2026-06-14; SEAM-D-1 2026-06-12.)
+/// When `node_state` is absent but `fiscal_documents` holds ANY row, node_state was LOST while the
+/// ledger SURVIVED (partial restore / corruption / rebaseline) — NOT a fresh FN. A silent bootstrap
+/// would reset the LND allocator to 1 (the allocator reads `node_state.next_lnd`) → the next write
+/// duplicates lnd / forks the MAC chain. Reconstruct the allocator (`next_lnd = MAX(lnd)+1`) + project
+/// the MAC seed from the ACTIVE chain tip (`active_chain_tip_unsigned_xml_sha256`, AUD-L6-1 lineage but
+/// rewind-aware per bd PRRO_GATE-2nk: a `NotAcceptedOffline`-superseded held doc yields its own
+/// `previous_hash`, NOT its resurrected hash; NOT the ACK-only tail), surface any surviving OPEN shift
+/// in the CRITICAL audit (SEAM-D-1: it is NOT
+/// auto-recovered), then BLOCK. One `with_immediate` envelope; the transient `Online` is never
+/// observable (boot runs before ingress).
+///
+/// Returns `true` when it reconstructed (ledger non-empty), `false` when the ledger is empty (a
+/// genuinely fresh FN — the caller keeps the original bootstrap). Extracted from branch-(a) so the
+/// S7-1 boot-first reservation pass (§7.2 step 3) can invoke the SAME repair for a deferred FN —
+/// UNFENCED there because a live PENDING reservation is EXPECTED during it (fencing this write would
+/// strand the deferred apply — S7-2 exclusion).
+///
+/// **`restore`** (CS-3 S7-1 A3 cutover fix, external review): branch-(a) passes `None` — node ends
+/// **BLOCKED**, `active_delivery_reservation_id = NULL` (a lost node_state with no surviving
+/// reservation is operator-led). The reservation pass passes `Some(reservation_id)` for a deferred FN
+/// whose active reservation survived: the node's authority columns are restored **in the same tx** to
+/// that reservation's captured `authorized_generation` + pointer, and the node ends **STOP_MODE** (not
+/// BLOCKED) — WITHOUT this, both `apply_outcome` and `complete_operator_pending` fail the identical
+/// generation/pointer CAS forever and the reservation is unrecoverable (the "operator-led" path is a
+/// dead end). Single active reservation per FN (the §3.1 fence) + node_state loss (no other survivor)
+/// ⇒ no fork / no stale-generation collision.
+pub(crate) async fn reconstruct_lost_node_state(
     pool: &SqlitePool,
     fiscal_number: &str,
-    deps: Option<&super::RuntimeView<'_>>,
-) -> anyhow::Result<BranchOutcome> {
+    restore: Option<crate::db::repositories::delivery_reservation::ReservationId>,
+) -> anyhow::Result<bool> {
     use crate::db::repositories::{fiscal_documents, node_state};
 
-    let row = node_state::get(pool, fiscal_number).await?;
-
-    // ── Branch (a) — FN row absent ───────────────────────────────
-    let Some(row) = row else {
-        // NC-03 (external-critic FT, adjudicated 2026-06-11): the `node_state`
-        // row is absent.  Before bootstrapping a FRESH FN (next_lnd=1, genesis
-        // seed), cross-check the ledger.  If ANY `fiscal_documents` row exists,
-        // node_state was LOST while the ledger SURVIVED (partial restore /
-        // corruption / rebaseline) — NOT a fresh FN.  A silent bootstrap would
-        // reset the LND allocator to 1 (the allocator reads `node_state.next_lnd`)
-        // → the next write either fail-closes on `ux_fd_fn_lnd` OR (sparse
-        // history) allocates BELOW the tail and signs with `previous_hash=None`
-        // → duplicate lnd / forked MAC chain.  Reconstruct the allocator
-        // (`next_lnd = MAX(lnd)+1`) + project the MAC seed from the highest-lnd
-        // EVER-ISSUED doc.  **AUD-L6-1 (FT, 2026-06-14):** project from
-        // `last_issued_unsigned_xml_sha256` (online ACK OR offline-origin that
-        // reached OFFLINE_LOCAL_ACK), NOT the ACK-only `last_ack_…`.  Since M2-01
-        // the seed advances at OFFLINE_LOCAL_ACK for offline-origin docs (and
-        // `stage_finalize` skips the advance for them), so when the FN tail is an
-        // offline-origin doc with lnd > the last online ACK, projecting from the
-        // last ACK is a STALE seed → the next write forks the legal MAC chain.
-        // Shares `OFFLINE_ISSUED_STATES` with the M2-N2b invariant_scan walk, so
-        // the projected seed equals the walk's final `expected`.  `None` when no
-        // issued doc = genesis.  Then BLOCK + CRITICAL: a node whose node_state
-        // vanished under it is NOT healthy and must not silently resume trading.
-        if let Some(max_lnd) = fiscal_documents::max_lnd_any_state(pool, fiscal_number).await? {
-            let next_lnd = max_lnd + 1;
-            let projected_seed: Option<[u8; 32]> =
-                match fiscal_documents::last_issued_unsigned_xml_sha256(pool, fiscal_number).await? {
-                    Some(bytes) => Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-                        anyhow::anyhow!(
-                            "AUD-L6-1: last issued unsigned_xml_sha256 for FN {fiscal_number} is not \
-                             32 bytes — corrupted MAC seed, refusing to project"
-                        )
-                    })?),
-                    None => None,
-                };
-            // SEAM-D-1 (functional seam-pass, 2026-06-12): `node_state.shift_state`
-            // is a MIRROR of the `shifts` table.  NC-03 reconstructs it as `Closed`
-            // (current_shift_id NULL), but NC-03's domain (node_state lost, ledger
-            // survived) lives in the SAME DB file, so a surviving OPEN `shifts` row
-            // can coexist — and boot shift-recovery keys on
-            // `node_state.shift_state == Opened`, so a `Closed` reconstruction would
-            // MASK it (the hazard node_state.rs's caller-contract warns about).  We do
-            // NOT auto-resume the shift here (a node whose node_state vanished is
-            // operator-led, and Branch (f) freezes a Blocked node anyway) — instead we
-            // SURFACE the surviving active shift in the CRITICAL audit so the operator
-            // reconciles it BEFORE clearing the block (RUNBOOK step).
-            let surviving_open_shift =
-                match crate::db::repositories::shifts::active_shift_for_fn(pool, fiscal_number)
-                    .await?
-                {
-                    Some((id_bytes, state)) => serde_json::json!({
-                        "shift_id": hex_lower(&id_bytes),
-                        "state": state,
-                    }),
-                    None => serde_json::Value::Null,
-                };
-            let fn_owned = fiscal_number.to_string();
-            let payload = serde_json::json!({
-                "fiscal_number": fiscal_number,
-                "branch": "a-block",
-                "recovered_next_lnd": next_lnd,
-                "max_ledger_lnd": max_lnd,
-                "mac_seed_projected": projected_seed.is_some(),
-                // SEAM-D-1: non-null ⇒ a surviving OPEN shift the operator MUST
-                // reconcile before unblocking (it is NOT auto-recovered here).
-                "surviving_open_shift": surviving_open_shift,
-                "rationale":
-                    "node_state row LOST while the fiscal_documents ledger SURVIVED — LND allocator + MAC seed reconstructed from the ledger; node BLOCKED (no silent bootstrap, no trading until an operator clears the block). If surviving_open_shift is non-null, the operator MUST reconcile that shift before clearing the block — it is surfaced here, NOT auto-recovered.",
-            });
-            // One envelope: create the row with the reconstructed allocator,
-            // project the seed, then flip to BLOCKED via the existing W10.3
-            // setter (the row now exists), + CRITICAL audit.  The transient
-            // Online is never observable — boot runs before ingress is accepted
-            // and the flip commits atomically.
-            with_immediate(pool, move |tx| {
-                Box::pin(async move {
-                    node_state::upsert_initial_tx(
-                        tx,
-                        &fn_owned,
-                        NodeMode::Online,
-                        ShiftState::Closed,
-                        next_lnd,
-                    )
-                    .await?;
-                    if let Some(seed) = projected_seed {
-                        node_state::update_last_known_xml_sha_tx(tx, &fn_owned, &seed).await?;
-                    }
+    let Some(max_lnd) = fiscal_documents::max_lnd_any_state(pool, fiscal_number).await? else {
+        return Ok(false); // empty ledger → genuinely fresh FN (caller bootstraps)
+    };
+    let next_lnd = max_lnd + 1;
+    // bd PRRO_GATE-2nk — project the ACTIVE chain tip, NOT merely the last issued doc's hash: after a
+    // `NotAcceptedOffline` rewind the tip is the held doc's own `previous_hash` (which may be a non-doc
+    // T=112 seed), and last_issued would resurrect the rewound-away doc. `active_chain_tip` reads the
+    // rewind target directly from the superseded doc.
+    let projected_seed: Option<[u8; 32]> =
+        match fiscal_documents::active_chain_tip_unsigned_xml_sha256(pool, fiscal_number).await? {
+            Some(bytes) => Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                anyhow::anyhow!(
+                    "AUD-L6-1: active chain tip for FN {fiscal_number} is not 32 bytes — corrupted \
+                     MAC seed, refusing to project"
+                )
+            })?),
+            None => None,
+        };
+    let surviving_open_shift =
+        match crate::db::repositories::shifts::active_shift_for_fn(pool, fiscal_number).await? {
+            Some((id_bytes, state)) => serde_json::json!({
+                "shift_id": hex_lower(&id_bytes),
+                "state": state,
+            }),
+            None => serde_json::Value::Null,
+        };
+    let fn_owned = fiscal_number.to_string();
+    // The branch-(a) BLOCKED payload — kept byte-identical (existing NC-03 tests pin it).
+    let blocked_payload = serde_json::json!({
+        "fiscal_number": fiscal_number,
+        "branch": "a-block",
+        "recovered_next_lnd": next_lnd,
+        "max_ledger_lnd": max_lnd,
+        "mac_seed_projected": projected_seed.is_some(),
+        // SEAM-D-1: non-null ⇒ a surviving OPEN shift the operator MUST reconcile before unblocking.
+        "surviving_open_shift": surviving_open_shift.clone(),
+        "rationale":
+            "node_state row LOST while the fiscal_documents ledger SURVIVED — LND allocator + MAC seed reconstructed from the ledger; node BLOCKED (no silent bootstrap, no trading until an operator clears the block). If surviving_open_shift is non-null, the operator MUST reconcile that shift before clearing the block — it is surfaced here, NOT auto-recovered.",
+    });
+    with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            node_state::upsert_initial_tx(
+                tx,
+                &fn_owned,
+                NodeMode::Online,
+                ShiftState::Closed,
+                next_lnd,
+            )
+            .await?;
+            if let Some(seed) = projected_seed {
+                node_state::update_last_known_xml_sha_tx(tx, &fn_owned, &seed).await?;
+            }
+            match restore {
+                None => {
                     let blocked = node_state::set_mode_blocked_tx(tx, &fn_owned).await?;
                     anyhow::ensure!(
                         blocked,
@@ -1821,13 +1789,92 @@ pub async fn run_boot_reconciliation(
                         "BOOT_LEDGER_WITHOUT_NODE_STATE_BLOCKED",
                         crate::db::models::enums::Severity::Critical,
                         None,
-                        Some(&payload.to_string()),
+                        Some(&blocked_payload.to_string()),
                     )
                     .await?;
-                    Ok::<(), anyhow::Error>(())
-                })
-            })
-            .await?;
+                }
+                Some(res_id) => {
+                    // Restore the surviving reservation's authority so the operator can complete it:
+                    // set delivery_generation = R.authorized_generation and the active pointer = R,
+                    // matching authorize_submission's write (delivery_reservation.rs:542). STOP (not
+                    // BLOCKED) so complete_operator_pending's STOP_MODE→target mode-CAS matches.
+                    let gen: Option<i64> = sqlx::query_scalar(
+                        "SELECT authorized_generation FROM delivery_reservation \
+                         WHERE reservation_id = ?",
+                    )
+                    .bind(&res_id[..])
+                    .fetch_one(&mut **tx)
+                    .await?;
+                    let gen = gen.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "NC-03 restore: active reservation for FN {fn_owned} has no \
+                             authorized_generation"
+                        )
+                    })?;
+                    sqlx::query(
+                        "UPDATE node_state SET delivery_generation = ?, \
+                             active_delivery_reservation_id = ? WHERE fiscal_number = ?",
+                    )
+                    .bind(gen)
+                    .bind(&res_id[..])
+                    .bind(&fn_owned)
+                    .execute(&mut **tx)
+                    .await?;
+                    let stopped = node_state::set_mode_stop_mode_tx(tx, &fn_owned).await?;
+                    anyhow::ensure!(
+                        stopped,
+                        "NC-03 restore: node_state row vanished mid-bootstrap for FN {fn_owned}"
+                    );
+                    let restore_payload = serde_json::json!({
+                        "fiscal_number": fn_owned,
+                        "branch": "a-block-reservation-restored",
+                        "recovered_next_lnd": next_lnd,
+                        "max_ledger_lnd": max_lnd,
+                        "mac_seed_projected": projected_seed.is_some(),
+                        "surviving_open_shift": surviving_open_shift,
+                        "restored_reservation_id": hex_lower(&res_id),
+                        "restored_generation": gen,
+                        "rationale":
+                            "node_state row LOST while the ledger AND a live delivery reservation SURVIVED — allocator + MAC seed reconstructed, and the reservation's authority (generation + active pointer) restored so operator completion can resolve it; node STOP_MODE (not trading) pending operator resolution.",
+                    });
+                    audit_log::append_tx(
+                        tx,
+                        "node_state",
+                        &fn_owned,
+                        "BOOT_LEDGER_WITHOUT_NODE_STATE_RESERVATION_RESTORED",
+                        crate::db::models::enums::Severity::Critical,
+                        None,
+                        Some(&restore_payload.to_string()),
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .await?;
+    Ok(true)
+}
+
+pub async fn run_boot_reconciliation(
+    _guard: &super::ReconcileGuard<'_>,
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    deps: Option<&super::RuntimeView<'_>>,
+) -> anyhow::Result<BranchOutcome> {
+    use crate::db::repositories::{fiscal_documents, node_state};
+
+    let row = node_state::get(pool, fiscal_number).await?;
+
+    // ── Branch (a) — FN row absent ───────────────────────────────
+    let Some(row) = row else {
+        // NC-03 (external-critic FT, adjudicated 2026-06-11; AUD-L6-1; SEAM-D-1): the `node_state`
+        // row is absent.  If ANY `fiscal_documents` row survived, node_state was LOST (partial
+        // restore / corruption) — NOT a fresh FN.  A silent bootstrap would reset the LND allocator
+        // to 1 → duplicate lnd / forked MAC chain, so reconstruct the allocator + MAC seed and BLOCK.
+        // Extracted to `reconstruct_lost_node_state` (shared verbatim with the S7-1 boot-first
+        // reservation pass §7.2 step 3, which invokes the SAME repair UNFENCED for a deferred FN).
+        if reconstruct_lost_node_state(pool, fiscal_number, None).await? {
             return Ok(BranchOutcome::BlockedLedgerWithoutNodeState);
         }
 
@@ -1995,19 +2042,21 @@ pub async fn run_boot_reconciliation(
                    AND state NOT IN ('ABORTED','REJECTED','CANCELLED')"
             ))
             .bind(fiscal_number)
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .fetch_one(pool)
             .await?;
             if live_anchor_count == 0 {
                 // Forensic anchor: the latest dead lifecycle doc, if any.
                 let dead_anchor: Option<Vec<u8>> = sqlx::query_scalar(&format!(
+                    // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+                    // scoped to a single shift of one `fiscal_number`, so `lnd` is unique here.
                     "SELECT document_id FROM fiscal_documents \
                      WHERE fiscal_number = ? AND shift_id = ? \
                        AND doc_type IN {anchor_types} \
                      ORDER BY lnd DESC LIMIT 1"
                 ))
                 .bind(fiscal_number)
-                .bind(shift_id)
+                .bind(DbShiftId(shift_id))
                 .fetch_optional(pool)
                 .await?;
                 let anchor_doc_id = dead_anchor
@@ -2070,13 +2119,17 @@ pub async fn run_boot_reconciliation(
                 // Read orphan shifts inside the envelope so any
                 // parallel writer (theoretical under non-SWFN) cannot
                 // race between SELECT and UPDATE.
-                let orphans: Vec<(ShiftId, ShiftState)> = sqlx::query_as(
-                    "SELECT shift_id, state FROM shifts \
-                     WHERE fiscal_number = ? AND state IN ('OPENING', 'CLOSING')",
-                )
-                .bind(&fn_owned)
-                .fetch_all(&mut **tx)
-                .await?;
+                let orphans: Vec<(ShiftId, ShiftState)> =
+                    sqlx::query_as::<_, (DbShiftId, DbShiftState)>(
+                        "SELECT shift_id, state FROM shifts \
+                         WHERE fiscal_number = ? AND state IN ('OPENING', 'CLOSING')",
+                    )
+                    .bind(&fn_owned)
+                    .fetch_all(&mut **tx)
+                    .await?
+                    .into_iter()
+                    .map(|(id, state)| (id.0, state.0))
+                    .collect();
                 let orphans_resolved = orphans.len();
                 for (shift_id, current) in orphans {
                     // Branch e2 system-context recovery — raw UPDATE to
@@ -2187,7 +2240,7 @@ pub async fn run_boot_reconciliation(
             "error_retryable_dispatched": histogram.error_retryable_dispatched,
             "sent_match_to_kvt1": histogram.sent_match_to_kvt1,
             "sent_mismatch_to_manual": histogram.sent_mismatch_to_manual,
-            "sent_not_found_to_error_retryable": histogram.sent_not_found_to_error_retryable,
+            "sent_not_found_to_manual": histogram.sent_not_found_to_manual,
             "sent_probe_failure_deferred": histogram.sent_probe_failure_deferred,
             "prepared_dispatched": histogram.prepared_dispatched,
             // M3b W7b — post-sign dispatcher outcomes (operator PR
@@ -2616,10 +2669,11 @@ async fn defer_probe(
 ///   state Sent → RequiresManualReconciliation (operator handoff per
 ///   W0-3 §6.4-b; whitelist edge from prep PR #35) + trace completion
 ///   with `Rejected` outcome.
-/// - **NotFound**: `cas_sent_to_error_retryable_from_probe` → state
-///   Sent → ErrorRetryable + trace completion with `RetryableServer`
-///   outcome.  Tick-2 of the two-tick retry path
-///   (operator-decided per W11 design doc §9 Q1).
+/// - **NotFound**: `cas_sent_not_found_to_manual_from_probe` → state
+///   Sent → RequiresManualReconciliation + node STOP + trace completion
+///   with `RetryableServer` (`retry_class = NULL`).  CS-3 S7-1 F2: a Sent
+///   doc DPS reports NotFound is issuance-AMBIGUOUS → escalate, NOT the
+///   retired two-tick Sent → ErrorRetryable redrive (R6 killed blind re-drive).
 /// - **TransportRetry / DecodeEscalate / Unexpected**:
 ///   `complete_probe_trace_no_state_change` → trace completion +
 ///   `BOOT_SENT_PROBE_DEFERRED` audit; doc stays in SENT for next
@@ -2793,16 +2847,17 @@ pub(crate) async fn dispatch_sent_via_probe(
             }
         }
         ProbeOutcome::NotFound => {
-            match cas_sent_to_error_retryable_from_probe(
+            match cas_sent_not_found_to_manual_from_probe(
                 pool,
                 doc_id,
+                &doc.fiscal_number,
                 attempt_no,
                 &wire_started,
                 &wire_finished,
             )
             .await
             {
-                Ok(_) => histogram.sent_not_found_to_error_retryable += 1,
+                Ok(_) => histogram.sent_not_found_to_manual += 1,
                 Err(e) => {
                     emit_dispatch_error(pool, doc_id, "c-sent-notfound", &e, histogram).await?
                 }
@@ -2920,10 +2975,38 @@ pub async fn cas_error_retryable_to_manual_reconciliation(
                 },
             )
             .await?;
-            Ok::<bool, anyhow::Error>(matches!(outcome, TransitionOutcome::Applied))
+            let applied = matches!(outcome, TransitionOutcome::Applied);
+            if applied {
+                stop_node_for_escalated_doc(tx, doc_id).await?;
+            }
+            Ok::<bool, anyhow::Error>(applied)
         })
     })
     .await
+}
+
+/// B4 re-audit (internal MAJOR — the '+STOP' half): halt the node in the SAME tx as an
+/// `ErrorRetryable → RequiresManualReconciliation` escalation, so a PERSISTENT doc-level failure
+/// (e.g. -13 FnConfigError) cannot mint an unbounded ER→RMR stream while the node stays `Online`
+/// (the cashier would get 202s forever, node never halts). Before this, only the offline-drain path
+/// set STOP; the online/boot ER→RMR sites escalated the doc but left the node `Online`.
+async fn stop_node_for_escalated_doc(
+    tx: &mut crate::db::tx::WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> anyhow::Result<()> {
+    let fscl: String =
+        sqlx::query_scalar("SELECT fiscal_number FROM fiscal_documents WHERE document_id = ?")
+            .bind(doc_id.as_bytes().as_slice())
+            .fetch_one(&mut **tx)
+            .await?;
+    let ok = crate::db::repositories::node_state::set_mode_stop_mode_tx(tx, &fscl).await?;
+    if !ok {
+        anyhow::bail!(
+            "stop_node_for_escalated_doc: node_state row missing for escalated doc {doc_id:?} — \
+             cannot set STOP_MODE"
+        );
+    }
+    Ok(())
 }
 
 /// M3a hardening pass 1 — H2 closure: CAS `ErrorRetryable →
@@ -2968,7 +3051,13 @@ async fn cas_error_retryable_budget_exhausted(
                 },
             )
             .await?;
-            Ok::<bool, anyhow::Error>(matches!(outcome, TransitionOutcome::Applied))
+            let applied = matches!(outcome, TransitionOutcome::Applied);
+            if applied {
+                // B4 re-audit: halt the node atomically (budget-exhausted ER → RMR is the same
+                // manual-triage escalation as the per-class one; the node must not stay Online).
+                stop_node_for_escalated_doc(tx, doc_id).await?;
+            }
+            Ok::<bool, anyhow::Error>(applied)
         })
     })
     .await
@@ -3039,7 +3128,10 @@ async fn emit_error_retryable_hold_audit(
 /// design freeze flagged.
 async fn dispatch_error_retryable_by_class(
     pool: &SqlitePool,
-    deps: &super::RuntimeView<'_>,
+    // CS-3 S7-1 (R6): this dispatcher is escalation-only now — the transient re-wire arm was
+    // deleted, so the DPS view is intentionally unused. Kept in the signature for stability with
+    // the boot cohort loop's `Some(deps)` call-site; a full param drop is deferred to the R7 sweep.
+    _deps: &super::RuntimeView<'_>,
     doc: &crate::db::repositories::fiscal_documents::DocumentRow,
     histogram: &mut DispatchHistogram,
 ) -> anyhow::Result<()> {
@@ -3058,38 +3150,10 @@ async fn dispatch_error_retryable_by_class(
     let decision = evaluate_er_redrive(pool, doc_id).await?;
 
     match decision {
-        ErRedriveDecision::Redrive => {
-            // TransientRetry + attempts < MAX_BOOT_ATTEMPTS — Pattern B
-            // retry path (existing W11 PR-2a wiring).
-            match stage_send::run(pool, deps.dps, doc_id, Some(deps.signing_ctx)).await {
-                // W14a-2b Commit 5 NIT-C5-2 + NIT-C5-5: split
-                // SignerRefused off the generic dispatched bucket
-                // AND split Mismatch (operator-actionable) from the
-                // structural caller-bug variants (engineering signal).
-                // M1-01 fix: exhaustive classification (no `Ok(_)` catch-all) so
-                // zero-wire StateConflict/DocumentMissing are NOT counted as an
-                // answered exchange (they'd falsely suppress the boot tip-guard).
-                Ok(outcome) => match classify_send_dispatch(&outcome) {
-                    SendDispatchClass::Dispatched => histogram.error_retryable_dispatched += 1,
-                    SendDispatchClass::StateConflict => histogram.dispatch_state_conflict += 1,
-                    SendDispatchClass::DocumentMissing => histogram.dispatch_document_missing += 1,
-                    SendDispatchClass::SignerRefusedMismatch => histogram.signer_refused_mismatch += 1,
-                    SendDispatchClass::SignerRefusedStructural => {
-                        histogram.signer_refused_structural_bug += 1
-                    }
-                },
-                Err(e) => {
-                    emit_dispatch_error(
-                        pool,
-                        doc_id,
-                        "c-error-retryable-transient",
-                        &anyhow::Error::new(e),
-                        histogram,
-                    )
-                    .await?
-                }
-            }
-        }
+        // CS-3 S7-1 (R6): the `Redrive` arm is DELETED. A transient ErrorRetryable no longer
+        // re-invokes `stage_send::run` at boot (that would be a SECOND wire for an already
+        // CALL_STARTED doc — double-issue). `evaluate_er_redrive` now returns
+        // `EscalateManual { TransientRetry }`, handled by the EscalateManual arm below → RMR.
         ErRedriveDecision::BudgetExhausted { attempts_used } => {
             // M3a hardening pass 1 — H2 closure: enforce the
             // boot-attempt budget cap.  `MAX_BOOT_ATTEMPTS = 5` is
@@ -3325,7 +3389,7 @@ async fn dispatch_prepared_via_chain(
                         payload_sha256_canonical, source_sha256 \
                  FROM fiscal_documents WHERE document_id = ?",
             )
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_one(&mut **tx)
             .await?;
             let request_id_v: Vec<u8> = fd_row.try_get("request_id")?;
@@ -3386,7 +3450,7 @@ async fn dispatch_prepared_via_chain(
             let inbox_row = InboxRow {
                 request_id: inbox_request_id,
                 fiscal_number: inbox_row_db.try_get("fiscal_number")?,
-                protocol: inbox_row_db.try_get::<Protocol, _>("protocol")?,
+                protocol: inbox_row_db.try_get::<DbProtocol, _>("protocol")?.0,
                 operation_type: inbox_row_db.try_get("operation_type")?,
                 idempotency_key: inbox_row_db.try_get("idempotency_key")?,
                 status: inbox_row_db.try_get("status")?,
@@ -4210,7 +4274,7 @@ mod tests {
         }
         .answered_wire_contact());
         assert!(DispatchHistogram {
-            sent_not_found_to_error_retryable: 1,
+            sent_not_found_to_manual: 1,
             ..Default::default()
         }
         .answered_wire_contact());
@@ -4396,6 +4460,42 @@ mod tests {
         DocumentId::from_bytes(<[u8; 16]>::try_from(bytes.as_slice()).unwrap())
     }
 
+    /// Seed one OFFLINE-origin fiscal document (bd PRRO_GATE-2nk boot tests). Mod-level so the
+    /// NotAcceptedOffline-rewind boot repros share it.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_off(
+        pool: &SqlitePool,
+        fscl: &str,
+        b: u8,
+        lnd: i64,
+        state: &str,
+        prev: Option<[u8; 32]>,
+        unsigned: [u8; 32],
+        session: &[u8; 16],
+    ) {
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, \
+                payload_json, payload_sha256_canonical, unsigned_xml_sha256, offline_fiscal_no, \
+                offline_session_id, previous_hash) \
+             VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'OFFLINE', '2026-07-17T12:34:56Z', '{}', \
+                ?, ?, ?, ?, ?)",
+        )
+        .bind(vec![b; 16])
+        .bind(vec![b ^ 0xFF; 16])
+        .bind(fscl)
+        .bind(lnd)
+        .bind(state)
+        .bind(&[0u8; 32][..])
+        .bind(&unsigned[..])
+        .bind(lnd)
+        .bind(&session[..])
+        .bind(prev.map(|h| h.to_vec()))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn emit_dispatch_error_writes_audit_and_increments_counter() {
         let (_dir, pool) = fresh_pool().await;
@@ -4462,5 +4562,236 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 2, "two distinct audit rows");
+    }
+
+    /// BLOCKER-1 repro (external audit of the invariant_scan cohort-cancel PR; bd PRRO_GATE-2nk):
+    /// the durable `NotAcceptedOffline` seed REWIND is UNDONE by NC-03 boot recovery.
+    /// `reconstruct_lost_node_state` projects the MAC seed via `last_issued_unsigned_xml_sha256`,
+    /// which counts the RMR held predecessor as issued and picks ITS hash (H1) — resurrecting the
+    /// rewound-away value instead of the rewind target (H0 = the held doc's own `previous_hash`).
+    /// Runs the REAL completion (`complete_operator_pending`) + the REAL reconstruction; the step-3
+    /// asserts guard that the completion produced the oc10/oc15-pinned durable state before probing
+    /// recovery. Regression pin for the coordinated fix (migration 039 `chain_superseded_at` marker +
+    /// `last_issued_unsigned_xml_sha256` exclusion, bd PRRO_GATE-2nk): boot reconstructs the durable
+    /// rewind target H0 (the surviving prefix doc, lnd 9), NOT the RMR held doc's own hash H1.
+    #[tokio::test]
+    async fn nc03_boot_preserves_not_accepted_offline_rewind() {
+        use crate::db::models::ids::DocumentId;
+        use crate::db::repositories::delivery_reservation::{
+            authorize_submission, complete_operator_pending, resume_crashed_reservation,
+            NewReservation, OperatorResolution, ReservationId,
+        };
+        use crate::db::tx::with_immediate;
+
+        async fn dstate(pool: &SqlitePool, b: u8) -> String {
+            sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id=?")
+                .bind(vec![b; 16])
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        async fn seed(pool: &SqlitePool, fscl: &str) -> Option<Vec<u8>> {
+            sqlx::query_scalar(
+                "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number=?",
+            )
+            .bind(fscl)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let (_dir, pool) = fresh_pool().await;
+        let fscl = "5100000099";
+        let h0 = [0xB0u8; 32]; // rewind target = the held BEGIN's previous_hash
+        let h1 = [0xB1u8; 32]; // the held doc's OWN unsigned hash (what last_issued wrongly picked pre-fix)
+        let session = [0x5Eu8; 16];
+
+        // (1) pre-completion cohort: fn_config + node_state (pre-rewind seed = TIP) + DRAINING session
+        //     + held pred (SENDING, prev=H0, unsigned=H1) + two later OLA successors (real chain).
+        sqlx::query("INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '12345678', 'test')")
+            .bind(fscl).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO node_state (fiscal_number, mode, shift_state, next_lnd, last_known_unsigned_xml_sha256) VALUES (?, 'ONLINE', 'CREATED', 1, ?)")
+            .bind(fscl).bind(&[0xEEu8; 32][..]).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) VALUES (?, ?, 'DRAINING', '2026-07-24T00:00:00Z')")
+            .bind(&session[..]).bind(fscl).execute(&pool).await.unwrap();
+        // lnd 9: the prior active-chain tip the held BEGIN chained onto — an online SENT doc
+        // (is_issued via server_fiscal_no), unsigned = H0.  The rewind target H0 == THIS surviving
+        // doc's hash (single-writer chaining), so `last_issued(exclude superseded)` must return it.
+        sqlx::query(
+            "INSERT INTO fiscal_documents(document_id, request_id, fiscal_number, lnd, doc_type, \
+                state, backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
+                payload_sha256_canonical, server_fiscal_no, unsigned_xml_sha256, previous_hash) \
+             VALUES (?, ?, ?, 9, 'SELL', 'SENT', 'b1', 't1', 'ONLINE', '2026-07-17T12:00:00Z', '{}', \
+                ?, 'D-9', ?, NULL)",
+        )
+        .bind(vec![0x09u8; 16])
+        .bind(vec![0x09u8 ^ 0xFF; 16])
+        .bind(fscl)
+        .bind(&[0u8; 32][..])
+        .bind(&h0[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_off(&pool, fscl, 0x10, 10, "SENDING", Some(h0), h1, &session).await;
+        seed_off(
+            &pool,
+            fscl,
+            0x11,
+            11,
+            "OFFLINE_LOCAL_ACK",
+            None,
+            [0xB2; 32],
+            &session,
+        )
+        .await;
+        seed_off(
+            &pool,
+            fscl,
+            0x12,
+            12,
+            "OFFLINE_LOCAL_ACK",
+            None,
+            [0xB3; 32],
+            &session,
+        )
+        .await;
+
+        // Held reservation → PENDING_APPLY + STOP_MODE (mirrors operator_completion::held_pending).
+        let res_id: ReservationId = [0x01u8; 16];
+        let row = NewReservation {
+            reservation_id: res_id,
+            document_id: DocumentId::from_bytes([0x10u8; 16]),
+            fiscal_number: fscl.to_string(),
+            dps_protocol_id: "FSCO_ZZD".to_string(),
+            protocol_contract_version: 1,
+            capability_profile_version: None,
+            endpoint_config_revision: None,
+            envelope_hash: [0xAB; 32],
+        };
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                authorize_submission(tx, row, "2026-07-20T00:00:00Z")
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("authorize");
+        let fscl_o = fscl.to_string();
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                resume_crashed_reservation(tx, res_id, &fscl_o)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("resume to PENDING_APPLY + STOP_MODE");
+
+        // (2) the REAL NotAcceptedOffline completion.
+        with_immediate(&pool, move |tx| {
+            Box::pin(async move {
+                complete_operator_pending(tx, res_id, OperatorResolution::NotAcceptedOffline)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .expect("offline not-accepted completes");
+
+        // (3) durable post-state (oc10/oc15) — the completion did its job.
+        assert_eq!(
+            seed(&pool, fscl).await.as_deref(),
+            Some(&h0[..]),
+            "completion rewound the seed to H0 (the held doc's previous_hash)"
+        );
+        assert_eq!(dstate(&pool, 0x10).await, "REQUIRES_MANUAL_RECONCILIATION");
+        assert_eq!(dstate(&pool, 0x11).await, "CANCELLED");
+        assert_eq!(dstate(&pool, 0x12).await, "CANCELLED");
+
+        // (4) NC-03: node_state row LOST while the ledger SURVIVES.
+        sqlx::query("DELETE FROM node_state WHERE fiscal_number=?")
+            .bind(fscl)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // (5) the REAL reconstruction (the seam run_boot_reconciliation invokes for NC-03, :1871).
+        let recovered = reconstruct_lost_node_state(&pool, fscl, None)
+            .await
+            .expect("reconstruct");
+        assert!(
+            recovered,
+            "ledger survived → reconstruct returns true (BLOCKED branch)"
+        );
+
+        // (6) RED — the recovered seed MUST be the durable rewind target H0, NOT the RMR held doc's
+        //     own resurrected hash H1.  Today `last_issued_unsigned_xml_sha256` picks the RMR doc → H1.
+        assert_eq!(
+            seed(&pool, fscl).await.as_deref(),
+            Some(&h0[..]),
+            "NC-03 boot MUST preserve the NotAcceptedOffline rewind (seed=H0), not resurrect the RMR \
+             held doc's own hash (H1={h1:02x?})"
+        );
+    }
+
+    /// Tooth 1 (audit BLOCKER, boot e2e) — the `NotAcceptedOffline` rewind target is a T=112
+    /// code-replenish seed `Hs` with NO producing fiscal doc (offline_code_replenish sets the seed to
+    /// sha256(request_xml) without minting a doc). NC-03 boot must recover `Hs` from the superseded
+    /// held doc's `previous_hash` DIRECTLY — the exclusion approach returned the previous doc / None.
+    /// No `node_state` row (NC-03 loss); the post-completion ledger is seeded directly.
+    #[tokio::test]
+    async fn nc03_boot_recovers_non_doc_t112_rewind_target() {
+        let (_dir, pool) = fresh_pool().await;
+        let fscl = "5100000098";
+        let hs = [0xC0u8; 32]; // sha256(T=112 request xml) — NO fiscal doc produces it
+        let session = [0x5Fu8; 16];
+        sqlx::query("INSERT OR IGNORE INTO fiscal_number_config(fiscal_number, tax_number, fiscal_mode) VALUES (?, '12345678', 'test')")
+            .bind(fscl).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) VALUES (?, ?, 'DRAINING', '2026-07-25T00:00:00Z')")
+            .bind(&session[..]).bind(fscl).execute(&pool).await.unwrap();
+        // Post-completion ledger: held BEGIN superseded, previous_hash = Hs (the non-doc T=112 rewind
+        // target); a cancelled cohort chained onto it. node_state is ABSENT (NC-03 loss).
+        seed_off(
+            &pool,
+            fscl,
+            0x10,
+            10,
+            "REQUIRES_MANUAL_RECONCILIATION",
+            Some(hs),
+            [0xD1; 32],
+            &session,
+        )
+        .await;
+        seed_off(
+            &pool,
+            fscl,
+            0x11,
+            11,
+            "CANCELLED",
+            Some([0xD1; 32]),
+            [0xD2; 32],
+            &session,
+        )
+        .await;
+        sqlx::query("UPDATE fiscal_documents SET chain_superseded_at = '2026-07-25T00:00:01Z' WHERE fiscal_number = ? AND lnd = 10")
+            .bind(fscl).execute(&pool).await.unwrap();
+        let recovered = reconstruct_lost_node_state(&pool, fscl, None)
+            .await
+            .expect("reconstruct");
+        assert!(recovered, "ledger survived → reconstruct returns true");
+        let seed: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number=?",
+        )
+        .bind(fscl)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            seed.as_deref(),
+            Some(&hs[..]),
+            "NC-03 boot must recover the non-doc T=112 rewind target Hs from the superseded held doc's \
+             previous_hash — the exclusion approach returned the previous doc / None (audit BLOCKER)"
+        );
     }
 }

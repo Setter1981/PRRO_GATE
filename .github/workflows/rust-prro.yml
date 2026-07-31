@@ -9,24 +9,23 @@ name: rust-prro
 # cost ~10 min of PR wall-clock (windows runner slowest). Keep the two files'
 # step lists in sync when touching build/test steps.
 on:
+  # CS-1R4 — the integrity check is UNCONDITIONAL. push.paths is deliberately
+  # UNFILTERED (was `rust/** + scripts/cs1r/** + docs/cs1r/inventory/** + this
+  # file`) so the `x86_64-unknown-linux-gnu` context — the required
+  # branch-protection gate — ALWAYS runs on both push and pull_request, on EVERY
+  # ref, with no dispatch to defeat. The CS-1R4 simplification DELETED the old
+  # `changes` (detect rust changes) job + `scripts/cs1r/rust_change_paths.py` +
+  # `scripts/cs1r/manifest_detector_paths.py`: a path-detector is an attackable
+  # surface (a PR touching only an uncovered path SKIPPED the required context =
+  # satisfied — the #305 bypass class; plus every rename/glob/negation/comment-
+  # injection trick against the detector). Removing the gate removes the whole
+  # class. The trade-off (this leg now runs on genuinely docs-only PRs too) is
+  # accepted: correctness of the required gate outranks a few minutes of CI on
+  # rare docs-only PRs, and the heavy mutation ratchet stays path-filtered in
+  # mutation-diff.yml.
   push:
     branches: [rust-gateway]
-    paths:
-      # `prro` plus its workspace path-dependencies (rust/prro/Cargo.toml
-      # references ../prro_crypto and ../prro_escpos), so a change there
-      # also breaks `cargo build -p prro` and must trigger this workflow.
-      - 'rust/prro/**'
-      - 'rust/prro_crypto/**'
-      - 'rust/prro_escpos/**'
-      - 'rust/Cargo.*'
-      - '.github/workflows/rust-prro.yml'
   pull_request:
-    paths:
-      - 'rust/prro/**'
-      - 'rust/prro_crypto/**'
-      - 'rust/prro_escpos/**'
-      - 'rust/Cargo.*'
-      - '.github/workflows/rust-prro.yml'
 
 # Default to least-privilege: this workflow only reads the repo.
 permissions:
@@ -46,30 +45,83 @@ env:
 jobs:
   # `fmt + clippy (gnu)` (also a REQUIRED merge gate) lives in
   # .github/workflows/fmt-clippy.yml — an always-run, NON-path-filtered
-  # workflow — so that required check reports on EVERY PR, including
-  # docs-only / .claude-only ones that never trigger this path-filtered one.
+  # workflow — so that required check reports on EVERY PR.
+  #
+  # CS-1R4 — there is NO `changes` (detect rust changes) dispatch job any more.
+  # The `build` job below is a single, non-matrix, ALWAYS-RUN job with no `needs:`
+  # / `if:` gate: the required `x86_64-unknown-linux-gnu` context runs its full
+  # integrity signal on EVERY push and EVERY PR and can only report green by
+  # actually passing every step. Deleting a step, adding `if: false` /
+  # `continue-on-error` / `|| true`, or changing the `checkout` ref weakens a
+  # VISIBLE part of this job's diff (CODEOWNERS-gated, see .github/CODEOWNERS) and
+  # still leaves the job itself fail-closed. Structural weakening is a workflow-
+  # file diff, which branch protection (operator) must gate — the code here is
+  # deliberately un-dispatchable.
+
   build:
     # MUST stay exactly `x86_64-unknown-linux-gnu`: this is the REQUIRED
-    # branch-protection context, mirrored by rust-prro-skip.yml on non-rust
-    # PRs (the skip-companion reports the same context name).
+    # branch-protection context. It runs UNCONDITIONALLY (no `needs:`/`if:`) —
+    # CS-1R4 removed the path-detector dispatch that previously SKIPPED it on
+    # out-of-path PRs (the #305 skip-the-required bypass class). A skipped
+    # required check counts as satisfied, so any detector was an attackable
+    # surface; running always removes the class entirely.
     name: x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
 
-    steps:
-      - uses: actions/checkout@v4
+    # Serial compile+link (one codegen/link job at a time). The ubuntu-latest
+    # runner (~7 GB) intermittently OOMs the `lld` linker
+    # (`ld terminated with signal 7 [Bus error], core dumped`) when linking the
+    # ~200 workspace test binaries in parallel, failing this REQUIRED context
+    # non-deterministically — observed 4/5 link attempts on PR #338, in BOTH the
+    # `Test` step and the inventory-gate `nextest list`, always on unrelated
+    # binaries (`cert_refresher_smoke`, `live_dps_extended_smoke`, …). `-j1` caps
+    # peak link memory deterministically. Scoped to THIS heavy x86 job only;
+    # nextest RUNTIME parallelism is untouched (the OOM is at LINK, before any
+    # test runs). If serial build later hits the step timeout, raise the timeout
+    # before reintroducing parallelism.
+    env:
+      CARGO_BUILD_JOBS: "1"
+      # Peak-link-memory cap (bd PRRO_GATE-hpc, 2026-07-30). `-j1` above serialises
+      # the links but does NOT bound the peak of a SINGLE link, and debug info is the
+      # dominant contributor: once this PR added the ~201st test binary the
+      # inventory-gate `nextest list` link began dying with the SAME documented
+      # `ld terminated with signal 7 [Bus error]` on 3/3 consecutive attempts (a
+      # sibling PR on the identical base linked fine, so it is a threshold, not a
+      # code defect). `line-tables-only` keeps file:line in panics and backtraces —
+      # the only debug info CI actually reads — while dropping the type/variable DWARF
+      # that dominates link peak. Applied to BOTH profiles: test targets link their
+      # dependencies' `dev`-profile debug info too, so capping `test` alone is not
+      # enough. Scoped to THIS heavy x86 job; local dev builds are untouched.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
 
-      - uses: dtolnay/rust-toolchain@stable
+    steps:
+      # fetch-depth: 0 — the CS-1R R1 provenance test (`cs1_test_provenance`)
+      # shells `git show f2c17b1:… / f2628ba:…` to compare the CS-1 base/head
+      # blobs; a shallow (depth-1) checkout lacks those commits and the test
+      # panics. Full history makes both pinned SHAs reachable.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: rust
 
       # Parallel per-binary test runner — ~2× wall-clock vs `cargo test`
       # (measured 300s→150s locally, 2026-06-11).  No crate in the
       # workspace has doc-tests, so nothing is silently skipped.
-      - uses: taiki-e/install-action@nextest
+      # CS-1R R1.2: PIN cargo-nextest to 0.9.137 (was `@nextest` = latest). The
+      # inventory gate's `nextest list` snapshots are version-sensitive, so the
+      # committed manifests are only reproducible against a pinned runner; cargo
+      # is already pinned to 1.95.0 via rust-toolchain.toml.
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: nextest@0.9.137
 
       - name: Build
         working-directory: rust
@@ -100,6 +152,46 @@ jobs:
         # (aarch64) is covered by the nightly cross workflow.
         run: cargo nextest run -p prro_crypto --target x86_64-unknown-linux-gnu --locked
 
+      - name: Test prro-domain (RP-CS1-1 purity gate + RP-CS1-4 contract-DAG + testkit graph-absence)
+        working-directory: rust
+        # CS-1 skeleton (contract §8 / RP-CS1-6): the `prro-domain` crate carries
+        # the cargo-metadata purity gate (sqlx/tonic/tokio/axum/prost/hyper/reqwest
+        # must never enter its normal+build+target closure), the RP-CS1-4
+        # `prro-testkit` graph-absence check AND the CS-1d contract-crate DAG gate
+        # (rp_cs1_4_contract_dag.rs: the three `*-contract` crates carry no
+        # adapter/IO dep and stay orthogonal — ingress ⊥ dps ⊥ fleet), plus the
+        # trybuild canary. Also compiles the (currently empty) `prro-testkit` +
+        # the three `*-contract` members so a crate-local change is linted/tested,
+        # never SKIPPED.
+        run: cargo nextest run -p prro-domain -p prro-testkit -p prro-ingress-contract -p prro-dps-contract -p prro-fleet-contract --target x86_64-unknown-linux-gnu --locked
+
+      # CS-1R R1.3 (contract §12 member×dimension matrix): the remaining five
+      # workspace members had NO build/test leg on the required x86 context — a
+      # crate-local break in prro_crypto_v2 / prro_sidecar / maria304_driver /
+      # prro_escpos / prro_escpos_daemon was SKIPPED. Every member now carries
+      # build + test (all five ship test targets: crypto_v2 21 src, sidecar
+      # 1 int+10 src, maria304 10 int+27 src, escpos/escpos_daemon 1 int each).
+      - name: Build CS-1R matrix members (crypto_v2 / sidecar / maria304 / escpos / escpos_daemon)
+        working-directory: rust
+        run: cargo build -p prro_crypto_v2 -p prro_sidecar -p maria304_driver -p prro_escpos -p prro_escpos_daemon --target x86_64-unknown-linux-gnu --locked
+
+      - name: Test CS-1R matrix members (crypto_v2 / sidecar / maria304 / escpos / escpos_daemon)
+        working-directory: rust
+        run: cargo nextest run -p prro_crypto_v2 -p prro_sidecar -p maria304_driver -p prro_escpos -p prro_escpos_daemon --target x86_64-unknown-linux-gnu --locked
+
+      # CS-1R R1.2: forward additions-only inventory gate (three-way: live
+      # `nextest list` == committed manifest per profile, additions-only vs base,
+      # every new source test file recorded). Pins cargo-nextest to 0.9.137 (the
+      # install-action step below). A drift RED's here; a human re-mints via
+      # scripts/cs1r/mint_manifests.sh (CI never auto-mints).
+      - name: CS-1R R1.2 inventory gate (three-way, --pr base)
+        run: bash scripts/cs1r/inventory_gate.sh --pr "${{ github.event.pull_request.base.sha }}"
+        if: github.event_name == 'pull_request'
+
+      - name: CS-1R R1.2 inventory gate (controls 1+3, push)
+        run: bash scripts/cs1r/inventory_gate.sh
+        if: github.event_name != 'pull_request'
+
       # Phase-2 U2 (spec §4 / F2): the fuzzer above writes a regression seed to
       # the pinned file on a find. Surface it so a find is never silently
       # dropped: (1) upload the seed as an artifact so a find's repro is
@@ -109,7 +201,7 @@ jobs:
       # failure.
       - name: Upload regression seed (if any)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: invariant-fuzzer-regressions-x86_64-unknown-linux-gnu
           path: rust/prro/tests/invariant_fuzzer.regressions

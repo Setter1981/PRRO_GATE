@@ -45,6 +45,7 @@ use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEnt
 use prro::db::repositories::transport_trace::{self, NewAttempt};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
 use prro::db::tx::with_immediate;
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::runtime::ingress::canonical_builder::build_canonical;
 use prro::services::offline_sync::backlog_drain;
@@ -122,7 +123,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -139,9 +140,9 @@ async fn seed_node_state_online(pool: &SqlitePool, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -155,9 +156,9 @@ async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Offline)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(NodeMode::Offline.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -165,7 +166,7 @@ async fn seed_node_state_offline(pool: &SqlitePool, shift_id: ShiftId) {
 
 async fn set_node_mode(pool: &SqlitePool, mode: NodeMode) {
     sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ?")
-        .bind(mode)
+        .bind(mode.as_str())
         .bind(FN)
         .execute(pool)
         .await
@@ -178,7 +179,7 @@ async fn seed_open_offline_session(pool: &SqlitePool) -> OfflineSessionId {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-06-09T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(FN)
     .bind(OfflineSessionState::Open.as_str())
     .execute(pool)
@@ -303,11 +304,16 @@ async fn k6_offline_local_ack_drains_to_ack() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: the first offline SELL lazily mints a DocType=9 BEGIN (code#1) before
+    // the SELL (code#2); the drain then mints a DocType=10 END (code#3).
     seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
     let row = seed_inbox_sell(&pool).await;
 
     // ── Phase 1: full inline::run on the offline node — terminates at
-    //    OFFLINE_LOCAL_ACK.  DPS is never called on the offline branch.
+    //    OFFLINE_LOCAL_ACK.  DPS is never called on the offline branch (neither
+    //    for the SELL nor the lazily-minted BEGIN).
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
     let phase1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
@@ -324,11 +330,25 @@ async fn k6_offline_local_ack_drains_to_ack() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("offline SELL must land at OFFLINE_LOCAL_ACK (success, not error)");
     assert_eq!(outcome.document_state, DocState::OfflineLocalAck);
-    assert_eq!(read_doc_state(&pool, FN).await, "OFFLINE_LOCAL_ACK");
+    // B10: two OLA docs pre-drain — the lazy BEGIN + the SELL.
+    assert_eq!(
+        count_doc_rows(&pool).await,
+        2,
+        "B10: BEGIN + SELL both minted offline"
+    );
+    let sell_state: String = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'SELL'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sell_state, "OFFLINE_LOCAL_ACK");
     assert_eq!(
         read_inbox_status(&pool, &row.request_id).await,
         "PROCESSING"
@@ -345,10 +365,12 @@ async fn k6_offline_local_ack_drains_to_ack() {
     set_node_mode(&pool, NodeMode::GoingOnline).await;
 
     // ── Phase 2: drain with a mock DPS — send Ok (carries KVT1 data_sign) +
-    //    lastChk Match.  Counters are SHARED with phase 1.
+    //    lastChk Match, for BEGIN + SELL + the drain-time END.  Counters SHARED.
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    for _ in 0..3 {
+        phase2.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+        phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+    }
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -360,13 +382,18 @@ async fn k6_offline_local_ack_drains_to_ack() {
     let summary = backlog_drain::drain(&recon_guard(), &pool, &view, FN)
         .await
         .expect("drain must succeed");
-    assert_eq!(summary.backlog_size_before(), 1, "exactly one backlog doc");
+    assert_eq!(
+        summary.backlog_size_before(),
+        2,
+        "B10: two content backlog docs (BEGIN + SELL); the END is a finalize \
+         precondition, not a cohort member"
+    );
 
     // ── Locked assertions.
     assert_eq!(
-        read_doc_state(&pool, FN).await,
+        sell_state_after(&pool).await,
         "ACK",
-        "drain → terminal ACK"
+        "drain → the SELL reaches terminal ACK"
     );
     assert_eq!(
         read_inbox_status(&pool, &row.request_id).await,
@@ -375,24 +402,44 @@ async fn k6_offline_local_ack_drains_to_ack() {
     );
     assert_eq!(
         count_consumed_offline_codes(&pool).await,
-        1,
-        "offline code consumed exactly once (phase 1)"
+        2,
+        "B10: two codes consumed — the offline BEGIN + SELL; the ONLINE END \
+         (advance-at-SEND, bare <MAC>) consumes NONE"
     );
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
-        1,
-        "exactly one send_chk across both phases (drain's wire submit)"
+        3,
+        "three send_chk across both phases: BEGIN + SELL + END (all at drain)"
     );
-    assert_eq!(count_doc_rows(&pool).await, 1, "exactly one ledger row");
+    assert_eq!(
+        count_doc_rows(&pool).await,
+        3,
+        "B10: three ledger rows — BEGIN + SELL + END"
+    );
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
 
+/// Read the SELL doc's state (B10: the ledger now has BEGIN + SELL + END, so the
+/// single-row `read_doc_state` is ambiguous — target the SELL by doc_type).
+async fn sell_state_after(pool: &SqlitePool) -> String {
+    sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND doc_type = 'SELL'",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 async fn read_doc_id(pool: &SqlitePool) -> DocumentId {
-    sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE fiscal_number = ?")
-        .bind(FN)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, DbDocumentId>(
+        "SELECT document_id FROM fiscal_documents WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .0
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -437,6 +484,7 @@ async fn k5_kvt2_committed_finalizes_to_ack() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("online SELL with Hold lastChk returns Ok(Sent), a 202");
@@ -449,7 +497,7 @@ async fn k5_kvt2_committed_finalizes_to_ack() {
     //    short immediate transaction.  This is state-construction of the
     //    "KVT2 committed, finalize not run" crash point — NOT a production call.
     let doc_id = read_doc_id(&pool).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             let o1 = fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
@@ -551,6 +599,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         ));
         tokio::select! {
             _ = &mut fut => panic!("inline::run must hang on lastChk, not complete"),
@@ -567,7 +616,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
 
     // ── Phase 2: boot with deps; lastChk now answers Match.
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -601,7 +650,7 @@ async fn k4_sent_committed_probe_holds_at_kvt1() {
     //    converges it to ACK — without resending.  Counters stay SHARED, so the
     //    "exactly one send_chk EVER" property is proven across crash + boot + tick.
     let phase3 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase3.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // confirm Match
+    phase3.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // confirm Match
     let sign_ctx3 = det_signing_ctx();
     let fn_sign3 = fn_sign_blob();
     let view3 = RuntimeView {
@@ -685,6 +734,7 @@ async fn k3_sending_committed_resumes_to_error_retryable_without_resend() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         ));
         tokio::select! {
             _ = &mut fut => panic!("inline::run must hang on send_chk, not complete"),
@@ -806,7 +856,7 @@ async fn k1_prepared_boot_redrives_to_sent_exactly_once() {
     //    and advances Sent→KVT1 (as K4).  send_chk MUST stay == 1: this turns
     //    "one send so far" into "exactly one send EVER".  Counters are shared.
     let stub2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view2 = RuntimeView {
@@ -911,7 +961,7 @@ async fn k2_signed_boot_redrives_to_sent_exactly_once() {
     //    and advances Sent→KVT1 (as K4).  send_chk MUST stay == 1: this turns
     //    "one send so far" into "exactly one send EVER".  Counters are shared.
     let stub2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view2 = RuntimeView {
@@ -1023,6 +1073,7 @@ async fn m1_02_reachability_second_sell_while_first_rests_sent() {
             &fn_sign1,
             &guard,
             &row1,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("run #1: online SELL with Hold lastChk returns Ok(Sent)");
@@ -1048,6 +1099,7 @@ async fn m1_02_reachability_second_sell_while_first_rests_sent() {
             &fn_sign2,
             &guard,
             &row2,
+            prro::services::time_budget::system_gate(),
         )
         .await
     };
@@ -1158,6 +1210,7 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("phase 1 rests at SENT");
@@ -1211,7 +1264,7 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
     // ── Recovery: boot with a Match stub.  No push_send queued → a resend would
     //    be observable; asserted ZERO below.
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF]))); // Match
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64]))); // Match
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -1239,7 +1292,7 @@ async fn k7_sent_probe_alloc_orphan_is_benign_after_m1_04() {
     let probe_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM transport_trace WHERE document_id = ? AND is_probe = 1",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1303,6 +1356,7 @@ async fn k4b_sent_probe_matching_id_empty_data_sign_holds_at_sent() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("phase 1 rests at SENT");
@@ -1371,8 +1425,11 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: BEGIN(1) + receipt#1(2) + receipt#2(3) at issuance + END(4) at drain.
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await;
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1383,18 +1440,36 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1)
-            .await
-            .expect("offline receipt 1 → OFFLINE_LOCAL_ACK");
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub1,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row1,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .expect("offline receipt 1 → OFFLINE_LOCAL_ACK");
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
     let row2 = seed_inbox_sell_keyed(&pool, "idem-m2-pin-2").await;
     let stub2 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub2, &sign_ctx, &fn_sign, &g, &row2)
-            .await
-            .expect("offline receipt 2 → OFFLINE_LOCAL_ACK");
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub2,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row2,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .expect("offline receipt 2 → OFFLINE_LOCAL_ACK");
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
 
@@ -1409,16 +1484,31 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
             .await
             .unwrap()
     }
-    let prev1 = chain_col(&pool, 1, "previous_hash").await;
-    let prev2 = chain_col(&pool, 2, "previous_hash").await;
-    let uns1 = chain_col(&pool, 1, "unsigned_xml_sha256").await;
-    let uns2 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
-    assert!(prev1.is_none(), "doc#1 chains off genesis");
+    // B10: the REAL chain is now BEGIN(lnd1, prev=genesis None) → receipt#1(lnd2,
+    // prev=BEGIN.uns) → receipt#2(lnd3, prev=receipt#1.uns).  The lazy BEGIN is
+    // the lowest-lnd offline doc.
+    let prev_begin = chain_col(&pool, 1, "previous_hash").await;
+    let prev1 = chain_col(&pool, 2, "previous_hash").await; // receipt#1
+    let prev2 = chain_col(&pool, 3, "previous_hash").await; // receipt#2
+    let uns_begin = chain_col(&pool, 1, "unsigned_xml_sha256").await;
+    let uns1 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
+    let uns2 = chain_col(&pool, 3, "unsigned_xml_sha256").await;
+    assert!(
+        prev_begin.is_none(),
+        "the lazy BEGIN (lnd1) chains off genesis"
+    );
+    assert_eq!(
+        prev1, uns_begin,
+        "receipt#1 chains off the BEGIN's unsigned_xml_sha256"
+    );
     assert_ne!(
         prev1, prev2,
-        "M2-01: the two offline docs have DISTINCT previous_hash"
+        "M2-01: the two receipts have DISTINCT previous_hash"
     );
-    assert_eq!(prev2, uns1, "doc#2 chains off doc#1's unsigned_xml_sha256");
+    assert_eq!(
+        prev2, uns1,
+        "receipt#2 chains off receipt#1's unsigned_xml_sha256"
+    );
     let seed: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
     )
@@ -1428,21 +1518,22 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     .unwrap();
     assert_eq!(
         seed, uns2,
-        "node seed advanced to the last issued offline doc"
+        "node seed advanced to the last issued offline doc (receipt#2)"
     );
 
     // ── invariant_scan is CLEAN during the offline window (closes M2-03).
     prro::db::invariant_scan::assert_clean(&pool).await;
 
-    // ── Go online + drain.  Two send + two lastChk (one per doc).
+    // ── Go online + drain.  B10: BEGIN + receipt#1 + receipt#2 + the drain-time
+    //    END = 4 send + 4 lastChk.
     set_node_mode(&pool, NodeMode::GoingOnline).await;
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
     let phase = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    phase.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    phase.push_send(Ok(ack("DPS-FN-ONLINE-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
-    phase.push_last(Ok(ack("DPS-FN-ONLINE-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    for _ in 0..4 {
+        phase.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+        phase.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+    }
     let sc2 = det_signing_ctx();
     let fs2 = fn_sign_blob();
     let view = RuntimeView {
@@ -1453,9 +1544,13 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     let summary = backlog_drain::drain(&recon_guard(), &pool, &view, FN)
         .await
         .expect("drain must succeed (no ChainSeedMismatch post-fix)");
-    assert_eq!(summary.backlog_size_before(), 2);
+    assert_eq!(
+        summary.backlog_size_before(),
+        3,
+        "B10: BEGIN + 2 receipts in the content backlog (END is a finalize precondition)"
+    );
 
-    // ── Both ACK, exactly two send_chk, scan clean AFTER drain.
+    // ── All ACK (BEGIN + 2 receipts + END), scan clean AFTER drain.
     let states: Vec<(i64, String)> = sqlx::query_as(
         "SELECT lnd, state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd",
     )
@@ -1465,13 +1560,18 @@ async fn m2_two_offline_receipts_real_chain_drains_both_to_ack() {
     .unwrap();
     assert_eq!(
         states,
-        vec![(1, "ACK".to_string()), (2, "ACK".to_string())],
-        "both offline receipts drain to ACK"
+        vec![
+            (1, "ACK".to_string()),
+            (2, "ACK".to_string()),
+            (3, "ACK".to_string()),
+            (4, "ACK".to_string()),
+        ],
+        "BEGIN + both receipts + END all drain to ACK"
     );
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
-        2,
-        "exactly two send_chk (one per doc)"
+        4,
+        "four send_chk — BEGIN + receipt#1 + receipt#2 + END"
     );
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
@@ -1498,15 +1598,18 @@ async fn m2_online_offline_boundary_chain_continuous() {
     let gate = Arc::new(tokio::sync::Mutex::new(()));
 
     async fn doc_id_by_req(pool: &SqlitePool, req: &[u8; 16]) -> DocumentId {
-        sqlx::query_scalar("SELECT document_id FROM fiscal_documents WHERE request_id = ?")
-            .bind(&req[..])
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar::<_, DbDocumentId>(
+            "SELECT document_id FROM fiscal_documents WHERE request_id = ?",
+        )
+        .bind(&req[..])
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .0
     }
     async fn state_by_id(pool: &SqlitePool, id: DocumentId) -> String {
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(id)
+            .bind(DbDocumentId(id))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -1514,7 +1617,7 @@ async fn m2_online_offline_boundary_chain_continuous() {
     async fn col_by_id(pool: &SqlitePool, id: DocumentId, col: &str) -> Option<Vec<u8>> {
         let q = format!("SELECT {col} FROM fiscal_documents WHERE document_id = ?");
         sqlx::query_scalar(&q)
-            .bind(id)
+            .bind(DbDocumentId(id))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -1527,13 +1630,22 @@ async fn m2_online_offline_boundary_chain_continuous() {
     stub0.push_last(Ok(ack(SERVER_FISCAL_NO, vec![]))); // empty → online Hold → SENT
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub0, &sign_ctx, &fn_sign, &g, &row0)
-            .await
-            .unwrap();
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub0,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row0,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .unwrap();
         assert_eq!(o.document_state, DocState::Sent);
     }
     let doc0 = doc_id_by_req(&pool, &row0.request_id).await;
-    let kvt1 = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1 = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             fiscal_documents::transition_state(tx, doc0, DocState::Sent, DocState::Kvt1)
@@ -1565,24 +1677,60 @@ async fn m2_online_offline_boundary_chain_continuous() {
         "online ACK advanced the seed to doc#0.unsigned"
     );
 
-    // ── Flip OFFLINE, emit doc#1 → OFFLINE_LOCAL_ACK; it must chain off doc#0.
+    // ── Flip OFFLINE, emit the first offline SELL.  B10: it lazily interposes a
+    //    DocType=9 BEGIN as the FIRST offline doc, so it is the BEGIN (not the
+    //    SELL) that chains off the last online ACK; the SELL then chains off the
+    //    BEGIN.  Seed 2 codes (BEGIN + SELL).  The boundary-continuity INTENT is
+    //    preserved AND strengthened: BEGIN.prev == uns0 AND SELL.prev == BEGIN.uns.
     set_node_mode(&pool, NodeMode::Offline).await;
     seed_open_offline_session(&pool).await;
     seed_offline_code(&pool, 1).await;
+    seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await; // T2 close-reserve: +1 reserved for the offline Z (1 offline sell)
     let row1 = seed_inbox_sell_keyed(&pool, "idem-m2-boundary-1").await;
     let stub1 = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     {
         let g = gate.clone().lock_owned().await;
-        let o = inline::run(&pool, &pool_secure, &stub1, &sign_ctx, &fn_sign, &g, &row1)
-            .await
-            .unwrap();
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub1,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row1,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
+    // The lazy BEGIN is the lowest-lnd offline doc; it chains off the online ACK.
+    let begin_prev: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT previous_hash FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let begin_uns: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT unsigned_xml_sha256 FROM fiscal_documents \
+         WHERE fiscal_number = ? AND doc_type = 'OFFLINE_SESSION_BEGIN'",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        begin_prev, uns0,
+        "online→offline boundary: the lazy BEGIN (first offline doc) chains off the last online ACK"
+    );
     let doc1 = doc_id_by_req(&pool, &row1.request_id).await;
     let prev1 = col_by_id(&pool, doc1, "previous_hash").await;
     assert_eq!(
-        prev1, uns0,
-        "online→offline boundary: the first offline doc chains off the last online ACK"
+        prev1, begin_uns,
+        "the offline SELL chains off the BEGIN's unsigned_xml_sha256 (chain extends past the boundary)"
     );
     // Chain continuous across the boundary.
     prro::db::invariant_scan::assert_clean(&pool).await;
@@ -1610,8 +1758,16 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: BEGIN(lnd1) + receipt#1(lnd2) + receipt#2(lnd3) → 3 codes.  The drain
+    // below targets lnd=1, which is now the lazy BEGIN — itself an offline-origin
+    // doc, so it is a valid subject for the "mac_recovery refuses offline-origin"
+    // pin (the test's intent is preserved: an offline-origin doc hitting -12 on
+    // drain must NOT be re-signed; the shift escalates to RMR; the chain stays clean).
+    // T2 close-reserve: +1 reserved for the offline Z (2 offline sells → pool 4).
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await;
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1622,18 +1778,36 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     {
         let g = gate.clone().lock_owned().await;
         let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row1)
-            .await
-            .unwrap();
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row1,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
     let row2 = seed_inbox_sell_keyed(&pool, "idem-m2x1-2").await;
     {
         let g = gate.clone().lock_owned().await;
         let stub = ScriptedDps::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let o = inline::run(&pool, &pool_secure, &stub, &sign_ctx, &fn_sign, &g, &row2)
-            .await
-            .unwrap();
+        let o = inline::run(
+            &pool,
+            &pool_secure,
+            &stub,
+            &sign_ctx,
+            &fn_sign,
+            &g,
+            &row2,
+            prro::services::time_budget::system_gate(),
+        )
+        .await
+        .unwrap();
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
 
@@ -1660,7 +1834,7 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
     .await
     .unwrap();
     sqlx::query("UPDATE shifts SET state = 'OPENED_LOCAL_PENDING_DRAIN' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -1706,7 +1880,14 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
         doc1_prev_before,
         "doc#1 previous_hash unchanged (no re-sign)"
     );
-    // No re-sign audit; one distinct refusal audit.
+    // ── CS-3 S7-1 (R3): the offline-origin -12 re-sign loop is DELETED, so there is no
+    //    explicit "refuse" step anymore. The -12 is a recorded HOLD (MacReseedPending): the
+    //    doc rests SENDING under a PENDING_APPLY reservation, the drain HALTS and escalates
+    //    the pending-drain shift to RequiresManualReconciliation. The offline-origin invariant
+    //    that motivated this pin SURVIVES verbatim — NO re-sign, so the seed never desyncs and
+    //    the chain stays intact (asserted above via invariant_scan + unchanged unsigned/prev).
+    //    The old MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED audit is retired; the escalation is now the
+    //    drain's own OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL (§16.7 universal EscalateManual, edges 6/14).
     let resigned: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_log WHERE event_type = 'MAC_RECOVERY_RESIGNED'",
     )
@@ -1717,16 +1898,63 @@ async fn m2x1_mac_recovery_refuses_offline_origin_doc() {
         resigned, 0,
         "mac_recovery must NOT re-sign an offline-origin doc"
     );
-    let refused: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED'",
+
+    // The -12 is recorded HELD: doc#1 rests SENDING under a PENDING_APPLY MacReseedPending reservation.
+    let doc1_state: String = sqlx::query_scalar(
+        "SELECT state FROM fiscal_documents WHERE fiscal_number = ? AND lnd = 1",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        doc1_state, "SENDING",
+        "offline-origin -12 → HELD (doc rests SENDING, no re-sign)"
+    );
+    let (res_apply, res_effect): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT apply_state, node_effect FROM delivery_reservation WHERE fiscal_number = ?",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        res_apply.as_deref(),
+        Some("PENDING_APPLY"),
+        "held reservation"
+    );
+    assert_eq!(
+        res_effect.as_deref(),
+        Some("MacReseedPending"),
+        "-12 node-effect"
+    );
+
+    // M2-X1 UNIQUE (idempotent, no 2nd wire): the drain fires exactly ONE wire for doc#1, records
+    // the -12, then HALTS + escalates — it does NOT consume the 2nd queued -12 (no retry re-wire).
+    let mismatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'STAGE_SEND_MAC_HASH_MISMATCH'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(refused, 1, "one MAC_RECOVERY_OFFLINE_ORIGIN_REFUSED audit");
-    // Shift escalated to manual-recon.
+    assert_eq!(
+        mismatches, 1,
+        "exactly one -12 wire attempt — the drain halts, no 2nd re-wire"
+    );
+
+    // The pending-drain shift escalates to manual-recon via the drain's halt audit + shift CAS.
+    let escalated: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        escalated, 1,
+        "one OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL audit"
+    );
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1755,6 +1983,8 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await; // B10: +1 for the lazy BEGIN
+    seed_offline_code(&pool, 5).await; // T2 close-reserve: +1 reserved for the offline Z (3 sells)
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1777,6 +2007,7 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .unwrap_or_else(|e| panic!("offline SELL {i} must land OFFLINE_LOCAL_ACK: {e:?}"));
@@ -1801,13 +2032,13 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     //    DocumentReject (terminal) → strict-sequential HALT + escalate Manual;
     //    doc3 is NEVER sent (no stub response provided for it).
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_send(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF]))); // doc1 send
+    phase2.push_send(Ok(ack("SFN-1", vec![0xDE; 64]))); // doc1 send
     phase2.push_send(Err(DpsError::Authorization {
         code: -1,
         kind: AuthorizationKind::DocumentReject,
         message: "reject_doc2".into(),
     })); // doc2 send
-    phase2.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF]))); // doc1 lastChk Match
+    phase2.push_last(Ok(ack("SFN-1", vec![0xDE; 64]))); // doc1 lastChk Match
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -1833,8 +2064,19 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
             .unwrap()
         }
     };
+    // ── FT pin (strict-sequential halt, post-cutover HELD semantics):
+    //    doc1 sends OK → ACK.  doc2's offline-origin DocumentReject during drain is now a
+    //    recorded HELD (SENDING under a PENDING_APPLY reservation) — a drain reject has crossed
+    //    the local-commit threshold, so rollback-to-terminal-Rejected does NOT apply (§6.3
+    //    universal EscalateManual); the drain HALTS and escalates the shift to
+    //    RequiresManualReconciliation.  doc3 is NEVER sent (strict-sequential halt at the
+    //    rejected predecessor — the M2-N1 unique value that survives the cutover).
     assert_eq!(state_at(1).await, "ACK", "doc1 → ACK");
-    assert_eq!(state_at(2).await, "REJECTED", "doc2 → REJECTED (terminal)");
+    assert_eq!(
+        state_at(2).await,
+        "SENDING",
+        "doc2 offline-origin drain reject → HELD (SENDING), NOT terminal REJECTED"
+    );
     assert_eq!(
         state_at(3).await,
         "OFFLINE_LOCAL_ACK",
@@ -1843,19 +2085,50 @@ async fn m2_n1_three_real_offline_sells_strict_drain_halts_on_reject() {
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
         2,
-        "only doc1 + doc2 reached the wire; doc3 never did"
+        "only doc1 + doc2 reached the wire; doc3 never did (strict halt)"
     );
 
-    // FN escalated to durable manual-recon via edge 15 (plain Opened, NOT wedged).
+    // doc2 rests OUTCOME_OBSERVED + PENDING_APPLY (held, not applied — the reject is unresolved).
+    let doc2_apply: Option<String> = sqlx::query_scalar(
+        "SELECT dr.apply_state FROM delivery_reservation dr JOIN fiscal_documents fd \
+         ON dr.document_id = fd.document_id WHERE dr.fiscal_number = ? AND fd.lnd = 2",
+    )
+    .bind(FN)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        doc2_apply.as_deref(),
+        Some("PENDING_APPLY"),
+        "doc2 held PENDING_APPLY"
+    );
+
+    // The drain recorded doc2's reject and escalated the shift to manual-recon (edge 15).
+    let rejected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'STAGE_SEND_REJECTED'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected, 1, "doc2's -1 DocumentReject was recorded");
+    let escalated: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        escalated, 1,
+        "one OFFLINE_DRAIN_HALTED_ESCALATE_MANUAL audit"
+    );
     let shift_state: String = sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(shift_state, "REQUIRES_MANUAL_RECONCILIATION");
 
-    // Ledger clean over the REAL chain incl. the REJECTED offline-origin
-    // predecessor (M2-N2b).
+    // Ledger clean over the REAL chain incl. the HELD offline-origin doc2 (M2-N2b).
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
 
@@ -1904,6 +2177,8 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
     seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await; // B10: +1 for the lazy BEGIN
+    seed_offline_code(&pool, 5).await; // T2 close-reserve: +1 reserved for the offline Z (3 sells)
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -1924,6 +2199,7 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .unwrap_or_else(|e| panic!("offline SELL {i} must land OFFLINE_LOCAL_ACK: {e:?}"));
@@ -1959,7 +2235,7 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
         let pool = &pool;
         async move {
             sqlx::query_scalar::<_, String>("SELECT state FROM shifts WHERE shift_id = ?")
-                .bind(shift_id)
+                .bind(DbShiftId(shift_id))
                 .fetch_one(pool)
                 .await
                 .unwrap()
@@ -1981,13 +2257,13 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
     // ── Tick 1: doc1 send OK + lastChk ACK; doc2 send → DocumentReject →
     //    strict-sequential HALT + escalate Manual; doc3 never sent.
     let tick1 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    tick1.push_send(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    tick1.push_send(Ok(ack("SFN-1", vec![0xDE; 64])));
     tick1.push_send(Err(DpsError::Authorization {
         code: -1,
         kind: AuthorizationKind::DocumentReject,
         message: "reject_doc2".into(),
     }));
-    tick1.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    tick1.push_last(Ok(ack("SFN-1", vec![0xDE; 64])));
     let sc1 = det_signing_ctx();
     let fs1 = fn_sign_blob();
     let view1 = RuntimeView {
@@ -2000,7 +2276,11 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
         .expect("tick 1 strict drain returns Ok (escalates Manual)");
 
     assert_eq!(state_at(1).await, "ACK", "tick 1: doc1 → ACK");
-    assert_eq!(state_at(2).await, "REJECTED", "tick 1: doc2 → REJECTED");
+    assert_eq!(
+        state_at(2).await,
+        "SENDING",
+        "tick 1: doc2 offline-origin drain reject → HELD (SENDING), NOT terminal REJECTED"
+    );
     assert_eq!(state_at(3).await, "OFFLINE_LOCAL_ACK", "tick 1: doc3 held");
     assert_eq!(
         send_calls.load(Ordering::SeqCst),
@@ -2039,7 +2319,11 @@ async fn k8_halted_strict_drain_is_idempotent_under_retick() {
         .expect("tick 2 re-tick drain returns Ok (idempotent no-op)");
 
     assert_eq!(state_at(1).await, "ACK", "re-tick: doc1 stable");
-    assert_eq!(state_at(2).await, "REJECTED", "re-tick: doc2 stable");
+    assert_eq!(
+        state_at(2).await,
+        "SENDING",
+        "re-tick: doc2 held-SENDING stable (idempotent — no re-send, no re-escalate)"
+    );
     assert_eq!(
         state_at(3).await,
         "OFFLINE_LOCAL_ACK",
@@ -2081,8 +2365,15 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
     let shift_id = seed_open_shift(&pool).await;
     seed_node_state_offline(&pool, shift_id).await;
     seed_open_offline_session(&pool).await;
+    // B10: the FIRST offline sell mints BEGIN(lnd1) + SELL1(lnd2); the second
+    // (post-restart) sell mints SELL2(lnd3).  No drain here → no END.
+    // T2 close-reserve: SELL1 admits at free>=3 (consumes codes 1+2); the
+    // post-restart SELL2 (BEGIN already present) needs free>=2, so seed a 4th
+    // code — one stays reserved for the eventual offline Z.
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await;
+    seed_offline_code(&pool, 4).await;
 
     let sign_ctx = det_signing_ctx();
     let fn_sign = fn_sign_blob();
@@ -2120,19 +2411,32 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
             &fn_sign,
             &guard,
             &row1,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("doc1 → OFFLINE_LOCAL_ACK");
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
 
-    // unsigned(doc1) == h1; the node seed advanced to it (M2-01).
-    let h1 = chain_col(&pool, 1, "unsigned_xml_sha256").await;
-    assert!(h1.is_some(), "doc1 carries an unsigned hash");
+    // B10: the first offline sell minted BEGIN(lnd1) + SELL1(lnd2).  The node
+    // seed advanced to unsigned(SELL1) — the HIGHEST-lnd issued offline doc (M2-01).
+    // `h1` is now SELL1's unsigned hash (lnd2), the surviving-seed subject.
+    let h1 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
+    assert!(h1.is_some(), "SELL1 (lnd2) carries an unsigned hash");
     assert_eq!(
         node_seed(&pool).await,
         h1,
-        "seed advanced to unsigned(doc1) (M2-01)"
+        "seed advanced to unsigned(SELL1) — the highest-lnd issued offline doc (M2-01)"
+    );
+    // The BEGIN (lnd1) chains off genesis; SELL1 (lnd2) chains off the BEGIN.
+    assert!(
+        chain_col(&pool, 1, "previous_hash").await.is_none(),
+        "the lazy BEGIN (lnd1) is genesis"
+    );
+    assert_eq!(
+        chain_col(&pool, 2, "previous_hash").await,
+        chain_col(&pool, 1, "unsigned_xml_sha256").await,
+        "SELL1 chains off the BEGIN's unsigned hash"
     );
     prro::db::invariant_scan::assert_clean(&pool).await;
 
@@ -2161,28 +2465,35 @@ async fn k9_offline_seed_survives_restart_chain_not_forked() {
             &fn_sign,
             &guard,
             &row2,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("doc2 → OFFLINE_LOCAL_ACK");
         assert_eq!(o.document_state, DocState::OfflineLocalAck);
     }
 
-    let prev1 = chain_col(&pool, 1, "previous_hash").await;
-    let prev2 = chain_col(&pool, 2, "previous_hash").await;
-    let uns2 = chain_col(&pool, 2, "unsigned_xml_sha256").await;
-    assert!(prev1.is_none(), "doc1 is genesis (prev NULL)");
+    // B10: doc2 (the post-restart offline sell) is SELL2 at lnd3 — the BEGIN
+    // already exists, so no new BEGIN is interposed.  It chains off the SURVIVING
+    // seed = unsigned(SELL1) = h1, and the seed advances to unsigned(SELL2).
+    let prev_begin = chain_col(&pool, 1, "previous_hash").await;
+    let prev3 = chain_col(&pool, 3, "previous_hash").await; // SELL2
+    let uns3 = chain_col(&pool, 3, "unsigned_xml_sha256").await;
+    assert!(
+        prev_begin.is_none(),
+        "the BEGIN (lnd1) is genesis (prev NULL)"
+    );
     assert_eq!(
-        prev2, h1,
-        "doc2 chains off the surviving unsigned(doc1) seed"
+        prev3, h1,
+        "SELL2 (lnd3) chains off the surviving unsigned(SELL1) seed — chain not forked"
     );
     assert_ne!(
-        prev1, prev2,
+        prev_begin, prev3,
         "distinct previous_hash — a real chain, not a pre-M2-01 fork"
     );
     assert_eq!(
         node_seed(&pool).await,
-        uns2,
-        "seed advanced to unsigned(doc2)"
+        uns3,
+        "seed advanced to unsigned(SELL2)"
     );
     prro::db::invariant_scan::assert_clean(&pool).await;
 }
@@ -2215,7 +2526,7 @@ async fn read_doc_state_by_lnd(pool: &SqlitePool, lnd: i64) -> String {
 }
 
 async fn doc_id_by_lnd(pool: &SqlitePool, lnd: i64) -> DocumentId {
-    sqlx::query_scalar(
+    sqlx::query_scalar::<_, DbDocumentId>(
         "SELECT document_id FROM fiscal_documents WHERE fiscal_number = ? AND lnd = ?",
     )
     .bind(FN)
@@ -2223,11 +2534,12 @@ async fn doc_id_by_lnd(pool: &SqlitePool, lnd: i64) -> DocumentId {
     .fetch_one(pool)
     .await
     .unwrap()
+    .0
 }
 
 async fn read_shift_state_by_id(pool: &SqlitePool, shift_id: ShiftId) -> String {
     sqlx::query_scalar("SELECT state FROM shifts WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -2271,6 +2583,8 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     seed_open_offline_session(&pool).await;
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await; // B10: +1 for the lazy BEGIN
+    seed_offline_code(&pool, 4).await; // T2 close-reserve: +1 reserved for the offline Z (2 sells)
 
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
@@ -2292,6 +2606,7 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .unwrap_or_else(|e| panic!("offline SELL {n} must land OFFLINE_LOCAL_ACK: {e:?}"));
@@ -2309,7 +2624,7 @@ async fn drain_kvt1_reentry_superseded_escalates_manual() {
     //    that supersedes doc1.
     let doc1_id = doc_id_by_lnd(&pool, 1).await;
     let doc2_id = doc_id_by_lnd(&pool, 2).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             // A.3 PR-B step 6 removed the direct (OfflineLocalAck, Sent) M3a
@@ -2461,13 +2776,14 @@ async fn boot_kvt2_chain_seed_mismatch_escalates_manual() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("online SELL Hold rests at SENT");
     drop(guard);
 
     let doc_id = read_doc_id(&pool).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             let o1 = fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
@@ -2584,6 +2900,7 @@ async fn m1_02_online_seed_fork_a24_prerequisite() {
             &fn_sign,
             &guard,
             &row1,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("doc1 rests at SENT");
@@ -2602,6 +2919,7 @@ async fn m1_02_online_seed_fork_a24_prerequisite() {
             &fn_sign,
             &guard,
             &row2,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .expect("doc2 rests at SENT");
@@ -2681,12 +2999,13 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("online SELL Hold rests at SENT");
     drop(guard);
     let doc_id = read_doc_id(&pool).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             fiscal_documents::transition_state(tx, doc_id, DocState::Sent, DocState::Kvt1)
@@ -2704,7 +3023,7 @@ async fn boot_kvt2_chain_seed_mismatch_closed_shift_no_abort() {
 
     // Pin the dangling-pointer status quo: shift CLOSED, current_shift_id still set.
     sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -2804,6 +3123,7 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
         &fn_sign,
         &guard,
         &row,
+        prro::services::time_budget::system_gate(),
     )
     .await
     .expect("online SELL Hold rests at SENT");
@@ -2812,7 +3132,7 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
 
     // The Batch-C escalation state: shift CAS'd to RMR, mode LEFT at Online.
     sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();
@@ -2826,7 +3146,7 @@ async fn boot_skips_rmr_but_online_fn_no_redrive() {
 
     // Boot WITH deps + a stub that WOULD answer the SENT probe (Match → advance).
     let phase2 = ScriptedDps::new(Arc::clone(&send_calls), Arc::clone(&last_calls));
-    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    phase2.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx2 = det_signing_ctx();
     let fn_sign2 = fn_sign_blob();
     let view = RuntimeView {
@@ -2887,6 +3207,8 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
     seed_open_offline_session(&pool).await;
     seed_offline_code(&pool, 1).await;
     seed_offline_code(&pool, 2).await;
+    seed_offline_code(&pool, 3).await; // B10: +1 for the lazy BEGIN
+    seed_offline_code(&pool, 4).await; // T2 close-reserve: +1 reserved for the offline Z (2 sells)
 
     let send_calls = Arc::new(AtomicUsize::new(0));
     let last_calls = Arc::new(AtomicUsize::new(0));
@@ -2907,6 +3229,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
             &fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await
         .unwrap_or_else(|e| panic!("offline SELL {n} must land OFFLINE_LOCAL_ACK: {e:?}"));
@@ -2917,7 +3240,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
     // doc1 (lnd=1) → KVT1, doc2 (lnd=2) → SENT; doc2.sfn supersedes doc1.
     let doc1_id = doc_id_by_lnd(&pool, 1).await;
     let doc2_id = doc_id_by_lnd(&pool, 2).await;
-    let kvt1_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let kvt1_bytes = vec![0xDE; 64];
     with_immediate(&pool, move |tx| {
         Box::pin(async move {
             fiscal_documents::transition_state(
@@ -2953,7 +3276,7 @@ async fn drain_superseded_on_nonescalatable_shift_fails_loud_not_busyloop() {
     // Make the shift NON-escalatable: a stale current_shift_id dangling on a
     // CLOSED shift (SEAM-D-1 mirror-desync).  (Closed → RMR) is not whitelisted.
     sqlx::query("UPDATE shifts SET state = 'CLOSED' WHERE shift_id = ?")
-        .bind(shift_id)
+        .bind(DbShiftId(shift_id))
         .execute(&pool)
         .await
         .unwrap();

@@ -214,6 +214,25 @@ pub async fn list_active_for_fn(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// All payment methods for a FN (active + inactive).  Used by the cash-ledger
+/// reconcile seam (`cash_ledger::reconcile_opening_anchor`): historical receipts
+/// may reference a form that was later de-activated, so active-only would miss it.
+pub async fn list_all_for_fn(
+    pool: &SqlitePool,
+    fn_id: &str,
+) -> Result<Vec<PaymentMethod>, PaymentMethodsRepoError> {
+    let rows = sqlx::query_as::<_, PaymentMethodRowRaw>(
+        "SELECT fn, pay_index, name, iscash, is_active, created_at \
+         FROM payment_methods \
+         WHERE fn = ? \
+         ORDER BY pay_index ASC",
+    )
+    .bind(fn_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 #[derive(sqlx::FromRow)]
 struct PaymentMethodRowRaw {
     #[sqlx(rename = "fn")]

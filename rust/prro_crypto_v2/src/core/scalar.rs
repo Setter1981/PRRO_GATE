@@ -416,9 +416,7 @@ fn ct_select_limbs(a: &[u64; 4], b: &[u64; 4], selector: u64) -> [u64; 4] {
     let choice = subtle::Choice::from(selector as u8);
     let mut out = [0u64; 4];
     for i in 0..4 {
-        out[i] = <u64 as subtle::ConditionallySelectable>::conditional_select(
-            &a[i], &b[i], choice,
-        );
+        out[i] = <u64 as subtle::ConditionallySelectable>::conditional_select(&a[i], &b[i], choice);
     }
     out
 }
@@ -430,9 +428,7 @@ fn ct_select_5_limbs(a: &[u64; 5], b: &[u64; 5], selector: u64) -> [u64; 5] {
     let choice = subtle::Choice::from(selector as u8);
     let mut out = [0u64; 5];
     for i in 0..5 {
-        out[i] = <u64 as subtle::ConditionallySelectable>::conditional_select(
-            &a[i], &b[i], choice,
-        );
+        out[i] = <u64 as subtle::ConditionallySelectable>::conditional_select(&a[i], &b[i], choice);
     }
     out
 }
@@ -546,8 +542,16 @@ mod tests {
             0x0011_2233_4455_6677,
         ]);
         // Make canonical
-        let a_canon = if a.is_canonical() { a } else { Scalar::from_le_bytes(&a.to_le_bytes()) };
-        let b_canon = if b.is_canonical() { b } else { Scalar::from_le_bytes(&b.to_le_bytes()) };
+        let a_canon = if a.is_canonical() {
+            a
+        } else {
+            Scalar::from_le_bytes(&a.to_le_bytes())
+        };
+        let b_canon = if b.is_canonical() {
+            b
+        } else {
+            Scalar::from_le_bytes(&b.to_le_bytes())
+        };
 
         let result = a_canon.mul_mod(&b_canon);
 
@@ -722,10 +726,22 @@ mod tests {
         let cases: &[(Scalar, Scalar)] = &[
             (Scalar::ONE, Scalar::ONE),
             (Scalar::from_limbs([u64::MAX; 4]), Scalar::ONE),
-            (Scalar::from_limbs([u64::MAX; 4]), Scalar::from_limbs([u64::MAX; 4])),
-            (bn_to_scalar(&(order_bn() - 1u32)), bn_to_scalar(&(order_bn() - 1u32))),
-            (bn_to_scalar(&(order_bn() - 1u32)), Scalar::from_limbs([2, 0, 0, 0])),
-            (Scalar::from_limbs([0, 0, 0, 1u64 << 63]), Scalar::from_limbs([0, 0, 0, 1u64 << 63])),
+            (
+                Scalar::from_limbs([u64::MAX; 4]),
+                Scalar::from_limbs([u64::MAX; 4]),
+            ),
+            (
+                bn_to_scalar(&(order_bn() - 1u32)),
+                bn_to_scalar(&(order_bn() - 1u32)),
+            ),
+            (
+                bn_to_scalar(&(order_bn() - 1u32)),
+                Scalar::from_limbs([2, 0, 0, 0]),
+            ),
+            (
+                Scalar::from_limbs([0, 0, 0, 1u64 << 63]),
+                Scalar::from_limbs([0, 0, 0, 1u64 << 63]),
+            ),
         ];
         for (i, (a, b)) in cases.iter().enumerate() {
             let got = a.mul_mod(b);

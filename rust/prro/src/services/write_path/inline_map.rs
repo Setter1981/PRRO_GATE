@@ -47,6 +47,10 @@ pub(crate) mod codes {
     /// Q-A — the true signer-vs-opening-cashier mismatch (operator reissues
     /// with the correct cashier); pre-wire, no fiscal commitment → 422.
     pub const SIGNER_CASHIER_MISMATCH: &str = "SIGNER_CASHIER_MISMATCH";
+    /// INV-21 in-lease re-check (HOLE 2 fix) — a RETURN was admitted by the
+    /// pre-inbox L1 guard but cash was consumed concurrently; fail-closed 422
+    /// (same HTTP class as the pre-inbox `CASH_INSUFFICIENT` from convert.rs).
+    pub const CASH_INSUFFICIENT_IN_LEASE: &str = "CASH_INSUFFICIENT_IN_LEASE";
 
     // ── OfflineRefused → 503 (node-mode refusals; GOING_ONLINE is retryable) ──
     pub const NODE_BLOCKED: &str = "NODE_BLOCKED";
@@ -58,6 +62,43 @@ pub(crate) mod codes {
     /// RETRYABLE/transient (the `online_convergence` resolver re-drives the
     /// blocker, then the client retries) → 503, NOT terminal.
     pub const WRITE_GATE_SIBLING_PENDING: &str = "WRITE_GATE_SIBLING_PENDING";
+    /// B10 — a fresh offline business doc arrived while this session's lazy
+    /// DocType=9 (OFFLINE_SESSION_BEGIN) predecessor is still BELOW
+    /// `OFFLINE_LOCAL_ACK` (a crashed-mid-sign BEGIN).  The offline lane bypasses
+    /// the D5 sibling-pending gate, so this DocType-9-scoped guard fail-closes
+    /// the business doc RETRYABLE (503) rather than let it sign against a
+    /// non-issued BEGIN → chain fork.  The boot-resume tick drives the crashed
+    /// BEGIN to OFFLINE_LOCAL_ACK; the client retries and then proceeds.
+    pub const OFFLINE_SESSION_BEGIN_PENDING: &str = "OFFLINE_SESSION_BEGIN_PENDING";
+    /// T2 (RULING 3.5) — an ORDINARY offline op (SELL/RETURN) was refused
+    /// fail-closed PRE-MINT because granting its code would starve the dynamic
+    /// legal close-reserve (the codes reserved so the shift can always be closed
+    /// offline: the lazy DocType=9 BEGIN, if not yet issued, plus the offline Z).
+    /// RETRYABLE 503: the operator seeds more codes (seed-codes / T=112) and the
+    /// SAME op retries.  Close-path ops (offline Z, the BEGIN mint, the DocType=10
+    /// END) are NEVER blocked by this gate — they always draw the reserve.
+    /// Invariant: «a shift is NEVER wedged un-closable for lack of a code».
+    pub const OFFLINE_CODE_RESERVE_HELD: &str = "OFFLINE_CODE_RESERVE_HELD";
+    /// T3 (RULING 3.3) — a NEW ordinary fiscal op (SELL/RETURN) was refused
+    /// fail-closed PRE-MINT because a document-derived TIME budget is over its
+    /// legal limit AND that budget's enforcement toggle is ON:
+    ///   - `SHIFT_DURATION_LIMIT_EXCEEDED` — the open shift has run ≥ 24h
+    ///     (`now − SHIFT_OPEN.business_ts`).  Note the UNCONDITIONAL auto-Z
+    ///     ticker also acts at this boundary regardless of the toggle
+    ///     (RULING 3.4), so a live gateway normally closes the shift before an
+    ///     operator sees this refusal.
+    ///   - `OFFLINE_SESSION_LIMIT_EXCEEDED` — the continuous offline session has
+    ///     run ≥ 36h (`now − offline_sessions.opened_at`, INV-09).
+    ///   - `OFFLINE_MONTH_LIMIT_EXCEEDED` — cumulative offline this calendar
+    ///     month has reached ≥ 168h (recomputed from `offline_sessions`, INV-10).
+    ///
+    /// All three are RETRYABLE 503 (the legal CLOSE path — Z / session END /
+    /// drain — is NEVER blocked): the operator resolves the condition (close the
+    /// shift / return online / wait for month rollover) and retries.  Tracking is
+    /// ALWAYS on (RULING 3.2); only refusal is toggled per budget (RULING 3.3).
+    pub const SHIFT_DURATION_LIMIT_EXCEEDED: &str = "SHIFT_DURATION_LIMIT_EXCEEDED";
+    pub const OFFLINE_SESSION_LIMIT_EXCEEDED: &str = "OFFLINE_SESSION_LIMIT_EXCEEDED";
+    pub const OFFLINE_MONTH_LIMIT_EXCEEDED: &str = "OFFLINE_MONTH_LIMIT_EXCEEDED";
     /// PR-Z2 — a live Z was submitted while the shift still has in-flight
     /// receipts (C10 quiescence pending).  RETRYABLE → 503.  STOP-S6 ruling (B):
     /// carried on `OfflineRefused` for boundary discipline (no ingress/seam
@@ -211,6 +252,10 @@ pub(crate) fn map_rejection(reason: &RejectionReason, request_id: [u8; 16]) -> F
         // OfflineRefused, NOT a client-fixable 422 (the client cannot fix
         // its input to clear the blocker — it retries after the resolver).
         R::WriteGateSiblingPending => node_refused(request_id, codes::WRITE_GATE_SIBLING_PENDING),
+        // INV-21 in-lease re-check — same 422 class as the pre-inbox L1 guard.
+        R::CashInsufficientInLease { .. } => {
+            shift_guard(request_id, codes::CASH_INSUFFICIENT_IN_LEASE)
+        }
         // T2/T3 — structural / manual-recon (500).
         R::ShiftInError => internal(request_id, codes::SHIFT_IN_ERROR),
         R::ShiftInvariantViolation => internal(request_id, codes::SHIFT_INVARIANT_VIOLATION),
@@ -429,6 +474,7 @@ mod tests {
             codes::NODE_CRYPTO_DEGRADED,
             codes::NODE_GOING_ONLINE,
             codes::WRITE_GATE_SIBLING_PENDING,
+            codes::OFFLINE_SESSION_BEGIN_PENDING,
         ] {
             assert_eq!(http(c), 503, "{c} must route to 503 (OfflineRefused)");
         }

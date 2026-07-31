@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT offline_fiscal_no,\n                  offline_fiscal_date,\n                  offline_session_id as \"offline_session_id: DbOfflineSessionId\",\n                  offline_dps_code\n           FROM fiscal_documents WHERE document_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "offline_fiscal_no",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "offline_fiscal_date",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "offline_session_id: DbOfflineSessionId",
+        "ordinal": 2,
+        "type_info": "Blob"
+      },
+      {
+        "name": "offline_dps_code",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "06a1c3119cee09ea5f097fd68642b641a3cb7c29b082f9fc3d8cbf10026ebc13"
+}

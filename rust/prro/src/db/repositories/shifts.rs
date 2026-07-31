@@ -14,6 +14,7 @@ use crate::db::models::{
 };
 use crate::db::repositories::audit_log;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::{DbCashierId, DbDocumentId, DbShiftId, DbShiftState};
 use crate::services::write_path::types::hex_encode_lower as hex_lower;
 use sqlx::SqlitePool;
 
@@ -35,10 +36,10 @@ pub struct ShiftRow {
 /// M3b W14a-2a — whitelist of allowed shift state transitions per spec
 /// `docs/superpowers/specs/2026-05-17-m3b-shift-state-expansion.md` §4.1.
 ///
-/// Drift-guard: edge count is locked at **14**.  Any addition / removal
+/// Drift-guard: edge count is locked at **18**.  Any addition / removal
 /// MUST update both this function body AND the matching scanner test
 /// `tests/shift_state_whitelist_matrix.rs` (9×9 = 81 (from, to) pairs:
-/// 14 Applied + 67 Forbidden).
+/// 18 Applied + 63 Forbidden).
 ///
 /// Per spec §4.4 forbidden patterns:
 /// - **`Error` is reachable via `force_to_error_with_audit` seam (operator-driven)
@@ -70,6 +71,19 @@ pub struct ShiftRow {
 ///       reject of an offline-origin predecessor on an online-opened shift that
 ///       went OFFLINE mid-shift — a normal state-machine branch, NOT an operator
 ///       override.  Same drain-reject class as 6 / 14, from a plain `Opened` shift.)
+///   16. Opening → Closed  (CS-3 gap 4a: operator-completion rollback of an
+///       online SHIFT_OPEN whose ambiguous send the operator resolves as NOT
+///       accepted — the shift never opened at DPS, so it rolls straight to
+///       Closed.  Authorized ONLY by the operator-completion service
+///       (`services::reconciliation::operator_completion`); NOT a normal ingress
+///       edge.  Pinned as such by the sole-caller test.)
+///   17. OpenedLocalPendingDrain → Closed  (CS-3 gap 4b: operator-completion rollback
+///       of an OFFLINE SHIFT_OPEN resolved NOT-accepted — the never-opened offline shift
+///       rolls straight to Closed.  Offline analogue of edge 16.  Operator-completion only.)
+///   18. ClosingLocalPendingDrain → OpenedLocalPendingDrain  (CS-3 gap 4b: operator-completion
+///       rollback of an OFFLINE SHIFT_CLOSE / Z_REPORT resolved NOT-accepted — the not-closed
+///       offline shift rolls back to its open pending-drain state.  Offline analogue of edge 11.
+///       Operator-completion only.)
 pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
     use ShiftState::*;
     matches!(
@@ -89,6 +103,9 @@ pub fn allowed_transition(from: ShiftState, to: ShiftState) -> bool {
             | (ClosingLocalPendingDrain, Closed)            // 13
             | (ClosingLocalPendingDrain, RequiresManualReconciliation) // 14
             | (Opened, RequiresManualReconciliation) // 15 (M2-N2a)
+            | (Opening, Closed) // 16 (CS-3 gap 4a)
+            | (OpenedLocalPendingDrain, Closed) // 17 (CS-3 gap 4b)
+            | (ClosingLocalPendingDrain, OpenedLocalPendingDrain) // 18 (CS-3 gap 4b)
     )
 }
 
@@ -129,15 +146,17 @@ pub async fn insert_created(
     fiscal_number: &str,
     open_mode: &str,
     opened_by_cashier_id: &str,
+    opening_cash_kop: i64,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
             opened_by_cashier_id) \
-         VALUES (?, ?, 'CREATED', ?, 0, ?)",
+         VALUES (?, ?, 'CREATED', ?, ?, ?)",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(fiscal_number)
     .bind(open_mode)
+    .bind(opening_cash_kop)
     .bind(opened_by_cashier_id)
     .execute(pool)
     .await?;
@@ -148,47 +167,72 @@ pub async fn insert_created(
 /// but enrolled in the caller's `with_immediate` envelope so the shift-row
 /// create commits (or rolls back) atomically with the `create_shift_tx`
 /// node_state projection CAS.
+///
+/// `opening_cash_kop` — the carry-over opening balance for this shift
+/// (prior shift's closing cash in `shifts.cash_balance_kop`; 0 for the
+/// FN's first shift).  L0 carry semantics: persisted in `cash_balance_kop`
+/// at create-time, re-derivable from the journal via `invariant_scan`.
 pub async fn insert_created_tx(
     tx: &mut WriteTxConn<'_>,
     id: ShiftId,
     fiscal_number: &str,
     open_mode: &str,
     opened_by_cashier_id: &str,
+    opening_cash_kop: i64,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, state, open_mode, cash_balance_kop, \
             opened_by_cashier_id) \
-         VALUES (?, ?, 'CREATED', ?, 0, ?)",
+         VALUES (?, ?, 'CREATED', ?, ?, ?)",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(fiscal_number)
     .bind(open_mode)
+    .bind(opening_cash_kop)
     .bind(opened_by_cashier_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
+/// L0 — update `cash_balance_kop` for a shift row.  Called at shift CLOSE
+/// (inside the same `with_immediate` envelope as the `Closing → Closed`
+/// transition) to persist the closing cash as the next shift's carry anchor.
+/// Pure SQL; no crypto/network (invariant #1 preserved).
+pub async fn update_cash_balance_tx(
+    tx: &mut WriteTxConn<'_>,
+    id: ShiftId,
+    cash_balance_kop: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE shifts SET cash_balance_kop = ? WHERE shift_id = ?")
+        .bind(cash_balance_kop)
+        .bind(DbShiftId(id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub async fn get(pool: &SqlitePool, id: ShiftId) -> sqlx::Result<Option<ShiftRow>> {
+    let db_id = DbShiftId(id);
     let row = sqlx::query!(
-        r#"SELECT shift_id      as "shift_id: ShiftId",
+        r#"SELECT shift_id      as "shift_id: DbShiftId",
                   fiscal_number,
                   serial,
-                  state          as "state: ShiftState",
+                  state          as "state: DbShiftState",
                   cash_balance_kop,
-                  opened_by_cashier_id as "opened_by_cashier_id: CashierId"
+                  opened_by_cashier_id as "opened_by_cashier_id: DbCashierId"
            FROM shifts WHERE shift_id = ?"#,
-        id
+        db_id
     )
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| ShiftRow {
-        shift_id: r.shift_id,
+        shift_id: r.shift_id.0,
         fiscal_number: r.fiscal_number,
         serial: r.serial,
-        state: r.state,
+        state: r.state.0,
         cash_balance_kop: r.cash_balance_kop,
-        opened_by_cashier_id: r.opened_by_cashier_id,
+        opened_by_cashier_id: r.opened_by_cashier_id.0,
     }))
 }
 
@@ -213,10 +257,14 @@ pub async fn active_shift_for_fn(
     fiscal_number: &str,
 ) -> sqlx::Result<Option<(Vec<u8>, String)>> {
     sqlx::query_as::<_, (Vec<u8>, String)>(
+        // bd PRRO_GATE-seb: no ordering needed — the remaining states are exactly the
+        // predicate of the partial UNIQUE index
+        // `ux_shifts_one_open_per_fn(fiscal_number)`, so AT MOST ONE row can match and
+        // `LIMIT 1` is deterministic.  The former `ORDER BY serial DESC` was phantom:
+        // production never writes `shifts.serial` (bd PRRO_GATE-seb).
         "SELECT shift_id, state FROM shifts \
          WHERE fiscal_number = ? \
            AND state NOT IN ('CLOSED', 'REQUIRES_MANUAL_RECONCILIATION', 'ERROR') \
-         ORDER BY serial DESC \
          LIMIT 1",
     )
     .bind(fiscal_number)
@@ -228,25 +276,26 @@ pub async fn active_shift_for_fn(
 /// reads the shift row inside its `with_immediate` envelope alongside
 /// `node_state.current_shift_id`.  No CAS, no UPDATE — strictly read.
 pub async fn get_tx(tx: &mut WriteTxConn<'_>, id: ShiftId) -> sqlx::Result<Option<ShiftRow>> {
+    let db_id = DbShiftId(id);
     let row = sqlx::query!(
-        r#"SELECT shift_id      as "shift_id: ShiftId",
+        r#"SELECT shift_id      as "shift_id: DbShiftId",
                   fiscal_number,
                   serial,
-                  state          as "state: ShiftState",
+                  state          as "state: DbShiftState",
                   cash_balance_kop,
-                  opened_by_cashier_id as "opened_by_cashier_id: CashierId"
+                  opened_by_cashier_id as "opened_by_cashier_id: DbCashierId"
            FROM shifts WHERE shift_id = ?"#,
-        id
+        db_id
     )
     .fetch_optional(&mut **tx)
     .await?;
     Ok(row.map(|r| ShiftRow {
-        shift_id: r.shift_id,
+        shift_id: r.shift_id.0,
         fiscal_number: r.fiscal_number,
         serial: r.serial,
-        state: r.state,
+        state: r.state.0,
         cash_balance_kop: r.cash_balance_kop,
-        opened_by_cashier_id: r.opened_by_cashier_id,
+        opened_by_cashier_id: r.opened_by_cashier_id.0,
     }))
 }
 
@@ -275,9 +324,9 @@ pub async fn transition(
         return Ok(false);
     }
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
-        .bind(to)
-        .bind(id)
-        .bind(from)
+        .bind(to.as_str())
+        .bind(DbShiftId(id))
+        .bind(from.as_str())
         .execute(&mut **tx)
         .await?;
     Ok(res.rows_affected() == 1)
@@ -308,9 +357,9 @@ pub async fn transition_state(
         return Ok(TransitionOutcome::Forbidden { from, to });
     }
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
-        .bind(to)
-        .bind(id)
-        .bind(from)
+        .bind(to.as_str())
+        .bind(DbShiftId(id))
+        .bind(from.as_str())
         .execute(&mut **tx)
         .await?;
     if res.rows_affected() == 1 {
@@ -325,10 +374,11 @@ pub async fn transition_state(
     // `fiscal_documents::TransitionOutcome::NotFound` naming) so callers
     // don't have to map opaque `sqlx::Error::RowNotFound`.
     let observed: Option<ShiftState> =
-        sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
-            .bind(id)
+        sqlx::query_scalar::<_, DbShiftState>(r#"SELECT state FROM shifts WHERE shift_id = ?"#)
+            .bind(DbShiftId(id))
             .fetch_optional(&mut **tx)
-            .await?;
+            .await?
+            .map(|w| w.0);
     match observed {
         Some(state) => Ok(TransitionOutcome::Conflict { observed: state }),
         None => Ok(TransitionOutcome::NotFound),
@@ -517,12 +567,13 @@ pub async fn force_to_error_with_audit(
     // PR #66 R3 LOW-R3-1: renamed local from shadowing parameter `actor_id`
     // to `normalized_actor` for readability.
     let normalized_actor = actor_id.filter(|s| !s.is_empty()); // R2 LOW-4: drop Some("")
-    let row: Option<(ShiftState, String)> = sqlx::query_as(
-        r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
+    let row: Option<(ShiftState, String)> = sqlx::query_as::<_, (DbShiftState, String)>(
+        r#"SELECT state, fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_optional(&mut **tx)
-    .await?;
+    .await?
+    .map(|(s, fiscal_number)| (s.0, fiscal_number));
     let (current_state, fiscal_number) = row.ok_or_else(|| ForceSeamError::ShiftNotFound {
         shift_id_hex: hex_lower(shift_id.as_bytes()),
     })?;
@@ -567,9 +618,9 @@ pub async fn force_to_error_with_audit(
     // failure path (replaces R2's `assert_eq!` panic) per established
     // `fiscal_documents.rs:351` HIGH-3 convention.
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
-        .bind(ShiftState::Error)
-        .bind(shift_id)
-        .bind(current_state)
+        .bind(ShiftState::Error.as_str())
+        .bind(DbShiftId(shift_id))
+        .bind(current_state.as_str())
         .execute(&mut **tx)
         .await?;
     if res.rows_affected() != 1 {
@@ -646,12 +697,13 @@ pub async fn force_to_manual_reconciliation_with_audit(
     // PR #66 R2 LOW-1 + LOW-4 + R3 LOW-R3-1: single round-trip + actor_id
     // empty filter + rename to avoid parameter shadowing.
     let normalized_actor = actor_id.filter(|s| !s.is_empty());
-    let row: Option<(ShiftState, String)> = sqlx::query_as(
-        r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
+    let row: Option<(ShiftState, String)> = sqlx::query_as::<_, (DbShiftState, String)>(
+        r#"SELECT state, fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_optional(&mut **tx)
-    .await?;
+    .await?
+    .map(|(s, fiscal_number)| (s.0, fiscal_number));
     let (current_state, fiscal_number) = row.ok_or_else(|| ForceSeamError::ShiftNotFound {
         shift_id_hex: hex_lower(shift_id.as_bytes()),
     })?;
@@ -686,9 +738,9 @@ pub async fn force_to_manual_reconciliation_with_audit(
     // success audit AFTER (avoids false-success audit on isolation
     // violation path — see force_to_error_with_audit for rationale).
     let res = sqlx::query("UPDATE shifts SET state = ? WHERE shift_id = ? AND state = ?")
-        .bind(ShiftState::RequiresManualReconciliation)
-        .bind(shift_id)
-        .bind(current_state)
+        .bind(ShiftState::RequiresManualReconciliation.as_str())
+        .bind(DbShiftId(shift_id))
+        .bind(current_state.as_str())
         .execute(&mut **tx)
         .await?;
     if res.rows_affected() != 1 {
@@ -770,10 +822,11 @@ async fn emit_cas_isolation_violation_audit(
 ) -> sqlx::Result<Option<ShiftState>> {
     // Re-read for diagnostics — same tx, serialised with the failed UPDATE.
     let observed: Option<ShiftState> =
-        sqlx::query_scalar(r#"SELECT state as "state: ShiftState" FROM shifts WHERE shift_id = ?"#)
-            .bind(ctx.shift_id)
+        sqlx::query_scalar::<_, DbShiftState>(r#"SELECT state FROM shifts WHERE shift_id = ?"#)
+            .bind(DbShiftId(ctx.shift_id))
             .fetch_optional(&mut **tx)
-            .await?;
+            .await?
+            .map(|w| w.0);
     let mut payload = serde_json::json!({
         "fiscal_number": ctx.fiscal_number,
         "shift_id": ctx.shift_id_hex,
@@ -920,12 +973,13 @@ pub async fn senior_cashier_close_shift_with_audit(
         .map_err(|e| SeniorCloseError::InvalidEvidenceJson(format!("not valid JSON: {e}")))?;
 
     // 2. Load current shift state + fiscal_number (single tx-bound read).
-    let row: Option<(ShiftState, String)> = sqlx::query_as(
-        r#"SELECT state as "state: ShiftState", fiscal_number FROM shifts WHERE shift_id = ?"#,
+    let row: Option<(ShiftState, String)> = sqlx::query_as::<_, (DbShiftState, String)>(
+        r#"SELECT state, fiscal_number FROM shifts WHERE shift_id = ?"#,
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_optional(&mut **tx)
-    .await?;
+    .await?
+    .map(|(s, fiscal_number)| (s.0, fiscal_number));
     let (current_state, fiscal_number) = row.ok_or_else(|| SeniorCloseError::ShiftNotFound {
         shift_id_hex: hex_lower(shift_id.as_bytes()),
     })?;
@@ -1010,11 +1064,11 @@ pub async fn senior_cashier_close_shift_with_audit(
             closed_at = CURRENT_TIMESTAMP \
          WHERE shift_id = ? AND state = ?",
     )
-    .bind(ShiftState::Closed)
+    .bind(ShiftState::Closed.as_str())
     .bind(senior_cashier_id.as_str())
-    .bind(z_report_doc_id)
-    .bind(shift_id)
-    .bind(current_state)
+    .bind(DbDocumentId(z_report_doc_id))
+    .bind(DbShiftId(shift_id))
+    .bind(current_state.as_str())
     .execute(&mut **tx)
     .await?;
     if res.rows_affected() != 1 {

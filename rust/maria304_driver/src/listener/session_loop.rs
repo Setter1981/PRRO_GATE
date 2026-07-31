@@ -11,16 +11,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Instant};
 
-use crate::bridge::{Bridge, BridgeError};
 use crate::bridge::dto::{classify_response, DocumentOutcome};
+use crate::bridge::{Bridge, BridgeError};
 use crate::observability::SessionMetrics;
 use crate::protocol::{Command, Response};
 // NOTE: Command::Cnac is the cancel-receipt command (no bridge call, Done path).
+#[cfg(test)]
+use crate::session::dispatcher::dispatch;
 use crate::session::dispatcher::{
     dispatch_prepare, dispatch_with_result, Clock, Correlation, DispatchPrepared, Identity,
 };
-#[cfg(test)]
-use crate::session::dispatcher::dispatch;
 use crate::session::Session;
 use crate::wire::{decode_frame, FrameError};
 
@@ -79,8 +79,16 @@ pub async fn run_connection(
         // client, which read CSIN1's response with CRC=off, would
         // see extra CRC bytes as junk bytes on the wire.
         let crc_for_write = session.crc_enabled;
-        if let Some(responses) =
-            process_buffered(&mut buf, &mut session, &identity, &bridge, &*clock_src, &mut correlation, &metrics).await
+        if let Some(responses) = process_buffered(
+            &mut buf,
+            &mut session,
+            &identity,
+            &bridge,
+            &*clock_src,
+            &mut correlation,
+            &metrics,
+        )
+        .await
         {
             for resp in responses {
                 write_response(&mut stream, &resp, crc_for_write).await?;
@@ -136,7 +144,10 @@ async fn process_buffered(
         Ok((frame, consumed)) => {
             buf.drain(..consumed);
             let (date, time) = clock_src.now();
-            let clock = Clock { date: &date, time: &time };
+            let clock = Clock {
+                date: &date,
+                time: &time,
+            };
             let command = Command::parse(&frame);
             match dispatch_prepare(session, &command, identity, clock, correlation) {
                 DispatchPrepared::Done(r) => {
@@ -166,7 +177,12 @@ async fn process_buffered(
                             }
                         }
                     }
-                    Some(dispatch_with_result(session, &command, bridge_result, correlation))
+                    Some(dispatch_with_result(
+                        session,
+                        &command,
+                        bridge_result,
+                        correlation,
+                    ))
                 }
             }
         }
@@ -217,7 +233,10 @@ fn try_handle_buffered(
         Ok((frame, consumed)) => {
             buf.drain(..consumed);
             let (date, time) = clock_src.now();
-            let clock = Clock { date: &date, time: &time };
+            let clock = Clock {
+                date: &date,
+                time: &time,
+            };
             let command = Command::parse(&frame);
             let responses = dispatch(session, command, identity, clock, &**bridge, correlation);
             Some(responses)
@@ -282,7 +301,10 @@ mod tests {
         let id = Identity::default();
         let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(MockBridge::new());
         let clock = FixedClock;
-        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut corr = Correlation {
+            session_uuid: "s".to_string(),
+            receipt_seq: 0,
+        };
         let out = try_handle_buffered(&mut buf, &mut s, &id, &bridge, &clock, &mut corr);
         assert!(out.is_none());
     }
@@ -294,7 +316,10 @@ mod tests {
         let id = Identity::default();
         let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(MockBridge::new());
         let clock = FixedClock;
-        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut corr = Correlation {
+            session_uuid: "s".to_string(),
+            receipt_seq: 0,
+        };
         let out = try_handle_buffered(&mut buf, &mut s, &id, &bridge, &clock, &mut corr);
         assert!(out.is_none());
         assert_eq!(buf.len(), 3, "partial buffer must be preserved");
@@ -307,11 +332,17 @@ mod tests {
         let id = Identity::default();
         let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(MockBridge::new());
         let clock = FixedClock;
-        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut corr = Correlation {
+            session_uuid: "s".to_string(),
+            receipt_seq: 0,
+        };
         let out = try_handle_buffered(&mut buf, &mut s, &id, &bridge, &clock, &mut corr)
             .expect("a full frame should dispatch");
         assert_eq!(out.len(), 2); // DONE + READY
-        assert!(buf.is_empty(), "buffer must be drained after consuming the frame");
+        assert!(
+            buf.is_empty(),
+            "buffer must be drained after consuming the frame"
+        );
         assert!(s.crc_enabled);
     }
 
@@ -322,7 +353,10 @@ mod tests {
         let id = Identity::default();
         let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(MockBridge::new());
         let clock = FixedClock;
-        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut corr = Correlation {
+            session_uuid: "s".to_string(),
+            receipt_seq: 0,
+        };
         let out = try_handle_buffered(&mut buf, &mut s, &id, &bridge, &clock, &mut corr);
         assert_eq!(out, Some(Vec::new()));
         assert_eq!(buf.len(), 1, "single junk byte should be dropped");
@@ -342,7 +376,10 @@ mod tests {
         let id = Identity::default();
         let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(MockBridge::new());
         let clock = FixedClock;
-        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut corr = Correlation {
+            session_uuid: "s".to_string(),
+            receipt_seq: 0,
+        };
         let mut s = Session::new();
 
         let r1 = try_handle_buffered(&mut buf, &mut s, &id, &bridge, &clock, &mut corr).unwrap();
@@ -368,7 +405,10 @@ mod tests {
         let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(MockBridge::new());
         let clock = Arc::new(FixedClock);
         let metrics = Arc::new(SessionMetrics::new());
-        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut corr = Correlation {
+            session_uuid: "s".to_string(),
+            receipt_seq: 0,
+        };
 
         process_buffered(&mut buf, &mut s, &id, &bridge, &*clock, &mut corr, &metrics).await;
 
@@ -383,9 +423,10 @@ mod tests {
 
         struct ErrorBridge;
         impl Bridge for ErrorBridge {
-            fn submit(&self, _: &crate::bridge::CanonicalCommand)
-                -> Result<crate::bridge::CanonicalResponse, BridgeError>
-            {
+            fn submit(
+                &self,
+                _: &crate::bridge::CanonicalCommand,
+            ) -> Result<crate::bridge::CanonicalResponse, BridgeError> {
                 Err(BridgeError::Transport("injected".into()))
             }
         }
@@ -397,7 +438,10 @@ mod tests {
         let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(ErrorBridge);
         let clock = Arc::new(FixedClock);
         let metrics = Arc::new(SessionMetrics::new());
-        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut corr = Correlation {
+            session_uuid: "s".to_string(),
+            receipt_seq: 0,
+        };
         let mut buf = crate::wire::encode_frame("COMP", false).unwrap();
 
         process_buffered(&mut buf, &mut s, &id, &bridge, &*clock, &mut corr, &metrics).await;
@@ -414,9 +458,10 @@ mod tests {
 
         struct OkBridge;
         impl Bridge for OkBridge {
-            fn submit(&self, _: &crate::bridge::CanonicalCommand)
-                -> Result<CanonicalResponse, crate::bridge::BridgeError>
-            {
+            fn submit(
+                &self,
+                _: &crate::bridge::CanonicalCommand,
+            ) -> Result<CanonicalResponse, crate::bridge::BridgeError> {
                 Ok(CanonicalResponse {
                     ok: true,
                     document_id: "DOC1".to_string(),
@@ -436,7 +481,10 @@ mod tests {
         let bridge: Arc<dyn Bridge + Send + Sync> = Arc::new(OkBridge);
         let clock = Arc::new(FixedClock);
         let metrics = Arc::new(SessionMetrics::new());
-        let mut corr = Correlation { session_uuid: "s".to_string(), receipt_seq: 0 };
+        let mut corr = Correlation {
+            session_uuid: "s".to_string(),
+            receipt_seq: 0,
+        };
         let mut buf = crate::wire::encode_frame("COMP", false).unwrap();
 
         process_buffered(&mut buf, &mut s, &id, &bridge, &*clock, &mut corr, &metrics).await;
@@ -444,5 +492,4 @@ mod tests {
         assert_eq!(metrics.snapshot().receipts_acked, 1);
         assert_eq!(metrics.snapshot().bridge_errors, 0);
     }
-
 }

@@ -1,0 +1,19 @@
+# nextest config.
+#
+# ── Serialize the `*_compile_fail` (trybuild) tests ──────────────────────────────
+# Every `*_compile_fail` test drives `trybuild`, which shells out to `cargo` to compile
+# a fail-case into the SHARED workspace target dir. Cargo does NOT lock a target dir
+# between concurrent processes (see ~/.cargo/config.toml note), so two trybuild tests
+# racing on the same target intermittently produce a false compile-success or a spurious
+# failure — a flake, green in isolation, that makes the exact `cargo nextest run` unstable.
+#
+# A dedicated test-group with `max-threads = 1` forces every `*_compile_fail` test to run
+# ONE AT A TIME (they may still run concurrently with ordinary tests — only the trybuild
+# cohort is serialized), removing the shared-target race. The test SET is unchanged, so the
+# CS-1 inventory manifest (nextest list) is unaffected.
+[test-groups]
+compile-fail = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(/compile_fail/)'
+test-group = 'compile-fail'

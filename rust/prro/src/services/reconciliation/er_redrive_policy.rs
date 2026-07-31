@@ -37,11 +37,10 @@ use crate::services::write_path::error_routing::RetryClass;
 /// drain time.  Caller selects projection by inspecting the variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErRedriveDecision {
-    /// Last attempt was `RetryClass::TransientRetry` AND
-    /// `attempts_used < MAX_BOOT_ATTEMPTS`.  Caller is authorized to
-    /// re-invoke `stage_send::run` (Pattern B retry path).
-    Redrive,
-
+    // CS-3 S7-1 (R6): the `Redrive` variant is DELETED. Post-cutover an `ErrorRetryable` re-drive
+    // would be a SECOND wire for an already-`CALL_STARTED` doc (double-issue); `evaluate_er_redrive`
+    // now collapses the former transient-redrive case into `EscalateManual { TransientRetry }`, so a
+    // stuck `ErrorRetryable` doc reaches `RequiresManualReconciliation` + STOP instead of re-wiring.
     /// Last attempt was `RetryClass::TransientRetry` AND
     /// `attempts_used >= MAX_BOOT_ATTEMPTS`.  Caller MUST escalate to
     /// `DocState::RequiresManualReconciliation` with `Severity::Error`;
@@ -96,14 +95,22 @@ pub async fn evaluate_er_redrive(
                     attempts_used: attempts,
                 })
             } else {
-                Ok(ErRedriveDecision::Redrive)
+                // CS-3 S7-1 (R6): a transient ErrorRetryable no longer re-wires (that would be a
+                // second wire for an already-CALL_STARTED doc). Escalate to manual/RMR + STOP.
+                Ok(ErRedriveDecision::EscalateManual {
+                    class: RetryClass::TransientRetry,
+                })
             }
         }
+        // Legacy-only B10 tag: it was written by a withdrawn `-8` retry
+        // experiment.  Preserve decoding so historical rows cannot become an
+        // indeterminate hold, but never re-send their persisted bytes.
         Some(
             rc @ (RetryClass::FnConfigError
             | RetryClass::WrapperBug
             | RetryClass::OperatorEscalation
-            | RetryClass::MacRecovery),
+            | RetryClass::MacRecovery
+            | RetryClass::DrainChainSettleRetry),
         ) => Ok(ErRedriveDecision::EscalateManual { class: rc }),
         Some(RetryClass::TerminalReject) => Ok(ErRedriveDecision::EscalateInconsistent {
             class: RetryClass::TerminalReject,

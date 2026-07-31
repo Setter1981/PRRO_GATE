@@ -29,6 +29,7 @@
 use crate::db::models::enums::{NodeMode, ShiftState};
 use crate::db::models::ids::ShiftId;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::{DbNodeMode, DbShiftId, DbShiftState};
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,8 +94,8 @@ pub async fn upsert_initial(
             mode = excluded.mode, shift_state = excluded.shift_state",
     )
     .bind(fn_id)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .bind(next_lnd)
     .execute(pool)
     .await?;
@@ -120,8 +121,8 @@ pub async fn upsert_initial_tx(
             mode = excluded.mode, shift_state = excluded.shift_state",
     )
     .bind(fn_id)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .bind(next_lnd)
     .execute(&mut **tx)
     .await?;
@@ -169,6 +170,29 @@ pub async fn update_last_known_xml_sha_tx(
         "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? WHERE fiscal_number = ?",
     )
     .bind(&hash[..])
+    .bind(fn_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// CS-3 gap 4b — set (or CLEAR to genesis NULL) the chain seed for an FN, tx-bound.
+///
+/// Unlike [`update_last_known_xml_sha_tx`] (which only ever writes a non-NULL 32-byte hash), the
+/// offline-cohort operator completion must be able to REWIND the seed to the current document's
+/// own `previous_hash`, which is `None` when the current doc chained off GENESIS. `Some(h)` writes
+/// the 32-byte hash; `None` writes SQL NULL (genesis). Returns `false` iff no `node_state` row
+/// existed for `fn_id` — the caller MUST treat that as a structural breach (roll back), never a
+/// silent ignore.
+pub async fn set_last_known_xml_sha_nullable_tx(
+    tx: &mut WriteTxConn<'_>,
+    fn_id: &str,
+    hash: Option<&[u8; 32]>,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE node_state SET last_known_unsigned_xml_sha256 = ? WHERE fiscal_number = ?",
+    )
+    .bind(hash.map(|h| h.to_vec()))
     .bind(fn_id)
     .execute(&mut **tx)
     .await?;
@@ -286,11 +310,11 @@ pub async fn set_mode_going_online_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> 
 pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
     let row = sqlx::query!(
         r#"SELECT fiscal_number,
-                  mode               as "mode: NodeMode",
-                  shift_state        as "shift_state: ShiftState",
+                  mode               as "mode: DbNodeMode",
+                  shift_state        as "shift_state: DbShiftState",
                   next_lnd,
                   last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
-                  current_shift_id   as "current_shift_id: ShiftId",
+                  current_shift_id   as "current_shift_id: DbShiftId",
                   backend_profile_id,
                   transport_profile_id,
                   next_z_report_number
@@ -304,11 +328,11 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
     };
     Ok(Some(NodeStateRow {
         fiscal_number: r.fiscal_number,
-        mode: r.mode,
-        shift_state: r.shift_state,
+        mode: r.mode.0,
+        shift_state: r.shift_state.0,
         next_lnd: r.next_lnd,
         last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
-        current_shift_id: r.current_shift_id,
+        current_shift_id: r.current_shift_id.map(|s| s.0),
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
         next_z_report_number: r.next_z_report_number,
@@ -321,11 +345,11 @@ pub async fn get(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Option<NodeStat
 pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Option<NodeStateRow>> {
     let row = sqlx::query!(
         r#"SELECT fiscal_number,
-                  mode               as "mode: NodeMode",
-                  shift_state        as "shift_state: ShiftState",
+                  mode               as "mode: DbNodeMode",
+                  shift_state        as "shift_state: DbShiftState",
                   next_lnd,
                   last_known_unsigned_xml_sha256 as "last_known_unsigned_xml_sha256: Vec<u8>",
-                  current_shift_id   as "current_shift_id: ShiftId",
+                  current_shift_id   as "current_shift_id: DbShiftId",
                   backend_profile_id,
                   transport_profile_id,
                   next_z_report_number
@@ -339,11 +363,11 @@ pub async fn get_tx(tx: &mut WriteTxConn<'_>, fn_id: &str) -> sqlx::Result<Optio
     };
     Ok(Some(NodeStateRow {
         fiscal_number: r.fiscal_number,
-        mode: r.mode,
-        shift_state: r.shift_state,
+        mode: r.mode.0,
+        shift_state: r.shift_state.0,
         next_lnd: r.next_lnd,
         last_known_unsigned_xml_sha256: decode_chain_hash(r.last_known_unsigned_xml_sha256)?,
-        current_shift_id: r.current_shift_id,
+        current_shift_id: r.current_shift_id.map(|s| s.0),
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
         next_z_report_number: r.next_z_report_number,

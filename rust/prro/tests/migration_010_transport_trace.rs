@@ -18,6 +18,7 @@
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::transport_trace::{self, AttemptCompletion, NewAttempt, OutcomeKind};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
@@ -219,7 +220,7 @@ async fn partial_completion_check_rejects_mid_state_row() {
         "UPDATE transport_trace SET completed_at = '2026-05-09T10:00:00Z' \
          WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .expect_err("partial completion (only completed_at) must violate CHECK");
@@ -239,21 +240,21 @@ async fn fiscal_documents_cascade_drops_trace_rows() {
 
     let before: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(before, 1);
 
     sqlx::query("DELETE FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .expect("delete fiscal_documents row (CASCADE)");
 
     let after: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -597,7 +598,7 @@ async fn recovery_completes_inflight_row_with_probe_wire_times() {
                 wire_call_started_at, wire_call_finished_at, error_message \
          FROM transport_trace WHERE document_id = ? AND attempt_no = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(attempt_no)
     .fetch_one(&pool)
     .await
@@ -640,7 +641,7 @@ async fn recovery_on_already_completed_returns_zero_rows_affected() {
     let server_id: Option<String> = sqlx::query_scalar(
         "SELECT server_fiscal_no FROM transport_trace WHERE document_id = ? AND attempt_no = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(attempt_no)
     .fetch_one(&pool)
     .await

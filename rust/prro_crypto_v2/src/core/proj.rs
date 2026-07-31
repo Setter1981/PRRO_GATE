@@ -39,9 +39,15 @@ fn get_g_table(curve: &Curve) -> &'static [FeAffine; SHAMIR_TABLE_SIZE] {
     G_TABLE.get_or_init(|| {
         let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
         let aff = precompute_odd_affine(&g, curve, SHAMIR_TABLE_SIZE);
-        let mut table = [FeAffine { x: Fe::ZERO, y: Fe::ZERO }; SHAMIR_TABLE_SIZE];
+        let mut table = [FeAffine {
+            x: Fe::ZERO,
+            y: Fe::ZERO,
+        }; SHAMIR_TABLE_SIZE];
         for (i, p) in aff.iter().enumerate() {
-            table[i] = FeAffine { x: (&p.x).into(), y: (&p.y).into() };
+            table[i] = FeAffine {
+                x: (&p.x).into(),
+                y: (&p.y).into(),
+            };
         }
         table
     })
@@ -62,8 +68,7 @@ pub(crate) fn set_q_cache_capacity(cap: usize) {
 
 /// Precomputed FeAffine odd multiples per public key.
 /// Key = compressed pubkey 33 bytes.
-static Q_CACHE: Mutex<Option<HashMap<[u8; 33], [FeAffine; SHAMIR_TABLE_SIZE]>>> =
-    Mutex::new(None);
+static Q_CACHE: Mutex<Option<HashMap<[u8; 33], [FeAffine; SHAMIR_TABLE_SIZE]>>> = Mutex::new(None);
 
 fn get_q_table(pub_q: &Point, curve: &Curve) -> [FeAffine; SHAMIR_TABLE_SIZE] {
     let compressed = crate::core::point::compress_point(pub_q, curve);
@@ -83,9 +88,15 @@ fn get_q_table(pub_q: &Point, curve: &Curve) -> [FeAffine; SHAMIR_TABLE_SIZE] {
 
     // Build table
     let aff = precompute_odd_affine(pub_q, curve, SHAMIR_TABLE_SIZE);
-    let mut table = [FeAffine { x: Fe::ZERO, y: Fe::ZERO }; SHAMIR_TABLE_SIZE];
+    let mut table = [FeAffine {
+        x: Fe::ZERO,
+        y: Fe::ZERO,
+    }; SHAMIR_TABLE_SIZE];
     for (i, p) in aff.iter().enumerate() {
-        table[i] = FeAffine { x: (&p.x).into(), y: (&p.y).into() };
+        table[i] = FeAffine {
+            x: (&p.x).into(),
+            y: (&p.y).into(),
+        };
     }
 
     // Store (with cap to prevent unbounded growth)
@@ -377,7 +388,11 @@ pub fn mul_proj_wnaf_fe(point: &Point, scalar: &FieldEl, curve: &Curve) -> Point
                 }
             };
             if !started {
-                acc = FeProj { x: p.x, y: p.y, z: Fe::ONE };
+                acc = FeProj {
+                    x: p.x,
+                    y: p.y,
+                    z: Fe::ONE,
+                };
                 started = true;
             } else {
                 // madd_affine with doubling/negation handling (VT, public scalars)
@@ -388,7 +403,11 @@ pub fn mul_proj_wnaf_fe(point: &Point, scalar: &FieldEl, curve: &Curve) -> Point
                     if acc.y.ct_eq(&y2_z1sq) {
                         acc = fe_double(&acc, &b_fe);
                     } else {
-                        acc = FeProj { x: Fe::ONE, y: Fe::ONE, z: Fe::ZERO };
+                        acc = FeProj {
+                            x: Fe::ONE,
+                            y: Fe::ONE,
+                            z: Fe::ZERO,
+                        };
                         started = false;
                     }
                 } else {
@@ -452,7 +471,10 @@ pub fn mul_shamir_wnaf(
     let fe_q = get_q_table(pub_q, curve);
 
     let negate_fe = |p: &FeAffine| -> FeAffine {
-        FeAffine { x: p.x, y: p.x.add(&p.y) }
+        FeAffine {
+            x: p.x,
+            y: p.x.add(&p.y),
+        }
     };
 
     let b_fe: Fe = (&curve.b).into();
@@ -468,7 +490,11 @@ pub fn mul_shamir_wnaf(
     let fe_madd_safe = |acc: &FeProj, q: &FeAffine, started: &mut bool| -> FeProj {
         if !*started {
             *started = true;
-            return FeProj { x: q.x, y: q.y, z: Fe::ONE };
+            return FeProj {
+                x: q.x,
+                y: q.y,
+                z: Fe::ONE,
+            };
         }
         // Check B = X₁ + x₂·Z₁ — zero means same affine x (double or negate)
         let x2_z1 = q.x.mod_mul(&acc.z);
@@ -481,7 +507,11 @@ pub fn mul_shamir_wnaf(
             }
             // Negation → identity
             *started = false;
-            return FeProj { x: Fe::ONE, y: Fe::ONE, z: Fe::ZERO };
+            return FeProj {
+                x: Fe::ONE,
+                y: Fe::ONE,
+                z: Fe::ZERO,
+            };
         }
         fe_madd(acc, q)
     };
@@ -497,14 +527,22 @@ pub fn mul_shamir_wnaf(
         if ds != 0 {
             let abs = ds.unsigned_abs() as usize;
             let idx = (abs - 1) / 2;
-            let p = if ds > 0 { fe_g[idx] } else { negate_fe(&fe_g[idx]) };
+            let p = if ds > 0 {
+                fe_g[idx]
+            } else {
+                negate_fe(&fe_g[idx])
+            };
             acc = fe_madd_safe(&acc, &p, &mut started);
         }
 
         if dr != 0 {
             let abs = dr.unsigned_abs() as usize;
             let idx = (abs - 1) / 2;
-            let p = if dr > 0 { fe_q[idx] } else { negate_fe(&fe_q[idx]) };
+            let p = if dr > 0 {
+                fe_q[idx]
+            } else {
+                negate_fe(&fe_q[idx])
+            };
             acc = fe_madd_safe(&acc, &p, &mut started);
         }
     }
@@ -593,7 +631,10 @@ mod tests {
         let g3_proj = g2_proj.madd_affine(&g, &curve);
         let g3_back = g3_proj.to_affine(&curve);
 
-        assert!(g3_aff.equals(&g3_back), "2G + G via projective != 3G affine");
+        assert!(
+            g3_aff.equals(&g3_back),
+            "2G + G via projective != 3G affine"
+        );
     }
 
     #[test]
@@ -606,11 +647,7 @@ mod tests {
             let scalar = FieldEl::from_words(words);
             let naive = g.mul_naive(&scalar, &curve);
             let via_proj = mul_proj_wnaf(&g, &scalar, &curve);
-            assert!(
-                naive.equals(&via_proj),
-                "mul_proj mismatch at k={}",
-                k
-            );
+            assert!(naive.equals(&via_proj), "mul_proj mismatch at k={}", k);
         }
     }
 
@@ -626,7 +663,10 @@ mod tests {
 
         let naive = g.mul_naive(&scalar, &curve);
         let via_proj = mul_proj_wnaf(&g, &scalar, &curve);
-        assert!(naive.equals(&via_proj), "mul_proj != naive on 256-bit scalar");
+        assert!(
+            naive.equals(&via_proj),
+            "mul_proj != naive on 256-bit scalar"
+        );
     }
 
     #[test]
@@ -670,7 +710,8 @@ mod tests {
                 assert!(
                     expected.equals(&got),
                     "Shamir mismatch at s={} r={}",
-                    s_val, r_val,
+                    s_val,
+                    r_val,
                 );
             }
         }

@@ -1,0 +1,60 @@
+# cargo-mutants configuration.
+#
+# The integration-test suite uses test-only helpers gated behind the
+# `test-support` feature (e.g. `ReconcileGuard::for_integration_test_only`,
+# the `invariant_scan` hooks the fuzzer drives). Without the feature the
+# UNMUTATED baseline build fails to compile the test targets, so cargo-mutants
+# aborts before testing any mutant. Pass the feature to every cargo invocation
+# (build + test), matching the CI gate (`--features test-support`).
+#
+# `test_tool = "nextest"` — the project's gate runner (~2× faster than `cargo
+# test`), which cuts per-mutant wall time.
+additional_cargo_args = ["--features", "test-support"]
+test_tool = "nextest"
+
+# ── FW-1 confirmed dead / deliberately-retained survivors ──
+# These functions have ZERO callers @ 3e2088b (verified via `git grep`) and are
+# NOT test-oracle gaps — mutating them cannot change any reachable fiscal
+# behaviour. Excluding retires them from the actionable survivor list WITHOUT
+# deleting fiscal hot-zone source (physical deletion of the two true orphans is
+# a deferred architect decision, not a mutation-driven one). The comment on each
+# line IS the record of why — config-level anti-doc-rot.
+exclude_re = [
+    # A24 do-not-widen pin, twinned with `last_server_fiscal_no`: DELIBERATELY
+    # retained so no future consumer re-wires the stale ACK-only MAC-seed
+    # projection (would fork the DPS-legal chain). Boot uses the sibling
+    # `last_issued_unsigned_xml_sha256`. See the A24 seed-fork dossier.
+    "last_ack_unsigned_xml_sha256 ->",
+    # Orphaned by the M2-N4 ruling: the superseded classifier moved from an
+    # lnd-only compare against `max_submitted_lnd` to sfn-membership via
+    # `submitted_above_lnd`. The repo fn is dead; the concept lives on as local
+    # vars/audit keys of the same name (not this fn).
+    "fiscal_documents.rs.*max_submitted_lnd ->",
+    # Orphaned by B10: the END-online fix removed its only caller
+    # (`stage_sign::resolve_offline_dps_code_forced`). Offline-drain hot zone —
+    # its stale present-tense doc-comment is doc-rot; delete-vs-rewire is an
+    # architect call, so it is retired here rather than deleted.
+    "current_open_or_draining_session_id_tx ->",
+
+    # ── round 2/3: ONLY genuinely dead / latent / test-only retired here ──
+    # The other LOW / observability round-2/3 survivors — boot_phase diagnostic
+    # counters (DispatchHistogram / ReconciliationSummary / TickSummary /
+    # dispatch_* `+=`), the reconcile_pending_inner log guard, stage_sign:372's
+    # single-writer-unreachable defensive arm, the dead-`active_shift` arm,
+    # iso8601_now / hex_lower audit-id+time helpers, is_unique_violation — are
+    # deliberately NOT excluded: they live in REAL functions whose CURRENTLY
+    # CAUGHT mutants would be silenced too (e.g. ReconciliationSummary feeds the
+    # asserted `prepared_dispatched == 1`), and they are already accepted in
+    # `docs/mutation/baseline/survivors.txt`, so `run.sh diff` reports them as
+    # known rather than NEW. See docs/MUTATION_TEETH_BACKLOG.md §C/D. Only
+    # zero-coverage-to-lose dead code is retired via config:
+    #
+    # LATENT: at-rest JKS password sealing is a deferred, unwired feature —
+    # `unseal_jks` and its `hex_digit` nibble decoder have ZERO production callers
+    # today. (`param_d`, the LIVE DSTU signing-scalar accessor, is deliberately
+    # NOT excluded — it is a real teeth-gap covered by a dedicated test.)
+    "unseal_jks",
+    "crypto/session.rs.*hex_digit",
+    # Test-only validator (`_for_testing`; not a production oracle).
+    "validate_signer_payload_shape_for_testing",
+]

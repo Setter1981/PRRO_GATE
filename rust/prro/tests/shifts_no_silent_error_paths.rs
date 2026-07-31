@@ -19,6 +19,7 @@ use prro::db::open_pool;
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::repositories::shifts::{self, TransitionOutcome};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbShiftId;
 
 const ALL_STATES: [ShiftState; 9] = [
     ShiftState::Created,
@@ -76,9 +77,9 @@ async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftS
             opened_by_cashier_id) \
          VALUES (?, ?, ?, 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(fn_id)
-    .bind(state)
+    .bind(state.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -114,7 +115,7 @@ async fn tier_a_error_unreachable_via_whitelist_from_any_source() {
         // before the next `from` state is seeded.  This scanner isolates the
         // Error-unreachability contract, not per-FN uniqueness.
         sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .execute(&pool)
             .await
             .unwrap();
@@ -170,7 +171,7 @@ async fn tier_b_manual_reachable_only_from_4_whitelist_sources() {
         // before the next `from` state is seeded.  This scanner isolates the
         // Manual-source contract, not per-FN uniqueness.
         sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .execute(&pool)
             .await
             .unwrap();

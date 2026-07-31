@@ -55,18 +55,34 @@ tokio::task_local! {
 /// Substrate methods (`crypto::*`, `transports::dps::*`) call this as
 /// their first body line; in debug / test builds it `debug_assert!`s
 /// that we are NOT inside a `with_immediate` BEGIN IMMEDIATE scope.
-/// In release builds the assert compiles to a no-op.
 ///
-/// The `method` parameter names the offending entry in the panic
-/// message so reviewers reading a CI failure see exactly which
-/// substrate call leaked into a transaction without grepping the
-/// stack frame addresses.
+/// **Release builds (CS-3 S7-1 §4.5 minor):** the `debug_assert!` compiles
+/// to a no-op, so without the branch below an invariant-#1 breach (network /
+/// crypto inside a `BEGIN IMMEDIATE`) would pass SILENTLY in production —
+/// exactly where it matters most (a write transaction holding a SQLite lock
+/// across a network/crypto call stalls every other writer). Log-not-panic: we
+/// surface it at CRITICAL for operators/telemetry rather than `panic!`, which
+/// mid-transaction could crash the gateway (a strictly worse outcome than the
+/// leak it is reporting). No `audit_log` row here — this guard has no pool /
+/// tx handle by design (it is called from the substrate boundary).
+///
+/// The `method` parameter names the offending entry so a reader of the panic
+/// message / CRITICAL log sees exactly which substrate call leaked into a
+/// transaction without grepping stack-frame addresses.
 #[inline]
 pub(crate) fn assert_not_in_with_immediate(method: &'static str) {
-    debug_assert!(
-        IN_WITH_IMMEDIATE.try_with(|_| ()).is_err(),
-        "foreign IO inside with_immediate: {method}"
-    );
+    let inside = IN_WITH_IMMEDIATE.try_with(|_| ()).is_ok();
+    debug_assert!(!inside, "foreign IO inside with_immediate: {method}");
+    if inside {
+        tracing::error!(
+            method,
+            "INVARIANT #1 VIOLATION: foreign IO (crypto/transport) inside a \
+             with_immediate BEGIN IMMEDIATE scope — a write transaction is \
+             holding a SQLite lock across a network/crypto call. This must \
+             never happen in production; log-not-panic to avoid crashing the \
+             gateway mid-transaction."
+        );
+    }
 }
 
 /// Sealed handle to a SQLite connection that is **inside** a

@@ -44,6 +44,7 @@ use crate::db::models::enums::OfflineSessionState;
 use crate::db::models::ids::{DocumentId, OfflineSessionId};
 use crate::db::repositories::fiscal_documents::TransitionOutcome;
 use crate::db::tx::WriteTxConn;
+use crate::db::types::{DbDocumentId, DbOfflineSessionId, DbOfflineSessionState};
 use sqlx::SqlitePool;
 
 /// Errors that callers of this repository may need to branch on.
@@ -165,7 +166,7 @@ pub async fn insert_opening(
         "INSERT INTO offline_sessions (offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPENING', ?)",
     )
-    .bind(n.offline_session_id)
+    .bind(DbOfflineSessionId(n.offline_session_id))
     .bind(n.fiscal_number)
     .bind(n.opened_at)
     .execute(&mut **tx)
@@ -234,9 +235,9 @@ pub async fn transition_state(
                  SET state = ?, drained_at = COALESCE(drained_at, CURRENT_TIMESTAMP) \
                  WHERE offline_session_id = ? AND state = ?",
                 )
-                .bind(to)
-                .bind(session_id)
-                .bind(from)
+                .bind(to.as_str())
+                .bind(DbOfflineSessionId(session_id))
+                .bind(from.as_str())
                 .execute(&mut **tx)
                 .await?
             }
@@ -246,9 +247,9 @@ pub async fn transition_state(
                  SET state = ?, closed_at = COALESCE(closed_at, CURRENT_TIMESTAMP) \
                  WHERE offline_session_id = ? AND state = ?",
                 )
-                .bind(to)
-                .bind(session_id)
-                .bind(from)
+                .bind(to.as_str())
+                .bind(DbOfflineSessionId(session_id))
+                .bind(from.as_str())
                 .execute(&mut **tx)
                 .await?
             }
@@ -262,10 +263,10 @@ pub async fn transition_state(
                  SET state = ?, reason_abort = ? \
                  WHERE offline_session_id = ? AND state = ?",
                 )
-                .bind(to)
+                .bind(to.as_str())
                 .bind(reason_abort)
-                .bind(session_id)
-                .bind(from)
+                .bind(DbOfflineSessionId(session_id))
+                .bind(from.as_str())
                 .execute(&mut **tx)
                 .await?
             }
@@ -278,9 +279,9 @@ pub async fn transition_state(
             OfflineSessionState::Opening | OfflineSessionState::Open => sqlx::query(
                 "UPDATE offline_sessions SET state = ? WHERE offline_session_id = ? AND state = ?",
             )
-            .bind(to)
-            .bind(session_id)
-            .bind(from)
+            .bind(to.as_str())
+            .bind(DbOfflineSessionId(session_id))
+            .bind(from.as_str())
             .execute(&mut **tx)
             .await?,
         };
@@ -294,7 +295,7 @@ pub async fn transition_state(
     // another writer's INSERT/DELETE.
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM offline_sessions WHERE offline_session_id = ? LIMIT 1")
-            .bind(session_id)
+            .bind(DbOfflineSessionId(session_id))
             .fetch_optional(&mut **tx)
             .await?;
     Ok(if exists.is_some() {
@@ -396,6 +397,9 @@ pub async fn acquire_code_tx(
     // — a pool containing only drill rows surfaces as `CodePoolExhausted`,
     // which the caller maps to `Refused(CodePoolExhausted)`.
     let row: Result<Option<(i64, String, String)>, sqlx::Error> = sqlx::query_as(
+        // ordering-justified: the sub-select PROJECTS the very column it orders by
+        // (`code_lnd`), so even if two rows tied the returned VALUE would be identical —
+        // the result is deterministic regardless of which tied row the plan picks.
         "UPDATE offline_codes \
          SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? \
@@ -408,7 +412,7 @@ pub async fn acquire_code_tx(
            ) \
          RETURNING code_lnd, consumed_at, dps_code",
     )
-    .bind(document_id)
+    .bind(DbDocumentId(document_id))
     .bind(fiscal_number)
     .bind(fiscal_number)
     .fetch_optional(&mut **tx)
@@ -452,14 +456,43 @@ pub async fn current_active_session_id_tx(
     tx: &mut WriteTxConn<'_>,
     fiscal_number: &str,
 ) -> sqlx::Result<Option<OfflineSessionId>> {
-    sqlx::query_scalar::<_, OfflineSessionId>(
+    Ok(sqlx::query_scalar::<_, DbOfflineSessionId>(
         "SELECT offline_session_id FROM offline_sessions \
          WHERE fiscal_number = ? AND state = 'OPEN' \
          LIMIT 1",
     )
     .bind(fiscal_number)
     .fetch_optional(&mut **tx)
-    .await
+    .await?
+    .map(|w| w.0))
+}
+
+/// B10 (W10b) — tx-bound reader widened to `OPEN|DRAINING`, for the
+/// drain-time DocType=10 (OFFLINE_SESSION_END) mint ONLY.
+///
+/// The END is minted at drain finalize, when the session is `DRAINING` (the
+/// per-doc drain loop already flipped Open→Draining).  The strict-`OPEN`
+/// [`current_active_session_id_tx`] therefore returns `None` at that point — the
+/// exact reason the naive offline-sign path fails to stamp the END (dossier
+/// §10 gate 3).  This widened reader is the sanctioned bypass: it is invoked
+/// only from the boundary-END forced-resolve path (`stage_sign::
+/// resolve_offline_dps_code_forced`), never from the regular SELL/RETURN sign
+/// (which stays strict-OPEN so an in-progress drain does not extend the
+/// backlog — W7 criterion 6).  Schema partial UNIQUE `ux_offline_active` still
+/// guarantees at most one such row.
+pub async fn current_open_or_draining_session_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<OfflineSessionId>> {
+    Ok(sqlx::query_scalar::<_, DbOfflineSessionId>(
+        "SELECT offline_session_id FROM offline_sessions \
+         WHERE fiscal_number = ? AND state IN ('OPEN', 'DRAINING') \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|w| w.0))
 }
 
 /// M3b W9b §2.2 step 3 — pool-bound read of the FN's currently-active
@@ -492,14 +525,17 @@ pub async fn current_open_or_draining_session(
     pool: &SqlitePool,
     fiscal_number: &str,
 ) -> sqlx::Result<Option<(OfflineSessionId, OfflineSessionState)>> {
-    sqlx::query_as::<_, (OfflineSessionId, OfflineSessionState)>(
+    // Decode the TEXT state via the store-side wrapper, then map back to the
+    // pure domain enum so the public return type stays unchanged (CS-1b §3).
+    let row = sqlx::query_as::<_, (DbOfflineSessionId, DbOfflineSessionState)>(
         "SELECT offline_session_id, state FROM offline_sessions \
          WHERE fiscal_number = ? AND state IN ('OPEN', 'DRAINING') \
          LIMIT 1",
     )
     .bind(fiscal_number)
     .fetch_optional(pool)
-    .await
+    .await?;
+    Ok(row.map(|(id, state)| (id.0, state.0)))
 }
 
 /// All `fiscal_documents` rows tied to this session that are NOT
@@ -529,7 +565,7 @@ pub async fn list_pending_for_session(
     pool: &SqlitePool,
     session_id: OfflineSessionId,
 ) -> sqlx::Result<Vec<DocumentId>> {
-    sqlx::query_scalar::<_, DocumentId>(
+    Ok(sqlx::query_scalar::<_, DbDocumentId>(
         "SELECT document_id FROM fiscal_documents \
          WHERE offline_session_id = ? \
            AND state IN ( \
@@ -538,9 +574,12 @@ pub async fn list_pending_for_session(
            ) \
          ORDER BY lnd ASC",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .fetch_all(pool)
-    .await
+    .await?
+    .into_iter()
+    .map(|w| w.0)
+    .collect())
 }
 
 // ─── Error classification helpers ─────────────────────────────────────

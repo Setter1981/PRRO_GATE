@@ -2152,10 +2152,12 @@ dependencies = [
  "hyper-util",
  "libsqlite3-sys",
  "pretty_assertions",
+ "proc-macro2",
  "proptest",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "prro-domain",
  "prro_crypto",
  "prro_escpos",
  "quote",
@@ -2165,6 +2167,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "static_assertions",
  "syn",
  "tempfile",
  "thiserror 1.0.69",
@@ -2183,6 +2186,33 @@ dependencies = [
  "wiremock",
  "zeroize",
 ]
+
+[[package]]
+name = "prro-domain"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "trybuild",
+ "uuid",
+]
+
+[[package]]
+name = "prro-dps-contract"
+version = "0.1.0"
+
+[[package]]
+name = "prro-fleet-contract"
+version = "0.1.0"
+
+[[package]]
+name = "prro-ingress-contract"
+version = "0.1.0"
+
+[[package]]
+name = "prro-testkit"
+version = "0.1.0"
 
 [[package]]
 name = "prro_crypto"
@@ -3230,6 +3260,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stringprep"
@@ -4541,6 +4577,13 @@ name = "xml-rs"
 version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "yansi"

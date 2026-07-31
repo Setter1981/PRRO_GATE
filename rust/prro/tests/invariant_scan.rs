@@ -12,6 +12,7 @@ use prro::db::models::enums::{FiscalMode, NodeMode, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId, RequestId, ShiftId};
 use prro::db::open_pool;
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId, DbShiftId};
 use sqlx::SqlitePool;
 
 const FN: &str = "4000000001";
@@ -49,7 +50,7 @@ async fn seed_fn(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .execute(pool)
     .await
@@ -65,9 +66,9 @@ async fn seed_node_state(pool: &SqlitePool, shift_id: ShiftId, seed: Option<[u8;
          VALUES (?, ?, ?, ?, 10, 'b', 't', ?)",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .bind(seed.map(|s| s.to_vec()))
     .execute(pool)
     .await
@@ -98,10 +99,10 @@ async fn seed_doc(
          ) VALUES (?, ?, ?, ?, ?, 'SELL', ?, 'b', 't', 'ONLINE', \
             '2026-06-11T00:00:00Z', '{}', ?, ?, ?, ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(&request_id[..])
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(state)
     .bind(vec![0u8; 32])
@@ -116,7 +117,7 @@ async fn seed_doc(
         sqlx::query(
             "INSERT INTO document_files(document_id, kind, content) VALUES (?, 'KVT1_RAW', ?)",
         )
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .bind(vec![0xAAu8; 8])
         .execute(pool)
         .await
@@ -231,7 +232,7 @@ async fn clean_offline_drained_ack_scans_clean() {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-06-13T00:00:00Z')",
     )
-    .bind(session)
+    .bind(DbOfflineSessionId(session))
     .bind(FN)
     .execute(&pool)
     .await
@@ -256,13 +257,13 @@ async fn clean_offline_drained_ack_scans_clean() {
          VALUES (?, 1, '2026-06-13T00:00:01Z', ?)",
     )
     .bind(FN)
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
-        .bind(session)
-        .bind(doc)
+        .bind(DbOfflineSessionId(session))
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
@@ -702,7 +703,7 @@ async fn detects_unbacked_offline_fiscal_no() {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-06-11T00:00:00Z')",
     )
-    .bind(session)
+    .bind(DbOfflineSessionId(session))
     .bind(FN)
     .execute(&pool)
     .await
@@ -788,7 +789,7 @@ async fn clean_error_retryable_offline_doc_mid_drain_scans_clean() {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-06-12T00:00:00Z')",
     )
-    .bind(session)
+    .bind(DbOfflineSessionId(session))
     .bind(FN)
     .execute(&pool)
     .await
@@ -825,13 +826,13 @@ async fn clean_error_retryable_offline_doc_mid_drain_scans_clean() {
         )
         .bind(FN)
         .bind(code_lnd)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
-            .bind(session)
-            .bind(doc)
+            .bind(DbOfflineSessionId(session))
+            .bind(DbDocumentId(doc))
             .execute(&pool)
             .await
             .unwrap();
@@ -858,7 +859,7 @@ async fn m2_n2b_rejected_offline_origin_predecessor_scans_clean() {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, 'OPEN', '2026-06-13T00:00:00Z')",
     )
-    .bind(session)
+    .bind(DbOfflineSessionId(session))
     .bind(FN)
     .execute(&pool)
     .await
@@ -898,13 +899,13 @@ async fn m2_n2b_rejected_offline_origin_predecessor_scans_clean() {
         )
         .bind(FN)
         .bind(code_lnd)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query("UPDATE fiscal_documents SET offline_session_id = ? WHERE document_id = ?")
-            .bind(session)
-            .bind(doc)
+            .bind(DbOfflineSessionId(session))
+            .bind(DbDocumentId(doc))
             .execute(&pool)
             .await
             .unwrap();
@@ -1000,7 +1001,7 @@ async fn detects_shift_state_mirror_drift() {
     seed_node_state(&pool, shift, None).await; // node_state.shift_state = OPENED, current_shift_id = shift
                                                // Desync Mirror-1: drive the shifts row to RMR while node_state stays OPENED.
     sqlx::query("UPDATE shifts SET state = 'REQUIRES_MANUAL_RECONCILIATION' WHERE shift_id = ?")
-        .bind(shift)
+        .bind(DbShiftId(shift))
         .execute(&pool)
         .await
         .unwrap();
@@ -1061,7 +1062,7 @@ async fn clean_null_current_shift_id_no_mirror_drift() {
 
 /// U1 A1 — mechanical exhaustiveness of the derive-don't-adopt funnel: ALL DB
 /// access in the fuzzer's `RefModel` (`invariant_fuzzer/model.rs`) MUST go through
-/// one of the three tagged wrapper fns, so no future raw read can silently
+/// one of the tagged wrapper fns listed below, so no future raw read can silently
 /// re-open a differential vacuity at the D1–D5 adoption sites.  A raw
 /// `sqlx`/`query_as`/`query_scalar`/`fetch_`/`.execute` outside a wrapper =
 /// FORBIDDEN non-empty = scan failure.  Source-text scan (the model file is a
@@ -1069,9 +1070,19 @@ async fn clean_null_current_shift_id_no_mirror_drift() {
 #[test]
 fn model_db_access_is_funneled_through_tagged_wrappers() {
     const WRAPPERS: &[&str] = &[
-        "adopt_fault_deferred", // post-fault recovery residue (was resync_from_db)
-        "adopt_precondition",   // mode/shift/session precondition residue
-        "read_seed_fixture",    // seed-fixture grounding
+        "adopt_fault_deferred",  // post-fault recovery residue (was resync_from_db)
+        "adopt_precondition",    // mode/shift/session precondition residue
+        "read_seed_fixture",     // seed-fixture grounding
+        "sync_held_reservation", // CS-3 held-reservation precondition re-sync (C-i; funneled, outcome-independent)
+        // CS-3 S7-2 active-reservation FENCE precondition re-sync (bd PRRO_GATE-hpc/2ds).  A
+        // SEPARATE primitive from `sync_held_reservation` on purpose: the fence predicate is
+        // strictly wider (in-flight RESERVED_NOT_STARTED / CALL_STARTED, not just the completable
+        // PENDING_APPLY hold) and the two have different consumers — collapsing them would be the
+        // very conflation the `[Crash(Send), Replenish(Granted)]` counterexample exposed.  Funneled
+        // + outcome-independent on the same terms: it re-syncs a PRECONDITION only; every predicted
+        // OUTCOME stays independently modelled.  Reads via prod's own `ACTIVE_FENCE_STATE_PREDICATE`
+        // const, so it cannot drift from the predicate `fn_fence_active_tx` enforces.
+        "sync_fence_active",
     ];
     // The DB-access tokens sqlx exposes; a raw one outside a wrapper is a leak.
     const MARKERS: &[&str] = &[
@@ -1196,7 +1207,7 @@ async fn seed_shift_with_anchor(
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, ?, 'OFFLINE', 0, 'cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(state)
     .execute(pool)
@@ -1211,7 +1222,7 @@ async fn seed_shift_with_anchor(
     )
     .bind(FN)
     .bind(state)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -1221,10 +1232,10 @@ async fn seed_shift_with_anchor(
             payload_json, payload_sha256_canonical) \
          VALUES (?, ?, ?, ?, 1, ?, ?, 'b', 't', 'OFFLINE', '2026-07-07T00:00:00Z', '{}', ?)",
     )
-    .bind(DocumentId::new())
+    .bind(DbDocumentId(DocumentId::new()))
     .bind(&(*RequestId::new().as_bytes())[..])
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(doc_type)
     .bind(doc_state)
     .bind(vec![0u8; 32])

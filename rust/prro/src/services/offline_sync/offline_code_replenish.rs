@@ -47,7 +47,9 @@ use sha2::{Digest, Sha256};
 use crate::app::App;
 use crate::crypto::errors::CryptoError;
 use crate::crypto::provider::SignCmsRequest;
-use crate::db::repositories::{node_state, offline_sessions};
+use crate::db::repositories::{
+    chain_seed_transitions, delivery_reservation, node_state, offline_sessions,
+};
 use crate::db::tx::with_immediate;
 use crate::services::write_path::stage_sign::SigningContext;
 use crate::transports::dps::channel::DpsChannel;
@@ -258,6 +260,17 @@ impl OfflineCodeReplenishService {
         let fn_id = fiscal_number.to_string();
         let inserted_summary = with_immediate(pool, move |tx| {
             Box::pin(async move {
+                // CS-3 S7-2 — fail-closed FN fence: refuse the chain-seed advance while a
+                // delivery reservation is in-flight (INACTIVE today; guards the tip against
+                // a fork at cutover). This surface has NO equality gate → highest fork risk.
+                if delivery_reservation::fn_fence_active_tx(tx, &fn_id)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                {
+                    return Err(anyhow::anyhow!(
+                        "replenish refused: FN {fn_id} has an active delivery reservation (S7-2 fence)"
+                    ));
+                }
                 // insert_dps_codes_tx: INSERT OR IGNORE (dedupe-safe / INV-4).
                 let ins = offline_sessions::insert_dps_codes_tx(tx, &fn_id, &codes)
                     .await
@@ -276,6 +289,47 @@ impl OfflineCodeReplenishService {
                         fn_id
                     ));
                 }
+
+                // ── bd PRRO_GATE-hpc: durable seed-transition witness ─────────
+                // The seed just advanced to `Hs = sha256(request_xml)` — a
+                // NON-DOCUMENT seed (no fiscal_documents row carries it).  Append
+                // a durable witness so NC-03 boot / MacReseed guard-B / the
+                // invariant_scan oracle (all folded through
+                // `active_chain_tip_unsigned_xml_sha256`) can recover `Hs` after a
+                // node_state loss.  Same `with_immediate` envelope as the seed
+                // advance → no window where seed advanced but the witness did not
+                // (atomicity is load-bearing; invariant #8 preserved — the seed
+                // still advances via `update_last_known_xml_sha_tx`, the witness is
+                // a sibling record, not a second seed authority).
+                //
+                // Invariant #2 (single-writer per FN) is LOAD-BEARING here: this
+                // whole envelope runs under the replenish's `acquire_fn_gate`
+                // lease, so no document can interleave between reading the FN's
+                // `next_lnd` and the witness insert.  That is what makes
+                // `lnd_at_write` sit in the SAME strictly-monotonic per-FN frame as
+                // `fiscal_documents.lnd` (the ordinal the NEXT doc will take), which
+                // the §4.2 strict-`>` tie-break relies on.  Invariant #1 preserved:
+                // pure SQLite, no wire/crypto (the DPS call already returned above).
+                let next_lnd = node_state::get_tx(tx, &fn_id)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "replenish witness: node_state row missing for {} \
+                             (impossible under the FN gate)",
+                            fn_id
+                        )
+                    })?
+                    .next_lnd;
+                chain_seed_transitions::insert_seed_transition_tx(
+                    tx,
+                    &fn_id,
+                    next_lnd,
+                    &new_seed,
+                    chain_seed_transitions::SOURCE_T112,
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
 
                 Ok(ins)
             })

@@ -25,15 +25,16 @@
 
 use std::collections::BTreeMap;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use prro::db::invariant_scan::Violation;
-use prro::db::models::enums::DocState;
+use prro::db::models::enums::{DocState, ShiftState};
 use prro::services::reconciliation::online_convergence::TickSummary;
 
-use crate::interp::{ObservedDoc, RealOutcome};
-use crate::model::{ExpectedOutcome, Mutation};
+use crate::interp::{ObservedDoc, ObservedHeld, ObservedRelease, RealOutcome};
+use crate::model::{ExpectedOutcome, HeldWitness, Mutation, ReleasedWitness};
 
 /// The op classification the differential dispatches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,13 @@ pub enum OpClass {
     ExpectedNoIssuanceRow,
     /// A fault / recovery op — deferred to Task 5 (bounded postcond + re-sync).
     FaultOrRecovery,
+    /// CS-3 operator-completion (1b) — a release/refuse op. `run_harness` owns the comparison
+    /// (`check_release_witness` + the doc/seed/mode transition), NOT the per-doc differential.
+    Release,
+    /// bd `PRRO_GATE-hpc` — a T=112 replenish: mutates durable state (code pool + chain seed) while
+    /// minting NO document and allocating NO `lnd`.  Its ledger assertions live in `run_harness`
+    /// (narrow and asserted, not a blanket exemption from the no-mutation invariants).
+    Replenish,
 }
 
 /// A differential mismatch — carries a human-readable reason (the fuzzer reports
@@ -66,6 +74,8 @@ pub fn classify(expected: &ExpectedOutcome) -> OpClass {
         ExpectedOutcome::NoMutation => OpClass::ExpectedNoMutation,
         ExpectedOutcome::NoIssuanceRow => OpClass::ExpectedNoIssuanceRow,
         ExpectedOutcome::Fault => OpClass::FaultOrRecovery,
+        ExpectedOutcome::Release(_) => OpClass::Release,
+        ExpectedOutcome::Replenish { .. } => OpClass::Replenish,
     }
 }
 
@@ -86,6 +96,7 @@ pub fn check_differential(
 ) -> Result<(), Divergence> {
     match classify(expected) {
         OpClass::FaultOrRecovery => Ok(()), // Task 5 owns fault/recovery
+        OpClass::Release => Ok(()),         // 1b: run_harness owns the release comparison
         OpClass::PredictableMutating => {
             let m = match expected {
                 ExpectedOutcome::Mutated(m) => m,
@@ -103,6 +114,19 @@ pub fn check_differential(
         // Both no-issuance classes share the permissive differential shape; the
         // ledger assertions (zero rows vs ≤1 non-issued row, no seed/code) are the
         // harness's, split by class.
+        // bd hpc — the ONLY doc-less mutating class.  The shape check is here; the ledger
+        // assertions (seed moved iff granted, next_lnd UNCHANGED, no doc row, codes grew iff granted)
+        // are the harness's, so a wrong-direction outcome cannot pass silently.
+        OpClass::Replenish => {
+            let granted = matches!(expected, ExpectedOutcome::Replenish { granted: true });
+            match (granted, real) {
+                (true, RealOutcome::Replenished { .. }) => Ok(()),
+                (false, RealOutcome::Refused(_)) => Ok(()),
+                (g, other) => Err(Divergence(format!(
+                    "Replenish: model granted={g} but real outcome was {other:?}"
+                ))),
+            }
+        }
         OpClass::ExpectedNoMutation | OpClass::ExpectedNoIssuanceRow => match real {
             // A typed refusal is the expected shape (online-reject / offline-ack).
             RealOutcome::Refused(_) => Ok(()),
@@ -112,8 +136,23 @@ pub fn check_differential(
             // A replay-resolve (DuplicateIdemKey) returns the EXISTING doc; the
             // "no NEW issuance" assertion (no seed/code advance) is the test's.
             RealOutcome::Doc(_) => Ok(()),
+            // L6 — an X-report read is inherently a no-op for the differential
+            // (no doc, no lnd, no seed, no code).  The turnover-snapshot equality
+            // is the harness's extra assertion (`check_x_report_turnover`).
+            RealOutcome::XReport { .. } => Ok(()),
             RealOutcome::Crashed { .. } => Err(Divergence(
                 "ExpectedNoMutation/NoIssuanceRow but the real op crashed".to_string(),
+            )),
+            // CS-3 operator-completion — a release is checked by the SEPARATE `check_release_witness`
+            // pass (like `check_ledger_delta`), not the per-doc differential.  Inert here (the release
+            // op is directed-only this increment; the generative call site + prediction land later).
+            RealOutcome::Released(_) => Ok(()),
+            // bd hpc — a replenish mutates the seed + code pool, so it can NEVER be the real shape of
+            // a no-mutation class.  Fail loudly rather than silently tolerating a class mix-up.
+            RealOutcome::Replenished { .. } => Err(Divergence(
+                "ExpectedNoMutation/NoIssuanceRow but the real op was a T=112 replenish (which \
+                 advances the seed and grows the code pool)"
+                    .to_string(),
             )),
         },
     }
@@ -144,6 +183,14 @@ fn check_doc_against_mutation(
             doc.code_consumed, m.code_consumed
         )));
     }
+    if let Some(expected_shift) = m.shift_state_after {
+        if doc.shift_state_after != expected_shift {
+            return Err(Divergence(format!(
+                "shift_state mismatch: real {:?} != model {:?}",
+                doc.shift_state_after, expected_shift
+            )));
+        }
+    }
 
     // Structural seed (constraint #2):
     // (a) the seed ADVANCED this op iff the model says it advanced.  The model
@@ -166,6 +213,124 @@ fn check_doc_against_mutation(
     Ok(())
 }
 
+/// CS-3 Slice E — assert the REAL durable delivery-axis witness (read from `delivery_reservation` +
+/// `node_state`) matches the model's INDEPENDENT [`HeldWitness`] prediction for a HELD online
+/// outcome.  `observed == None` while the model predicted a witness is itself a divergence: the
+/// contract says a held outcome MUST persist a reservation row.  Every axis compares as DB-TEXT, so a
+/// persisted-classifier regression (e.g. `ProbeRequired` → `TransientRetry`) surfaces as a plain
+/// mismatch — the fuzzer's independent oracle for the Slice E routing contract.
+pub fn check_held_witness(
+    observed: Option<&ObservedHeld>,
+    expected: &HeldWitness,
+) -> Result<(), Divergence> {
+    let o = observed.ok_or_else(|| {
+        Divergence(format!(
+            "held-witness: model predicted a held reservation ({expected:?}) but the doc has NO \
+             delivery_reservation row (a held outcome MUST reserve)"
+        ))
+    })?;
+    let string_axes: [(&str, &str, &str); 7] = [
+        (
+            "submission_certainty",
+            o.submission_certainty.as_str(),
+            expected.submission_certainty,
+        ),
+        (
+            "response_provenance",
+            o.response_provenance.as_str(),
+            expected.response_provenance,
+        ),
+        (
+            "routing_class",
+            o.routing_class.as_deref().unwrap_or("<NULL>"),
+            expected.routing_class,
+        ),
+        ("node_effect", o.node_effect.as_str(), expected.node_effect),
+        (
+            "evidence_kind",
+            o.evidence_kind.as_str(),
+            expected.evidence_kind,
+        ),
+        ("apply_state", o.apply_state.as_str(), expected.apply_state),
+        ("node_mode", o.node_mode.as_str(), expected.node_mode),
+    ];
+    for (axis, real, exp) in string_axes {
+        if real != exp {
+            return Err(Divergence(format!(
+                "held-witness {axis} mismatch: real {real:?} != model {exp:?}"
+            )));
+        }
+    }
+    if o.evidence_code != expected.evidence_code {
+        return Err(Divergence(format!(
+            "held-witness evidence_code mismatch: real {:?} != model {:?}",
+            o.evidence_code, expected.evidence_code
+        )));
+    }
+    if o.fence_held != expected.fence_held {
+        return Err(Divergence(format!(
+            "held-witness fence_held mismatch: real {} != model {}",
+            o.fence_held, expected.fence_held
+        )));
+    }
+    Ok(())
+}
+
+/// CS-3 operator-completion — assert the REAL durable witness after a legal completion matches the
+/// model's INDEPENDENT [`ReleasedWitness`].  The load-bearing anti-BRICK checks are the last two:
+/// `apply_state == "APPLIED"`, `fence_held == false`, and — always — `node_mode != "STOP_MODE"`.  A
+/// completion that leaves the reservation `PENDING_APPLY`, the fence set, or the node in `STOP_MODE`
+/// is an eternal BRICK and REDs here.
+pub fn check_release_witness(
+    observed: &ObservedRelease,
+    expected: &ReleasedWitness,
+) -> Result<(), Divergence> {
+    let axes: [(&str, &str, &str); 3] = [
+        (
+            "apply_state",
+            observed.apply_state.as_str(),
+            expected.apply_state,
+        ),
+        ("node_mode", observed.node_mode.as_str(), expected.node_mode),
+        ("doc_state", observed.doc_state.as_str(), expected.doc_state),
+    ];
+    for (axis, real, exp) in axes {
+        if real != exp {
+            return Err(Divergence(format!(
+                "release-witness {axis} mismatch: real {real:?} != model {exp:?}"
+            )));
+        }
+    }
+    if observed.fence_held != expected.fence_held {
+        return Err(Divergence(format!(
+            "release-witness fence_held mismatch: real {} != model {}",
+            observed.fence_held, expected.fence_held
+        )));
+    }
+    // The unconditional anti-BRICK invariant — independent of the model tuple: a released
+    // reservation can NEVER rest bricked (node halted STOP_MODE) nor with the fence still held.
+    if observed.node_mode == "STOP_MODE" || observed.fence_held {
+        return Err(Divergence(format!(
+            "release-witness BRICK: released reservation still halted/fenced (mode={:?}, fence_held={})",
+            observed.node_mode, observed.fence_held
+        )));
+    }
+    Ok(())
+}
+
+/// Teeth helper for shift-aware model predictions.  It is intentionally tiny:
+/// the real fuzzer path checks this through [`check_doc_against_mutation`], and
+/// directed canaries can call it with synthetic states to prove the oracle goes
+/// RED on shift drift without constructing a whole DB.
+pub fn check_shift_state(real: ShiftState, expected: Option<ShiftState>) -> Result<(), Divergence> {
+    match expected {
+        Some(expected) if real != expected => Err(Divergence(format!(
+            "shift_state mismatch: real {real:?} != model {expected:?}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Ledger-delta for `Recovered` (drain / go-online) ops: the real ledger
 /// (lnd → state, read by the test via `ctx.read_ledger()`) must equal the
 /// model's predicted ledger (`model.docs`).
@@ -179,6 +344,469 @@ pub fn check_ledger_delta(
         )));
     }
     Ok(())
+}
+
+/// L0/INV-21 cash-on-hand oracle.
+///
+/// Independent re-derive of the cash-on-hand for `fiscal_number`'s open shift
+/// from the ledger, then compare to the model's `cash_on_hand` accumulator.
+///
+/// **Differential contract:**
+/// - Model `cash_on_hand` must equal the real derived value after every op.
+/// - If they diverge, a prod-side cash accounting bug or an L1-guard drift is
+///   detected (e.g. the L1 guard being reverted would let a cash RETURN issue,
+///   making real `cash_on_hand` go negative while the model stays at 0).
+///
+/// **Teeth (durable):** reverting the L1 guard in `convert.rs` makes this
+/// oracle RED: the model refuses the cash RETURN (NoMutation, cash stays at
+/// prior value) while prod accepts it (cash decrements) → divergence caught.
+///
+/// Called AFTER every op in the proptest harness (same cadence as
+/// `check_ledger_delta`).
+pub async fn check_cash_on_hand(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+    model_cash: i64,
+) -> Result<(), Divergence> {
+    // Re-derive cash using the prod cash_ledger (INDEPENDENT model is the
+    // RefModel accumulator above; this reads the actual DB to cross-check).
+    let real_cash = prro::services::cash_ledger::cash_on_hand_for_fn(pool, fiscal_number)
+        .await
+        .map_err(|e| Divergence(format!("cash oracle: cash_on_hand_for_fn failed: {e}")))?;
+    if real_cash != model_cash {
+        return Err(Divergence(format!(
+            "cash oracle: real cash_on_hand {real_cash} != model {model_cash} \
+             (INV-21 differential breach — cash ledger diverged)"
+        )));
+    }
+    Ok(())
+}
+
+/// L6 — X-report turnover-snapshot oracle.
+///
+/// The X-report is a SIDE-EFFECT-FREE read, so the differential (no doc / lnd /
+/// seed / code) already passes.  This adds the "turnover snapshot == model
+/// totals" check: the `cash_on_hand_kop` the real X-report returned must equal
+/// the model's independently-tracked `cash_on_hand`.
+///
+/// **Independence:** `model_cash` is the RefModel's own accumulator (built from
+/// first principles per op — SELL `+`, RETURN `−`, ServiceIn `+`, ServiceOut
+/// `−`, EPZ `−`); `real_cash` is what the prod `handle_x_report` derived from the
+/// durable ledger via `cash_on_hand_for_fn`.  A divergence signals a prod X-report
+/// aggregation bug (or a side-effect that changed the ledger under it).
+///
+/// **Teeth:** reverting the side-effect-free property (making X consume an lnd /
+/// write a row) is caught by the harness's six-point no-mutation set FIRST; this
+/// oracle additionally catches a turnover that silently under/over-reports.
+pub fn check_x_report_turnover(real_cash: i64, model_cash: i64) -> Result<(), Divergence> {
+    if real_cash != model_cash {
+        return Err(Divergence(format!(
+            "x-report oracle: real snapshot cash_on_hand {real_cash} != model {model_cash} \
+             (turnover snapshot diverged from the model totals)"
+        )));
+    }
+    Ok(())
+}
+
+/// Z aggregation oracle — independent from `runtime::ingress::convert`.
+///
+/// Reads the latest Z/close-shift document and the issued SELL/RETURN receipts
+/// in that same shift, then recomputes the signer-ready Z payload shape from
+/// persisted receipt payloads + persisted signing snapshots.  This catches the
+/// fiscally expensive class where the state machine is correct but Z turnover /
+/// tax totals are silently wrong.
+pub async fn check_latest_z_aggregation(pool: &SqlitePool) -> Result<(), Divergence> {
+    let z_payload: Option<String> = sqlx::query_scalar(
+        "SELECT payload_json \
+         FROM fiscal_documents \
+         WHERE doc_type IN ('Z_REPORT','SHIFT_CLOSE') \
+         ORDER BY lnd DESC \
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| Divergence(format!("Z oracle: latest Z query failed: {e}")))?;
+    let z_payload = z_payload.ok_or_else(|| {
+        Divergence("Z oracle: no Z_REPORT/SHIFT_CLOSE document found".to_string())
+    })?;
+
+    let receipt_rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "WITH latest_z AS ( \
+             SELECT shift_id \
+             FROM fiscal_documents \
+             WHERE doc_type IN ('Z_REPORT','SHIFT_CLOSE') \
+             ORDER BY lnd DESC \
+             LIMIT 1 \
+         ) \
+         SELECT d.doc_type, d.payload_json, s.payload_json \
+         FROM fiscal_documents d \
+         JOIN latest_z z ON d.shift_id = z.shift_id \
+         LEFT JOIN signing_config_snapshots s ON s.id = d.signing_config_snapshot_id \
+         WHERE d.doc_type IN ('SELL','RETURN') \
+           AND d.state IN ('ACK','OFFLINE_LOCAL_ACK') \
+         ORDER BY d.lnd",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Divergence(format!("Z oracle: receipt query failed: {e}")))?;
+
+    check_z_payload_against_receipts(&z_payload, &receipt_rows)
+}
+
+#[derive(Debug, Clone)]
+struct ReceiptForZ {
+    doc_type: String,
+    payload_json: String,
+    snapshot_json: Option<String>,
+}
+
+impl From<&(String, String, Option<String>)> for ReceiptForZ {
+    fn from(row: &(String, String, Option<String>)) -> Self {
+        Self {
+            doc_type: row.0.clone(),
+            payload_json: row.1.clone(),
+            snapshot_json: row.2.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ZPayload {
+    payments: Vec<ZPayment>,
+    #[serde(default)]
+    tax_summaries: Vec<ZTaxSummary>,
+    sell_count: u32,
+    return_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+struct ZPayment {
+    name: String,
+    sum_in_kop: i64,
+    sum_out_kop: i64,
+    type_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+struct ZTaxSummary {
+    tx: i64,
+    tx_short_form: bool,
+    txpr: String,
+    txal: i64,
+    txty: i64,
+    dtpr: String,
+    smi: i64,
+    smo: i64,
+    txi: i64,
+    txo: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredCheckForZ {
+    items: Vec<StoredItemForZ>,
+    payments: Vec<StoredPaymentForZ>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredItemForZ {
+    #[serde(default)]
+    tax_group_1: Option<i64>,
+    sum_kop: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredPaymentForZ {
+    name: String,
+    sum_kop: i64,
+    type_code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotForZ {
+    #[serde(default)]
+    driver_mapping: Vec<DriverMappingForZ>,
+    groups: Vec<TaxGroupForZ>,
+    kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DriverMappingForZ {
+    driver_number: i64,
+    canonical_tx_num: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct TaxGroupForZ {
+    tx: i64,
+    txpr_bps: i64,
+    dtpr_bps: i64,
+    txal: i64,
+    txty: i64,
+}
+
+struct TaxAccumForZ {
+    smi: i64,
+    smo: i64,
+    rate: Option<TaxGroupForZ>,
+    established: bool,
+}
+
+fn check_z_payload_against_receipts(
+    z_payload: &str,
+    rows: &[(String, String, Option<String>)],
+) -> Result<(), Divergence> {
+    let receipts: Vec<ReceiptForZ> = rows.iter().map(ReceiptForZ::from).collect();
+    let expected = expected_z_payload(&receipts)?;
+    let real: ZPayload = serde_json::from_str(z_payload)
+        .map_err(|e| Divergence(format!("Z oracle: Z payload JSON parse failed: {e}")))?;
+    if real != expected {
+        return Err(Divergence(format!(
+            "Z oracle: aggregated payload mismatch: real {real:?} != expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn expected_z_payload(receipts: &[ReceiptForZ]) -> Result<ZPayload, Divergence> {
+    let mut payments: BTreeMap<(String, String), (i64, i64)> = BTreeMap::new();
+    let mut tax: BTreeMap<i64, TaxAccumForZ> = BTreeMap::new();
+    let mut sell_count = 0_u32;
+    let mut return_count = 0_u32;
+
+    for receipt in receipts {
+        let is_sell = match receipt.doc_type.as_str() {
+            "SELL" => {
+                sell_count += 1;
+                true
+            }
+            "RETURN" => {
+                return_count += 1;
+                false
+            }
+            other => {
+                return Err(Divergence(format!(
+                    "Z oracle: unexpected shift receipt doc_type {other:?}"
+                )))
+            }
+        };
+        let parsed: StoredCheckForZ = serde_json::from_str(&receipt.payload_json).map_err(|e| {
+            Divergence(format!(
+                "Z oracle: stored receipt payload parse failed for {}: {e}",
+                receipt.doc_type
+            ))
+        })?;
+        for payment in parsed.payments {
+            if payment.sum_kop < 0 {
+                return Err(Divergence(format!(
+                    "Z oracle: negative stored payment {} for type_code={} name={:?}",
+                    payment.sum_kop, payment.type_code, payment.name
+                )));
+            }
+            let key = (payment.type_code, payment.name);
+            let entry = payments.entry(key.clone()).or_insert((0, 0));
+            let target = if is_sell { &mut entry.0 } else { &mut entry.1 };
+            *target = target.checked_add(payment.sum_kop).ok_or_else(|| {
+                Divergence(format!(
+                    "Z oracle: payment sum overflow for type_code={} name={:?}",
+                    key.0, key.1
+                ))
+            })?;
+        }
+
+        let snapshot = match &receipt.snapshot_json {
+            Some(raw) => {
+                let snapshot: SnapshotForZ = serde_json::from_str(raw).map_err(|e| {
+                    Divergence(format!("Z oracle: signing snapshot parse failed: {e}"))
+                })?;
+                if snapshot.kind != "check_tax_mapping_v1" {
+                    return Err(Divergence(format!(
+                        "Z oracle: unsupported signing snapshot kind {:?}",
+                        snapshot.kind
+                    )));
+                }
+                Some(snapshot)
+            }
+            None => None,
+        };
+
+        for item in parsed.items {
+            let Some(driver_tx) = item.tax_group_1 else {
+                continue;
+            };
+            let canonical_tx = snapshot
+                .as_ref()
+                .and_then(|s| resolve_driver_tx_for_z(s, driver_tx))
+                .unwrap_or(driver_tx);
+            let rate = snapshot
+                .as_ref()
+                .and_then(|s| s.groups.iter().find(|g| g.tx == canonical_tx).cloned());
+            let accum = tax.entry(canonical_tx).or_insert(TaxAccumForZ {
+                smi: 0,
+                smo: 0,
+                rate: None,
+                established: false,
+            });
+            if !accum.established {
+                accum.rate = rate;
+                accum.established = true;
+            } else if accum.rate != rate {
+                return Err(Divergence(format!(
+                    "Z oracle: tax snapshot drift for tx={canonical_tx}"
+                )));
+            }
+            let target = if is_sell {
+                &mut accum.smi
+            } else {
+                &mut accum.smo
+            };
+            *target = target.checked_add(item.sum_kop).ok_or_else(|| {
+                Divergence(format!("Z oracle: tax sum overflow for tx={canonical_tx}"))
+            })?;
+        }
+    }
+
+    let payments = payments
+        .into_iter()
+        .map(|((type_code, name), (sum_in_kop, sum_out_kop))| ZPayment {
+            name,
+            sum_in_kop,
+            sum_out_kop,
+            type_code,
+        })
+        .collect();
+    let tax_summaries = tax
+        .into_iter()
+        .map(|(tx, accum)| z_tax_summary(tx, accum))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ZPayload {
+        payments,
+        tax_summaries,
+        sell_count,
+        return_count,
+    })
+}
+
+fn resolve_driver_tx_for_z(snapshot: &SnapshotForZ, driver_tx: i64) -> Option<i64> {
+    snapshot
+        .driver_mapping
+        .iter()
+        .find(|m| m.driver_number == driver_tx)
+        .map(|m| m.canonical_tx_num)
+}
+
+fn z_tax_summary(tx: i64, accum: TaxAccumForZ) -> Result<ZTaxSummary, Divergence> {
+    match accum.rate {
+        Some(rate) => {
+            let txi = if accum.smi == 0 {
+                0
+            } else {
+                calc_tax_included_for_z(accum.smi, &rate)?.0
+            };
+            let txo = if accum.smo == 0 {
+                0
+            } else {
+                calc_tax_included_for_z(accum.smo, &rate)?.0
+            };
+            Ok(ZTaxSummary {
+                tx,
+                tx_short_form: false,
+                txpr: format_bps(rate.txpr_bps),
+                txal: rate.txal,
+                txty: rate.txty,
+                dtpr: format_bps(rate.dtpr_bps),
+                smi: accum.smi,
+                smo: accum.smo,
+                txi,
+                txo,
+            })
+        }
+        None => Ok(ZTaxSummary {
+            tx,
+            tx_short_form: true,
+            txpr: String::new(),
+            txal: 0,
+            txty: 0,
+            dtpr: String::new(),
+            smi: accum.smi,
+            smo: accum.smo,
+            txi: 0,
+            txo: 0,
+        }),
+    }
+}
+
+fn calc_tax_included_for_z(sum_kop: i64, rate: &TaxGroupForZ) -> Result<(i64, i64), Divergence> {
+    let txpr = rate.txpr_bps as f64 / 100.0;
+    let dtpr = rate.dtpr_bps as f64 / 100.0;
+    if txpr < 0.0 || dtpr < 0.0 {
+        return Err(Divergence(format!(
+            "Z oracle: negative tax rate txpr_bps={} dtpr_bps={}",
+            rate.txpr_bps, rate.dtpr_bps
+        )));
+    }
+    let g = sum_kop as f64;
+    match rate.txal {
+        0 => {
+            let tx = if txpr > 0.0 {
+                bankers_round_for_z(g * txpr / (100.0 + txpr))
+            } else {
+                0
+            };
+            Ok((tx, 0))
+        }
+        1 => {
+            let dt = if dtpr > 0.0 {
+                bankers_round_for_z(g * dtpr / 100.0)
+            } else {
+                0
+            };
+            let tx = if txpr > 0.0 {
+                bankers_round_for_z((g + dt as f64) * txpr / (100.0 + txpr))
+            } else {
+                0
+            };
+            Ok((tx, dt))
+        }
+        2 => {
+            let dt = if dtpr > 0.0 {
+                bankers_round_for_z(g * dtpr / (100.0 + dtpr))
+            } else {
+                0
+            };
+            let tx = if txpr > 0.0 {
+                bankers_round_for_z((g - dt as f64) * txpr / (100.0 + txpr))
+            } else {
+                0
+            };
+            Ok((tx, dt))
+        }
+        other => Err(Divergence(format!(
+            "Z oracle: unsupported TXAL {other} for tx={}",
+            rate.tx
+        ))),
+    }
+}
+
+fn bankers_round_for_z(x: f64) -> i64 {
+    let floor = x.floor();
+    let diff = x - floor;
+    if diff < 0.5 {
+        floor as i64
+    } else if diff > 0.5 {
+        (floor + 1.0) as i64
+    } else {
+        let f = floor as i64;
+        if f % 2 == 0 {
+            f
+        } else {
+            f + 1
+        }
+    }
+}
+
+fn format_bps(bps: i64) -> String {
+    format!("{}.{:02}", bps / 100, (bps % 100).abs())
 }
 
 // ── Layer 2 — quiescent-boundary scan ───────────────────────────────────────
@@ -446,4 +1074,46 @@ pub async fn check_mirrors(pool: &SqlitePool) -> Result<(), Divergence> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn taxable_receipt_rows() -> Vec<(String, String, Option<String>)> {
+        vec![(
+            "SELL".to_string(),
+            r#"{"items":[{"tax_group_1":1,"sum_kop":15000}],"payments":[{"name":"Cash","sum_kop":15000,"type_code":"0"}]}"#
+                .to_string(),
+            Some(
+                r#"{"driver_mapping":[],"groups":[{"dtpr_bps":0,"tx":1,"txal":0,"txpr_bps":2000,"txty":0}],"kind":"check_tax_mapping_v1"}"#
+                    .to_string(),
+            ),
+        )]
+    }
+
+    #[test]
+    fn z_aggregation_oracle_accepts_independently_computed_taxable_payload() {
+        let z = r#"{"payments":[{"name":"Cash","sum_in_kop":15000,"sum_out_kop":0,"type_code":"0"}],"tax_summaries":[{"tx":1,"tx_short_form":false,"txpr":"20.00","txal":0,"txty":0,"dtpr":"0.00","smi":15000,"smo":0,"txi":2500,"txo":0}],"sell_count":1,"return_count":0}"#;
+        check_z_payload_against_receipts(z, &taxable_receipt_rows())
+            .expect("matching taxable Z payload must pass");
+    }
+
+    #[test]
+    fn z_aggregation_oracle_catches_payment_drift() {
+        let z = r#"{"payments":[{"name":"Cash","sum_in_kop":14999,"sum_out_kop":0,"type_code":"0"}],"tax_summaries":[{"tx":1,"tx_short_form":false,"txpr":"20.00","txal":0,"txty":0,"dtpr":"0.00","smi":15000,"smo":0,"txi":2500,"txo":0}],"sell_count":1,"return_count":0}"#;
+        assert!(
+            check_z_payload_against_receipts(z, &taxable_receipt_rows()).is_err(),
+            "wrong Z payment turnover must fail the oracle"
+        );
+    }
+
+    #[test]
+    fn z_aggregation_oracle_catches_tax_drift() {
+        let z = r#"{"payments":[{"name":"Cash","sum_in_kop":15000,"sum_out_kop":0,"type_code":"0"}],"tax_summaries":[{"tx":1,"tx_short_form":false,"txpr":"20.00","txal":0,"txty":0,"dtpr":"0.00","smi":15000,"smo":0,"txi":2499,"txo":0}],"sell_count":1,"return_count":0}"#;
+        assert!(
+            check_z_payload_against_receipts(z, &taxable_receipt_rows()).is_err(),
+            "wrong Z TXS amount must fail the oracle"
+        );
+    }
 }

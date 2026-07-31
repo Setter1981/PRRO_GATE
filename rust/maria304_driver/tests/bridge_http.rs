@@ -44,7 +44,9 @@ async fn serve_one_request(
         buf.extend_from_slice(&scratch[..n]);
         if let Some(hdr_end) = find_header_end(&buf) {
             // Extract Content-Length.
-            let header_text = std::str::from_utf8(&buf[..hdr_end]).unwrap_or("").to_string();
+            let header_text = std::str::from_utf8(&buf[..hdr_end])
+                .unwrap_or("")
+                .to_string();
             let content_length = header_text
                 .lines()
                 .find_map(|l| {
@@ -93,7 +95,10 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-async fn spawn_server(response_line: &'static str, response_body: &'static str) -> (String, Arc<Mutex<CapturedServer>>) {
+async fn spawn_server(
+    response_line: &'static str,
+    response_body: &'static str,
+) -> (String, Arc<Mutex<CapturedServer>>) {
     let captured = Arc::new(Mutex::new(CapturedServer::default()));
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr: SocketAddr = probe.local_addr().unwrap();
@@ -137,8 +142,13 @@ async fn successful_ack_response_is_parsed_into_canonical_response() {
     // Run the blocking reqwest call on a dedicated thread so we
     // don't block the test runtime.
     let bridge = tokio::task::spawn_blocking(move || {
-        HttpBridge::new(url, "secret-token", Duration::from_millis(500), Duration::from_secs(2))
-            .unwrap()
+        HttpBridge::new(
+            url,
+            "secret-token",
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+        )
+        .unwrap()
     })
     .await
     .unwrap();
@@ -225,5 +235,8 @@ async fn empty_token_skips_authorization_header() {
         .unwrap()
         .unwrap();
     let cap = captured.lock().await;
-    assert!(cap.last_auth.is_none(), "empty token must not send Authorization header");
+    assert!(
+        cap.last_auth.is_none(),
+        "empty token must not send Authorization header"
+    );
 }

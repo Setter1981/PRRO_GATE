@@ -30,6 +30,14 @@ pub enum WireResponse {
     Superseded,
     BadHashPrev,
     NotFound,
+    /// CS-3 Slice E oracle: a parsed DPS envelope carrying an unnamed non-zero status code
+    /// (`-4 ERROR_UNKNOWN`, `-17`, …) → the `UnknownStatus` evidence leaf → `ProbeRequired` HELD.
+    /// **Appended LAST** so existing regression-corpus seed indices are preserved. Unlike the
+    /// other arms, this MUST reach the wire through the REAL production decode
+    /// (`observe_check_reply` / `scripted_raw_observation`), NOT a legacy `DpsError` — a legacy
+    /// `Indeterminate` degrades to `NoResponse` in `observe_faithful_from_legacy`, losing the
+    /// `ProbeRequired` classification (see `interp::load_script` + `ScriptedDps` obs-override).
+    UnknownStatus(i32),
 }
 
 /// An ORDERED queue of per-call wire responses for a wire-hitting op.  A real
@@ -72,6 +80,32 @@ impl DpsScript {
     pub fn bad_hash_prev() -> Self {
         Self(vec![WireResponse::BadHashPrev])
     }
+
+    /// CS-3 Slice E: the DPS returns a parsed envelope with an unnamed non-zero status `code`
+    /// (`-4`/`-17`) → `UnknownStatus → ProbeRequired` HELD (SENDING + STOP + PENDING_APPLY, one wire,
+    /// no auto-resend). A single send response (the leaf HOLDS; no `last_chk` in the send path).
+    pub fn unknown_status(code: i32) -> Self {
+        Self(vec![WireResponse::UnknownStatus(code)])
+    }
+}
+
+/// bd `PRRO_GATE-2ds` / `PRRO_GATE-hpc` — the DECIDED outcomes of a T=112
+/// `ask_offline_codes` replenish.
+///
+/// **Deliberately only two leaves.** `RULING 2` §4
+/// (`docs/RULINGS_2026-07-10_SHIFT_T112_AUTOZ.md`) pins the ambiguous /
+/// transport-timeout branch as **known-red until a live capture lands**
+/// (bd `PRRO_GATE-2ds`, blocked on the operator), so the generator MUST NOT emit
+/// it: doing so would pin a contract that has no evidence behind it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplenishLeaf {
+    /// DPS grants a code window.  Prod persists the codes (`INSERT OR IGNORE`),
+    /// advances the chain seed to `sha256(request_xml)` — a NON-DOCUMENT seed —
+    /// and appends the durable witness row (migration 040), all in ONE
+    /// `with_immediate` envelope.  Allocates NO `lnd`.
+    Granted,
+    /// DPS refuses server-side: NO codes persisted, NO seed advance, NO witness.
+    ServerReject,
 }
 
 /// Operation alphabet (spec §5).  Wire-hitting ops carry a [`DpsScript`]; there
@@ -98,6 +132,54 @@ pub enum Op {
     /// LOCAL so `OfflineReturn` carries none.
     OnlineReturn(DpsScript),
     OfflineReturn,
+    /// Online service cash-in (службове внесення).  Wire-hitting; carries a script.
+    OnlineServiceIn(DpsScript),
+    /// Online service cash-out (службова видача).  Wire-hitting; carries a script.
+    OnlineServiceOut(DpsScript),
+    /// Offline service cash-in.  Issuance is local (OFFLINE_LOCAL_ACK + code
+    /// consumed); drain/GoOnline submits it.  Mirrors `OfflineSell`/`OfflineReturn`.
+    OfflineServiceIn,
+    /// Offline service cash-out.  Issuance is local; drain/GoOnline submits it.
+    /// Guard-3b (cash-floor) is NOT checked in-lease for offline — only
+    /// pre-inbox L1 guard fires.  The fuzzer fixture always has sufficient
+    /// cash after a prior `OfflineServiceIn`.
+    OfflineServiceOut,
+    /// Online shift-open path.  The script drives send/last.
+    OnlineShiftOpen(DpsScript),
+    /// Offline shift-open path.  Issuance is local; Drain/GoOnline submits it.
+    OfflineShiftOpen,
+    /// Online close-shift / Z-report path.  The production write path treats
+    /// `Z_REPORT` as the close-shift wire artifact; the script drives send/last.
+    OnlineZReport(DpsScript),
+    /// Offline close-shift / Z-report path.  Issuance is local; later wire
+    /// interaction is driven by the existing Drain/GoOnline ops.
+    OfflineZReport,
+    /// Online EPZ — видача готівки за ЕПЗ (cash advance against a card).
+    /// Wire-hitting (`<C T='8'>`); carries a script.  Cash-OUT (`− epz_out`);
+    /// guard-3c refuses (NoMutation) when the card sum exceeds cash-on-hand.
+    OnlineEpz(DpsScript),
+    /// Offline EPZ.  Issuance is local (OFFLINE_LOCAL_ACK + code consumed);
+    /// drain/GoOnline submits it.  Mirrors `OfflineServiceOut`.
+    OfflineEpz,
+    /// L6 — X-report (поточний звіт): a LOCAL-ONLY, SIDE-EFFECT-FREE read of the
+    /// current open shift's turnover.  Carries NO `DpsScript` (never hits the
+    /// wire) and can be inserted at ANY point in a sequence.  The whole point is
+    /// that it mutates NOTHING: no lnd, no seed, no code, no doc row, no inbox
+    /// row, no shift transition — the model predicts `NoMutation` and the oracle
+    /// asserts the six-point no-mutation set PLUS that the returned turnover
+    /// snapshot (cash-on-hand) matches the model's tracked total.
+    XReport,
+    /// L5 — a SELL whose AMOUNT-SHAPE deliberately spans the four fail-closed
+    /// pre-inbox input guards (`convert.rs`).  Unlike every other SELL op — which
+    /// seeds an already-CONVERTED signer payload directly and enters at
+    /// `inline::run` — this op drives the SELL THROUGH `convert_to_signer_payload`
+    /// (the layer the L5 guards live in), so an over-cap / zero-price /
+    /// zero-payment / underpaid shape is actually REFUSED pre-inbox (no row) and a
+    /// `Valid` shape converts + issues.  Carries the violation `kind`; the wire
+    /// script (for `Valid`) is fixed to `ack_path` (issuance-shape is orthogonal
+    /// to the amount guard).  This is the "equivalent bounded strategy spanning
+    /// the guard boundaries" the L5 fuzzer mandate asks for.
+    L5Probe(L5Kind),
     Drain(DpsScript),
     Crash(Stage),
     Reboot,
@@ -108,4 +190,69 @@ pub enum Op {
     GoOnlineWithoutBacklog,
     OfflineSellDuringGoingOnline,
     SellWithClosedShift,
+    /// T=112 offline-code replenish — the ONLY op that moves the MAC chain seed
+    /// WITHOUT minting a document.  Drives the REAL
+    /// `OfflineCodeReplenishService`, so the durable witness (migration 040) and
+    /// the `active_chain_tip` fold that bd `PRRO_GATE-hpc` added are exercised
+    /// generatively rather than by directed tests alone.  Allocates no `lnd`,
+    /// which is exactly what makes the witness's `lnd_at_write` ordering frame
+    /// meaningful.
+    Replenish(ReplenishLeaf),
+    /// CS-3 operator-completion — the SOLE legal exit from a `PENDING_APPLY` + `STOP_MODE` HELD
+    /// reservation (the eternal-BRICK guard).  Drives the real `admin::resolve_operator_pending`
+    /// seam against the doc held by the most-recent wire op; a no-op when no held reservation rests.
+    /// **Appended LAST** (preserves the `Op` discriminant order the regression corpus depends on).
+    OperatorComplete(OperatorResolutionKind),
+}
+
+/// The operator's verified resolution of a HELD reservation.  A test-local mirror of the prod
+/// `OperatorResolution` (op.rs must not import prod types into the generator); the interpreter maps
+/// each kind to the real `OperatorResolution` when it drives `resolve_operator_pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorResolutionKind {
+    /// DPS accepted (operator supplies the observed FN) → doc `SENT`, seed advances, node released.
+    Accepted,
+    /// DPS did not accept (ONLINE origin) → doc `REQUIRES_MANUAL_RECONCILIATION`, node released.
+    NotAccepted,
+    /// OFFLINE-origin not accepted → doc RMR + OLA-cohort cancel + chain rewind.
+    NotAcceptedOffline,
+    /// `-12` MacReseed (operator supplies the corrected seed) → doc RMR, seed re-based, node released.
+    MacReseed,
+}
+
+/// L5 amount-shape for an [`Op::L5Probe`].  Each violation kind targets exactly
+/// one of the four fail-closed pre-inbox guards in `convert.rs`; `Valid` is the
+/// admit-and-issue control.  The interpreter builds a `CanonicalCommand` with the
+/// matching amount shape and drives it through `convert_to_signer_payload`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L5Kind {
+    /// G1 — a single cash payment of 5_000_000 kop (Σ cash > 4_999_999 cap).
+    OverCap,
+    /// G2 — a good priced 0 (item_sum_kop == 0).
+    ZeroPrice,
+    /// G3 — a card leg that covers the good + a zero-amount cash leg.
+    ZeroPayment,
+    /// G4 — a good of 1000 kop paid by a 900-kop cash leg (underpaid).
+    Underpaid,
+    /// Control — a good of 15_000 kop paid in full by cash (converts + issues).
+    Valid,
+}
+
+impl Op {
+    /// CS-3 Slice E — the wire `DpsScript` carried by an online wire op that mints a HELD-able Doc
+    /// (rests SENDING under a reservation), for the held-witness delivery-axis oracle.  `None` for
+    /// non-wire / offline / recovery ops (`GoOnline` / `Drain` produce a `Recovered` ledger-delta,
+    /// not a single held Doc, so they are intentionally excluded).
+    pub fn wire_script(&self) -> Option<&DpsScript> {
+        match self {
+            Op::OnlineSell(s)
+            | Op::OnlineReturn(s)
+            | Op::OnlineServiceIn(s)
+            | Op::OnlineServiceOut(s)
+            | Op::OnlineEpz(s)
+            | Op::OnlineShiftOpen(s)
+            | Op::OnlineZReport(s) => Some(s),
+            _ => None,
+        }
+    }
 }

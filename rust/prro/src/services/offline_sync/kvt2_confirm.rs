@@ -307,10 +307,14 @@ pub fn classify_check_result(
     match result {
         Ok(ack) => {
             // `by_server_fiscal_no` has already verified `ack.id ==
-            // expected_id` per `channel.rs:60-69`.  We only need to
-            // check `data_sign` non-empty for W0b §99 conformance.
-            if ack.data_sign.is_empty() {
+            // expected_id` per `channel.rs:60-69`.  We check `data_sign` is a
+            // plausible KVT1 quittance (W0b §99 conformance): empty OR implausibly
+            // short (< a bare DSTU signature) is NOT evidence and holds — RISK 1
+            // fail-closed harden against a byzantine DPS returning garbage bytes.
+            if ack.data_sign.len() < crate::transports::dps::dto::MIN_KVT1_DATA_SIGN_LEN {
                 Kvt2ConfirmOutcome::Hold {
+                    // `LastChkDataSignEmpty` now covers empty AND sub-signature
+                    // lengths (both = "data_sign is not a usable quittance").
                     reason: Kvt2ConfirmHoldReason::LastChkDataSignEmpty,
                     sent_replay_trace_attempt_no,
                 }
@@ -388,6 +392,19 @@ pub fn classify_check_result(
             reason: Kvt2ConfirmHoldReason::DpsDecode(msg),
             sent_replay_trace_attempt_no,
         },
+        // RA — COMPATIBILITY PROJECTION (not an ideal semantic classification):
+        // R1 `RemoteStatus` / slice-A `Indeterminate` map to the exact SAME
+        // Hold(DpsServer) with the Debug-formatted detail the `Err(other)` catch-all
+        // below already produced — byte-identical `format!("{err:?}")`, so RA is
+        // behaviour-neutral vs the current confirm path.  Handled EXPLICITLY (not
+        // accidentally via the catch-all) so the intent is documented and pinned.
+        // A dedicated `Kvt2ConfirmHoldReason` for these is a FUTURE slice, out of RA scope.
+        Err(err @ (DpsError::RemoteStatus { .. } | DpsError::Indeterminate { .. })) => {
+            Kvt2ConfirmOutcome::Hold {
+                reason: Kvt2ConfirmHoldReason::DpsServer(format!("{err:?}")),
+                sent_replay_trace_attempt_no,
+            }
+        }
         Err(other) => {
             // Defensive catch-all for `DpsError::QueryNotSupported` /
             // `DpsError::Internal` (and any future variant).  Lands as
@@ -553,6 +570,24 @@ pub enum ConfirmDrainOutcome {
     /// predecessor is unsafe in the strict M2-01 chain).  Resolution of the
     /// superseded doc is owned by B1-v2 doc-scoped confirmation (future).
     SupersededHeld,
+    /// **CS-3 S7-1 re-audit F2-kvt2 (2026-07-22)** — SentReplay-exclusive: the
+    /// probed SENT doc's `last_chk` returned NotFound (DPS has no record of the
+    /// `server_fiscal_no`).  This is issuance-AMBIGUOUS (DPS may hold the receipt
+    /// or never saw it), so a blind re-send is the double-issue hazard the whole
+    /// campaign removes.  `confirm_drain_doc` has ALREADY escalated atomically:
+    /// `Sent → RequiresManualReconciliation` + node `STOP_MODE` (fork-guard, via
+    /// the shared `reconciliation::sent_not_found::sent_not_found_to_manual`) +
+    /// Critical `SENT_NOT_FOUND_ESCALATED_MANUAL` operator-handoff audit + the
+    /// recovery trace completed with `retry_class = NULL` (R6 retired the old ER
+    /// redrive).  The doc is now durably RMR; the node is halted.
+    ///
+    /// **Caller maps to `DocVerdict::Failed { NotFound, manual_recon: true }`**
+    /// → the drain loop escalates the FN shift to Manual + HALTS (mirrors the
+    /// boot-side F2 producer `cas_sent_not_found_to_manual_from_probe`).  Because
+    /// the classifier only emits `SentNotFoundDowngrade` for `SentReplay`, this
+    /// outcome is STRUCTURALLY UNREACHABLE for SentFresh / Kvt1Reentry callers —
+    /// those fail loud.
+    SentNotFoundEscalated,
     /// **AUD-L2-1b (2026-06-14)** — the Envelope 2 (`stage_finalize::run`,
     /// `Kvt2 → Ack`) step returned `ChainSeedMismatch`: the FN chain seed does
     /// not equal this online-origin doc's `previous_hash` (chain-integrity
@@ -1001,33 +1036,27 @@ pub(crate) async fn confirm_drain_doc(
             let wire_finished = sent_replay_wire_finished
                 .clone()
                 .expect("SentReplay implies wire_finished captured");
-            commit_sent_replay_envelope_1c_post(
+            commit_sent_replay_envelope_1c_manual(
                 pool,
                 &fiscal_number,
                 doc_id,
-                &id_hex,
                 trace_attempt_no_i32,
                 wire_started,
                 wire_finished,
-                expected_server_fiscal_no,
             )
             .await?;
-            // **REC-1 Phase 2a.1 Commit 6.1.2 (2026-05-24)**:
-            // ErRedriveQueued surface counter == 0 because Envelope
-            // 1c-post atomically reset counter (Sent→ER advance =
-            // any-advance-resets contract); ER class guard takes
-            // over via transport_trace.retry_class budget.
-            // **REC-6 Phase 2b Commit 6.2 (2026-05-24)**: class =
-            // `FailureClass::NotFound` (semantically точно — DPS
-            // healthy + functioning, application-level negative
-            // result).  НЕ `Transport` бо це не network failure —
-            // запобігає false-positive auto-offline transitions per
-            // memory `feedback_offline_transition_strategy`.
-            Ok(ConfirmDrainOutcome::HoldFnDrain {
-                projection: HoldFnDrainProjection::ErRedriveQueued,
-                consecutive_holds: 0,
-                class: FailureClass::NotFound,
-            })
+            // **CS-3 S7-1 re-audit F2-kvt2 (2026-07-22)**: the SentReplay
+            // NotFound path no longer downgrades Sent→ER for a next-tick
+            // redrive — R6 retired that edge, and a blind re-send of an
+            // issuance-ambiguous doc is the double-issue hazard this whole
+            // campaign removes.  Envelope 1c-manual has ALREADY escalated the
+            // doc to RequiresManualReconciliation + halted the node to
+            // STOP_MODE + written the Critical `SENT_NOT_FOUND_ESCALATED_MANUAL`
+            // operator-handoff audit + completed the recovery trace with
+            // `retry_class = NULL`.  The caller maps this outcome to a manual-
+            // recon `DocVerdict::Failed` so the drain loop escalates the FN
+            // shift to Manual + HALTS (mirrors the boot-side F2 producer).
+            Ok(ConfirmDrainOutcome::SentNotFoundEscalated)
         }
         Kvt2ConfirmOutcome::SupersededHold { dps_tip_id, .. } => {
             // **SEAM-B-3 (architect-locked contract, 2026-06-13)**:
@@ -1619,109 +1648,86 @@ async fn commit_sent_replay_envelope_1a_replay(
     Ok(())
 }
 
-/// **M3b W12 Commit 5b.1 (plan §412 Envelope 1c-post, 2026-05-22)**
-/// — SentReplay NotFound path: 3-write atomic envelope bundling
-/// `transport_trace::complete_tx` TransientRetry + `Sent →
-/// ErrorRetryable` CAS + `OFFLINE_DRAIN_DOC_FAILED` audit (failure_
-/// class="transport", manual_recon_class=false).  HIGH-C5-3 safe-
-/// redrive seam: doc lands in ER cohort for next-tick W9b ER-class-
-/// guard bounded Pattern B redrive via `stage_send::run`.
+/// **CS-3 S7-1 re-audit F2-kvt2 (2026-07-22)** — SentReplay NotFound
+/// escalation envelope; offline-drain twin of the boot-side
+/// `cas_sent_not_found_to_manual_from_probe` (`52f562f`).  A `SENT` doc whose
+/// `last_chk` probe returns NotFound is issuance-AMBIGUOUS (DPS may hold the
+/// receipt or never saw it), so it MUST NOT be blindly re-driven — a second
+/// wire for an already-`CALL_STARTED` doc is the double-issue hazard this whole
+/// campaign removes.  In ONE `with_immediate`:
+///   1. `sent_not_found::sent_not_found_to_manual` — `Sent → RMR` + node
+///      `STOP_MODE` (fork-guard: the SENT doc leaves the cohort, so a successor
+///      must not become the chain head) + Critical `SENT_NOT_FOUND_ESCALATED_
+///      MANUAL` operator-handoff audit.  A `DocNotSent` (someone already moved
+///      the doc — structurally impossible under the drain's single-writer lease,
+///      tolerated for parity with the boot mirror) is benign → no-op.
+///   2. `transport_trace::complete_tx` with `retry_class = None` — R6 retired
+///      the two-tick ErrorRetryable redrive, so NO dispatcher re-drives this doc;
+///      it is terminal-manual (RMR), not an ER cohort member.
 ///
-/// `retry_class=TransientRetry` enables next-tick `ErRedriveDecision::
-/// Redrive` per W9b guard contract (durable last-attempt retry_class
-/// must be TransientRetry + attempts_used < MAX_BOOT_ATTEMPTS).
-#[allow(clippy::too_many_arguments)] // 8 args — bundled envelope shape
-async fn commit_sent_replay_envelope_1c_post(
+/// Replaces the retired `commit_sent_replay_envelope_1c_post` (Sent→ER + a
+/// two-tick redrive), whose ER queueing both WEDGED the R6 drain and left an
+/// issued-looking ER doc that a successor could fork off.
+async fn commit_sent_replay_envelope_1c_manual(
     pool: &SqlitePool,
     fiscal_number: &str,
     doc_id: DocumentId,
-    id_hex: &str,
     trace_attempt_no: i32,
     wire_started: String,
     wire_finished: String,
-    server_fiscal_no: &str,
 ) -> Result<(), BootError> {
-    let payload = serde_json::json!({
-        "document_id": id_hex,
-        "failure_class": "transport",
-        "probe_outcome": "NotFound",
-        "expected_server_fiscal_no": server_fiscal_no,
-        "manual_recon_class": false,
-        "dispatch_via": "kvt2_confirm",
-        "trace_attempt_no": trace_attempt_no,
-        "downgrade_to": DocState::ErrorRetryable.as_str(),
-    });
-    let payload_owned = payload.to_string();
-    let id_hex_owned = id_hex.to_string();
+    use crate::services::reconciliation::sent_not_found::{
+        sent_not_found_to_manual, SentNotFoundError,
+    };
     let fn_owned = fiscal_number.to_string();
     with_immediate(pool, move |tx| {
         Box::pin(async move {
-            // (a) Complete recovery trace row з TransientRetry
-            // outcome — enables W9b ER guard next-tick redrive.
-            let trace_rows = transport_trace::complete_tx(
+            // (1) Sent → RequiresManualReconciliation + node STOP_MODE + Critical
+            // operator-handoff audit — the fiscal-critical writes, atomic with
+            // the trace completion below.
+            match sent_not_found_to_manual(tx, doc_id, &fn_owned).await {
+                Ok(()) => {}
+                Err(SentNotFoundError::DocNotSent(_)) => {
+                    // Someone else already moved the doc out of Sent — benign, no
+                    // partial trail (structurally impossible under the drain's
+                    // single-writer lease; tolerated for boot-mirror parity).
+                    return Ok::<(), anyhow::Error>(());
+                }
+                Err(e) => return Err(anyhow::Error::new(e)),
+            }
+            // (2) Complete the recovery trace — server-side condition (DPS has no
+            // record).  `retry_class = None` so NO dispatcher re-drives it (R6
+            // retired the two-tick ErrorRetryable redrive); the doc is now
+            // terminal-manual (RMR), and `sent_not_found_to_manual` already wrote
+            // the Critical operator-handoff audit above.
+            let n = transport_trace::complete_tx(
                 tx,
                 doc_id,
                 trace_attempt_no,
                 transport_trace::AttemptCompletion {
                     wire_call_started_at: wire_started,
                     wire_call_finished_at: wire_finished,
-                    outcome_kind: transport_trace::OutcomeKind::RetryableTransport,
+                    outcome_kind: transport_trace::OutcomeKind::RetryableServer,
                     server_fiscal_no: None,
                     server_status_code: None,
                     error_kind: Some("LASTCHK_NOT_FOUND".to_string()),
                     error_message: Some(
-                        "DPS lastChk returned empty id (NotFound); \
-                         doc downgraded to ErrorRetryable for next-tick \
-                         Pattern B redrive (HIGH-C5-3 safe-redrive)"
+                        "DPS last_chk returned NotFound for a Sent doc; escalated to \
+                         RequiresManualReconciliation + STOP (issuance-ambiguous, no \
+                         blind re-drive)"
                             .to_string(),
                     ),
-                    retry_class: Some("TransientRetry".to_string()),
+                    retry_class: None,
                 },
             )
             .await?;
-            if trace_rows != 1 {
+            if n != 1 {
                 return Err(anyhow::anyhow!(
-                    "backlog_drain({fn_id}): Envelope 1c-post trace.complete \
-                     produced rows_affected={trace_rows} for doc {doc_hex} \
-                     attempt_no={trace_attempt_no}",
+                    "kvt2_confirm({fn_id}): Envelope 1c-manual trace.complete produced \
+                     rows_affected={n} for doc {doc_id:?} attempt_no={trace_attempt_no}",
                     fn_id = fn_owned,
-                    doc_hex = id_hex_owned,
                 ));
             }
-            // (b) CAS Sent → ErrorRetryable.
-            let sent_to_er = fiscal_documents::transition_state(
-                tx,
-                doc_id,
-                DocState::Sent,
-                DocState::ErrorRetryable,
-            )
-            .await?;
-            if sent_to_er != TransitionOutcome::Applied {
-                return Err(anyhow::anyhow!(
-                    "backlog_drain({fn_id}): Envelope 1c-post CAS \
-                     Sent→ErrorRetryable produced {outcome:?} for doc {doc_hex}",
-                    fn_id = fn_owned,
-                    outcome = sent_to_er,
-                    doc_hex = id_hex_owned,
-                ));
-            }
-            // (c) **REC-1 Phase 2a.1 (2026-05-24)**: reset consecutive_
-            // holds counter — SentNotFoundDowngrade Sent→ER advance
-            // clears any prior Hold accumulation per Tier reset semantics
-            // (doc now in ER cohort awaiting W9b Pattern B redrive next
-            // tick; previous Hold history irrelevant to new attempt budget).
-            fiscal_documents::reset_consecutive_holds_tx(tx, doc_id).await?;
-            // (d) Forensic audit row.
-            audit_log::append_tx(
-                tx,
-                AUDIT_ENTITY_DOC,
-                &id_hex_owned,
-                "OFFLINE_DRAIN_DOC_FAILED",
-                Severity::Warning,
-                None,
-                Some(&payload_owned),
-            )
-            .await?;
             Ok::<(), anyhow::Error>(())
         })
     })
@@ -2049,14 +2055,14 @@ mod tests {
 
     #[test]
     fn ok_with_data_sign_returns_acked_sent_fresh() {
-        let result = Ok(ack("FN-001", vec![0xAA, 0xBB, 0xCC]));
+        let result = Ok(ack("FN-001", vec![0xAA; 64]));
         let outcome = classify_check_result(result, Kvt2ConfirmSource::SentFresh, None, false);
         match outcome {
             Kvt2ConfirmOutcome::Acked {
                 kvt1_raw_bytes,
                 sent_replay_trace_attempt_no,
             } => {
-                assert_eq!(kvt1_raw_bytes, vec![0xAA, 0xBB, 0xCC]);
+                assert_eq!(kvt1_raw_bytes, vec![0xAA; 64]);
                 assert_eq!(sent_replay_trace_attempt_no, None);
             }
             other => panic!("expected Acked, got {other:?}"),
@@ -2065,14 +2071,14 @@ mod tests {
 
     #[test]
     fn ok_with_data_sign_returns_acked_sent_replay_threads_trace_attempt_no() {
-        let result = Ok(ack("FN-001", vec![0xDE, 0xAD]));
+        let result = Ok(ack("FN-001", vec![0xDE; 64]));
         let outcome = classify_check_result(result, Kvt2ConfirmSource::SentReplay, Some(7), false);
         match outcome {
             Kvt2ConfirmOutcome::Acked {
                 kvt1_raw_bytes,
                 sent_replay_trace_attempt_no,
             } => {
-                assert_eq!(kvt1_raw_bytes, vec![0xDE, 0xAD]);
+                assert_eq!(kvt1_raw_bytes, vec![0xDE; 64]);
                 assert_eq!(sent_replay_trace_attempt_no, Some(7));
             }
             other => panic!("expected Acked with trace_attempt_no=Some(7), got {other:?}"),
@@ -2081,7 +2087,7 @@ mod tests {
 
     #[test]
     fn ok_with_data_sign_returns_acked_kvt1_reentry() {
-        let result = Ok(ack("FN-001", vec![0xFF]));
+        let result = Ok(ack("FN-001", vec![0xFF; 64]));
         let outcome = classify_check_result(result, Kvt2ConfirmSource::Kvt1Reentry, None, false);
         assert!(matches!(
             outcome,
@@ -2329,5 +2335,35 @@ mod tests {
             map_hold_reason_to_class(&Kvt2ConfirmHoldReason::LastChkDataSignEmpty),
             FailureClass::Internal
         );
+    }
+
+    #[test]
+    fn classify_remote_status_and_indeterminate_hold_dps_server_ra() {
+        // RA all-consumers pin (compatibility projection): R1 `RemoteStatus` / slice-A
+        // `Indeterminate` map to Hold(DpsServer, Debug-formatted) — identical to the
+        // catch-all — so the confirm path is behaviour-neutral vs current main.
+        for err in [
+            DpsError::RemoteStatus {
+                code: "Unauthenticated".into(),
+                message: "creds rejected".into(),
+                digest: prro_domain::delivery::GrpcStatusDigest::from_transport_digest([0xAB; 32]),
+            },
+            DpsError::Indeterminate {
+                code: -4,
+                message: "server unknown".into(),
+                digest: prro_domain::delivery::DecodedResponseDigest::from_transport_digest(
+                    [0xAB; 32],
+                ),
+            },
+        ] {
+            let out = classify_check_result(Err(err), Kvt2ConfirmSource::SentFresh, None, false);
+            match out {
+                Kvt2ConfirmOutcome::Hold {
+                    reason: Kvt2ConfirmHoldReason::DpsServer(_),
+                    ..
+                } => {}
+                other => panic!("expected Hold(DpsServer) for RA compat projection, got {other:?}"),
+            }
+        }
     }
 }

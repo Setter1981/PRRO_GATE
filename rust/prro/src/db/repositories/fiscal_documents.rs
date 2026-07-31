@@ -24,6 +24,9 @@ use crate::db::models::{
     ids::{CashierId, DocumentId, OfflineSessionId, RequestId, ShiftId},
 };
 use crate::db::tx::WriteTxConn;
+use crate::db::types::{
+    DbCashierId, DbDocState, DbDocType, DbDocumentId, DbOfflineSessionId, DbRequestId, DbShiftId,
+};
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone)]
@@ -201,6 +204,12 @@ pub fn allowed_transition(from: DocState, to: DocState) -> bool {
             // hop through ErrorRetryable, because the situation is not retryable
             // (DPS state and local state diverged at the protocol layer).
             | (Sent, RequiresManualReconciliation)
+            // CS-3 Slice 5 (design §3.4): the one missing live document edge for operator
+            // completion of a crashed / SubmittedUnknown send — a `Sending` document with a
+            // matching CALL_STARTED / PENDING reservation whose operator resolution is
+            // not-accepted (or MAC) is moved to the existing manual/terminal state.  Callable
+            // only from the operator-completion branch (`complete_operator_pending`); NOT a resend.
+            | (Sending, RequiresManualReconciliation)
             | (Kvt1, Kvt2)
             | (Kvt1, ErrorRetryable)
             | (Kvt2, Ack)
@@ -267,13 +276,13 @@ pub async fn insert_prepared(pool: &SqlitePool, n: &NewDocument) -> sqlx::Result
              signed_by_cashier_id, signing_config_snapshot_id
            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
-    .bind(n.document_id)
-    .bind(n.request_id)
+    .bind(DbDocumentId(n.document_id))
+    .bind(DbRequestId(n.request_id))
     .bind(&n.fiscal_number)
-    .bind(n.shift_id)
-    .bind(n.offline_session_id)
+    .bind(n.shift_id.map(DbShiftId))
+    .bind(n.offline_session_id.map(DbOfflineSessionId))
     .bind(n.lnd)
-    .bind(n.doc_type)
+    .bind(n.doc_type.as_str())
     .bind(&n.backend_profile_id)
     .bind(&n.transport_profile_id)
     .bind(n.fs_mode)
@@ -333,16 +342,16 @@ pub async fn transition_state(
              SET state = ?, first_kvt1_at = COALESCE(first_kvt1_at, CURRENT_TIMESTAMP) \
              WHERE document_id = ? AND state = ?",
         )
-        .bind(to)
-        .bind(id)
-        .bind(from)
+        .bind(to.as_str())
+        .bind(DbDocumentId(id))
+        .bind(from.as_str())
         .execute(&mut **tx)
         .await?
     } else {
         sqlx::query("UPDATE fiscal_documents SET state = ? WHERE document_id = ? AND state = ?")
-            .bind(to)
-            .bind(id)
-            .bind(from)
+            .bind(to.as_str())
+            .bind(DbDocumentId(id))
+            .bind(from.as_str())
             .execute(&mut **tx)
             .await?
     };
@@ -355,7 +364,7 @@ pub async fn transition_state(
     // INSERT/DELETE.
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ? LIMIT 1")
-            .bind(id)
+            .bind(DbDocumentId(id))
             .fetch_optional(&mut **tx)
             .await?;
     Ok(if exists.is_some() {
@@ -435,9 +444,9 @@ pub async fn transition_to_offline_local_ack_tx(
     )
     .bind(code_lnd)
     .bind(consumed_at)
-    .bind(offline_session_id)
+    .bind(DbOfflineSessionId(offline_session_id))
     .bind(dps_code)
-    .bind(id)
+    .bind(DbDocumentId(id))
     .bind(fiscal_number)
     .execute(&mut **tx)
     .await?;
@@ -450,7 +459,7 @@ pub async fn transition_to_offline_local_ack_tx(
     // the doc EXISTS but its fiscal_number doesn't match).
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ? LIMIT 1")
-            .bind(id)
+            .bind(DbDocumentId(id))
             .fetch_optional(&mut **tx)
             .await?;
     Ok(if exists.is_some() {
@@ -498,9 +507,9 @@ pub async fn stamp_offline_issuance_tx(
     )
     .bind(code_lnd)
     .bind(consumed_at)
-    .bind(offline_session_id)
+    .bind(DbOfflineSessionId(offline_session_id))
     .bind(dps_code)
-    .bind(id)
+    .bind(DbDocumentId(id))
     .bind(fiscal_number)
     .execute(&mut **tx)
     .await?;
@@ -517,13 +526,14 @@ pub async fn read_offline_stamp_tx(
     tx: &mut WriteTxConn<'_>,
     id: DocumentId,
 ) -> sqlx::Result<Option<OfflineStamp>> {
+    let db_id = DbDocumentId(id);
     let row = sqlx::query!(
         r#"SELECT offline_fiscal_no,
                   offline_fiscal_date,
-                  offline_session_id as "offline_session_id: OfflineSessionId",
+                  offline_session_id as "offline_session_id: DbOfflineSessionId",
                   offline_dps_code
            FROM fiscal_documents WHERE document_id = ?"#,
-        id
+        db_id
     )
     .fetch_optional(&mut **tx)
     .await?;
@@ -538,7 +548,7 @@ pub async fn read_offline_stamp_tx(
             Ok(Some(OfflineStamp {
                 code_lnd,
                 consumed_at,
-                offline_session_id,
+                offline_session_id: offline_session_id.0,
                 dps_code,
             }))
         }
@@ -553,6 +563,107 @@ pub struct OfflineStamp {
     pub consumed_at: String,
     pub offline_session_id: OfflineSessionId,
     pub dps_code: String,
+}
+
+/// B10 — existence probe for the offline-session boundary docs (DocType
+/// `OFFLINE_SESSION_BEGIN` / `OFFLINE_SESSION_END`).  Returns `true` iff an
+/// ACTIVE (non-terminal-failed) boundary doc of `doc_type` already exists for
+/// `(fiscal_number, shift_id)`.
+///
+/// **Keyed on `shift_id`, NOT `offline_session_id`** — the session_id is
+/// stamped only at SIGN (`stamp_offline_issuance_tx`), so a crashed-PREPARED
+/// boundary doc has a NULL `offline_session_id` and would be invisible to a
+/// session-keyed probe → double-mint (the arch-locked idempotency trap).  The
+/// `shift_id` is set at mint and is the stable per-session anchor that survives
+/// the PREPARED-crash window (one offline session per open shift).
+///
+/// **State set**: any state OTHER than the terminal-FAILED ones
+/// (`REJECTED`/`ABORTED`/`CANCELLED`/`REQUIRES_MANUAL_RECONCILIATION`).  A
+/// still-live (PREPARED/SIGNED/OFFLINE_LOCAL_ACK/…) or successfully-issued
+/// (ACK) boundary doc counts as "exists" → do NOT re-mint.  A boundary doc that
+/// terminated in a failed state (a prior aborted attempt) does NOT count → a
+/// fresh mint is allowed.  This mirrors the partial UNIQUE index
+/// `ux_fd_active_offline_boundary` (migration 030) — the DB constraint is the
+/// fail-closed backstop; this read is the idempotency gate.
+pub async fn active_boundary_doc_state_tx(
+    tx: &mut WriteTxConn<'_>,
+    fiscal_number: &str,
+    shift_id: ShiftId,
+    doc_type: DocType,
+) -> sqlx::Result<Option<DocState>> {
+    debug_assert!(
+        matches!(
+            doc_type,
+            DocType::OfflineSessionBegin | DocType::OfflineSessionEnd
+        ),
+        "active_boundary_doc_state_tx is only meaningful for boundary doc types"
+    );
+    let row: Option<DocState> = sqlx::query_scalar::<_, DbDocState>(
+        "SELECT state FROM fiscal_documents \
+         WHERE fiscal_number = ? AND shift_id = ? AND doc_type = ? \
+           AND state NOT IN ( \
+               'REJECTED','ABORTED','CANCELLED','REQUIRES_MANUAL_RECONCILIATION' \
+           ) \
+         LIMIT 1",
+    )
+    .bind(fiscal_number)
+    .bind(DbShiftId(shift_id))
+    .bind(doc_type.as_str())
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|w| w.0);
+    Ok(row)
+}
+
+/// B10 (review Finding B fix) — read the `state` of the fiscal_documents row with
+/// the given `request_id`, or `None` if no row exists.
+///
+/// This is the crash-safe idempotency probe for the lazy DocType=9 BEGIN, keyed
+/// on the BEGIN's DETERMINISTIC synthetic `request_id` (`sha256("b10-begin-<fn>")`)
+/// — the ONLY anchor stamped at MINT (stage_acquire INSERT) that survives EVERY
+/// crash window AND works for EVERY first-offline-doc type:
+///   - keying on `shift_id` misses when the first offline doc is a SHIFT_OPEN
+///     (the shift is not created until that SHIFT_OPEN's acquire);
+///   - keying on `offline_session_id` misses a crashed PREPARED BEGIN (the column
+///     is stamped only at sign).
+///
+/// The caller maps the returned state: issued → proceed, terminal-failed / None
+/// → mint, else (below-OLA non-terminal) → fail-closed 503.
+pub async fn doc_state_by_request_id_tx(
+    tx: &mut WriteTxConn<'_>,
+    request_id: &[u8; 16],
+) -> sqlx::Result<Option<DocState>> {
+    let row: Option<DocState> = sqlx::query_scalar::<_, DbDocState>(
+        "SELECT state FROM fiscal_documents WHERE request_id = ? LIMIT 1",
+    )
+    .bind(&request_id[..])
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|w| w.0);
+    Ok(row)
+}
+
+/// CS-3 S7-1 — read the current `state` of a document by id (pool-bound, no tx).
+///
+/// Used by the inline write-path to report the ACTUAL persisted document state on a
+/// `202 IN_PROGRESS` outcome, instead of the routing-target guess.  Post-cutover the composed
+/// apply HOLDS a transient (`SubmittedUnknown`) in `SENDING` (`PENDING_APPLY` + STOP), so the
+/// routing target (`ErrorRetryable`) is no longer the persisted state; the FnConfigError path DOES
+/// persist `ErrorRetryable`.  Both classify to `InProgress` (202), but the reported
+/// `document_state` string must be truthful (first-pass ↔ replay parity: the re-poll path already
+/// reads `fd.state`).  `None` ⟺ no such row.
+pub async fn state_by_document_id(
+    pool: &SqlitePool,
+    id: DocumentId,
+) -> sqlx::Result<Option<DocState>> {
+    let row: Option<DocState> = sqlx::query_scalar::<_, DbDocState>(
+        "SELECT state FROM fiscal_documents WHERE document_id = ? LIMIT 1",
+    )
+    .bind(DbDocumentId(id))
+    .fetch_optional(pool)
+    .await?
+    .map(|w| w.0);
+    Ok(row)
 }
 
 /// B9 Slice A — slim `SIGNED → OFFLINE_LOCAL_ACK` state CAS with **no** column
@@ -575,7 +686,7 @@ pub async fn transition_signed_to_offline_local_ack_tx(
          SET state = 'OFFLINE_LOCAL_ACK' \
          WHERE document_id = ? AND fiscal_number = ? AND state = 'SIGNED'",
     )
-    .bind(id)
+    .bind(DbDocumentId(id))
     .bind(fiscal_number)
     .execute(&mut **tx)
     .await?;
@@ -584,7 +695,7 @@ pub async fn transition_signed_to_offline_local_ack_tx(
     }
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ? LIMIT 1")
-            .bind(id)
+            .bind(DbDocumentId(id))
             .fetch_optional(&mut **tx)
             .await?;
     Ok(if exists.is_some() {
@@ -623,11 +734,11 @@ pub async fn transition_signed_to_offline_local_ack_tx(
 /// authoritative chain-recovery key; the other two are tiebreakers.
 pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result<Vec<DocumentRow>> {
     let rows = sqlx::query!(
-        r#"SELECT document_id    as "document_id: DocumentId",
+        r#"SELECT document_id    as "document_id: DbDocumentId",
                   fiscal_number,
                   lnd,
-                  state           as "state: DocState",
-                  doc_type        as "doc_type: DocType",
+                  state           as "state: DbDocState",
+                  doc_type        as "doc_type: DbDocType",
                   server_fiscal_no,
                   submission_attempted_at,
                   backend_profile_id,
@@ -636,7 +747,7 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signed_by_cashier_id  as "signed_by_cashier_id: DbCashierId",
                   signing_config_snapshot_id
            FROM fiscal_documents
            WHERE fiscal_number = ?
@@ -649,11 +760,11 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
     rows.into_iter()
         .map(|r| {
             Ok(DocumentRow {
-                document_id: r.document_id,
+                document_id: r.document_id.0,
                 fiscal_number: r.fiscal_number,
                 lnd: r.lnd,
-                state: r.state,
-                doc_type: r.doc_type,
+                state: r.state.0,
+                doc_type: r.doc_type.0,
                 server_fiscal_no: r.server_fiscal_no,
                 submission_attempted_at: r.submission_attempted_at,
                 backend_profile_id: r.backend_profile_id,
@@ -662,7 +773,7 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
                 z_report_number: r.z_report_number,
                 unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
                 signing_inputs_pinned_at: r.signing_inputs_pinned_at,
-                signed_by_cashier_id: r.signed_by_cashier_id,
+                signed_by_cashier_id: r.signed_by_cashier_id.map(|c| c.0),
                 signing_config_snapshot_id: r.signing_config_snapshot_id,
             })
         })
@@ -673,11 +784,24 @@ pub async fn list_pending_for_fn(pool: &SqlitePool, fn_id: &str) -> sqlx::Result
 /// signing_config_snapshot_id)`.  The snapshot FK (nullable; NULL only for
 /// pre-W4-Z2a docs) lets the Z TXS aggregation resolve each receipt's tax
 /// groups with the SAME config it was signed under.
-#[derive(sqlx::FromRow)]
 struct ShiftReceiptRow {
     doc_type: DocType,
     payload_json: String,
     signing_config_snapshot_id: Option<i64>,
+}
+
+// Manual `FromRow` (CS-1b): `doc_type` is the pure `prro_domain::DocType`,
+// which is sqlx-free, so decode it through the store-side `DbDocType` wrapper
+// then convert to the domain enum — keeping the struct field type unchanged.
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for ShiftReceiptRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            doc_type: row.try_get::<DbDocType, _>("doc_type")?.0,
+            payload_json: row.try_get("payload_json")?,
+            signing_config_snapshot_id: row.try_get("signing_config_snapshot_id")?,
+        })
+    }
 }
 
 /// RS-2 piece-2b — the issued `SELL` / `RETURN` receipts of a shift, for
@@ -708,7 +832,7 @@ pub async fn list_shift_issued_receipts(
          ORDER BY lnd",
     )
     .bind(fn_id)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -717,10 +841,21 @@ pub async fn list_shift_issued_receipts(
         .collect())
 }
 
-#[derive(sqlx::FromRow)]
 struct ShiftPendingRow {
     document_id: Vec<u8>,
     state: DocState,
+}
+
+// Manual `FromRow` (CS-1b): decode `state` via the store-side `DbDocState`
+// wrapper, then convert back to the pure domain enum.
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for ShiftPendingRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            document_id: row.try_get("document_id")?,
+            state: row.try_get::<DbDocState, _>("state")?.0,
+        })
+    }
 }
 
 /// RS-3 A1Z quiescence — the IN-FLIGHT (non-issued, non-terminal) SELL /
@@ -745,7 +880,7 @@ pub async fn list_shift_pending_receipts_for_z_quiescence(
         "SELECT document_id, state \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
-           AND doc_type IN ('SELL','RETURN') \
+           AND doc_type IN ('SELL','RETURN','SERVICE_IN','SERVICE_OUT','CASH_ADVANCE_EPZ') \
            AND ( \
                  state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT', \
                            'KVT1','KVT2','ERROR_RETRYABLE') \
@@ -763,7 +898,7 @@ pub async fn list_shift_pending_receipts_for_z_quiescence(
          ORDER BY lnd",
     )
     .bind(fn_id)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -783,7 +918,7 @@ pub async fn list_shift_pending_receipts_for_z_quiescence(
 /// lowercase 32-char hex (`lower(hex(...))`) to match
 /// `runtime::ingress::dto::request_id_to_string`.  Read-only
 /// (`fetch_optional`), runtime `query_as` (no `.sqlx` cache), NO write-tx.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct TerminalOutcome {
     pub document_id: String,
     pub state: DocState,
@@ -797,6 +932,25 @@ pub struct TerminalOutcome {
     /// are NOT used.
     pub first_kvt1_at: Option<String>,
     pub total_sum_kop: Option<i64>,
+}
+
+// Manual `FromRow` (CS-1b): `state` / `doc_type` are the pure (sqlx-free)
+// domain enums, decoded via the store-side `DbDocState` / `DbDocType` wrappers
+// and converted back. The public field types stay the domain enums, so external
+// consumers (`replay.rs`, `inbox_reaper.rs`, `is_terminally_failed`) are
+// unchanged. Column-name based (matches the derived FromRow it replaces).
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for TerminalOutcome {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            document_id: row.try_get("document_id")?,
+            state: row.try_get::<DbDocState, _>("state")?.0,
+            doc_type: row.try_get::<DbDocType, _>("doc_type")?.0,
+            server_fiscal_no: row.try_get("server_fiscal_no")?,
+            first_kvt1_at: row.try_get("first_kvt1_at")?,
+            total_sum_kop: row.try_get("total_sum_kop")?,
+        })
+    }
 }
 
 pub async fn terminal_outcome_by_request_id(
@@ -844,6 +998,8 @@ pub async fn last_server_fiscal_no(
     fiscal_number: &str,
 ) -> sqlx::Result<Option<String>> {
     sqlx::query_scalar::<_, String>(
+        // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+        // scoped to one `fiscal_number`, so `lnd` breaks every tie — a total order.
         "SELECT server_fiscal_no FROM fiscal_documents \
          WHERE fiscal_number = ? AND state = 'ACK' \
                AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0 \
@@ -879,6 +1035,8 @@ pub async fn last_submitted_server_fiscal_no(
     fiscal_number: &str,
 ) -> sqlx::Result<Option<String>> {
     sqlx::query_scalar::<_, String>(
+        // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+        // scoped to one `fiscal_number`, so `lnd` breaks every tie — a total order.
         "SELECT server_fiscal_no FROM fiscal_documents \
          WHERE fiscal_number = ? AND state IN ('SENT', 'KVT1', 'KVT2', 'ACK') \
                AND server_fiscal_no IS NOT NULL AND length(server_fiscal_no) > 0 \
@@ -981,6 +1139,8 @@ pub async fn newest_pending_submittable(
     fiscal_number: &str,
 ) -> sqlx::Result<Option<(i64, Option<String>)>> {
     sqlx::query_as::<_, (i64, Option<String>)>(
+        // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+        // scoped to one `fiscal_number`, so `lnd` breaks every tie — a total order.
         "SELECT lnd, server_fiscal_no FROM fiscal_documents \
          WHERE fiscal_number = ? AND state IN ('SENT', 'KVT1', 'KVT2') \
          ORDER BY lnd DESC \
@@ -1023,6 +1183,8 @@ pub async fn last_ack_unsigned_xml_sha256(
     pool: &SqlitePool,
     fiscal_number: &str,
 ) -> sqlx::Result<Option<Vec<u8>>> {
+    // ordering-justified: `ux_fd_fn_lnd(fiscal_number, lnd)` is UNIQUE and this query is
+    // scoped to one `fiscal_number`, so `lnd` breaks every tie — a total order.
     let row: Option<Option<Vec<u8>>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(
         "SELECT unsigned_xml_sha256 FROM fiscal_documents \
          WHERE fiscal_number = ? AND state = 'ACK' \
@@ -1043,8 +1205,16 @@ pub async fn last_ack_unsigned_xml_sha256(
 /// [`last_issued_unsigned_xml_sha256`] (AUD-L6-1 boot seed projection) so the two
 /// CANNOT diverge — the boot projection must equal the walk's final `expected`.
 /// Online-origin docs issue ONLY at `ACK` (handled separately, NOT in this set).
-pub const OFFLINE_ISSUED_STATES: [&str; 7] = [
+///
+/// **CS-3 S7-1 (2026-07-21):** `SENDING` joins the set. Under the composed HOLD contract an
+/// offline-origin doc whose drain wire is HELD (offline reject / submitted-unknown) rests durably
+/// in `SENDING` (`PENDING_APPLY`), yet it already crossed `OFFLINE_LOCAL_ACK` and advanced the
+/// seed (M2-01) — so it is STILL issued. Omitting it would break the MAC-walk (a held offline
+/// predecessor would drop out of the chain → false `ChainBreak` at its successor) and the boot
+/// `last_issued_unsigned_xml_sha256` projection (a held tip would be skipped).
+pub const OFFLINE_ISSUED_STATES: [&str; 8] = [
     "OFFLINE_LOCAL_ACK",
+    "SENDING",
     "SENT",
     "KVT1",
     "ERROR_RETRYABLE",
@@ -1132,8 +1302,8 @@ pub async fn exists_blocking_non_issued_sibling_tx(
            AND (? IS NULL OR lnd < ?)",
     )
     .bind(fiscal_number)
-    .bind(self_document_id)
-    .bind(self_document_id)
+    .bind(self_document_id.map(DbDocumentId))
+    .bind(self_document_id.map(DbDocumentId))
     .bind(self_lnd)
     .bind(self_lnd)
     .fetch_all(&mut **tx)
@@ -1157,7 +1327,7 @@ pub async fn is_online_origin_tx(
 ) -> sqlx::Result<bool> {
     let fs_mode: Option<String> =
         sqlx::query_scalar("SELECT fs_mode FROM fiscal_documents WHERE document_id = ?")
-            .bind(document_id)
+            .bind(DbDocumentId(document_id))
             .fetch_optional(&mut **tx)
             .await?;
     Ok(matches!(fs_mode.as_deref(), Some("ONLINE")))
@@ -1172,10 +1342,13 @@ pub async fn is_online_origin_tx(
 /// which is stale when the tail is offline-origin).  Result equals the
 /// `invariant_scan` MAC-walk's final `expected` by construction (same issued
 /// predicate + max-lnd).  `None` ⟺ no issued doc (genesis).  Pool-bound read.
-pub async fn last_issued_unsigned_xml_sha256(
-    pool: &SqlitePool,
+pub async fn last_issued_unsigned_xml_sha256<'e, E>(
+    executor: E,
     fiscal_number: &str,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<Vec<u8>>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     // A.3 / D4 — FETCH-THEN-FILTER: a SQL string cannot host the Rust
     // [`is_issued`] predicate (the online arm keys on `server_fiscal_no`, not a
     // state literal), so fetch candidate rows in descending `lnd` order and
@@ -1198,12 +1371,143 @@ pub async fn last_issued_unsigned_xml_sha256(
          ORDER BY lnd DESC",
     )
     .bind(fiscal_number)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()
         .find(|r| is_issued(&r.state, r.offline_fiscal_no, r.server_fiscal_no.as_deref()))
         .and_then(|r| r.unsigned_xml_sha256))
+}
+
+/// **Active MAC-chain tip** — the seed the live chain currently rests at, which is NOT always the
+/// last issued document's hash (bd PRRO_GATE-2nk). This is the projection **recovery + the MacReseed
+/// guard-B** must use; [`last_issued_unsigned_xml_sha256`] keeps its honest "last issued doc"
+/// semantics and is a lower-level primitive.
+///
+/// The only operation that moves the tip BELOW the last issued doc is a `NotAcceptedOffline`
+/// completion: it rewinds `node_state`'s seed to the held doc's own immutable `previous_hash` and
+/// marks that doc `chain_superseded_at` (delivery_reservation.rs). Crucially, that rewind target may
+/// be a **non-document seed** — e.g. a T=112 code-replenish sets the seed to `sha256(request_xml)`
+/// with NO producing fiscal document (offline_code_replenish.rs) — so it CANNOT be recovered by
+/// "the previous issued doc's hash". It IS, however, stored verbatim as the superseded doc's
+/// `previous_hash`, so we read it DIRECTLY.
+///
+/// Walk newest-first (`lnd DESC`), skipping dead cohort docs (`CANCELLED`/`ABORTED` — their
+/// back-pointers are voided-sub-chain artifacts):
+///   - first `chain_superseded_at` doc → its `previous_hash` (the exact rewind target, incl. genesis
+///     `NULL` and non-doc seeds);
+///   - else first `is_issued` doc → its `unsigned_xml_sha256` (a normal issuance AFTER any rewind
+///     overrides the older marker, since it re-advanced the seed);
+///   - else genesis (`None`).
+///
+/// NOTE (scope, bd PRRO_GATE-mcc + 2nk + hpc): this recovers the tip when the last seed-changing
+/// event left a trace EITHER in the ledger (an issued doc, or a rewind captured on a superseded
+/// doc's `previous_hash`) OR in the durable `chain_seed_transitions` witness (bd PRRO_GATE-hpc —
+/// the standalone T=112 replenish advances the seed to a NON-DOCUMENT value `Hs = sha256(request_xml)`
+/// with no producing fiscal document; the witness records it in the same per-FN `lnd` frame).  The
+/// doc-walk and the witness are reconciled by the §4.2 ordering rule below (strict `>` tie-break).
+/// All three seed consumers (NC-03 boot, MacReseed guard-B, invariant_scan) inherit both fixes
+/// through this ONE projection, exactly as bd 2nk folded in `chain_superseded_at`.
+pub async fn active_chain_tip_unsigned_xml_sha256<'e, E>(
+    executor: E,
+    fiscal_number: &str,
+) -> sqlx::Result<Option<Vec<u8>>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    // hpc: the projection now folds TWO sources (the doc walk + the durable T=112 witness).  It runs
+    // as ONE query so the public `E: Executor` signature — and all three call sites (boot `pool`,
+    // guard-B `&mut **tx`, scan `pool`) — stay byte-for-byte untouched (`E` is consumed once by a
+    // single `fetch_all`).  The query UNION-ALLs the fiscal_documents candidate rows with the single
+    // newest `chain_seed_transitions` witness, tagged by a `src` discriminator; the Rust below folds
+    // them via the §4.2 ordering rule.
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        src: String,
+        ord: i64,
+        state: Option<String>,
+        previous_hash: Option<Vec<u8>>,
+        unsigned_xml_sha256: Option<Vec<u8>>,
+        offline_fiscal_no: Option<i64>,
+        server_fiscal_no: Option<String>,
+        chain_superseded_at: Option<String>,
+        new_seed: Option<Vec<u8>>,
+    }
+    // Doc rows carry (src='DOC', ord=lnd, the raw columns the walk needs).  The witness row carries
+    // (src='WIT', ord=lnd_at_write, new_seed).  A `sort` key ('DOC'/'WIT') is only cosmetic — the
+    // Rust fold picks the doc-tip and the single witness independently.
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT 'DOC' AS src, lnd AS ord, state, previous_hash, unsigned_xml_sha256, \
+                offline_fiscal_no, server_fiscal_no, chain_superseded_at, NULL AS new_seed \
+           FROM fiscal_documents \
+          WHERE fiscal_number = ?1 AND unsigned_xml_sha256 IS NOT NULL \
+         UNION ALL \
+         SELECT src, ord, state, previous_hash, unsigned_xml_sha256, offline_fiscal_no, \
+                server_fiscal_no, chain_superseded_at, new_seed FROM ( \
+             SELECT 'WIT' AS src, lnd_at_write AS ord, NULL AS state, NULL AS previous_hash, \
+                    NULL AS unsigned_xml_sha256, NULL AS offline_fiscal_no, \
+                    NULL AS server_fiscal_no, NULL AS chain_superseded_at, new_seed \
+               FROM chain_seed_transitions \
+              WHERE fiscal_number = ?1 \
+              ORDER BY lnd_at_write DESC, created_at DESC, rowid DESC \
+              LIMIT 1) \
+         ORDER BY ord DESC",
+    )
+    .bind(fiscal_number)
+    .fetch_all(executor)
+    .await?;
+
+    // Doc-derived tip AND the ordinal of the doc that produced it (lnd of the superseded doc for a
+    // rewind marker, else lnd of the first issued doc).  Walk newest-first over the DOC rows only.
+    let mut doc_tip: Option<(Option<Vec<u8>>, i64)> = None;
+    let mut witness: Option<(Vec<u8>, i64)> = None;
+    for r in rows {
+        if r.src == "WIT" {
+            // Only ever one witness row (LIMIT 1 in the sub-select).  Newest T=112 seed.
+            if let Some(seed) = r.new_seed {
+                witness = Some((seed, r.ord));
+            }
+            continue;
+        }
+        if doc_tip.is_some() {
+            continue; // doc-tip already resolved; remaining DOC rows are older links
+        }
+        let state = r.state.unwrap_or_default();
+        if state == "CANCELLED" || state == "ABORTED" {
+            continue; // dead cohort — not a chain link
+        }
+        if r.chain_superseded_at.is_some() {
+            // The last seed-changing event was this rewind → its previous_hash IS the durable tip.
+            doc_tip = Some((r.previous_hash, r.ord));
+            continue;
+        }
+        if is_issued(&state, r.offline_fiscal_no, r.server_fiscal_no.as_deref()) {
+            // A normal issuance (newer than any marker) re-advanced the seed to its own hash.
+            doc_tip = Some((r.unsigned_xml_sha256, r.ord));
+            continue;
+        }
+        // A non-issued, non-dead doc (PREPARED/SIGNED/ENCRYPTED — a crash artifact) did not advance
+        // the seed; keep walking to the last seed-changing doc below it.
+    }
+
+    // §4.2 selection rule.  `lnd_at_write` (witness) and `ordinal` (doc) share the SAME
+    // strictly-monotonic per-FN frame (single-writer invariant #2), so:
+    //   - a witness with lnd_at_write = k is NEWER than every doc with lnd < k → witness wins;
+    //   - a doc that consumed lnd = k (issued AT/AFTER the witness reserved k) is NEWER → doc wins.
+    // STRICT `>` on the witness side encodes the load-bearing tie-break: at equal ordinal the DOC
+    // wins (it consumed the ordinal the witness merely reserved — the after-SELL case).
+    match (doc_tip, witness) {
+        (None, None) => Ok(None),                         // genesis
+        (Some((seed, _ordinal)), None) => Ok(seed), // pure-doc chain (incl. genesis rewind None)
+        (None, Some((w_seed, _lnd))) => Ok(Some(w_seed)), // replenish before any seed-changing doc
+        (Some((d_seed, d_ordinal)), Some((w_seed, w_lnd))) => {
+            if w_lnd > d_ordinal {
+                Ok(Some(w_seed)) // witness strictly newer than the producing doc
+            } else {
+                Ok(d_seed) // doc chained at/past the witness ordinal → doc wins
+            }
+        }
+    }
 }
 
 /// M3b W9b §3.1 + spec amendment 2026-05-21 (HIGH-C4-1 / HIGH-C4-8
@@ -1270,12 +1574,13 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
     fn_id: &str,
     session_id: OfflineSessionId,
 ) -> sqlx::Result<Vec<DocumentRow>> {
+    let db_session_id = DbOfflineSessionId(session_id);
     let rows = sqlx::query!(
-        r#"SELECT document_id    as "document_id: DocumentId",
+        r#"SELECT document_id    as "document_id: DbDocumentId",
                   fiscal_number,
                   lnd,
-                  state           as "state: DocState",
-                  doc_type        as "doc_type: DocType",
+                  state           as "state: DbDocState",
+                  doc_type        as "doc_type: DbDocType",
                   server_fiscal_no,
                   submission_attempted_at,
                   backend_profile_id,
@@ -1284,7 +1589,7 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signed_by_cashier_id  as "signed_by_cashier_id: DbCashierId",
                   signing_config_snapshot_id
            FROM fiscal_documents
            WHERE fiscal_number = ?
@@ -1293,18 +1598,18 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
              AND state IN ('OFFLINE_LOCAL_ACK','SENT','KVT1','ERROR_RETRYABLE','KVT2')
            ORDER BY lnd, created_at, document_id"#,
         fn_id,
-        session_id,
+        db_session_id,
     )
     .fetch_all(pool)
     .await?;
     rows.into_iter()
         .map(|r| {
             Ok(DocumentRow {
-                document_id: r.document_id,
+                document_id: r.document_id.0,
                 fiscal_number: r.fiscal_number,
                 lnd: r.lnd,
-                state: r.state,
-                doc_type: r.doc_type,
+                state: r.state.0,
+                doc_type: r.doc_type.0,
                 server_fiscal_no: r.server_fiscal_no,
                 submission_attempted_at: r.submission_attempted_at,
                 backend_profile_id: r.backend_profile_id,
@@ -1313,7 +1618,7 @@ pub async fn list_drain_candidates_for_fn_ordered_by_lnd(
                 z_report_number: r.z_report_number,
                 unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
                 signing_inputs_pinned_at: r.signing_inputs_pinned_at,
-                signed_by_cashier_id: r.signed_by_cashier_id,
+                signed_by_cashier_id: r.signed_by_cashier_id.map(|c| c.0),
                 signing_config_snapshot_id: r.signing_config_snapshot_id,
             })
         })
@@ -1359,6 +1664,9 @@ pub async fn is_session_drain_completable(
     pool: &SqlitePool,
     session_id: OfflineSessionId,
 ) -> sqlx::Result<bool> {
+    // `query!` binds params by reference, so the `Db*` wrapper needs a named
+    // binding to outlive the macro-generated borrow (CS-1b′).
+    let db_session_id = DbOfflineSessionId(session_id);
     let row = sqlx::query!(
         r#"SELECT
               COUNT(*)                                       AS "total!: i64",
@@ -1366,7 +1674,7 @@ pub async fn is_session_drain_completable(
            FROM fiscal_documents
            WHERE offline_session_id = ?
              AND fs_mode = 'OFFLINE'"#,
-        session_id,
+        db_session_id,
     )
     .fetch_one(pool)
     .await?;
@@ -1393,12 +1701,13 @@ pub async fn get_pending_by_request_id_tx(
     tx: &mut WriteTxConn<'_>,
     request_id: &RequestId,
 ) -> sqlx::Result<Option<DocumentRow>> {
+    let db_request_id = DbRequestId(*request_id);
     let row = sqlx::query!(
-        r#"SELECT document_id    as "document_id: DocumentId",
+        r#"SELECT document_id    as "document_id: DbDocumentId",
                   fiscal_number,
                   lnd,
-                  state           as "state: DocState",
-                  doc_type        as "doc_type: DocType",
+                  state           as "state: DbDocState",
+                  doc_type        as "doc_type: DbDocType",
                   server_fiscal_no,
                   submission_attempted_at,
                   backend_profile_id,
@@ -1407,22 +1716,22 @@ pub async fn get_pending_by_request_id_tx(
                   z_report_number,
                   unsigned_xml_sha256   as "unsigned_xml_sha256: Vec<u8>",
                   signing_inputs_pinned_at,
-                  signed_by_cashier_id  as "signed_by_cashier_id: CashierId",
+                  signed_by_cashier_id  as "signed_by_cashier_id: DbCashierId",
                   signing_config_snapshot_id
            FROM fiscal_documents
            WHERE request_id = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
-        request_id
+        db_request_id
     )
     .fetch_optional(&mut **tx)
     .await?;
     let Some(r) = row else { return Ok(None) };
     Ok(Some(DocumentRow {
-        document_id: r.document_id,
+        document_id: r.document_id.0,
         fiscal_number: r.fiscal_number,
         lnd: r.lnd,
-        state: r.state,
-        doc_type: r.doc_type,
+        state: r.state.0,
+        doc_type: r.doc_type.0,
         server_fiscal_no: r.server_fiscal_no,
         submission_attempted_at: r.submission_attempted_at,
         backend_profile_id: r.backend_profile_id,
@@ -1431,7 +1740,7 @@ pub async fn get_pending_by_request_id_tx(
         z_report_number: r.z_report_number,
         unsigned_xml_sha256: decode_blob32(r.unsigned_xml_sha256, "unsigned_xml_sha256")?,
         signing_inputs_pinned_at: r.signing_inputs_pinned_at,
-        signed_by_cashier_id: r.signed_by_cashier_id,
+        signed_by_cashier_id: r.signed_by_cashier_id.map(|c| c.0),
         signing_config_snapshot_id: r.signing_config_snapshot_id,
     }))
 }
@@ -1459,17 +1768,18 @@ pub async fn peek_pending_doc_id_and_snapshot_id_by_request_id(
     pool: &SqlitePool,
     request_id: &RequestId,
 ) -> sqlx::Result<Option<(DocumentId, Option<i64>)>> {
+    let db_request_id = DbRequestId(*request_id);
     let row = sqlx::query!(
-        r#"SELECT document_id as "document_id: DocumentId",
+        r#"SELECT document_id as "document_id: DbDocumentId",
                   signing_config_snapshot_id
            FROM fiscal_documents
            WHERE request_id = ?
              AND state IN ('PREPARED','SIGNED','ENCRYPTED','SENDING','SENT','KVT1','KVT2','ERROR_RETRYABLE')"#,
-        request_id,
+        db_request_id,
     )
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| (r.document_id, r.signing_config_snapshot_id)))
+    Ok(row.map(|r| (r.document_id.0, r.signing_config_snapshot_id)))
 }
 
 /// W5 / W0-1 §3.1 stage 1 — companion to
@@ -1494,7 +1804,7 @@ pub async fn exists_terminal_by_request_id_tx(
               AND state IN ('ACK','REJECTED','CANCELLED','OFFLINE_LOCAL_ACK','REQUIRES_MANUAL_RECONCILIATION','ABORTED')
             LIMIT 1"#,
     )
-    .bind(request_id)
+    .bind(DbRequestId(*request_id))
     .fetch_optional(&mut **tx)
     .await?;
     Ok(row.is_some())
@@ -1517,13 +1827,13 @@ pub async fn insert_prepared_tx(tx: &mut WriteTxConn<'_>, n: &NewDocument) -> sq
              signed_by_cashier_id, signing_config_snapshot_id
            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
-    .bind(n.document_id)
-    .bind(n.request_id)
+    .bind(DbDocumentId(n.document_id))
+    .bind(DbRequestId(n.request_id))
     .bind(&n.fiscal_number)
-    .bind(n.shift_id)
-    .bind(n.offline_session_id)
+    .bind(n.shift_id.map(DbShiftId))
+    .bind(n.offline_session_id.map(DbOfflineSessionId))
     .bind(n.lnd)
-    .bind(n.doc_type)
+    .bind(n.doc_type.as_str())
     .bind(&n.backend_profile_id)
     .bind(&n.transport_profile_id)
     .bind(n.fs_mode)
@@ -1574,20 +1884,21 @@ pub async fn get_signing_inputs_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<PinnedSigningInputs>> {
+    let db_doc_id = DbDocumentId(doc_id);
     let row = sqlx::query!(
-        r#"SELECT state                       as "state: DocState",
+        r#"SELECT state                       as "state: DbDocState",
                   previous_hash               as "previous_hash: Vec<u8>",
                   z_report_number,
                   signing_inputs_pinned_at,
                   signing_config_snapshot_id
            FROM fiscal_documents WHERE document_id = ?"#,
-        doc_id
+        db_doc_id
     )
     .fetch_optional(&mut **tx)
     .await?;
     let Some(r) = row else { return Ok(None) };
     Ok(Some(PinnedSigningInputs {
-        state: r.state,
+        state: r.state.0,
         is_pinned: r.signing_inputs_pinned_at.is_some(),
         previous_hash: decode_blob32(r.previous_hash, "previous_hash")?,
         z_report_number: r.z_report_number,
@@ -1654,7 +1965,7 @@ pub async fn pin_signing_inputs_tx(
     .bind(previous_hash.map(|h| &h[..]))
     .bind(z_report_number)
     .bind(signing_config_snapshot_id)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(signing_config_snapshot_id)
     .bind(signing_config_snapshot_id)
     .execute(&mut **tx)
@@ -1674,7 +1985,7 @@ pub async fn update_unsigned_xml_sha256_tx(
     let res =
         sqlx::query("UPDATE fiscal_documents SET unsigned_xml_sha256 = ? WHERE document_id = ?")
             .bind(&hash[..])
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .execute(&mut **tx)
             .await?;
     Ok(res.rows_affected() == 1)
@@ -1778,40 +2089,41 @@ pub async fn fetch_send_inputs_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<SendInputs>> {
+    let db_doc_id = DbDocumentId(doc_id);
     let row = sqlx::query!(
-        r#"SELECT state                as "state: DocState",
+        r#"SELECT state                as "state: DbDocState",
                   fiscal_number,
                   lnd,
-                  doc_type             as "doc_type: DocType",
+                  doc_type             as "doc_type: DbDocType",
                   business_ts,
                   backend_profile_id,
                   transport_profile_id,
                   offline_fiscal_no,
                   offline_dps_code,
-                  shift_id             as "shift_id: ShiftId",
-                  signed_by_cashier_id as "signed_by_cashier_id: CashierId",
+                  shift_id             as "shift_id: DbShiftId",
+                  signed_by_cashier_id as "signed_by_cashier_id: DbCashierId",
                   previous_hash        as "previous_hash: Vec<u8>",
                   unsigned_xml_sha256  as "unsigned_xml_sha256: Vec<u8>",
                   mac_recovery_attempts
            FROM fiscal_documents WHERE document_id = ?"#,
-        doc_id
+        db_doc_id
     )
     .fetch_optional(&mut **tx)
     .await?;
     let Some(r) = row else { return Ok(None) };
     Ok(Some(SendInputs {
-        state: r.state,
+        state: r.state.0,
         fiscal_number: r.fiscal_number,
         lnd: r.lnd,
-        doc_type: r.doc_type,
+        doc_type: r.doc_type.0,
         business_ts: r.business_ts,
         backend_profile_id: r.backend_profile_id,
         transport_profile_id: r.transport_profile_id,
         offline_fiscal_no: r.offline_fiscal_no,
         offline_dps_code: r.offline_dps_code,
         document_id: doc_id,
-        shift_id: r.shift_id,
-        signed_by_cashier_id: r.signed_by_cashier_id,
+        shift_id: r.shift_id.map(|s| s.0),
+        signed_by_cashier_id: r.signed_by_cashier_id.map(|c| c.0),
         previous_hash: r.previous_hash,
         unsigned_xml_sha256: r.unsigned_xml_sha256,
         mac_recovery_attempts: r.mac_recovery_attempts,
@@ -1854,21 +2166,22 @@ pub async fn fetch_offline_ack_inputs_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<OfflineAckInputs>> {
+    let db_doc_id = DbDocumentId(doc_id);
     let row = sqlx::query!(
-        r#"SELECT state              as "state: DocState",
-                  doc_type           as "doc_type: DocType",
+        r#"SELECT state              as "state: DbDocState",
+                  doc_type           as "doc_type: DbDocType",
                   fiscal_number,
                   previous_hash      as "previous_hash: Vec<u8>",
                   unsigned_xml_sha256 as "unsigned_xml_sha256: Vec<u8>"
            FROM fiscal_documents WHERE document_id = ?"#,
-        doc_id
+        db_doc_id
     )
     .fetch_optional(&mut **tx)
     .await?;
     let Some(r) = row else { return Ok(None) };
     Ok(Some(OfflineAckInputs {
-        state: r.state,
-        doc_type: r.doc_type,
+        state: r.state.0,
+        doc_type: r.doc_type.0,
         fiscal_number: r.fiscal_number,
         previous_hash: r.previous_hash,
         unsigned_xml_sha256: r.unsigned_xml_sha256,
@@ -1935,6 +2248,7 @@ pub async fn fetch_finalize_inputs_tx(
     tx: &mut WriteTxConn<'_>,
     doc_id: DocumentId,
 ) -> sqlx::Result<Option<FinalizeInputs>> {
+    let db_doc_id = DbDocumentId(doc_id);
     let row = sqlx::query!(
         r#"SELECT fiscal_number,
                   request_id                as "request_id!: Vec<u8>",
@@ -1944,7 +2258,7 @@ pub async fn fetch_finalize_inputs_tx(
                   payload_sha256_canonical  as "payload_sha256_canonical!: Vec<u8>",
                   offline_fiscal_no
            FROM fiscal_documents WHERE document_id = ?"#,
-        doc_id
+        db_doc_id
     )
     .fetch_optional(&mut **tx)
     .await?;
@@ -2027,7 +2341,7 @@ pub async fn mark_submission_attempted_tx(
         "UPDATE fiscal_documents SET submission_attempted_at = CURRENT_TIMESTAMP \
          WHERE document_id = ? AND submission_attempted_at IS NULL",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(&mut **tx)
     .await?;
     if res.rows_affected() == 1 {
@@ -2038,7 +2352,7 @@ pub async fn mark_submission_attempted_tx(
     // stamped.  Disambiguate with a SELECT in the same tx.
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .fetch_optional(&mut **tx)
             .await?;
     Ok(exists.is_some())
@@ -2065,7 +2379,7 @@ pub async fn set_server_fiscal_no_tx(
 ) -> sqlx::Result<bool> {
     let res = sqlx::query("UPDATE fiscal_documents SET server_fiscal_no = ? WHERE document_id = ?")
         .bind(server_fiscal_no)
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .execute(&mut **tx)
         .await?;
     Ok(res.rows_affected() == 1)
@@ -2122,7 +2436,7 @@ pub async fn mac_recovery_claim_counter_tx(
            AND state = 'ERROR_RETRYABLE' \
            AND mac_recovery_attempts = 0",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(&mut **tx)
     .await?;
     Ok(res.rows_affected() == 1)
@@ -2153,7 +2467,7 @@ pub async fn increment_consecutive_holds_tx(
          WHERE document_id = ? \
          RETURNING consecutive_holds",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .fetch_one(&mut **tx)
     .await?;
     Ok(row)
@@ -2175,7 +2489,7 @@ pub async fn reset_consecutive_holds_tx(
 ) -> sqlx::Result<bool> {
     let res =
         sqlx::query("UPDATE fiscal_documents SET consecutive_holds = 0 WHERE document_id = ?")
-            .bind(doc_id)
+            .bind(DbDocumentId(doc_id))
             .execute(&mut **tx)
             .await?;
     Ok(res.rows_affected() == 1)

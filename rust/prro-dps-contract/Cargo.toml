@@ -1,0 +1,20 @@
+[package]
+name = "prro-dps-contract"
+version = "0.1.0"
+edition = "2021"
+description = "PRRO Gateway DPS boundary contract — empty CS-1d skeleton (ports land in CS-6)"
+# Workspace-internal boundary crate, never published to any registry. It is a
+# workspace member (so `cargo build --workspace` compiles it) but carries no
+# API yet — the DPS port + the typed delivery-outcome land in a later sprint
+# (specs #3–5 / CS-6). Kept `publish = false` like `prro-testkit`.
+publish = false
+
+[lib]
+name = "prro_dps_contract"
+
+[dependencies]
+# INTENTIONALLY EMPTY (contract §8 item 5): this is a pure boundary skeleton.
+# No dependencies — not even `prro-domain` — until the port lands. RP-CS1-4
+# (prro-domain/tests/rp_cs1_4_contract_dag.rs) pins that this crate reaches no
+# adapter/IO crate (sqlx / tonic / tokio / axum / prost / hyper / reqwest) and
+# depends on no other `*-contract` crate (ingress ⊥ dps ⊥ fleet).

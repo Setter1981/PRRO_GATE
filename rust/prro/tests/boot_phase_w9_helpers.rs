@@ -12,6 +12,7 @@
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::transport_trace;
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 use prro::services::reconciliation::boot_phase;
 use prro::services::reconciliation::ReconcileGuard;
 use prro::transports::dps::dto::CheckAck;
@@ -75,7 +76,7 @@ async fn seed_doc_in_state(pool: &SqlitePool, doc_byte: u8, state: &str) -> Docu
 
 async fn read_state(pool: &SqlitePool, doc: DocumentId) -> String {
     let s: String = sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap();
@@ -179,7 +180,7 @@ async fn advance_sent_to_kvt1_applies_full_envelope() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xB1, "SENT").await;
     let attempt_no = alloc_inflight_trace(&pool, doc).await;
-    let ack = fake_ack("SRV-FISCAL-12345", &[0x11, 0x22, 0x33]);
+    let ack = fake_ack("SRV-FISCAL-12345", &[0x11; 64]);
 
     let ok = boot_phase::advance_sent_to_kvt1_from_probe(
         &pool,
@@ -200,11 +201,11 @@ async fn advance_sent_to_kvt1_applies_full_envelope() {
     let kvt1_raw: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT content FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_optional(&pool)
     .await
     .unwrap();
-    assert_eq!(kvt1_raw.as_deref(), Some(&[0x11, 0x22, 0x33][..]));
+    assert_eq!(kvt1_raw.as_deref(), Some(&[0x11; 64][..]));
 
     // (3) Trace completed with OK outcome + server_fiscal_no.
     let (completed_at, outcome, server_id): (Option<String>, Option<String>, Option<String>) =
@@ -212,7 +213,7 @@ async fn advance_sent_to_kvt1_applies_full_envelope() {
             "SELECT completed_at, outcome_kind, server_fiscal_no FROM transport_trace \
              WHERE document_id = ? AND attempt_no = ?",
         )
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(attempt_no)
         .fetch_one(&pool)
         .await
@@ -232,7 +233,7 @@ async fn advance_sent_to_kvt1_returns_false_when_doc_not_in_sent() {
     // NC-01: non-empty data_sign so the CAS-conflict path is what's exercised
     // here (the empty-data_sign guard would otherwise short-circuit first — that
     // case is pinned separately in kill_point_matrix::k4b_…).
-    let ack = fake_ack("SRV-X", &[0xDE, 0xAD]);
+    let ack = fake_ack("SRV-X", &[0xDE; 64]);
     let ok = boot_phase::advance_sent_to_kvt1_from_probe(
         &pool,
         doc,
@@ -248,7 +249,7 @@ async fn advance_sent_to_kvt1_returns_false_when_doc_not_in_sent() {
     assert_eq!(audit_count(&pool, "BOOT_LAST_CHK_MATCH_KVT1").await, 0);
     // No KVT1_RAW persisted on bail.
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM document_files WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -264,7 +265,7 @@ async fn advance_sent_to_kvt1_idempotent_on_repeat_call() {
     let (_dir, pool) = fresh_pool().await;
     let doc = seed_doc_in_state(&pool, 0xB4, "SENT").await;
     let attempt_no = alloc_inflight_trace(&pool, doc).await;
-    let ack = fake_ack("SRV-FISCAL-IDEMP", &[0xAB]);
+    let ack = fake_ack("SRV-FISCAL-IDEMP", &[0xAB; 64]);
 
     // First call applies the full envelope.
     let r1 = boot_phase::advance_sent_to_kvt1_from_probe(
@@ -304,7 +305,7 @@ async fn advance_sent_to_kvt1_idempotent_on_repeat_call() {
     let n_kvt1_raw: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM document_files WHERE document_id = ? AND kind = 'KVT1_RAW'",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -314,7 +315,7 @@ async fn advance_sent_to_kvt1_idempotent_on_repeat_call() {
     let wire_started: Option<String> = sqlx::query_scalar(
         "SELECT wire_call_started_at FROM transport_trace WHERE document_id = ? AND attempt_no = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(attempt_no)
     .fetch_one(&pool)
     .await
@@ -363,14 +364,14 @@ async fn passive_hold_kvt1_emits_audit_only() {
     assert_eq!(audit_count(&pool, "BOOT_KVT1_HOLD_DEFERRED").await, 1);
     // No transport_trace row created.
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(n, 0, "no transport_trace row created by passive hold");
     // No document_files row created.
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM document_files WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -396,7 +397,7 @@ async fn passive_hold_kvt1_idempotent_each_call_emits_one_audit() {
 async fn set_first_kvt1_at_literal(pool: &SqlitePool, doc: DocumentId, sqlite_ts: &str) {
     sqlx::query("UPDATE fiscal_documents SET first_kvt1_at = ? WHERE document_id = ?")
         .bind(sqlite_ts)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(pool)
         .await
         .expect("set first_kvt1_at to literal");
@@ -461,7 +462,7 @@ async fn passive_hold_kvt1_escalates_to_warning_after_one_hour() {
     sqlx::query(
         "UPDATE fiscal_documents SET first_kvt1_at = datetime('now', '-2 hours') WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .expect("backdate first_kvt1_at to -2h");
@@ -487,7 +488,7 @@ async fn passive_hold_kvt1_escalates_to_error_after_twenty_four_hours() {
     sqlx::query(
         "UPDATE fiscal_documents SET first_kvt1_at = datetime('now', '-25 hours') WHERE document_id = ?",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .expect("backdate first_kvt1_at to -25h");
@@ -552,7 +553,7 @@ async fn transition_state_stamps_first_kvt1_at_on_sent_to_kvt1() {
 
     let first_kvt1_at: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -619,7 +620,7 @@ async fn transition_state_coalesce_preserves_first_kvt1_at_on_kvt1_re_entry() {
     assert!(matches!(outcome_1, TransitionOutcome::Applied));
     let stamp_after_step1: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -632,7 +633,7 @@ async fn transition_state_coalesce_preserves_first_kvt1_at_on_kvt1_re_entry() {
     const SENTINEL: &str = "2020-01-01 00:00:00";
     sqlx::query("UPDATE fiscal_documents SET first_kvt1_at = ? WHERE document_id = ?")
         .bind(SENTINEL)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .expect("backdate first_kvt1_at to sentinel");
@@ -657,7 +658,7 @@ async fn transition_state_coalesce_preserves_first_kvt1_at_on_kvt1_re_entry() {
     assert!(matches!(outcome_3, TransitionOutcome::Applied));
     let stamp_after_step3: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -698,7 +699,7 @@ async fn transition_state_coalesce_preserves_first_kvt1_at_on_kvt1_re_entry() {
     }
     let stamp_after_step4: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -724,13 +725,13 @@ async fn migration_014_backfill_populates_first_kvt1_at_for_pre_w3_kvt1_rows() {
     // auto-populates it post-W3; clear it back to mimic a row that
     // existed before the migration ran).
     sqlx::query("UPDATE fiscal_documents SET first_kvt1_at = NULL WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(&pool)
         .await
         .unwrap();
     let cleared: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -745,7 +746,7 @@ async fn migration_014_backfill_populates_first_kvt1_at_for_pre_w3_kvt1_rows() {
     // the pre-backfill value and compare to THAT.
     let updated_at_before: String =
         sqlx::query_scalar("SELECT updated_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -762,7 +763,7 @@ async fn migration_014_backfill_populates_first_kvt1_at_for_pre_w3_kvt1_rows() {
 
     let backfilled: Option<String> =
         sqlx::query_scalar("SELECT first_kvt1_at FROM fiscal_documents WHERE document_id = ?")
-            .bind(doc)
+            .bind(DbDocumentId(doc))
             .fetch_one(&pool)
             .await
             .unwrap();

@@ -28,6 +28,7 @@
 
 use prro::db::models::enums::{NodeMode, OfflineSessionState, ShiftState};
 use prro::db::models::ids::{DocumentId, OfflineSessionId};
+use prro::db::types::{DbDocumentId, DbOfflineSessionId};
 use prro::services::write_path::dispatch::{self, DispatcherRefusalReason, PostSignRoute};
 use prro::services::write_path::stage_offline_ack::OfflineAckOutcome;
 use uuid::Uuid;
@@ -65,8 +66,8 @@ async fn seed_node_state(
          VALUES (?, ?, ?, 1)",
     )
     .bind(fn_id)
-    .bind(mode)
-    .bind(shift_state)
+    .bind(mode.as_str())
+    .bind(shift_state.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -82,7 +83,7 @@ async fn seed_offline_session(
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-05-16T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(fn_id)
     .bind(state.as_str())
     .execute(pool)
@@ -118,7 +119,7 @@ async fn insert_signed_doc(pool: &sqlx::SqlitePool, fn_id: &str, lnd: i64) -> Do
          VALUES (?, ?, ?, ?, 'SELL', 'SIGNED', 'b', 't', 'OFFLINE', \
             '2026-05-16T00:00:00Z', '{}', ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(fn_id)
     .bind(lnd)
@@ -145,7 +146,7 @@ async fn stamp_doc_at_sign(
         "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? AND code_lnd = ?",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(fn_id)
     .bind(code_lnd)
     .execute(pool)
@@ -165,9 +166,9 @@ async fn stamp_doc_at_sign(
              offline_dps_code = ? WHERE document_id = ?",
     )
     .bind(code_lnd)
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(&dps_code)
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .execute(pool)
     .await
     .unwrap();
@@ -175,7 +176,7 @@ async fn stamp_doc_at_sign(
 
 async fn fetch_doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -183,7 +184,7 @@ async fn fetch_doc_state(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> String 
 
 async fn fetch_transport_trace_count(pool: &sqlx::SqlitePool, doc_id: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
-        .bind(doc_id)
+        .bind(DbDocumentId(doc_id))
         .fetch_one(pool)
         .await
         .unwrap()

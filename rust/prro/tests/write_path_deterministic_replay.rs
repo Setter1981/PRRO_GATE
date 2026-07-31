@@ -35,6 +35,7 @@ use async_trait::async_trait;
 
 use prro::config::AppConfig;
 use prro::db::models::ids::DocumentId;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::runtime::ingress::convert::aggregate_z_payload;
 use prro::services::reconciliation::{ReconciliationRuntime, RuntimeView};
 use prro::transports::dps::channel::DpsChannel;
@@ -164,7 +165,7 @@ async fn seed_doc_in_state(
 
 async fn doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -202,7 +203,7 @@ async fn read_document_file_kind(
     kind: &str,
 ) -> Option<Vec<u8>> {
     sqlx::query_scalar("SELECT content FROM document_files WHERE document_id = ? AND kind = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(kind)
         .fetch_optional(pool)
         .await
@@ -211,7 +212,7 @@ async fn read_document_file_kind(
 
 async fn count_outbox_for(pool: &SqlitePool, doc: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("count outbox rows for doc")
@@ -219,7 +220,7 @@ async fn count_outbox_for(pool: &SqlitePool, doc: DocumentId) -> i64 {
 
 async fn insert_document_file(pool: &SqlitePool, doc: DocumentId, kind: &str, content: &[u8]) {
     sqlx::query("INSERT INTO document_files (document_id, kind, content) VALUES (?, ?, ?)")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .bind(kind)
         .bind(content)
         .execute(pool)
@@ -598,7 +599,7 @@ async fn seed_doc_with_signed_xml(
 
 async fn read_mac_recovery_attempts(pool: &SqlitePool, doc: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT mac_recovery_attempts FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read mac_recovery_attempts")
@@ -772,20 +773,20 @@ async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
     let doc = seed_doc_with_signed_xml(app.db(), fn_id, 0x99, "ERROR_RETRYABLE").await;
 
     // M3a hardening pass 1 — seed durable retry_class evidence.  The
-    // new `dispatch_error_retryable_by_class` dispatcher routes ER
-    // docs by their last-attempt `retry_class`; without a
-    // transport_trace row the dispatcher would hold the doc as
-    // indeterminate.  This fixture's intent (happy retry without
-    // MAC budget burn) requires `TransientRetry` to invoke
-    // stage_send::run.
+    // `dispatch_error_retryable_by_class` dispatcher routes ER docs by
+    // their last-attempt `retry_class`; without a transport_trace row
+    // the dispatcher would hold the doc as indeterminate.  This fixture
+    // needs a `TransientRetry` row so the dispatcher takes the (post-R6)
+    // ESCALATE-to-manual arm — the point of the fixture is that this
+    // non-MAC escalation does NOT burn the W10 MAC budget.
     //
     // **Boundary note (H2 closure boundary).**  `seed_completed_
     // transport_trace` writes exactly one row (`attempt_no=1`); the
-    // H2 budget cap fires only when
+    // H2 budget cap (`BudgetExhausted`) fires only when
     // `transport_trace::attempts_used(doc) >= MAX_BOOT_ATTEMPTS`
-    // (=5).  1 < 5, so the TransientRetry arm proceeds to
-    // stage_send::run as designed.  Fixture #9g covers the
-    // budget-exhausted case (5 seeded attempts).
+    // (=5).  1 < 5, so the TransientRetry arm takes the plain
+    // `EscalateManual` verdict (CS-3 S7-1 R6) — NOT the budget-exhausted
+    // branch (Fixture #9g covers the 5-attempt budget case).
     seed_completed_transport_trace(app.db(), doc, "RETRYABLE_TRANSPORT", Some("TransientRetry"))
         .await;
 
@@ -810,37 +811,56 @@ async fn fixture_9_error_retryable_retries_without_mac_counter_burn() {
         .await
         .expect("reconcile_pending_with green");
 
-    // (1) State advances past ERROR_RETRYABLE.
+    // (1) CS-3 S7-1 (R6): a stuck ErrorRetryable no longer re-wires. The boot dispatcher
+    // escalates it to RequiresManualReconciliation + STOP (re-driving would fire a SECOND
+    // wire for a doc that already consumed one under an active CALL_STARTED reservation).
     assert_eq!(
         doc_state(app.db(), doc).await,
-        "SENT",
-        "§6.7 + ADR-M3-A9 step 5-6 — happy retry drives ErrorRetryable → Sending → Sent"
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "R6: a TransientRetry ErrorRetryable escalates to manual — it is NOT re-driven to Sent"
     );
 
-    // (2) Exactly one send_chk invocation.
-    assert_eq!(stub.call_count(), 1, "§6.7 — one wire send during recovery");
-
-    // (2a) W11 PR-2a wiring observable in the dispatch histogram —
-    // ERROR_RETRYABLE arm produced exactly one dispatch (not deferred).
+    // (1b) B4 re-audit — the '+STOP' half the comment above claimed but NOTHING enforced (the online/
+    // boot ER→RMR sites left the node Online, so a persistent -13/exhausted failure minted an
+    // unbounded ER→RMR stream / 202-forever). The escalation now halts the node atomically.
     assert_eq!(
-        summary.docs_advanced.error_retryable_dispatched, 1,
-        "PR-2a wiring: ERROR_RETRYABLE Some(deps) path increments error_retryable_dispatched"
+        read_node_mode(app.db(), fn_id).await,
+        "STOP_MODE",
+        "B4: a stuck ErrorRetryable escalation must set node STOP_MODE (not leave it Online)"
+    );
+
+    // (2) ZERO send_chk — the escalation is a pure state CAS + STOP, no wire.
+    assert_eq!(
+        stub.call_count(),
+        0,
+        "R6: escalation makes NO new wire call"
+    );
+
+    // (2a) The dispatch histogram counts the ESCALATION arm, not the (deleted) redrive arm.
+    assert_eq!(
+        summary.docs_advanced.error_retryable_escalated_to_manual, 1,
+        "R6: ErrorRetryable routes to the escalate-to-manual arm"
     );
     assert_eq!(
-        summary.docs_advanced.error_retryable_deferred, 0,
-        "PR-2a wiring: ERROR_RETRYABLE must NOT fall through to DEFERRED arm under Some(deps)"
+        summary.docs_advanced.error_retryable_dispatched, 0,
+        "R6: the redrive dispatch arm is retired — no re-wire dispatch"
     );
     assert_eq!(
         summary.docs_advanced.total_visited(),
         1,
-        "exactly one pending doc dispatched, all other counters zero"
+        "exactly one pending doc visited, all other counters zero"
     );
 
-    // (2b) No `BOOT_DISPATCH_DEFERRED` audit fired.
+    // (2b) The escalation audit fired; no DEFERRED (the dispatcher is decisive, not holding).
+    assert_eq!(
+        audit_count(app.db(), "BOOT_ER_ESCALATED_TO_MANUAL").await,
+        1,
+        "R6: ErrorRetryable escalation emits BOOT_ER_ESCALATED_TO_MANUAL"
+    );
     assert_eq!(
         audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
         0,
-        "ERROR_RETRYABLE dispatch arm wired in PR-2a; deferred audit must not fire"
+        "R6: the ErrorRetryable arm is decisive (escalate), not deferred"
     );
 
     // (3) CRITICAL — MAC-recovery budget untouched.
@@ -939,6 +959,16 @@ impl DpsChannel for RecoveryDpsStub {
             .expect("RecoveryDpsStub.send_chk queue empty (caller forgot to enqueue)")
     }
 
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
+
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_chk_count.fetch_add(1, Ordering::SeqCst);
         self.last_chk_queue
@@ -985,7 +1015,7 @@ async fn seed_doc_sent_with_server_fiscal_no(
     let doc = seed_doc_with_signed_xml(pool, fn_id, doc_byte, "SENT").await;
     sqlx::query("UPDATE fiscal_documents SET server_fiscal_no = ? WHERE document_id = ?")
         .bind(server_fiscal_no)
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .execute(pool)
         .await
         .expect("seed server_fiscal_no on SENT doc");
@@ -1003,7 +1033,7 @@ async fn read_latest_transport_trace(
         "SELECT outcome_kind, server_fiscal_no FROM transport_trace \
          WHERE document_id = ? ORDER BY attempt_no DESC LIMIT 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(pool)
     .await
     .expect("read transport_trace row")
@@ -1011,7 +1041,7 @@ async fn read_latest_transport_trace(
 
 async fn count_transport_trace(pool: &SqlitePool, doc: DocumentId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM transport_trace WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("count transport_trace rows")
@@ -1052,7 +1082,7 @@ async fn seed_completed_transport_trace_at_attempt(
          VALUES (?, ?, 'b1', 't1', ?, '2026-04-22T12:00:00Z', \
             '2026-04-22T12:00:00Z', '2026-04-22T12:00:01Z', ?, ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(attempt_no)
     .bind(&envelope_sha)
     .bind(outcome_kind)
@@ -1064,10 +1094,18 @@ async fn seed_completed_transport_trace_at_attempt(
 
 async fn read_server_fiscal_no(pool: &SqlitePool, doc: DocumentId) -> Option<String> {
     sqlx::query_scalar("SELECT server_fiscal_no FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .expect("read server_fiscal_no")
+}
+
+async fn read_node_mode(pool: &SqlitePool, fscl: &str) -> String {
+    sqlx::query_scalar("SELECT mode FROM node_state WHERE fiscal_number = ?")
+        .bind(fscl)
+        .fetch_one(pool)
+        .await
+        .expect("read node mode")
 }
 
 // ─── Fixture #4 — §6.4-a SENT probe Match → KVT1 ───────────────────────
@@ -1097,7 +1135,7 @@ async fn fixture_4_sent_last_chk_match_advances_to_kvt1() {
     let expected_id = "expected-id-44";
     let doc = seed_doc_sent_with_server_fiscal_no(app.db(), fn_id, 0x44, expected_id).await;
 
-    let ack_data_sign = vec![0xDDu8; 32];
+    let ack_data_sign = vec![0xDDu8; 64];
     let stub = RecoveryDpsStub::for_last_chk(vec![Ok(CheckAck {
         id: expected_id.into(),
         id_sign: vec![],
@@ -1158,7 +1196,7 @@ async fn fixture_4_sent_last_chk_match_advances_to_kvt1() {
         "peer counter must stay zero"
     );
     assert_eq!(
-        summary.docs_advanced.sent_not_found_to_error_retryable, 0,
+        summary.docs_advanced.sent_not_found_to_manual, 0,
         "peer counter must stay zero"
     );
     assert_eq!(
@@ -1302,36 +1340,25 @@ async fn fixture_5_sent_last_chk_mismatch_to_manual_reconciliation() {
     );
 }
 
-// ─── Fixture #6 — §6.4-c SENT probe NotFound → two-tick retry path ─────
+// ─── Fixture #6 — §6.4-c SENT probe NotFound → escalate manual + STOP (S7-1 F2) ─────
 //
-// W0-3 §6.4-c:788-820 mandates: a SENT doc whose `last_chk` returns
-// `NotFound` (DPS has no record of any check for our FN_sign) was
-// safely NOT received — Pattern B re-drive via
-// `ErrorRetryable → Sending → wire` is the correct recovery.
-// ADR-M3-A9 step 3 forbids the direct `Sent → Sending` edge: recovery
-// MUST hop through `ErrorRetryable`.  This is the two-tick path,
-// operator-decided per W11 design doc §9 Q1 (2026-05-12).
-//
-// **CRITICAL — the load-bearing fixture in PR-2b.**  Proves the
-// two-tick driver is structural, not inline:
-//   - Tick 1: probe → state `Sent → ErrorRetryable`, NO send_chk.
-//   - Tick 2: NEW deps (separate stub with happy `send_chk` queue),
-//     dispatch via `stage_send::run` drives `ER → Sending → Sent`.
+// A SENT doc whose `last_chk` returns `NotFound` is issuance-AMBIGUOUS: DPS may have accepted the
+// receipt and lost its record, or never seen it — indistinguishable. The S7-1 F2 re-audit fix
+// (external-F2 / internal-B4) escalates it ATOMICALLY to `RequiresManualReconciliation` + node
+// `STOP_MODE` in ONE tick (`sent_not_found_to_manual`), NOT the old `Sent → ErrorRetryable` two-tick
+// redrive. The old path left the node `Online` between the ER CAS and R6's later escalation, and an
+// online ER doc with a stamped SFN counts as issued, so the sibling-gate let the NEXT doc issue as a
+// chain-fork head — the exact window this fix closes.
 //
 // **Hard assertions:**
-//   (1.a) Tick-1 state → ERROR_RETRYABLE.
-//   (1.b) Tick-1 `last_chk_count == 1`, `send_chk_count == 0`.
-//   (1.c) Tick-1 `sent_not_found_to_error_retryable == 1`.
-//   (1.d) Tick-1 `BOOT_SENT_LAST_CHK_NOTFOUND` audit fires.
-//   (1.e) Tick-1: NO `BOOT_RESUME_*` audit (NO direct Sent → Sending).
-//   (2.a) Tick-2 state → SENT.
-//   (2.b) Tick-2 NEW stub's `send_chk_count == 1`.
-//   (2.c) Tick-2 `error_retryable_dispatched == 1`.
-//   (2.d) Total `transport_trace` rows == 2 (one per tick).
-//   (2.e) Doc's server_fiscal_no updated to tick-2's fresh id.
+//   (a) doc `Sent → RequiresManualReconciliation` in ONE tick (never ErrorRetryable).
+//   (b) node → STOP_MODE atomically (the '+STOP' half — the sibling-gate cannot pass a successor).
+//   (c) `sent_not_found_to_manual == 1`; ZERO send_chk (probe-only); the retired ER arms stay zero.
+//   (d) `SENT_NOT_FOUND_ESCALATED_MANUAL` Critical audit fires.
+//   (e) tick-2 is a no-op: doc stays RMR, node stays STOP, no wire, SFN unchanged.
 
 #[tokio::test]
-async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
+async fn fixture_6_sent_last_chk_notfound_escalates_manual_with_stop() {
     let (_dir, app) = fresh_app().await;
     let fn_id = "1234567890";
     seed_fn_config(app.db(), fn_id).await;
@@ -1354,14 +1381,21 @@ async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
         .await
         .expect("tick 1 reconcile_pending_with green");
 
-    // (1.a) State → ERROR_RETRYABLE.
+    // (a) doc escalated DIRECTLY to RMR — never ErrorRetryable (S7-1 F2).
     assert_eq!(
         doc_state(app.db(), doc).await,
-        "ERROR_RETRYABLE",
-        "§6.4-c tick-1 NotFound must CAS Sent → ErrorRetryable (NOT direct Sent → Sending per ADR-M3-A9 step 3)"
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "F2: NotFound escalates Sent → RMR in ONE tick (NOT the old Sent → ErrorRetryable two-tick)"
     );
 
-    // (1.b) One last_chk, zero send_chk on tick 1.
+    // (b) node STOP_MODE — the '+STOP' half that closes the sibling-gate window atomically.
+    assert_eq!(
+        read_node_mode(app.db(), fn_id).await,
+        "STOP_MODE",
+        "F2: the escalation halts the node atomically — no successor can issue before operator triage"
+    );
+
+    // (c) One last_chk, zero send_chk on tick 1 (probe-only, no re-wire).
     assert_eq!(
         tick1_stub.last_chk_count(),
         1,
@@ -1370,20 +1404,17 @@ async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
     assert_eq!(
         tick1_stub.send_chk_count(),
         0,
-        "tick-1: send_chk MUST NOT fire — recovery is probe-only on the NotFound branch"
+        "tick-1: send_chk MUST NOT fire — NotFound escalates without re-wiring"
     );
 
-    // (1.c) Histogram — sent_not_found_to_error_retryable == 1.
+    // (c') Histogram — the manual-escalation counter; the retired ER arms stay zero.
     assert_eq!(
-        tick1_summary
-            .docs_advanced
-            .sent_not_found_to_error_retryable,
-        1,
-        "PR-2b wiring: NotFound increments sent_not_found_to_error_retryable"
+        tick1_summary.docs_advanced.sent_not_found_to_manual, 1,
+        "F2: NotFound increments sent_not_found_to_manual"
     );
     assert_eq!(
         tick1_summary.docs_advanced.error_retryable_dispatched, 0,
-        "tick-1: ER dispatch must NOT fire (doc was SENT at tick start)"
+        "F2: no ER dispatch — the doc never enters the ER cohort"
     );
     assert_eq!(
         tick1_summary.docs_advanced.total_visited(),
@@ -1391,27 +1422,23 @@ async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
         "tick-1: exactly one pending doc dispatched"
     );
 
-    // (1.d) Forensic audit fired.
+    // (d) Critical operator-handoff audit fired (written by `sent_not_found_to_manual`).
     assert_eq!(
-        audit_count(app.db(), "BOOT_SENT_LAST_CHK_NOTFOUND").await,
+        audit_count(app.db(), "SENT_NOT_FOUND_ESCALATED_MANUAL").await,
         1,
-        "§6.4-c tick-1: BOOT_SENT_LAST_CHK_NOTFOUND audit fires exactly once"
+        "F2: the escalation writes the Critical operator-handoff audit exactly once"
     );
 
-    // (1.e) **Load-bearing**: NO direct Sent → Sending audit.  ADR-M3-A9
-    //       step 3 forbids the direct edge; the only audit on this
-    //       tick must be BOOT_SENT_LAST_CHK_NOTFOUND.  W9's
-    //       `BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE` could only fire
-    //       if the doc were in SENDING (it is not — fixture seeds SENT).
+    // (e) NO direct Sent → Sending resume audit, and stage_send::run must NOT run (probe-only).
     assert_eq!(
         audit_count(app.db(), "BOOT_RESUME_SENDING_TO_ERROR_RETRYABLE").await,
         0,
-        "two-tick contract: no SENDING-resume audit (doc was SENT, not SENDING)"
+        "no SENDING-resume audit (doc was SENT, not SENDING)"
     );
     assert_eq!(
         audit_count(app.db(), "STAGE_SEND_RESULT").await,
         0,
-        "two-tick contract: stage_send::run must NOT run on tick-1 (probe-only branch)"
+        "stage_send::run must NOT run on the NotFound escalation (probe-only branch)"
     );
     assert_eq!(
         count_transport_trace(app.db(), doc).await,
@@ -1419,7 +1446,9 @@ async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
         "tick-1: exactly one transport_trace row (the probe recovery row)"
     );
 
-    // ── Tick 2 — NEW deps + happy send_chk → ER → Sending → Sent ───
+    // ── Tick 2 — the RMR doc is TERMINAL: a second reconcile is a no-op ───
+    // A fresh happy send_chk is queued to PROVE the escalated doc is not re-driven even when a
+    // re-issuance is available (F2 is a decisive halt, not a mere failure to reach the wire).
     let fresh_id = "fresh-fiscal-66";
     let tick2_stub = RecoveryDpsStub::for_send_chk(vec![Ok(CheckAck {
         id: fresh_id.into(),
@@ -1431,69 +1460,41 @@ async fn fixture_6_sent_last_chk_notfound_two_tick_retry_path() {
         signing_ctx: &signing_ctx,
         fn_sign: &fn_sign,
     });
-
-    let tick2_summary = app
+    let _tick2_summary = app
         .reconcile_pending_with(tick2_deps)
         .await
         .expect("tick 2 reconcile_pending_with green");
 
-    // (2.a) State → SENT.
+    // doc stays RMR; node stays STOP; ZERO wire; SFN unchanged (no re-issuance).
     assert_eq!(
         doc_state(app.db(), doc).await,
-        "SENT",
-        "§6.4-c tick-2 + ADR-M3-A9 steps 5-6: stage_send::run drives ER → Sending → Sent"
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "tick-2: the RMR doc is terminal — not re-driven"
     );
-
-    // (2.b) Tick-2 NEW stub: send_chk count == 1.
+    assert_eq!(
+        read_node_mode(app.db(), fn_id).await,
+        "STOP_MODE",
+        "tick-2: node stays halted until operator resolution"
+    );
     assert_eq!(
         tick2_stub.send_chk_count(),
-        1,
-        "tick-2: exactly one fresh send_chk on the retry"
+        0,
+        "tick-2: NO re-wire of a terminal-manual doc — an available ack is declined"
     );
     assert_eq!(
         tick2_stub.last_chk_count(),
         0,
-        "tick-2: last_chk must NOT fire — doc is in ER, not SENT, when tick-2 starts"
+        "tick-2: no probe — the doc is RMR, not SENT"
     );
-
-    // (2.c) Tick-2 histogram — error_retryable_dispatched == 1
-    //       (from PR-2a wiring; PR-2b reuses unchanged).
-    assert_eq!(
-        tick2_summary.docs_advanced.error_retryable_dispatched, 1,
-        "tick-2: PR-2a ER dispatch wiring increments error_retryable_dispatched"
-    );
-    assert_eq!(
-        tick2_summary
-            .docs_advanced
-            .sent_not_found_to_error_retryable,
-        0,
-        "tick-2: NotFound branch must NOT re-fire (doc was ER at tick start)"
-    );
-    assert_eq!(
-        tick2_summary.docs_advanced.total_visited(),
-        1,
-        "tick-2: exactly one pending doc dispatched"
-    );
-
-    // (2.d) Total transport_trace rows across both ticks == 2.
-    assert_eq!(
-        count_transport_trace(app.db(), doc).await,
-        2,
-        "two-tick contract: tick-1 probe row + tick-2 send row"
-    );
-
-    // (2.e) Doc's server_fiscal_no updated by stage_send 4b.
     assert_eq!(
         read_server_fiscal_no(app.db(), doc).await.as_deref(),
-        Some(fresh_id),
-        "tick-2 stage_send 4b: server_fiscal_no overwritten with fresh wire id"
+        Some(expected_id),
+        "tick-2: no re-issuance — server_fiscal_no keeps its original unconfirmed value, not {fresh_id}"
     );
-
-    // (3) Sanity: no deferred audit at any tick.
     assert_eq!(
-        audit_count(app.db(), "BOOT_DISPATCH_DEFERRED").await,
-        0,
-        "two-tick: PR-2a (ER) + PR-2b (SENT) arms wired; deferred audit must not fire"
+        count_transport_trace(app.db(), doc).await,
+        1,
+        "tick-2: wireless — only tick-1's probe trace row exists"
     );
 }
 
@@ -1596,7 +1597,7 @@ async fn seed_open_shift_and_node(
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'test-cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(fn_id)
     .execute(pool)
     .await
@@ -1607,7 +1608,7 @@ async fn seed_open_shift_and_node(
          VALUES (?, 'ONLINE', 'OPENED', ?, 1, 'b1', 't1')",
     )
     .bind(fn_id)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -1763,6 +1764,15 @@ impl DpsChannel for PerFnRecordingDpsStub {
     async fn send_chk(&self, _envelope: CheckEnvelope) -> Result<CheckAck, DpsError> {
         panic!("PerFnRecordingDpsStub: send_chk must not fire during SENT probe recovery")
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
 
     async fn last_chk(&self, blob: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.recorded_blobs.lock().unwrap().push(blob.0.clone());
@@ -1816,12 +1826,12 @@ async fn multi_fn_reconcile_pending_with_resolves_runtime_per_fn() {
     let stub_a = PerFnRecordingDpsStub::new(vec![Ok(CheckAck {
         id: "fiscal-A".into(),
         id_sign: vec![],
-        data_sign: vec![0xAA; 32],
+        data_sign: vec![0xAA; 64],
     })]);
     let stub_b = PerFnRecordingDpsStub::new(vec![Ok(CheckAck {
         id: "fiscal-B".into(),
         id_sign: vec![],
-        data_sign: vec![0xBB; 32],
+        data_sign: vec![0xBB; 64],
     })]);
 
     let signing_ctx = det_signing_ctx();
@@ -2301,7 +2311,7 @@ async fn make_doc_z(
     .bind(payload)
     .bind(&source[..])
     .bind(&payload_sha[..])
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(pool)
     .await
     .unwrap();
@@ -2410,7 +2420,7 @@ async fn a1z_non_z_consistently_corrupted_payload_is_drift() {
     .bind(doc_payload)
     .bind(&doc_sha[..])
     .bind(&doc_sha[..]) // non-Z: source == canonical
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(app.db())
     .await
     .unwrap();
@@ -2763,7 +2773,7 @@ async fn fixture_9h_er_latest_unfinished_trace_holds_no_send() {
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 2, 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(vec![0u8; 32])
     .execute(app.db())
     .await
@@ -2865,7 +2875,7 @@ async fn fixture_3b_sending_crash_after_transient_retry_second_boot_no_resend() 
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 2, 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(vec![0u8; 32])
     .execute(app.db())
     .await
@@ -2984,6 +2994,15 @@ impl DpsChannel for SequenceProbingDpsStub {
     async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
         unreachable!("SequenceProbingDpsStub: send_chk not exercised")
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.started.fetch_add(1, Ordering::SeqCst);
         let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2995,7 +3014,7 @@ impl DpsChannel for SequenceProbingDpsStub {
         Ok(CheckAck {
             id: "expected-id-CC".into(),
             id_sign: vec![],
-            data_sign: vec![0xCC; 32],
+            data_sign: vec![0xCC; 64],
         })
     }
     async fn ping(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
@@ -3233,7 +3252,7 @@ async fn fixture_5b_sent_mismatch_superseded_is_not_terminalised() {
         Ok(CheckAck {
             id: "SFN-B".into(),
             id_sign: vec![],
-            data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            data_sign: vec![0xDE; 64],
         }),
     ]);
     let signing_ctx = det_signing_ctx();
@@ -3324,7 +3343,7 @@ async fn m2_n4_boot_foreign_tip_is_manual_not_superseded() {
         Ok(CheckAck {
             id: "SFN-B".into(),
             id_sign: vec![],
-            data_sign: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            data_sign: vec![0xDE; 64],
         }),
     ]);
     let signing_ctx = det_signing_ctx();

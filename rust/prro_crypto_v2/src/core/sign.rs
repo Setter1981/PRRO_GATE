@@ -28,8 +28,8 @@ use std::sync::Mutex;
 use crate::core::curve::Curve;
 use crate::core::field::FieldEl;
 use crate::core::point::Point;
-use crate::core::{TauNafMode, TauNafPolicy};
 use crate::core::tau_naf;
+use crate::core::{TauNafMode, TauNafPolicy};
 
 /// Default cap for the pubkey validation cache.
 /// Override at runtime via [`set_verify_cache_capacity`].
@@ -193,12 +193,7 @@ pub struct Signature {
 ///   - `rand_e`: a uniformly random non-zero scalar < curve order
 ///
 /// All field elements MUST be sized with `mod_words = curve.mod_words`.
-pub fn sign(
-    curve: &Curve,
-    d: &FieldEl,
-    hash: &FieldEl,
-    rand_e: &FieldEl,
-) -> Option<Signature> {
+pub fn sign(curve: &Curve, d: &FieldEl, hash: &FieldEl, rand_e: &FieldEl) -> Option<Signature> {
     use crate::core::scalar::Scalar;
 
     // Require rand_e < 2^256 (word 8 must be zero). A rand_e with bits
@@ -286,9 +281,7 @@ pub fn verify(curve: &Curve, pub_q: &Point, hash: &FieldEl, signature: &Signatur
     };
 
     // Reject any non-zero bits above 2^256 (word 8 in FE_WORDS=9 layout).
-    if r_words[crate::core::fe::FE_WORDS - 1] != 0
-        || s_words[crate::core::fe::FE_WORDS - 1] != 0
-    {
+    if r_words[crate::core::fe::FE_WORDS - 1] != 0 || s_words[crate::core::fe::FE_WORDS - 1] != 0 {
         return false;
     }
 
@@ -369,12 +362,7 @@ pub fn verify_with_policy(
 ///
 /// TODO: replace `sign()` call with tau_naf::mul_tau_naf_point(rand_e, &G, curve)
 /// once the τ-NAF module passes the full vector set.
-fn sign_tau_naf(
-    curve: &Curve,
-    d: &FieldEl,
-    hash: &FieldEl,
-    rand_e: &FieldEl,
-) -> Option<Signature> {
+fn sign_tau_naf(curve: &Curve, d: &FieldEl, hash: &FieldEl, rand_e: &FieldEl) -> Option<Signature> {
     // Placeholder: delegate to the constant-time path.
     // When tau_naf base-point mul is complete, replace with:
     //   let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
@@ -389,12 +377,7 @@ fn sign_tau_naf(
 ///
 /// TODO: replace with tau_naf-based Shamir's trick once the τ-NAF module
 /// passes the full vector set.
-fn verify_tau_naf(
-    curve: &Curve,
-    pub_q: &Point,
-    hash: &FieldEl,
-    sig: &Signature,
-) -> bool {
+fn verify_tau_naf(curve: &Curve, pub_q: &Point, hash: &FieldEl, sig: &Signature) -> bool {
     // Placeholder: delegate to existing wNAF verify.
     verify(curve, pub_q, hash, sig)
 }
@@ -429,7 +412,10 @@ mod tests {
         v[6] = 0x1234_5678;
         let value = FieldEl::from_words(v.clone());
         let out = truncate(&value, &curve.order);
-        assert!(out.equals(&value), "values below the cut must be preserved verbatim");
+        assert!(
+            out.equals(&value),
+            "values below the cut must be preserved verbatim"
+        );
 
         // Case B: bit 255 set → MUST be cleared.
         let mut v = vec![0u32; curve.mod_words];
@@ -448,7 +434,10 @@ mod tests {
         let value = FieldEl::from_words(v);
         let out = truncate(&value, &curve.order);
         assert_eq!(out.bytes[8], 0, "word 8 (bit 256+) must be zero");
-        assert_eq!(out.bytes[7], 0x7FFF_FFFF, "bit 255 cleared, bits 224..254 kept");
+        assert_eq!(
+            out.bytes[7], 0x7FFF_FFFF,
+            "bit 255 cleared, bits 224..254 kept"
+        );
         assert_eq!(out.bytes[0], 0xBADD_F00D, "word 0 preserved");
 
         // Case D: non-word-aligned cut.
@@ -460,7 +449,10 @@ mod tests {
         assert_eq!(tiny_order.bit_length(), 5);
         let all_ones = FieldEl::from_words(vec![u32::MAX; curve.mod_words]);
         let out = truncate(&all_ones, &tiny_order);
-        assert_eq!(out.bytes[0], 0b1111, "low 4 bits must survive (cut at bit 4)");
+        assert_eq!(
+            out.bytes[0], 0b1111,
+            "low 4 bits must survive (cut at bit 4)"
+        );
         for i in 1..curve.mod_words {
             assert_eq!(out.bytes[i], 0, "word {} must be cleared", i);
         }
@@ -499,12 +491,18 @@ mod tests {
         let e = FieldEl::from_hex("123456789ABCDEF0FEDCBA9876543210", curve.mod_words);
 
         let sig = sign(&curve, &d, &hash, &e).expect("sign must succeed");
-        assert!(verify(&curve, &pub_q, &hash, &sig), "valid signature must verify");
+        assert!(
+            verify(&curve, &pub_q, &hash, &sig),
+            "valid signature must verify"
+        );
 
         let mut bad_hash_words = hash.bytes.clone();
         bad_hash_words[0] ^= 1;
         let bad_hash = FieldEl::from_words(bad_hash_words);
-        assert!(!verify(&curve, &pub_q, &bad_hash, &sig), "modified hash must not verify");
+        assert!(
+            !verify(&curve, &pub_q, &bad_hash, &sig),
+            "modified hash must not verify"
+        );
 
         let mut bad_r_words = sig.r.bytes.clone();
         bad_r_words[0] ^= 1;
@@ -512,7 +510,10 @@ mod tests {
             r: FieldEl::from_words(bad_r_words),
             s: sig.s.clone(),
         };
-        assert!(!verify(&curve, &pub_q, &hash, &bad_sig), "modified r must not verify");
+        assert!(
+            !verify(&curve, &pub_q, &hash, &bad_sig),
+            "modified r must not verify"
+        );
     }
 
     #[test]
@@ -549,7 +550,10 @@ mod tests {
             curve.mod_words,
         );
         let sig = sign(&curve, &d, &hash, &rand_e).expect("sign must succeed");
-        assert!(verify(&curve, &pub_q, &hash, &sig), "sign → verify roundtrip must succeed");
+        assert!(
+            verify(&curve, &pub_q, &hash, &sig),
+            "sign → verify roundtrip must succeed"
+        );
     }
 
     #[test]
@@ -605,8 +609,14 @@ mod tests {
         let hash = FieldEl::from_hex("1234", curve.mod_words);
         let zero = FieldEl::zero(curve.mod_words);
         let one = small_field(&curve, 1);
-        let bad1 = Signature { r: zero.clone(), s: one.clone() };
-        let bad2 = Signature { r: one.clone(), s: zero.clone() };
+        let bad1 = Signature {
+            r: zero.clone(),
+            s: one.clone(),
+        };
+        let bad2 = Signature {
+            r: one.clone(),
+            s: zero.clone(),
+        };
         assert!(!verify(&curve, &pub_q, &hash, &bad1));
         assert!(!verify(&curve, &pub_q, &hash, &bad2));
     }
@@ -634,7 +644,10 @@ mod tests {
     #[test]
     fn sign_with_policy_off_matches_sign() {
         let curve = Curve::dstu_pb_257();
-        let policy = TauNafPolicy { sign: TauNafMode::Off, verify: TauNafMode::Off };
+        let policy = TauNafPolicy {
+            sign: TauNafMode::Off,
+            verify: TauNafMode::Off,
+        };
         let d = FieldEl::from_hex("ABCDEF1234567890", curve.mod_words);
         let g = Point::new(curve.base_x.clone(), curve.base_y.clone());
         let pub_q = g.mul(&d, &curve).negate();
@@ -660,7 +673,10 @@ mod tests {
         let hash = FieldEl::from_hex("1234ABCD", curve.mod_words);
         let rand_e = FieldEl::from_hex("9876FEDC", curve.mod_words);
         let sig = sign(&curve, &d, &hash, &rand_e).expect("sign");
-        let policy = TauNafPolicy { sign: TauNafMode::Off, verify: TauNafMode::On };
+        let policy = TauNafPolicy {
+            sign: TauNafMode::Off,
+            verify: TauNafMode::On,
+        };
         assert!(verify_with_policy(&curve, &pub_q, &hash, &sig, &policy));
     }
 }

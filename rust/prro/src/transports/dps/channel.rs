@@ -13,6 +13,7 @@ use super::dto::{
     CheckAck, CheckEnvelope, CheckSignBlob, OfflineCodesResponse, RroInfo, StatusSnapshot,
 };
 use super::error::DpsError;
+use super::raw_reply::RawSendObservation;
 
 /// `Send + Sync` so impls can be wrapped in `Arc<dyn DpsChannel>` and
 /// shared across worker tasks.  All five wire RPCs are unary (W0-1
@@ -22,6 +23,29 @@ pub trait DpsChannel: Send + Sync {
     /// `sendChkV2` — submit a CMS-signed receipt.  Maps the `Check`
     /// proto + `CheckResponse` proto onto the typed envelope/ack pair.
     async fn send_chk(&self, envelope: CheckEnvelope) -> Result<CheckAck, DpsError>;
+
+    /// CS-3 3.2 PR2 pin3 — the single-RPC fan-out (spec §4.2): submit a receipt with EXACTLY ONE
+    /// wire call and return BOTH the legacy `Result` AND the total transport-minted
+    /// `RawSendObservation` (the typed delivery evidence the Bridge/engine maps at apply).
+    ///
+    /// **REQUIRED — NO trait default (CS-3 S7-1).** The composed write-path apply derives the
+    /// terminal document state from `observation.evidence()`, so a degraded observation silently
+    /// collapses every outcome to `SubmittedUnknown`/HELD. A synthetic reverse-projection default
+    /// (from the already-collapsed `Result`) is REFUSED here: it would let a future production
+    /// adapter that forgets to override emit a FABRICATED digest/provenance as if transport-minted.
+    /// By carrying no default, every impl MUST choose its fidelity explicitly, compiler-enforced —
+    /// production `GrpcDpsChannel` overrides with the lossless single-decode body; scripted test
+    /// mocks use `dto::scripted_observation(self.send_chk(env).await)`; a mock exercising the
+    /// ABSENCE of a trusted reply returns an explicit `NoResponse` observation.
+    ///
+    /// **RETURN-TYPE PIN:** keep the tuple `(Result<…>, RawSendObservation)`. It MUST NOT be
+    /// "simplified" to `Result<(CheckAck, RawSendObservation), DpsError>` — that would DROP the
+    /// observation on the `Err` arm, which is the most reconciliation-valuable shadow
+    /// (`NoResponse`/`RemoteAuthStatus`). `?` on the tuple is a compile error, by design.
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (Result<CheckAck, DpsError>, RawSendObservation);
 
     /// `lastChk` — fetch the last receipt the server has on file for
     /// the FN encoded in `fn_sign`.  Used by recovery and by the

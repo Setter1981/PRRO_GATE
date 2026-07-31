@@ -3,7 +3,7 @@
 //! Anchored on:
 //!   - W8 successor freeze: `docs/superpowers/specs/2026-05-10-m3a-w10-dps-dispatch-design.md` (v3.1).
 //!   - ADR-M3-A6 + ADR-M3-A9 step 5-6 (Pattern B retry path).
-//!   - W0-3 §2 main table (8 DpsError variants) + §2.1 sub-table
+//!   - W0-3 §2 main table (10 DpsError variants) + §2.1 sub-table
 //!     (12 Server-routed status codes).
 //!
 //! **Pure-fn boundary.**  This module contains NO DB, NO async,
@@ -15,8 +15,8 @@
 //!
 //! **Exhaustive match on `DpsError` (B1 close).**  `DpsError` is
 //! NOT `#[non_exhaustive]` (verified at `transports/dps/error.rs:15`).
-//! The `route_dps_error` body matches all 8 variants explicitly with
-//! NO `_` catch-all — adding a 9th variant breaks the build at
+//! The `route_dps_error` body matches all 10 variants explicitly with
+//! NO `_` catch-all — adding an 11th variant breaks the build at
 //! compile time, exactly the safety net we want.  Only the raw
 //! `Server { code: i32 }` integer dispatch carries a fail-closed
 //! `_` arm (since `i32` isn't an enum).
@@ -101,6 +101,11 @@ pub enum RetryClass {
     /// not auto-retried.  Routed via ErrorRetryable →
     /// RequiresManualReconciliation chain (W9 step).
     OperatorEscalation,
+    /// Historical B10 tag retained solely to decode rows written by the
+    /// withdrawn `-8` chain-settle experiment.  No current routing emits it.
+    /// Reconciliation treats it as manual-only, never as permission to
+    /// re-send the persisted document.
+    DrainChainSettleRetry,
 }
 
 impl RetryClass {
@@ -119,6 +124,7 @@ impl RetryClass {
             Self::ProbeRequired => "ProbeRequired",
             Self::MacRecovery => "MacRecovery",
             Self::OperatorEscalation => "OperatorEscalation",
+            Self::DrainChainSettleRetry => "DrainChainSettleRetry",
         }
     }
 
@@ -139,6 +145,7 @@ impl RetryClass {
             "ProbeRequired" => Self::ProbeRequired,
             "MacRecovery" => Self::MacRecovery,
             "OperatorEscalation" => Self::OperatorEscalation,
+            "DrainChainSettleRetry" => Self::DrainChainSettleRetry,
             _ => return None,
         })
     }
@@ -236,10 +243,35 @@ pub struct ProbeHint {
 pub enum ProbeReason {
     /// status=0 UNKNOWN — proto-default, server contract drift suspected.
     DecodeUnknown,
-    /// `-2` ERROR_CHECK + doc_type ∈ {SHIFT_CLOSE, Z_REPORT}.
-    Code2CloseShift,
-    /// `-15` ERROR_NOT_OPEN_SHIFT + doc_type ∈ {SHIFT_CLOSE, Z_REPORT}.
-    Code15CloseShift,
+    /// CS-3 Slice E: `-2` (ERROR_CHECK) or `-15` (ERROR_NOT_OPEN_SHIFT) on a
+    /// {SHIFT_CLOSE, Z_REPORT} doc — both are close-shift ambiguity that HOLDS for a probe with
+    /// zero second wire. The raw code is already discarded in the sealed `CloseAmbiguous` evidence
+    /// leaf (`prro-domain` `evidence.rs`), and both arms produced an identical `ProbeRequired`/HELD
+    /// `RoutingDecision`, so they unify to ONE reason — an accepted observable audit-label merge
+    /// (2→1). No downstream distinguishes `-2` from `-15`; the probe reads `routing_class`, not this.
+    CloseShiftProbe,
+    /// CS-3 S7-1 (dossier rev9): DPS returned OK (`status==1`) with an EMPTY fiscal id — no
+    /// issuance occurred, so the receipt is HELD for a `last_chk` probe rather than treated as a
+    /// `Sent{""}`. This is the target for the `OkButNoFiscalNumber` evidence leaf; the pre-cutover
+    /// early empty-id guard turned the same condition into a refusal.
+    OkButNoFiscalNumber,
+    /// CS-3 S7-1 (F3): a TLS-proven `Unauthenticated`/`PermissionDenied` (an authenticated non-DPS
+    /// peer, e.g. WAF/gateway) — the evidence classifier maps `RemoteAuthStatus → ProbeRequired`, so
+    /// the receipt is HELD for a `last_chk` probe rather than the legacy `TransientRetry` re-drive.
+    /// DISTINCT from [`OkButNoFiscalNumber`]: the cause is a remote status, not an empty fiscal id.
+    RemoteStatus,
+    /// CS-3 Slice E (Pin 2 / Track A): the `UnknownStatus` evidence leaf — a parsed DPS envelope
+    /// carrying a status code OUTSIDE the recognized reject/accept enum (e.g. `-4 ERROR_UNKNOWN`,
+    /// `-17`, `-99`). The submission crossed the wire and a real envelope came back, but its verdict
+    /// is unresolvable, so the receipt is HELD for a `last_chk` probe. DISTINCT from
+    /// [`DecodeUnknown`]: that is a proto-default `status==0` (no envelope verdict at all), whereas
+    /// this is a NON-zero code the server DID return but the contract does not name.
+    ///
+    /// **Activated by Pin 3.** Pin 2 pre-wired this leaf's `ProbeRequired` arm in `wire_decision_from`
+    /// dormant; Pin 3 flipped `routing_for_indeterminate(UnknownStatus) → ProbeRequired` (`prro-domain`
+    /// `mod.rs`, atomic with migration 038), so the classifier now HOLDS this leaf and the projection
+    /// emits this probe reason — no `wire_decision_from` change was needed for the flip.
+    SubmittedUnknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,8 +300,8 @@ pub fn route_send_result(
 
 /// Pure-fn routing of a `DpsError` per W0-3 §2 + §2.1.
 ///
-/// **Exhaustive match (B1 close):** all 8 `DpsError` variants have
-/// explicit arms; NO `_` catch-all.  A 9th variant added in the
+/// **Exhaustive match (B1 close):** all 10 `DpsError` variants have
+/// explicit arms; NO `_` catch-all.  An 11th variant added in the
 /// future BREAKS the build at compile time.  Only the raw
 /// `Server { code: i32 }` integer dispatch carries a fail-closed `_`
 /// arm (since `i32` isn't an enum).
@@ -286,6 +318,44 @@ pub fn route_dps_error(err: &DpsError, doc_type: DocType, is_live_send: bool) ->
             retry_class: RetryClass::TransientRetry,
             // F4 close: distinct audit event for transient retry —
             // forensic clarity vs happy-path StageSendResult.
+            audit_event: AuditEvent::StageSendTransientRetry,
+            audit_severity: Severity::Warning,
+            node_mode_flip: None,
+            probe_hint: None,
+            mac_recovery_hint: None,
+        },
+        // CS-3 Slice A′ + RA: gRPC `Unauthenticated` / `PermissionDenied` now arrive as
+        // `RemoteStatus` (they were collapsed into `Transport` in `map_tonic_status`).
+        // Routing here is IDENTICAL to `Transport` — same `ErrorRetryable` /
+        // `TransientRetry` / audit — a compatibility projection.  The slice is NOT
+        // behaviour-neutral overall: R1 TLS-gated the emission (a plaintext
+        // `Unauthenticated` now routes as `Transport`) and consumers observe the distinct
+        // type (`last_chk_probe` / `kvt2_confirm` / `dps_error_class`).  The distinct
+        // in-memory type lets slice E (classifier) map RemoteStatus → ProbeRequired
+        // without touching the Transport arm.  Separate arm kept intentionally.
+        //
+        // Slice E maps RemoteStatus → ProbeRequired; the incumbent routing stays
+        // TransientRetry here until that classifier lands.
+        DpsError::RemoteStatus { .. } => RoutingDecision {
+            target_state: DocState::ErrorRetryable,
+            retry_class: RetryClass::TransientRetry,
+            audit_event: AuditEvent::StageSendTransientRetry,
+            audit_severity: Severity::Warning,
+            node_mode_flip: None,
+            probe_hint: None,
+            mac_recovery_hint: None,
+        },
+        // CS-3 Slice A + RA: a parsed DPS `-4` (ERROR_UNKNOWN) now arrives as
+        // `Indeterminate` (it was collapsed into `Transport` at dto.rs). Routing here is
+        // IDENTICAL to `Transport` — same `ErrorRetryable` / `TransientRetry` / audit —
+        // a compatibility projection.  The `-4` retyping is NOT behaviour-neutral overall:
+        // it is observable via `dps_error_class` / probe / confirm consumers.  The
+        // distinct in-memory type lets the CS-3 classifier map `-4` to
+        // `Parsed(Indeterminate)` (the fence / differentiation is slice E). Kept a
+        // SEPARATE arm so E can change it without touching Transport.
+        DpsError::Indeterminate { .. } => RoutingDecision {
+            target_state: DocState::ErrorRetryable,
+            retry_class: RetryClass::TransientRetry,
             audit_event: AuditEvent::StageSendTransientRetry,
             audit_severity: Severity::Warning,
             node_mode_flip: None,
@@ -358,7 +428,7 @@ pub fn route_dps_error(err: &DpsError, doc_type: DocType, is_live_send: bool) ->
             probe_hint: None,
             mac_recovery_hint: None,
         },
-        // NO `_` catch-all on the enum match — adding a 9th DpsError
+        // NO `_` catch-all on the enum match — adding an 11th DpsError
         // variant in the future MUST break the build (B1 close).
     }
 }
@@ -405,7 +475,7 @@ fn route_server_code(
                     audit_severity: Severity::Warning,
                     node_mode_flip: None,
                     probe_hint: Some(ProbeHint {
-                        reason: ProbeReason::Code2CloseShift,
+                        reason: ProbeReason::CloseShiftProbe,
                     }),
                     mac_recovery_hint: None,
                 }
@@ -499,7 +569,7 @@ fn route_server_code(
                     audit_severity: Severity::Warning,
                     node_mode_flip: None,
                     probe_hint: Some(ProbeHint {
-                        reason: ProbeReason::Code15CloseShift,
+                        reason: ProbeReason::CloseShiftProbe,
                     }),
                     mac_recovery_hint: None,
                 }
@@ -562,7 +632,7 @@ mod tests {
         }
     }
 
-    // ─── 10 fixtures covering W0-3 §2 main 8 DpsError variants ──────
+    // ─── 10 fixtures covering W0-3 §2 main 10 DpsError variants ──────
 
     #[test]
     fn fixture_01_transport_routes_to_transient_retry() {
@@ -750,7 +820,7 @@ mod tests {
             assert_eq!(
                 d.probe_hint,
                 Some(ProbeHint {
-                    reason: ProbeReason::Code2CloseShift
+                    reason: ProbeReason::CloseShiftProbe
                 })
             );
         }
@@ -831,7 +901,7 @@ mod tests {
             assert_eq!(
                 d.probe_hint,
                 Some(ProbeHint {
-                    reason: ProbeReason::Code15CloseShift
+                    reason: ProbeReason::CloseShiftProbe
                 })
             );
         }
@@ -972,13 +1042,19 @@ mod tests {
         // NOT branch on it (per freeze §3.5: `false` branch RESERVED).
         // This test PINS that contract: as long as W10 is on its own,
         // both `true` and `false` must yield identical decisions for
-        // the full 8 DpsError variants × representative server codes.
+        // the full 10 DpsError variants × representative server codes.
         //
         // When W9 lands and starts diverging routing on `false`, the
         // freeze §3.5 STABILITY NOTE will be lifted and this pin test
         // will be UPDATED (not deleted) to encode the new contract.
         let cases: Vec<DpsError> = vec![
             DpsError::Transport("TLS".into()),
+            // CS-3 Slice A′ + RA: RemoteStatus added to pin its ROUTING identity to Transport (a compatibility projection; the slice is NOT behaviour-neutral overall — R1).
+            DpsError::RemoteStatus {
+                code: "Unauthenticated".into(),
+                message: "invalid token".into(),
+                digest: prro_domain::delivery::GrpcStatusDigest::from_transport_digest([0xAB; 32]),
+            },
             DpsError::Authorization {
                 code: -1,
                 kind: AuthorizationKind::DocumentReject,
@@ -1095,11 +1171,11 @@ mod tests {
             ),
             (
                 route_server_code(-2, "open shift", DocType::ShiftClose, true),
-                ProbeReason::Code2CloseShift,
+                ProbeReason::CloseShiftProbe,
             ),
             (
                 route_server_code(-15, "x", DocType::ZReport, true),
-                ProbeReason::Code15CloseShift,
+                ProbeReason::CloseShiftProbe,
             ),
         ];
         for (d, expected_reason) in cases {
@@ -1111,6 +1187,12 @@ mod tests {
             );
         }
     }
+
+    // (CS-3 Slice E Pin 2: `target_wire_decision` + `ok_but_no_fiscal_number_routing` were removed —
+    // the empty-SFN `Sent{""}`→held reconciliation is now the STRUCTURAL `OkButNoFiscalNumber` evidence
+    // leaf in `wire_decision_from` (`stage_send.rs`), covered end-to-end by
+    // `write_path_stage4_send.rs` (empty-SFN → OkButNoFiscalNumber ProbeRequired HELD). This unit test,
+    // which exercised the now-deleted legacy-WireDecision seam, is retired with it.)
 
     #[test]
     fn mac_recovery_class_carries_hint_with_raw_message() {

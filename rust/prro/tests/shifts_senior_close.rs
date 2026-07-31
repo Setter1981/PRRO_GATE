@@ -15,6 +15,7 @@ use prro::db::open_pool;
 use prro::db::repositories::fiscal_number_config::{self as fn_repo, NewFnConfig};
 use prro::db::repositories::shifts::{self, SeniorCloseError, SeniorCloseOutcome};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbShiftId;
 
 const ALL_NON_CLOSABLE_STATES: [ShiftState; 7] = [
     ShiftState::Created,
@@ -93,9 +94,9 @@ async fn seed_shift_in_state(pool: &sqlx::SqlitePool, fn_id: &str, state: ShiftS
             opened_by_cashier_id) \
          VALUES (?, ?, ?, 'ONLINE', 0, 'cashier-vasya')",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .bind(fn_id)
-    .bind(state)
+    .bind(state.as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -116,7 +117,7 @@ async fn count_audit_events(pool: &sqlx::SqlitePool, shift_id_hex: &str, event_t
 
 async fn shift_id_hex(pool: &sqlx::SqlitePool, id: ShiftId) -> String {
     sqlx::query_scalar("SELECT lower(hex(shift_id)) FROM shifts WHERE shift_id = ?")
-        .bind(id)
+        .bind(DbShiftId(id))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -265,7 +266,7 @@ async fn senior_close_refused_not_closable_for_all_7_disallowed_sources() {
         // before the next disallowed `from` state is seeded.  This covers the
         // senior-close source guard, not per-FN uniqueness.
         sqlx::query("DELETE FROM shifts WHERE shift_id = ?")
-            .bind(shift_id)
+            .bind(DbShiftId(shift_id))
             .execute(&pool)
             .await
             .unwrap();

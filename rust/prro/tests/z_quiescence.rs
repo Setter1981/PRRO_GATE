@@ -10,6 +10,7 @@
 use prro::db::models::ids::{DocumentId, ShiftId};
 use prro::db::open_pool;
 use prro::db::repositories::fiscal_documents;
+use prro::db::types::{DbDocumentId, DbShiftId};
 use prro::runtime::ingress::convert::{aggregate_z_payload, aggregate_z_payload_for_shift};
 use prro::runtime::ingress::z_builder::{quiesce_shift_before_z, QuiescenceOutcome};
 
@@ -38,7 +39,7 @@ async fn seed_open_shift(pool: &sqlx::SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, 'cashier')",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .execute(pool)
     .await
@@ -49,7 +50,7 @@ async fn seed_open_shift(pool: &sqlx::SqlitePool) -> ShiftId {
          VALUES (?, 'ONLINE', 'OPENED', ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -72,10 +73,10 @@ async fn seed_receipt(
             payload_json, payload_sha256_canonical \
          ) VALUES (?, ?, ?, ?, ?, 'SELL', ?, 'b', 't', 'ONLINE', '2026-06-08T00:00:00Z', '{}', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req)
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(state)
     .bind(&[0u8; 32][..])
@@ -106,10 +107,10 @@ async fn seed_receipt_d3(
          ) VALUES (?, ?, ?, ?, ?, 'SELL', ?, 'b', 't', 'ONLINE', '2026-06-08T00:00:00Z', \
             '{}', ?, ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req)
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(state)
     .bind(&[0u8; 32][..])
@@ -332,10 +333,10 @@ async fn seed_kvt2_finalizable(pool: &sqlx::SqlitePool, shift_id: ShiftId, lnd: 
          ) VALUES (?, ?, ?, ?, ?, 'SELL', 'KVT2', 'b', 't', 'ONLINE', \
             '2026-06-08T00:00:00Z', '{}', ?, ?, ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(&req)
     .bind(FN)
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(lnd)
     .bind(&[0u8; 32][..])
     .bind(&seed[..])
@@ -374,7 +375,7 @@ async fn kvt2_is_finalized_inline_then_clear_and_counted() {
     // The KVT2 doc was finalized to Ack (issued) and now counts.
     let state: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(kvt2_doc)
+            .bind(DbDocumentId(kvt2_doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -400,7 +401,7 @@ async fn kvt2_finalized_but_other_pending_blocks() {
     // AFTER it in lnd order, so the chain isn't blocked ahead of the KVT2).
     let state: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(kvt2_doc)
+            .bind(DbDocumentId(kvt2_doc))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -427,7 +428,7 @@ async fn kvt2_behind_an_earlier_blocker_is_not_finalized() {
     // The KVT2 was NOT finalized (it sits behind the SIGNED doc in the chain).
     let state: String =
         sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-            .bind(kvt2_doc)
+            .bind(DbDocumentId(kvt2_doc))
             .fetch_one(&pool)
             .await
             .unwrap();

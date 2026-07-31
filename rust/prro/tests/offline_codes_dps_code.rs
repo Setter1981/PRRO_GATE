@@ -15,6 +15,7 @@
 use prro::db::models::ids::DocumentId;
 use prro::db::repositories::offline_sessions::{self, InsertedSummary};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbDocumentId;
 
 const FN: &str = "4000162280";
 
@@ -67,7 +68,7 @@ async fn insert_fiscal_doc(pool: &sqlx::SqlitePool, fiscal_number: &str, lnd: i6
          VALUES (?, ?, ?, ?, 'SELL', 'PREPARED', 'b', 't', 'OFFLINE', \
             '2026-07-07T00:00:00Z', '{}', ?)",
     )
-    .bind(doc_id)
+    .bind(DbDocumentId(doc_id))
     .bind(req_id.as_bytes().to_vec())
     .bind(fiscal_number)
     .bind(lnd)

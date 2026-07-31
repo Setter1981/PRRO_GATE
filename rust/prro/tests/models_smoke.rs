@@ -6,6 +6,7 @@
 //! glue is exercised end-to-end against bundled SQLite.
 
 use prro::db::models::*;
+use prro::db::types::DbShiftId;
 
 #[test]
 fn document_id_roundtrip_bytes() {
@@ -62,17 +63,18 @@ async fn fiscal_mode_roundtrips_through_fn_config_text_column() {
     )
     .bind("4444444444")
     .bind("12345678")
-    .bind(FiscalMode::Test)
+    .bind(FiscalMode::Test.as_str())
     .execute(&pool)
     .await
     .unwrap();
 
-    let mode: FiscalMode = sqlx::query_scalar(
+    let mode: FiscalMode = sqlx::query_scalar::<_, prro::db::types::DbFiscalMode>(
         "SELECT fiscal_mode FROM fiscal_number_config WHERE fiscal_number = '4444444444'",
     )
     .fetch_one(&pool)
     .await
-    .unwrap();
+    .unwrap()
+    .0;
     assert_eq!(mode, FiscalMode::Test);
 }
 
@@ -93,16 +95,18 @@ async fn shift_id_roundtrips_through_shifts_blob_column() {
             cash_balance_kop, opened_by_cashier_id) VALUES (?, '5555555555', 'CREATED', 'ONLINE', \
             '2026-04-22T00:00:00Z', 0, 'test-cashier')",
     )
-    .bind(id)
+    .bind(DbShiftId(id))
     .execute(&pool)
     .await
     .unwrap();
 
-    let got: ShiftId =
-        sqlx::query_scalar("SELECT shift_id FROM shifts WHERE fiscal_number = '5555555555'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let got: ShiftId = sqlx::query_scalar::<_, DbShiftId>(
+        "SELECT shift_id FROM shifts WHERE fiscal_number = '5555555555'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .0;
     assert_eq!(
         id, got,
         "round-trip BLOB through real shifts column must be lossless"

@@ -19,6 +19,7 @@ use prro::db::models::enums::{DocState, FiscalMode, NodeMode, Protocol, ShiftSta
 use prro::db::models::ids::{RequestId, ShiftId};
 use prro::db::repositories::ingress_inbox::{self as inbox, InboxRow, NewInboxEntry};
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::DbShiftId;
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::backlog_drain;
 use prro::services::reconciliation::{boot_phase, ReconcileGuard, RuntimeView};
@@ -311,6 +312,15 @@ impl DpsChannel for DpsStub {
             .pop_front()
             .expect("send_q empty")
     }
+    async fn send_chk_observed(
+        &self,
+        envelope: CheckEnvelope,
+    ) -> (
+        Result<CheckAck, DpsError>,
+        prro::transports::dps::raw_reply::RawSendObservation,
+    ) {
+        prro::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+    }
     async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
         self.last_calls.fetch_add(1, Ordering::SeqCst);
         self.last_q
@@ -376,7 +386,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, \
             cash_balance_kop, opened_by_cashier_id) VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(FN)
     .bind(CASHIER)
     .execute(pool)
@@ -391,9 +401,9 @@ async fn seed_node_online(pool: &SqlitePool, shift_id: ShiftId) {
           backend_profile_id, transport_profile_id) VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(FN)
-    .bind(NodeMode::Online)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(NodeMode::Online.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -446,14 +456,23 @@ async fn issue_receipt_to_ack(pool: &SqlitePool, pool_secure: &SqlitePool, n: i6
     let row = seed_inbox_sell(pool, n).await;
     let stub = DpsStub::new();
     stub.push_send(Ok(ack(SERVER_FISCAL_NO, vec![])));
-    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
-    let outcome = inline::run(pool, pool_secure, &stub, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .unwrap_or_else(|e| panic!("receipt {n} must reach ACK: {e:?}"));
+    let outcome = inline::run(
+        pool,
+        pool_secure,
+        &stub,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("receipt {n} must reach ACK: {e:?}"));
     assert_eq!(outcome.document_state, DocState::Ack, "receipt {n} → ACK");
 }
 
@@ -581,14 +600,23 @@ async fn issue_receipt_to_ack_sfn(
     // send + online-confirm lastChk both carry the same wire id, so the
     // online write-path advances the doc to terminal ACK with this sfn.
     stub.push_send(Ok(ack(server_fiscal_no, vec![])));
-    stub.push_last(Ok(ack(server_fiscal_no, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack(server_fiscal_no, vec![0xDE; 64])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let guard = gate.lock_owned().await;
-    let outcome = inline::run(pool, pool_secure, &stub, &sign_ctx, &fn_sign, &guard, &row)
-        .await
-        .unwrap_or_else(|e| panic!("receipt {n} (sfn {server_fiscal_no}) must reach ACK: {e:?}"));
+    let outcome = inline::run(
+        pool,
+        pool_secure,
+        &stub,
+        &sign_ctx,
+        &fn_sign,
+        &guard,
+        &row,
+        prro::services::time_budget::system_gate(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("receipt {n} (sfn {server_fiscal_no}) must reach ACK: {e:?}"));
     assert_eq!(outcome.document_state, DocState::Ack, "receipt {n} → ACK");
 }
 
@@ -633,7 +661,7 @@ async fn node_mode(pool: &SqlitePool) -> String {
 /// (`backlog_drain.rs:687`).
 async fn set_node_going_online(pool: &SqlitePool) {
     sqlx::query("UPDATE node_state SET mode = ? WHERE fiscal_number = ?")
-        .bind(NodeMode::GoingOnline)
+        .bind(NodeMode::GoingOnline.as_str())
         .bind(FN)
         .execute(pool)
         .await
@@ -687,7 +715,7 @@ async fn tip_guard_stale_restore_blocks_node_e2e() {
     // zero wire), then the tip-guard with a stub whose lastChk reports SFN-2
     // (DPS is ahead of our restored tip SFN-1).
     let stub = DpsStub::new();
-    stub.push_last(Ok(ack("SFN-2", vec![0xDE, 0xAD, 0xBE, 0xEF])));
+    stub.push_last(Ok(ack("SFN-2", vec![0xDE; 64])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let view = RuntimeView {
@@ -1102,7 +1130,7 @@ async fn tip_guard_malformed_tail_null_sfn_blocks() {
     // lastChk would Match the older valid tip (SFN-1) → without NC-04 the guard
     // returns TIP_GUARD_OK.  The malformed newer tail must block first.
     let stub = DpsStub::new();
-    stub.push_last(Ok(ack("SFN-1", vec![0xDE, 0xAD])));
+    stub.push_last(Ok(ack("SFN-1", vec![0xDE; 64])));
     let sign_ctx = det_signing_ctx();
     let fn_sign = CheckSignBlob(vec![0xAB, 0xCD]);
     let view = RuntimeView {
@@ -1363,7 +1391,10 @@ async fn boot_branch_a_fresh_fn_empty_ledger_bootstraps_unchanged() {
 }
 
 // ─── Batch B (AUD-L4-1) — tip-guard NotFound on a non-ACK in-flight SENT tip ──
-//     must DEFER to the drain's safe-redrive, not BLOCK the FN.
+//     must DEFER (not BLOCK the FN) to the drain, which — post CS-3 S7-1 R5
+//     (F2-kvt2) — escalates the issuance-ambiguous SENT doc to RMR + STOP
+//     (double-issue-safe, operator-recoverable) rather than the old auto
+//     safe-redrive Sent→ER.
 
 /// Seed an in-flight offline-origin doc (sfn set) at `state` — the AUD-L4-1
 /// scenario: the FN's newest SUBMITTED tip is a non-ACK in-flight doc.
@@ -1471,8 +1502,15 @@ async fn tip_guard_inflight_sent_notfound_defers_to_drain() {
     assert_eq!(deferred, 1, "one TIP_GUARD_DEFERRED_INFLIGHT audit");
 
     // ── Phase 2: the drain now OWNS the deferred SENT doc.  lastChk(SFN-2) →
-    //    NotFound → HIGH-C5-3 safe-redrive (Sent → ER).  This proves the defer
-    //    enables recovery END-TO-END — no permanent wedge (spec §B pin). ──
+    //    NotFound → CS-3 S7-1 R5 (F2-kvt2): a Sent doc DPS reports NotFound is
+    //    issuance-AMBIGUOUS, so the drain does NOT blindly re-drive it (that
+    //    second wire is the double-issue hazard R6 retired).  It escalates
+    //    atomically to RMR + node STOP + a Critical operator-handoff audit — an
+    //    operator-recoverable halt (resolve-operator-pending), NOT the old auto
+    //    Sent→ER safe-redrive.  The defer still avoids the AUD-L4-1 *permanent
+    //    silent* wedge: the drain is NOT gated out and the SENT doc reaches a
+    //    surfaced, recoverable terminal (spec §B pin — recovery is now
+    //    operator-gated + double-issue-safe, per the deliberate P2>liveness pin). ──
     let stub_drain = DpsStub::new();
     stub_drain.push_last(Err(DpsError::NotFound));
     let view_drain = RuntimeView {
@@ -1493,12 +1531,30 @@ async fn tip_guard_inflight_sent_notfound_defers_to_drain() {
     .await
     .unwrap();
     assert_eq!(skipped, 0, "drain must NOT be gated out after the defer");
-    // ... and safe-redrove the deferred SENT doc to ERROR_RETRYABLE (next tick
-    // re-sends it via Pattern-B) — the SENT doc is no longer stranded.
+    // ... and escalated the deferred SENT doc to RequiresManualReconciliation +
+    // node STOP (issuance-ambiguous → no blind re-drive; CS-3 S7-1 R5 F2-kvt2).
+    // The SENT doc is no longer silently stranded — it rests at a surfaced,
+    // operator-recoverable terminal instead of the old double-issue-unsafe
+    // Sent→ER auto-redrive.
     assert_eq!(
         read_doc_state(&env.pool, 2).await,
-        "ERROR_RETRYABLE",
-        "the deferred SENT doc safe-redrives (Sent → ER), proving no wedge"
+        "REQUIRES_MANUAL_RECONCILIATION",
+        "the deferred SENT doc escalates to RMR (issuance-ambiguous, no blind re-drive)"
+    );
+    assert_eq!(
+        node_mode(&env.pool).await,
+        "STOP_MODE",
+        "the escalation halts the node to STOP_MODE atomically (fork-guard)"
+    );
+    let escalated: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE event_type = 'SENT_NOT_FOUND_ESCALATED_MANUAL'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        escalated, 1,
+        "one Critical SENT_NOT_FOUND_ESCALATED_MANUAL operator-handoff audit"
     );
 }
 

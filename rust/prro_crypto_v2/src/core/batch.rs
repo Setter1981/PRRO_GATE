@@ -46,7 +46,10 @@ pub struct BatchResult {
 /// All items are always checked (no short-circuit on first failure).
 pub fn batch_verify(items: &[BatchItem<'_>], curve: &Curve) -> BatchResult {
     if items.is_empty() {
-        return BatchResult { all_valid: true, failed: Vec::new() };
+        return BatchResult {
+            all_valid: true,
+            failed: Vec::new(),
+        };
     }
 
     // Build an index sorted by public-key x-coordinate bytes.
@@ -67,7 +70,10 @@ pub fn batch_verify(items: &[BatchItem<'_>], curve: &Curve) -> BatchResult {
         }
     }
     failed.sort_unstable(); // restore original-index order
-    BatchResult { all_valid: failed.is_empty(), failed }
+    BatchResult {
+        all_valid: failed.is_empty(),
+        failed,
+    }
 }
 
 /// Fast all-or-nothing batch verify using a random linear combination.
@@ -93,9 +99,7 @@ pub fn batch_verify_fast(items: &[BatchItem<'_>], curve: &Curve) -> bool {
 
     // Sort by pubkey for Q-cache locality, then short-circuit on first failure.
     let mut order: Vec<usize> = (0..items.len()).collect();
-    order.sort_by(|&a, &b| {
-        items[a].pub_q.x.bytes.cmp(&items[b].pub_q.x.bytes)
-    });
+    order.sort_by(|&a, &b| items[a].pub_q.x.bytes.cmp(&items[b].pub_q.x.bytes));
 
     for &idx in &order {
         let it = &items[idx];
@@ -110,8 +114,8 @@ pub fn batch_verify_fast(items: &[BatchItem<'_>], curve: &Curve) -> bool {
 mod tests {
     use super::*;
     use crate::core::curve::Curve;
-    use crate::core::sign::{sign, Signature};
     use crate::core::field::FieldEl;
+    use crate::core::sign::{sign, Signature};
 
     fn make_scalar(v: u32, mw: usize) -> FieldEl {
         let mut w = vec![0u32; mw];
@@ -150,7 +154,11 @@ mod tests {
     fn batch_single_valid() {
         let curve = Curve::dstu_pb_257();
         let (q, h, sig) = make_valid_item(&curve, 3, 7, 11);
-        let items = [BatchItem { pub_q: &q, hash: &h, sig: &sig }];
+        let items = [BatchItem {
+            pub_q: &q,
+            hash: &h,
+            sig: &sig,
+        }];
         let r = batch_verify(&items, &curve);
         assert!(r.all_valid, "single valid signature should pass");
     }
@@ -163,9 +171,21 @@ mod tests {
         let (_q, h2, sig2) = make_valid_item(&curve, 3, 13, 17);
         let (_q, h3, sig3) = make_valid_item(&curve, 3, 19, 23);
         let items = [
-            BatchItem { pub_q: &q, hash: &h1, sig: &sig1 },
-            BatchItem { pub_q: &q, hash: &h2, sig: &sig2 },
-            BatchItem { pub_q: &q, hash: &h3, sig: &sig3 },
+            BatchItem {
+                pub_q: &q,
+                hash: &h1,
+                sig: &sig1,
+            },
+            BatchItem {
+                pub_q: &q,
+                hash: &h2,
+                sig: &sig2,
+            },
+            BatchItem {
+                pub_q: &q,
+                hash: &h3,
+                sig: &sig3,
+            },
         ];
         let r = batch_verify(&items, &curve);
         assert!(r.all_valid, "all valid sigs from same key should pass");
@@ -178,7 +198,11 @@ mod tests {
         let (q, h, mut sig) = make_valid_item(&curve, 3, 7, 11);
         // Corrupt the signature
         sig.r.bytes[0] ^= 1;
-        let items = [BatchItem { pub_q: &q, hash: &h, sig: &sig }];
+        let items = [BatchItem {
+            pub_q: &q,
+            hash: &h,
+            sig: &sig,
+        }];
         let r = batch_verify(&items, &curve);
         assert!(!r.all_valid);
         assert_eq!(r.failed, vec![0]);
@@ -192,9 +216,21 @@ mod tests {
         let (q3, h3, sig3) = make_valid_item(&curve, 7, 19, 23);
         sig2.r.bytes[0] ^= 1; // corrupt index 1
         let items = [
-            BatchItem { pub_q: &q1, hash: &h1, sig: &sig1 },
-            BatchItem { pub_q: &q2, hash: &h2, sig: &sig2 },
-            BatchItem { pub_q: &q3, hash: &h3, sig: &sig3 },
+            BatchItem {
+                pub_q: &q1,
+                hash: &h1,
+                sig: &sig1,
+            },
+            BatchItem {
+                pub_q: &q2,
+                hash: &h2,
+                sig: &sig2,
+            },
+            BatchItem {
+                pub_q: &q3,
+                hash: &h3,
+                sig: &sig3,
+            },
         ];
         let r = batch_verify(&items, &curve);
         assert!(!r.all_valid);
@@ -205,7 +241,11 @@ mod tests {
     fn batch_fast_valid() {
         let curve = Curve::dstu_pb_257();
         let (q, h, sig) = make_valid_item(&curve, 3, 7, 11);
-        let items = [BatchItem { pub_q: &q, hash: &h, sig: &sig }];
+        let items = [BatchItem {
+            pub_q: &q,
+            hash: &h,
+            sig: &sig,
+        }];
         assert!(batch_verify_fast(&items, &curve));
     }
 
@@ -214,7 +254,11 @@ mod tests {
         let curve = Curve::dstu_pb_257();
         let (q, h, mut sig) = make_valid_item(&curve, 3, 7, 11);
         sig.s.bytes[0] ^= 1;
-        let items = [BatchItem { pub_q: &q, hash: &h, sig: &sig }];
+        let items = [BatchItem {
+            pub_q: &q,
+            hash: &h,
+            sig: &sig,
+        }];
         assert!(!batch_verify_fast(&items, &curve));
     }
 }

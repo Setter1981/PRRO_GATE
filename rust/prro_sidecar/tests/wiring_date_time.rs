@@ -51,7 +51,6 @@ fn sidecar_check_date_time_comes_from_business_ts_not_now() {
     );
 }
 
-
 #[test]
 fn sidecar_emits_pipeline_delay_metrics() {
     // M7-Py-4a-2: ops must be able to alert on abnormal gaps between
@@ -83,17 +82,13 @@ fn sidecar_emits_pipeline_delay_metrics() {
     }
 }
 
-
 #[test]
 fn xml_builder_format_ts_uses_iana_kyiv_tz_not_fixed_utc_plus_3() {
     // Source-level guard: xml_builder::format_ts must delegate to
     // time_utils::kyiv_local_yyyymmddhhmmss (which uses IANA
     // Europe/Kyiv with DST) — not the old hardcoded UTC+3 offset.
-    let src = fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/xml_builder.rs"
-    ))
-    .expect("xml_builder.rs is readable");
+    let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/xml_builder.rs"))
+        .expect("xml_builder.rs is readable");
 
     assert!(
         src.contains("kyiv_local_yyyymmddhhmmss"),
@@ -109,14 +104,13 @@ fn xml_builder_format_ts_uses_iana_kyiv_tz_not_fixed_utc_plus_3() {
     );
 }
 
-
 // ── S2: envelope integrity ─────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod envelope_integrity {
     use prro_sidecar::input::CanonicalCommand;
-    use sha2::{Digest, Sha256};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     fn make_cmd(schema_version: &str, payload_sha256: &str) -> CanonicalCommand {
         serde_json::from_value(json!({
@@ -176,23 +170,31 @@ mod envelope_integrity {
 mod idempotency {
     use prro_sidecar::repo::{PendingInsertResult, Repo};
 
-    fn make_repo() -> Repo { Repo::open(":memory:").expect("in-memory repo") }
+    fn make_repo() -> Repo {
+        Repo::open(":memory:").expect("in-memory repo")
+    }
     const OP: &str = "SELL";
     const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn fresh_key_returns_inserted() {
         let repo = make_repo();
-        let r = repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap();
+        let r = repo
+            .insert_pending_request("key-1", "FN001", OP, SHA, "")
+            .unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
     #[test]
     fn accepted_key_returns_cached_json() {
         let repo = make_repo();
-        repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("key-1", "FN001", OP, SHA, "")
+            .unwrap();
         repo.accept_request("key-1", r#"{"status":1}"#).unwrap();
-        match repo.insert_pending_request("key-1", "FN001", OP, SHA, "").unwrap() {
+        match repo
+            .insert_pending_request("key-1", "FN001", OP, SHA, "")
+            .unwrap()
+        {
             PendingInsertResult::DuplicateAccepted(json) => {
                 assert_eq!(json, r#"{"status":1}"#);
             }
@@ -203,16 +205,22 @@ mod idempotency {
     #[test]
     fn different_key_returns_inserted() {
         let repo = make_repo();
-        repo.insert_pending_request("key-A", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("key-A", "FN001", OP, SHA, "")
+            .unwrap();
         repo.accept_request("key-A", r#"{"status":1}"#).unwrap();
-        let r = repo.insert_pending_request("key-B", "FN001", OP, SHA, "").unwrap();
+        let r = repo
+            .insert_pending_request("key-B", "FN001", OP, SHA, "")
+            .unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
     #[test]
     fn fiscal_send_inner_contains_idempotency_wiring() {
         let src = include_str!("../src/bin/prro_sidecar.rs");
-        assert!(src.contains("insert_pending_request"), "must call insert_pending_request");
+        assert!(
+            src.contains("insert_pending_request"),
+            "must call insert_pending_request"
+        );
         assert!(src.contains("accept_request"), "must call accept_request");
     }
 
@@ -226,11 +234,22 @@ mod idempotency {
         let repo = make_repo();
 
         // Insert with empty identity (simulates pre-F2 row after migration).
-        repo.insert_pending_request("legacy-key", "FN001", "", "", "").unwrap();
-        repo.accept_request("legacy-key", r#"{"status":99}"#).unwrap();
+        repo.insert_pending_request("legacy-key", "FN001", "", "", "")
+            .unwrap();
+        repo.accept_request("legacy-key", r#"{"status":99}"#)
+            .unwrap();
 
         // Replay with real op/sha/ts — must return cached response, NOT HardConflict.
-        match repo.insert_pending_request("legacy-key", "FN001", "SELL", SHA, "2026-01-01T10:00:00+03:00").unwrap() {
+        match repo
+            .insert_pending_request(
+                "legacy-key",
+                "FN001",
+                "SELL",
+                SHA,
+                "2026-01-01T10:00:00+03:00",
+            )
+            .unwrap()
+        {
             PendingInsertResult::DuplicateAccepted(json) => {
                 assert_eq!(json, r#"{"status":99}"#);
             }
@@ -245,14 +264,20 @@ mod idempotency {
         // attacker could retrieve a cached response by reusing a known accepted key
         // with different content.
         let repo = make_repo();
-        repo.insert_pending_request("bound-key", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("bound-key", "FN001", OP, SHA, "")
+            .unwrap();
         repo.accept_request("bound-key", r#"{"status":1}"#).unwrap();
 
         // Different sha — must give HardConflict, not DuplicateAccepted.
         let other_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        match repo.insert_pending_request("bound-key", "FN001", OP, other_sha, "").unwrap() {
+        match repo
+            .insert_pending_request("bound-key", "FN001", OP, other_sha, "")
+            .unwrap()
+        {
             PendingInsertResult::HardConflict(_) => {}
-            other => panic!("expected HardConflict for bound accepted with wrong sha, got {other:?}"),
+            other => {
+                panic!("expected HardConflict for bound accepted with wrong sha, got {other:?}")
+            }
         }
     }
 
@@ -261,13 +286,18 @@ mod idempotency {
         // F3-fix: permanent DPS errors mark the row 'rejected', which allows a
         // fresh retry (unlike 'ambiguous' which blocks until reconciliation).
         let repo = make_repo();
-        repo.insert_pending_request("key-perm", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("key-perm", "FN001", OP, SHA, "")
+            .unwrap();
         repo.reject_request("key-perm").unwrap();
 
         // After rejection, a fresh insert with same identity must succeed.
-        let r = repo.insert_pending_request("key-perm", "FN001", OP, SHA, "").unwrap();
-        assert!(matches!(r, PendingInsertResult::Inserted),
-            "rejected row must allow fresh retry, got {r:?}");
+        let r = repo
+            .insert_pending_request("key-perm", "FN001", OP, SHA, "")
+            .unwrap();
+        assert!(
+            matches!(r, PendingInsertResult::Inserted),
+            "rejected row must allow fresh retry, got {r:?}"
+        );
     }
 
     #[test]
@@ -277,10 +307,14 @@ mod idempotency {
         let repo = make_repo();
         let ts1 = "2026-01-01T10:00:00+03:00";
         let ts2 = "2026-01-02T10:00:00+03:00";
-        repo.insert_pending_request("key-ts", "FN001", OP, SHA, ts1).unwrap();
+        repo.insert_pending_request("key-ts", "FN001", OP, SHA, ts1)
+            .unwrap();
         repo.accept_request("key-ts", r#"{"status":1}"#).unwrap();
 
-        match repo.insert_pending_request("key-ts", "FN001", OP, SHA, ts2).unwrap() {
+        match repo
+            .insert_pending_request("key-ts", "FN001", OP, SHA, ts2)
+            .unwrap()
+        {
             PendingInsertResult::HardConflict(_) => {}
             other => panic!("expected HardConflict for different business_ts, got {other:?}"),
         }
@@ -295,10 +329,14 @@ mod idempotency {
         // cleanup task (120 s → ambiguous), and DPS deduplicates on its side.
         let repo = make_repo();
         // Simulate pre-R3 insert: empty ts_key.
-        repo.insert_pending_request("key-pre-r3", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("key-pre-r3", "FN001", OP, SHA, "")
+            .unwrap();
 
         let ts_new = "2026-01-01T10:00:00+03:00";
-        match repo.insert_pending_request("key-pre-r3", "FN001", OP, SHA, ts_new).unwrap() {
+        match repo
+            .insert_pending_request("key-pre-r3", "FN001", OP, SHA, ts_new)
+            .unwrap()
+        {
             PendingInsertResult::DuplicatePending => {}
             other => panic!(
                 "pre-R3 pending row with empty ts_key must return DuplicatePending, not {other:?}"

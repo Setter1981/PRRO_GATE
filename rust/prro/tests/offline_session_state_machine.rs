@@ -26,6 +26,7 @@ use prro::db::models::ids::OfflineSessionId;
 use prro::db::repositories::fiscal_documents::TransitionOutcome;
 use prro::db::repositories::offline_sessions::{self, NewOpeningSession, OfflineSessionError};
 use prro::db::tx::with_immediate;
+use prro::db::types::DbOfflineSessionId;
 use prro::services::offline_session::OfflineSessionService;
 use std::sync::Arc;
 
@@ -311,7 +312,7 @@ async fn draining_entry_stamps_drained_at_only_on_open_to_draining() {
     // drained_at must be NULL before DRAINING entry.
     let pre: Option<String> =
         sqlx::query_scalar("SELECT drained_at FROM offline_sessions WHERE offline_session_id = ?")
-            .bind(sid)
+            .bind(DbOfflineSessionId(sid))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -327,7 +328,7 @@ async fn draining_entry_stamps_drained_at_only_on_open_to_draining() {
     .unwrap();
     let post: Option<String> =
         sqlx::query_scalar("SELECT drained_at FROM offline_sessions WHERE offline_session_id = ?")
-            .bind(sid)
+            .bind(DbOfflineSessionId(sid))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -362,7 +363,7 @@ async fn closed_entry_stamps_closed_at_only_on_draining_to_closed() {
     .unwrap();
     let pre: Option<String> =
         sqlx::query_scalar("SELECT closed_at FROM offline_sessions WHERE offline_session_id = ?")
-            .bind(sid)
+            .bind(DbOfflineSessionId(sid))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -378,7 +379,7 @@ async fn closed_entry_stamps_closed_at_only_on_draining_to_closed() {
     .unwrap();
     let post: Option<String> =
         sqlx::query_scalar("SELECT closed_at FROM offline_sessions WHERE offline_session_id = ?")
-            .bind(sid)
+            .bind(DbOfflineSessionId(sid))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -413,7 +414,7 @@ async fn aborted_exit_does_not_stamp_closed_at_only_reason_abort() {
     // closed_at MUST remain NULL — ABORTED ≠ CLOSED.
     let closed_at: Option<String> =
         sqlx::query_scalar("SELECT closed_at FROM offline_sessions WHERE offline_session_id = ?")
-            .bind(sid)
+            .bind(DbOfflineSessionId(sid))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -425,7 +426,7 @@ async fn aborted_exit_does_not_stamp_closed_at_only_reason_abort() {
     let reason: Option<String> = sqlx::query_scalar(
         "SELECT reason_abort FROM offline_sessions WHERE offline_session_id = ?",
     )
-    .bind(sid)
+    .bind(DbOfflineSessionId(sid))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -433,7 +434,7 @@ async fn aborted_exit_does_not_stamp_closed_at_only_reason_abort() {
     // state actually changed to ABORTED.
     let state: String =
         sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
-            .bind(sid)
+            .bind(DbOfflineSessionId(sid))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -568,7 +569,7 @@ async fn service_open_session_inserts_promotes_open_and_emits_audit() {
     // State is OPEN (open_session does INSERT + Opening→Open in one tx).
     let state: String =
         sqlx::query_scalar("SELECT state FROM offline_sessions WHERE offline_session_id = ?")
-            .bind(sid)
+            .bind(DbOfflineSessionId(sid))
             .fetch_one(&pool)
             .await
             .unwrap();

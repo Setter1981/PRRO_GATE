@@ -31,6 +31,7 @@
 //! handled by #5.
 
 use prro::db::models::ids::DocumentId;
+use prro::db::types::DbDocumentId;
 use prro::services::reconciliation::boot_phase::{self, BranchOutcome, SubBranch};
 use prro::services::reconciliation::ReconcileGuard;
 use sqlx::SqlitePool;
@@ -132,7 +133,7 @@ async fn audit_count(pool: &SqlitePool, event_type: &str) -> i64 {
 
 async fn doc_state(pool: &SqlitePool, doc: DocumentId) -> String {
     sqlx::query_scalar("SELECT state FROM fiscal_documents WHERE document_id = ?")
-        .bind(doc)
+        .bind(DbDocumentId(doc))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -994,7 +995,7 @@ async fn boot_with_deps_routes_offline_signed_doc_to_offline_local_ack() {
         "UPDATE offline_codes SET consumed_at = CURRENT_TIMESTAMP, consumed_by_document_id = ? \
          WHERE fiscal_number = ? AND code_lnd = 42",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind("1234567890")
     .execute(&pool)
     .await
@@ -1006,7 +1007,7 @@ async fn boot_with_deps_routes_offline_signed_doc_to_offline_local_ack() {
     )
     .bind(vec![0xA7u8; 32])
     .bind(&session_id_bytes[..])
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .execute(&pool)
     .await
     .unwrap();
@@ -1329,7 +1330,7 @@ async fn rec3_app_boot_wires_orphan_trace_scanner() {
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 1, datetime('now', '-120 seconds'), 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(vec![0u8; 32])
     .execute(&pool)
     .await
@@ -1339,7 +1340,7 @@ async fn rec3_app_boot_wires_orphan_trace_scanner() {
     let pre_outcome: Option<String> = sqlx::query_scalar(
         "SELECT outcome_kind FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1355,7 +1356,7 @@ async fn rec3_app_boot_wires_orphan_trace_scanner() {
     let post_outcome: String = sqlx::query_scalar(
         "SELECT outcome_kind FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1398,7 +1399,7 @@ async fn rec3_boot_orphan_trace_scanner_closes_old_allocated_rows() {
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 1, datetime('now', '-120 seconds'), 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(vec![0u8; 32])
     .execute(&pool)
     .await
@@ -1408,7 +1409,7 @@ async fn rec3_boot_orphan_trace_scanner_closes_old_allocated_rows() {
     let pre_outcome: Option<String> = sqlx::query_scalar(
         "SELECT outcome_kind FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1435,7 +1436,7 @@ async fn rec3_boot_orphan_trace_scanner_closes_old_allocated_rows() {
                     wire_call_finished_at, error_kind \
              FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1478,7 +1479,7 @@ async fn rec3_boot_orphan_trace_scanner_skips_rows_within_ttl_window() {
             transport_profile_id, request_envelope_sha256) \
          VALUES (?, 1, datetime('now', '-10 seconds'), 'b1', 't1', ?)",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .bind(vec![0u8; 32])
     .execute(&pool)
     .await
@@ -1493,7 +1494,7 @@ async fn rec3_boot_orphan_trace_scanner_skips_rows_within_ttl_window() {
     let outcome: Option<String> = sqlx::query_scalar(
         "SELECT outcome_kind FROM transport_trace WHERE document_id = ? AND attempt_no = 1",
     )
-    .bind(doc)
+    .bind(DbDocumentId(doc))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1672,7 +1673,7 @@ async fn aud_l6_1_boot_projects_seed_from_offline_origin_tip_not_last_ack() {
     // lnd1: online ACK, chain head (prev NULL), unsigned=h1.  ACK needs sfn + KVT1_RAW.
     let doc1 = seed_chain_doc(&pool, fn_id, 1, "ACK", Some("SFN-1"), None, h1, None, None).await;
     sqlx::query("INSERT INTO document_files(document_id, kind, content) VALUES (?, 'KVT1_RAW', ?)")
-        .bind(doc1)
+        .bind(DbDocumentId(doc1))
         .bind(vec![0xAAu8; 8])
         .execute(&pool)
         .await

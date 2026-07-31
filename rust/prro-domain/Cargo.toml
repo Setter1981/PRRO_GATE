@@ -1,0 +1,61 @@
+[package]
+name = "prro-domain"
+version = "0.1.0"
+edition = "2021"
+description = "PRRO Gateway pure domain model — no DB/network/async-runtime/RPC/HTTP adapter dependencies; the only capability dependency is getrandom (OS entropy for UUID v7); the v7 timestamp uses std::time, not a dependency (CS-1 skeleton)"
+# CS-1R R4.2 — no *supported* external Rust API. The domain types are consumed
+# only inside this workspace (via `prro`'s `db::models` facade + `db::types`
+# store-side wrappers); the CS-1 source-API refactor is deliberately
+# unsupported for external consumers. `publish = false` states that honestly.
+# (Contract rev 5, source-API-break register.)
+publish = false
+
+[lib]
+name = "prro_domain"
+
+[dependencies]
+# CS-1 dependency policy (contract §9): `uuid` is ALLOWED (the UUID-BLOB ids
+# — DocumentId/ShiftId/… — moved here in CS-1b′ keeping `now_v7`/`new_v5`/serde
+# unchanged). Every I/O / async-runtime / DB crate is FORBIDDEN
+# (sqlx / tonic / tokio / axum / prost / hyper / reqwest) and the RP-CS1-1
+# purity gate (tests/purity_gate.rs) parses `cargo metadata` to enforce it.
+# CS-1R2 A5: the earlier "no type moved yet (CS-1a)" note is stale — CS-1b moved
+# the 8 TEXT-affinity enums (#288) and CS-1b′ moved the id newtypes; the crate is
+# no longer an empty scaffold. The direct-dep set {serde, thiserror, uuid} is
+# pinned by full record in tests/purity_gate.rs (A3a).
+uuid = { version = "1", features = ["v7", "v5", "serde"] }
+
+# CS-1b: the moved TEXT-affinity enums keep BYTE-IDENTICAL serde output
+# (`#[serde(rename=$sql)]`). `serde` is NOT a forbidden crate under the CS-1R R2
+# purity gate (only sqlx / tonic / tokio / axum / prost / hyper / reqwest are
+# banned — see tests/purity_gate.rs::FORBIDDEN); it is a pure representation
+# crate, not a DB / network / async-runtime / RPC / HTTP adapter. The SQLite
+# mapping lives entirely in `prro::db::types` store-side wrappers, so the domain
+# crate reaches no DB client.
+serde = { version = "1", features = ["derive"] }
+
+# CS-1b′: the moved id newtypes carry `CashierIdError` / `DriverIdError`
+# (`#[derive(thiserror::Error)]`). `thiserror` is PURE (a proc-macro that
+# expands to `std::error::Error` / `Display` impls — no I/O, no runtime) and is
+# NOT in the RP-CS1-1 forbidden set (sqlx / tonic / tokio / axum / prost / hyper
+# / reqwest — see tests/purity_gate.rs::FORBIDDEN); the purity gate stays green.
+# `tracing` is deliberately NOT added — the CashierId oversize warn stays
+# store-side in `prro::db::types::DbCashierId` (contract §2), so the domain crate
+# keeps no logging dependency.
+thiserror = "1"
+
+[dev-dependencies]
+# RP-CS1-1 (purity gate) shells out to `cargo metadata --format-version 1`
+# and walks the JSON dependency graph; serde_json is the only parser it needs
+# (a full `cargo_metadata` crate dep is avoided to keep the graph minimal).
+# Dev-deps do NOT appear in the normal/build/target edges the gate inspects,
+# so this does not weaken the invariant it enforces. RP-CS1-5 (the enum
+# representation-conformance test) also asserts byte-identical serde output
+# via `serde_json::to_string`.
+serde_json = "1"
+
+# RP-CS1-1 fast canary — a `write_tx_conn_compile_fail.rs`-style trybuild
+# fixture asserting a forbidden crate is not `use`-able from prro-domain's
+# graph. The cargo-metadata test above is the PRIMARY (alias/build/target-dep
+# proof); this is the cheap smoke.
+trybuild = "1"

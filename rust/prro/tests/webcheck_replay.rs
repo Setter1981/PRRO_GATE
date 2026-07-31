@@ -39,6 +39,7 @@ use prro::db::repositories::ingress_inbox::{
     self as inbox, InboxInsertOutcome, InboxRow, NewInboxEntry,
 };
 use prro::db::repositories::{fiscal_number_config as fn_repo, fiscal_number_config::NewFnConfig};
+use prro::db::types::{DbOfflineSessionId, DbShiftId};
 use prro::db::{open_pool, open_secure_pool};
 use prro::services::offline_sync::{backlog_drain, return_online_probe};
 use prro::services::reconciliation::RuntimeView;
@@ -427,8 +428,8 @@ impl Harness {
         let row = self.seed_inbox_sell(op).await;
         let dps = self.new_dps();
         if online {
-            dps.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-            dps.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+            dps.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+            dps.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
         }
         let guard = self.gate.clone().lock_owned().await;
         let result = inline::run(
@@ -439,6 +440,7 @@ impl Harness {
             &self.fn_sign,
             &guard,
             &row,
+            prro::services::time_budget::system_gate(),
         )
         .await;
         drop(guard);
@@ -452,8 +454,8 @@ impl Harness {
         let dps = self.new_dps();
         dps.push_status(Ok(online_status()));
         for _ in 0..backlog {
-            dps.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
-            dps.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE, 0xAD, 0xBE, 0xEF])));
+            dps.push_send(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
+            dps.push_last(Ok(ack(SERVER_FISCAL_NO, vec![0xDE; 64])));
         }
         return_online_probe::run_tick_for_fn(&self.pool, &dps, HARNESS_FN, &self.fn_sign)
             .await
@@ -579,31 +581,79 @@ fn driven_sells(fx: &Fixture) -> (Vec<&CorpusOp>, bool) {
 
 /// Build the `Expected` from the fixture, restricted to the driven sells.
 fn expected_for(fx: &Fixture, driven: &[&CorpusOp]) -> Expected {
-    let lnds: Vec<i64> = driven.iter().map(|op| op.lnd).collect();
-    let classes: Vec<String> = driven.iter().map(|op| op.offline_class.clone()).collect();
+    let mut lnds: Vec<i64> = driven.iter().map(|op| op.lnd).collect();
+    let mut classes: Vec<String> = driven.iter().map(|op| op.offline_class.clone()).collect();
     // the fixture chain link for each driven op (index by op_index into the full
     // per-op chain).
-    let chain: Vec<Option<String>> = driven
+    let mut chain: Vec<Option<String>> = driven
         .iter()
         .map(|op| fx.expected.previous_hash_chain[op.op_index].clone())
         .collect();
-    let codes_consumed = driven
+    let mut codes_consumed = driven
         .iter()
         .filter(|op| op.offline_class == "offline_drained")
         .count() as i64;
+    let mut issued_count = driven.len();
+
+    // B10: an OFFLINE session that drains is bracketed by two gateway-internal
+    // boundary docs that the (pre-B10) WebCheck corpus fixture does not carry:
+    // a DocType=9 BEGIN (lazily minted as the FIRST offline doc — takes the
+    // LOWEST lnd, prepended) and a DocType=10 END (minted at drain finalize —
+    // takes the HIGHEST lnd, appended).
+    //
+    // B10 END-online fix: the BEGIN is a real OFFLINE issued doc (offline-shaped
+    // `<MAC ID>`, consumes ONE code, class "offline_drained").  The END is an
+    // ONLINE issuance (bare `<MAC>`, advance-at-SEND, class "online") that
+    // consumes NO code (WebCheck `CloseOfflineDoc`).  Both are issued docs that
+    // reach ACK on drain.  The `compare` structural checks (monotonic/gap-free
+    // lnds via a single offset, per-index class, interior chain-link presence)
+    // hold for them; we only reflect their presence in the counts + per-index
+    // vectors.
+    let offline = driven
+        .iter()
+        .any(|op| op.offline_class == "offline_drained");
+    if offline {
+        let lo = lnds.iter().copied().min().unwrap_or(1);
+        let hi = lnds.iter().copied().max().unwrap_or(0);
+        // BEGIN at lo-1 (prepended, lowest), END at hi+1 (appended, highest) —
+        // keeps the sequence contiguous + strictly monotonic for `compare`.
+        lnds.insert(0, lo - 1);
+        lnds.push(hi + 1);
+        classes.insert(0, "offline_drained".to_string());
+        classes.push("online".to_string());
+        // Interior chain links must be non-null (a synthetic marker suffices —
+        // `compare` only checks presence for interior links, not hex equality).
+        chain.insert(0, Some("b10-begin".to_string()));
+        chain.push(Some("b10-end".to_string()));
+        // Only the offline BEGIN consumes a code; the online END consumes none.
+        codes_consumed += 1;
+        issued_count += 2;
+    }
+
     Expected {
         lnds,
         classes,
         chain,
         codes_consumed,
-        issued_count: driven.len(),
+        issued_count,
     }
 }
 
 /// Drive a whole fixture and return (Expected, Observed).
 async fn replay(fx: &Fixture) -> (Expected, Observed) {
     let (driven, offline) = driven_sells(fx);
-    let codes = if offline { driven.len() as i64 } else { 0 };
+    // B10: an offline session lazily mints a DocType=9 BEGIN at the first offline
+    // doc (offline-shaped, consumes +1 code) and a DocType=10 END at drain
+    // finalize (ONLINE issuance, bare `<MAC>`, +1 wire send, consumes NO code).
+    // Seed `driven.len() + 2` codes anyway (a harmless upper bound — the END
+    // leaves its slot unused); the drain sends `driven.len() + 2` docs
+    // (BEGIN + content + END).
+    let boundary_docs = if offline { 2 } else { 0 };
+    let codes = if offline {
+        driven.len() as i64 + boundary_docs
+    } else {
+        0
+    };
     let mode = if offline {
         NodeMode::Offline
     } else {
@@ -617,8 +667,8 @@ async fn replay(fx: &Fixture) -> (Expected, Observed) {
             .unwrap_or_else(|e| panic!("{}: drive op {} failed: {e}", fx.name, op.op_index));
     }
     if offline {
-        // OLA → ACK via the real drain (WebCheck "drained").
-        h.drain_backlog(driven.len())
+        // OLA → ACK via the real drain (WebCheck "drained").  BEGIN + content + END.
+        h.drain_backlog(driven.len() + boundary_docs as usize)
             .await
             .unwrap_or_else(|e| panic!("{}: drain failed: {e}", fx.name));
     }
@@ -673,7 +723,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
             cash_balance_kop, opened_by_cashier_id) \
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
-    .bind(shift_id)
+    .bind(DbShiftId(shift_id))
     .bind(HARNESS_FN)
     .bind(CASHIER)
     .execute(pool)
@@ -690,9 +740,9 @@ async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
     .bind(HARNESS_FN)
-    .bind(mode)
-    .bind(ShiftState::Opened)
-    .bind(shift_id)
+    .bind(mode.as_str())
+    .bind(ShiftState::Opened.as_str())
+    .bind(DbShiftId(shift_id))
     .execute(pool)
     .await
     .unwrap();
@@ -704,7 +754,7 @@ async fn seed_open_offline_session(pool: &SqlitePool) {
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-01-01T00:00:00Z')",
     )
-    .bind(session_id)
+    .bind(DbOfflineSessionId(session_id))
     .bind(HARNESS_FN)
     .bind(OfflineSessionState::Open.as_str())
     .execute(pool)

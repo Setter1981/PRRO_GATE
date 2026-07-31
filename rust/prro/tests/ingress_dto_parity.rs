@@ -626,19 +626,15 @@ fn read_only_and_unsupported_command_types_rejected_at_ingress_boundary() {
         CommandClass::ReadOnly
     );
 
-    // Cash-movement ops + the driver-only PERIODIC_REPORT — typed-unsupported
-    // BEFORE any inbox write (the signer's old `UnsupportedDocType` is no
-    // longer the first line of defence).
-    for ct in [
-        CommandType::ServiceIn,
-        CommandType::ServiceOut,
-        CommandType::CashWithdrawal,
-        CommandType::PeriodicReport,
-    ] {
+    // EPZ (CashWithdrawal) + the driver-only PERIODIC_REPORT — typed-unsupported
+    // BEFORE any inbox write (STOP-S2: EPZ remains fail-closed).
+    // NOTE (L3): ServiceIn/Out are now Signable (wired fiscal ops) — moved below.
+    for ct in [CommandType::CashWithdrawal, CommandType::PeriodicReport] {
         assert_eq!(classify_command(ct), CommandClass::Unsupported, "{ct:?}");
     }
 
     // The signable set still maps cleanly (the boundary lets these through).
+    // L3: ServiceIn/Out are now Signable (wired).
     for (label, fixture) in [
         ("SELL", FIXTURE_SELL),
         ("RETURN", FIXTURE_RETURN),
@@ -653,4 +649,16 @@ fn read_only_and_unsupported_command_types_rejected_at_ingress_boundary() {
             "{label} must be signable at the boundary"
         );
     }
+
+    // L3: ServiceIn/Out are now Signable (wired fiscal cash-movement ops).
+    assert_eq!(
+        classify_command(CommandType::ServiceIn),
+        CommandClass::Signable,
+        "ServiceIn must be Signable (L3)"
+    );
+    assert_eq!(
+        classify_command(CommandType::ServiceOut),
+        CommandClass::Signable,
+        "ServiceOut must be Signable (L3)"
+    );
 }

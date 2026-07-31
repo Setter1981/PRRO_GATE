@@ -102,6 +102,19 @@ pub async fn probe(
         Err(DpsError::NotFound) => ProbeOutcome::NotFound,
         Err(DpsError::Transport(msg)) => ProbeOutcome::TransportRetry { reason: msg },
         Err(DpsError::Decode(msg)) => ProbeOutcome::DecodeEscalate { reason: msg },
+        // RA — COMPATIBILITY PROJECTION (not an ideal semantic classification):
+        // `RemoteStatus` (R1) and `Indeterminate` (slice A) are handled EXPLICITLY here
+        // (rather than accidentally via the `Err(other)` catch-all below), but map to the
+        // exact SAME `Unexpected { dps_error: format!("{err}") }` the catch-all already
+        // produced — byte-identical, so RA is behaviour-neutral vs the current wire path.
+        // Making the arm explicit documents the intent and lets the pins exercise the real
+        // variants.  Dedicated `ProbeOutcome` variants for these (with their own durable
+        // labels / severity / dashboards) are a FUTURE slice, out of RA scope.
+        Err(err @ (DpsError::RemoteStatus { .. } | DpsError::Indeterminate { .. })) => {
+            ProbeOutcome::Unexpected {
+                dps_error: format!("{err}"),
+            }
+        }
         // W9.4 L4 fix: surface unexpected variants distinctly so
         // operator alerting can fire on the right signal.
         // `last_chk` is a query path; Authorization / Server { code }
@@ -136,6 +149,15 @@ mod tests {
         async fn send_chk(&self, _: CheckEnvelope) -> Result<CheckAck, DpsError> {
             unreachable!("stub: send_chk not exercised in probe tests");
         }
+        async fn send_chk_observed(
+            &self,
+            envelope: CheckEnvelope,
+        ) -> (
+            Result<CheckAck, DpsError>,
+            crate::transports::dps::raw_reply::RawSendObservation,
+        ) {
+            crate::transports::dps::dto::scripted_observation(self.send_chk(envelope).await)
+        }
         async fn last_chk(&self, _: &CheckSignBlob) -> Result<CheckAck, DpsError> {
             // Clone the scripted response (CheckAck + DpsError are not
             // Clone in general — re-construct manually for these tests).
@@ -149,6 +171,27 @@ mod tests {
                 Err(DpsError::Transport(s)) => Err(DpsError::Transport(s.clone())),
                 Err(DpsError::Decode(s)) => Err(DpsError::Decode(s.clone())),
                 Err(DpsError::Internal(s)) => Err(DpsError::Internal(s.clone())),
+                // RA: pass the CS-3 typed variants through UNCHANGED so the pins exercise
+                // the real probe arm (the `Err(_)` fallback would otherwise collapse them
+                // to `Internal`, hiding the actual `RemoteStatus` / `Indeterminate` path).
+                Err(DpsError::RemoteStatus {
+                    code,
+                    message,
+                    digest,
+                }) => Err(DpsError::RemoteStatus {
+                    code: code.clone(),
+                    message: message.clone(),
+                    digest: *digest,
+                }),
+                Err(DpsError::Indeterminate {
+                    code,
+                    message,
+                    digest,
+                }) => Err(DpsError::Indeterminate {
+                    code: *code,
+                    message: message.clone(),
+                    digest: *digest,
+                }),
                 Err(_) => Err(DpsError::Internal("test-only unhandled variant".into())),
             }
         }
@@ -264,6 +307,52 @@ mod tests {
                 );
             }
             other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_remote_status_projects_to_unexpected_ra() {
+        // RA all-consumers pin (compatibility projection): R1 `RemoteStatus` on a query
+        // probe maps to `Unexpected` carrying the Display-formatted error — byte-identical
+        // to the prior catch-all. This is the audit made durable, NOT ideal semantics.
+        let stub = StubChannel {
+            last_chk_response: Err(DpsError::RemoteStatus {
+                code: "Unauthenticated".into(),
+                message: "creds rejected".into(),
+                digest: prro_domain::delivery::GrpcStatusDigest::from_transport_digest([0xAB; 32]),
+            }),
+        };
+        let out = probe(&stub, &fn_sign(), "abc-123").await;
+        match out {
+            ProbeOutcome::Unexpected { dps_error } => assert!(
+                dps_error.contains("remote status") && dps_error.contains("creds rejected"),
+                "RemoteStatus must project to Unexpected with the Display text: {dps_error}"
+            ),
+            other => panic!("expected Unexpected for RemoteStatus, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_indeterminate_projects_to_unexpected_ra() {
+        // RA all-consumers pin (compatibility projection): slice-A `Indeterminate` on a
+        // query probe maps to `Unexpected` with the Display text — byte-identical to the
+        // prior catch-all.
+        let stub = StubChannel {
+            last_chk_response: Err(DpsError::Indeterminate {
+                code: -4,
+                message: "server unknown".into(),
+                digest: prro_domain::delivery::DecodedResponseDigest::from_transport_digest(
+                    [0xAB; 32],
+                ),
+            }),
+        };
+        let out = probe(&stub, &fn_sign(), "abc-123").await;
+        match out {
+            ProbeOutcome::Unexpected { dps_error } => assert!(
+                dps_error.contains("indeterminate") && dps_error.contains("server unknown"),
+                "Indeterminate must project to Unexpected with the Display text: {dps_error}"
+            ),
+            other => panic!("expected Unexpected for Indeterminate, got {other:?}"),
         }
     }
 }

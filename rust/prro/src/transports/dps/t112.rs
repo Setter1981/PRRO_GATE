@@ -18,9 +18,9 @@
 //! `comp_date` format is `yyyyMMddHHmmss` as a bare 14-digit `i64`
 //! (e.g. `20260707224141`).  This is the Kyiv wall-clock, NOT a Unix
 //! epoch.  [`kyiv_comp_date`] converts a `DateTime<Utc>` to this format
-//! using the same DST logic as `stage_send::kyiv_local_epoch` (both
-//! convert to `Europe/Kiev` via `chrono-tz`), but returns the formatted
-//! digits rather than a fake epoch.
+//! (`Europe/Kiev` via `chrono-tz`) — the SAME 14-digit encoding every
+//! DPS document now uses for `<TS>` and `CheckEnvelope::date_time` (mirror
+//! of `stage_send::kyiv_comp_date`).
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Europe::Kiev;
@@ -118,10 +118,11 @@ pub fn build_t112_request(
 /// Convert a `DateTime<Utc>` to the `yyyyMMddHHmmss` Kyiv-wall-clock
 /// digit-integer that DPS expects in `<TS>` and `CheckEnvelope::date_time`.
 ///
-/// Uses the same `Europe/Kiev` DST logic as `stage_send::kyiv_local_epoch`
-/// but returns `yyyyMMddHHmmss` digit-integer rather than a fake epoch.
-/// Do NOT substitute `kyiv_local_epoch` for this: receipt documents use
-/// that fake-epoch convention; T=112 ask-code requests use this one.
+/// This is the DPS `Check.date` encoding — the same 14-digit form used by
+/// EVERY receipt / Z / service document (mirror of
+/// `stage_send::kyiv_comp_date`). A prior fake-epoch encoding for ONLINE
+/// receipts was WRONG (DPS `-8` "дата не відповідає Check.date") and was
+/// removed 2026-07-12 (docs/DPS_MINUS8_DATE_AND_SHIFT_RECOVERY.md).
 pub fn kyiv_comp_date(utc: DateTime<Utc>) -> i64 {
     let kyiv = utc.with_timezone(&Kiev);
     let y = kyiv.year() as i64;
@@ -244,6 +245,71 @@ mod tests {
         assert!(
             kyiv_comp_date(utc) > 20_000_000_000_000_i64,
             "comp_date must be the 14-digit yyyyMMddHHmmss integer, not a Unix epoch"
+        );
+    }
+
+    // ── FW-1 mutation teeth: nonzero-minute + live-clock ───────────────
+    // `kyiv_comp_date` packs y/mo/d/h/mi/s into a 14-digit yyyyMMddHHmmss i64.
+    // Survivor 1: the `+` before the `mi*100` term (`... + h*10_000 + mi*100 + s`)
+    //   flipped to `-` SUBTRACTS the minutes contribution. Every pre-existing
+    //   test uses a `:00:00` instant (mi=0 → mi*100=0 → `+0 ≡ -0`), so the flip
+    //   is invisible. These pin non-zero minute/second instants.
+    // Survivor 2: `kyiv_comp_date_now -> 0` stamps an epoch-zero Check.date; no
+    //   non-live test invokes it. Pinned with a live-14-digit sanity bound.
+    // This is the SAME civil-date family behind the live DPS `-8` stuck-shift
+    // incident (docs/DPS_MINUS8_DATE_AND_SHIFT_RECOVERY.md).
+
+    #[test]
+    fn kyiv_comp_date_nonzero_minute_seconds_summer() {
+        // 2026-07-15 10:37:29 UTC → EEST (+3) → 13:37:29 local.
+        let utc = Utc
+            .with_ymd_and_hms(2026, 7, 15, 10, 37, 29)
+            .single()
+            .unwrap();
+        assert_eq!(
+            kyiv_comp_date(utc),
+            20_260_715_133_729_i64,
+            "summer +3 non-zero minute/second: the mi*100 term must be ADDED, not subtracted"
+        );
+    }
+
+    #[test]
+    fn kyiv_comp_date_nonzero_minute_seconds_winter() {
+        // 2026-01-15 10:45:11 UTC → EET (+2) → 12:45:11 local.
+        let utc = Utc
+            .with_ymd_and_hms(2026, 1, 15, 10, 45, 11)
+            .single()
+            .unwrap();
+        assert_eq!(
+            kyiv_comp_date(utc),
+            20_260_115_124_511_i64,
+            "winter +2 non-zero minute/second: the mi*100 term must be ADDED, not subtracted"
+        );
+    }
+
+    #[test]
+    fn kyiv_comp_date_day_boundary_offset_flips_calendar_day() {
+        // 2026-07-15 21:30:00 UTC → EEST (+3) → 2026-07-16 00:30:00 local:
+        // the +3 offset rolls the instant PAST Kyiv midnight into the next day.
+        let utc = Utc
+            .with_ymd_and_hms(2026, 7, 15, 21, 30, 0)
+            .single()
+            .unwrap();
+        assert_eq!(
+            kyiv_comp_date(utc),
+            20_260_716_003_000_i64,
+            "Kyiv +3 must cross into 2026-07-16 00:30:00 (minute term added)"
+        );
+    }
+
+    #[test]
+    fn kyiv_comp_date_now_is_live_14digit_not_zero() {
+        // Kills `kyiv_comp_date_now -> 0`: a live yyyyMMddHHmmss is a 14-digit
+        // int in this era; `0` (or any constant) fails the lower bound.
+        let now = kyiv_comp_date_now();
+        assert!(
+            (20_000_000_000_000_i64..21_000_000_000_000_i64).contains(&now),
+            "kyiv_comp_date_now must be a live 14-digit yyyyMMddHHmmss int, got {now}"
         );
     }
 

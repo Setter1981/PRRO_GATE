@@ -18,16 +18,16 @@
 #[path = "kupyna_tables.rs"]
 mod kupyna_tables;
 
-use kupyna_tables::{Q_CONST_512, Q_CONST_1024, T};
+use kupyna_tables::{Q_CONST_1024, Q_CONST_512, T};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
 const ROWS: usize = 8;
-const NB_512: usize = 8;   // columns for ≤256-bit hash
+const NB_512: usize = 8; // columns for ≤256-bit hash
 const NB_1024: usize = 16; // columns for >256-bit hash
-const NR_512: usize = 10;  // rounds for 512-bit state
+const NR_512: usize = 10; // rounds for 512-bit state
 const NR_1024: usize = 14; // rounds for 1024-bit state
-const STATE_512: usize = NB_512 * ROWS;   // 64 bytes
+const STATE_512: usize = NB_512 * ROWS; // 64 bytes
 const STATE_1024: usize = NB_1024 * ROWS; // 128 bytes
 
 // ── T-table round function (combined SubBytes + ShiftRows + MixColumns) ─
@@ -36,28 +36,28 @@ const STATE_1024: usize = NB_1024 * ROWS; // 128 bytes
 /// ShiftRows for NB=8: row i shifts by i positions.
 #[inline(always)]
 fn table_g_512(s: &[u64; NB_512], j: usize) -> u64 {
-    T[0][(s[j]             & 0xFF) as usize]
-  ^ T[1][(s[(j + 7) & 7] >> 8  & 0xFF) as usize]
-  ^ T[2][(s[(j + 6) & 7] >> 16 & 0xFF) as usize]
-  ^ T[3][(s[(j + 5) & 7] >> 24 & 0xFF) as usize]
-  ^ T[4][(s[(j + 4) & 7] >> 32 & 0xFF) as usize]
-  ^ T[5][(s[(j + 3) & 7] >> 40 & 0xFF) as usize]
-  ^ T[6][(s[(j + 2) & 7] >> 48 & 0xFF) as usize]
-  ^ T[7][(s[(j + 1) & 7] >> 56 & 0xFF) as usize]
+    T[0][(s[j] & 0xFF) as usize]
+        ^ T[1][(s[(j + 7) & 7] >> 8 & 0xFF) as usize]
+        ^ T[2][(s[(j + 6) & 7] >> 16 & 0xFF) as usize]
+        ^ T[3][(s[(j + 5) & 7] >> 24 & 0xFF) as usize]
+        ^ T[4][(s[(j + 4) & 7] >> 32 & 0xFF) as usize]
+        ^ T[5][(s[(j + 3) & 7] >> 40 & 0xFF) as usize]
+        ^ T[6][(s[(j + 2) & 7] >> 48 & 0xFF) as usize]
+        ^ T[7][(s[(j + 1) & 7] >> 56 & 0xFF) as usize]
 }
 
 /// Apply one T-table round column for 1024-bit state (16 columns).
 /// ShiftRows for NB=16: rows shift by [0,1,2,3,4,5,6,11].
 #[inline(always)]
 fn table_g_1024(s: &[u64; NB_1024], j: usize) -> u64 {
-    T[0][(s[j]                & 0xFF) as usize]
-  ^ T[1][(s[(j + 15) & 15] >> 8  & 0xFF) as usize]
-  ^ T[2][(s[(j + 14) & 15] >> 16 & 0xFF) as usize]
-  ^ T[3][(s[(j + 13) & 15] >> 24 & 0xFF) as usize]
-  ^ T[4][(s[(j + 12) & 15] >> 32 & 0xFF) as usize]
-  ^ T[5][(s[(j + 11) & 15] >> 40 & 0xFF) as usize]
-  ^ T[6][(s[(j + 10) & 15] >> 48 & 0xFF) as usize]
-  ^ T[7][(s[(j +  5) & 15] >> 56 & 0xFF) as usize]
+    T[0][(s[j] & 0xFF) as usize]
+        ^ T[1][(s[(j + 15) & 15] >> 8 & 0xFF) as usize]
+        ^ T[2][(s[(j + 14) & 15] >> 16 & 0xFF) as usize]
+        ^ T[3][(s[(j + 13) & 15] >> 24 & 0xFF) as usize]
+        ^ T[4][(s[(j + 12) & 15] >> 32 & 0xFF) as usize]
+        ^ T[5][(s[(j + 11) & 15] >> 40 & 0xFF) as usize]
+        ^ T[6][(s[(j + 10) & 15] >> 48 & 0xFF) as usize]
+        ^ T[7][(s[(j + 5) & 15] >> 56 & 0xFF) as usize]
 }
 
 // ── P and Q permutations ───────────────────────────────────────────────
@@ -190,7 +190,10 @@ impl Kupyna {
     /// - `hash_len = 48` → Kupyna-384 (1024-bit internal state, 14 rounds)
     /// - `hash_len = 64` → Kupyna-512 (1024-bit internal state, 14 rounds)
     pub fn new(hash_len: usize) -> Self {
-        assert!(hash_len >= 1 && hash_len <= 64, "Kupyna hash_len must be 1..64");
+        assert!(
+            hash_len >= 1 && hash_len <= 64,
+            "Kupyna hash_len must be 1..64"
+        );
         let (nb, block_size) = if hash_len <= 32 {
             (NB_512, STATE_512)
         } else {
@@ -235,13 +238,11 @@ impl Kupyna {
         if self.buf_len > 0 {
             let need = self.block_size - self.buf_len;
             if data.len() < need {
-                self.buf[self.buf_len..self.buf_len + data.len()]
-                    .copy_from_slice(data);
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
                 self.buf_len += data.len();
                 return;
             }
-            self.buf[self.buf_len..self.buf_len + need]
-                .copy_from_slice(&data[..need]);
+            self.buf[self.buf_len..self.buf_len + need].copy_from_slice(&data[..need]);
             self.compress(&self.buf.clone());
             self.buf_len = 0;
             offset = need;
@@ -417,7 +418,9 @@ mod tests {
     use super::*;
 
     // M2 = 0x00..0xFF (256 bytes), used with various lengths
-    fn m2() -> Vec<u8> { (0x00u8..=0xFF).collect() }
+    fn m2() -> Vec<u8> {
+        (0x00u8..=0xFF).collect()
+    }
 
     fn h(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -429,42 +432,84 @@ mod tests {
     // ── Kupyna-256: 6 official DSTU 7564 vectors from UAPKI ──
 
     #[test]
-    fn k256_empty()    { assert_eq!(&kupyna_256(b"")[..], &h("CD5101D1CCDF0D1D1F4ADA56E888CD724CA1A0838A3521E7131D4FB78D0F5EB6")[..]); }
+    fn k256_empty() {
+        assert_eq!(
+            &kupyna_256(b"")[..],
+            &h("CD5101D1CCDF0D1D1F4ADA56E888CD724CA1A0838A3521E7131D4FB78D0F5EB6")[..]
+        );
+    }
 
     #[test]
-    fn k256_8bit()     { assert_eq!(&kupyna_256(&[0xFF])[..], &h("EA7677CA4526555680441C117982EA14059EA6D0D7124D6ECDB3DEEC49E890F4")[..]); }
+    fn k256_8bit() {
+        assert_eq!(
+            &kupyna_256(&[0xFF])[..],
+            &h("EA7677CA4526555680441C117982EA14059EA6D0D7124D6ECDB3DEEC49E890F4")[..]
+        );
+    }
 
     #[test]
-    fn k256_512bit()   { assert_eq!(&kupyna_256(&m2()[..64])[..], &h("08F4EE6F1BE6903B324C4E27990CB24EF69DD58DBE84813EE0A52F6631239875")[..]); }
+    fn k256_512bit() {
+        assert_eq!(
+            &kupyna_256(&m2()[..64])[..],
+            &h("08F4EE6F1BE6903B324C4E27990CB24EF69DD58DBE84813EE0A52F6631239875")[..]
+        );
+    }
 
     #[test]
-    fn k256_760bit()   { assert_eq!(&kupyna_256(&m2()[..95])[..], &h("1075C8B0CB910F116BDA5FA1F19C29CF8ECC75CAFF7208BA2994B68FC56E8D16")[..]); }
+    fn k256_760bit() {
+        assert_eq!(
+            &kupyna_256(&m2()[..95])[..],
+            &h("1075C8B0CB910F116BDA5FA1F19C29CF8ECC75CAFF7208BA2994B68FC56E8D16")[..]
+        );
+    }
 
     #[test]
-    fn k256_1024bit()  { assert_eq!(&kupyna_256(&m2()[..128])[..], &h("0A9474E645A7D25E255E9E89FFF42EC7EB31349007059284F0B182E452BDA882")[..]); }
+    fn k256_1024bit() {
+        assert_eq!(
+            &kupyna_256(&m2()[..128])[..],
+            &h("0A9474E645A7D25E255E9E89FFF42EC7EB31349007059284F0B182E452BDA882")[..]
+        );
+    }
 
     #[test]
-    fn k256_2048bit()  { assert_eq!(&kupyna_256(&m2()[..256])[..], &h("D305A32B963D149DC765F68594505D4077024F836C1BF03806E1624CE176C08F")[..]); }
+    fn k256_2048bit() {
+        assert_eq!(
+            &kupyna_256(&m2()[..256])[..],
+            &h("D305A32B963D149DC765F68594505D4077024F836C1BF03806E1624CE176C08F")[..]
+        );
+    }
 
     // ── Kupyna-512: 6 official DSTU 7564 vectors from UAPKI ──
 
     #[test]
-    fn k512_empty()    { assert_eq!(&kupyna_512(b"")[..], &h("656B2F4CD71462388B64A37043EA55DBE445D452AECD46C3298343314EF04019BCFA3F04265A9857F91BE91FCE197096187CEDA78C9C1C021C294A0689198538")[..]); }
+    fn k512_empty() {
+        assert_eq!(&kupyna_512(b"")[..], &h("656B2F4CD71462388B64A37043EA55DBE445D452AECD46C3298343314EF04019BCFA3F04265A9857F91BE91FCE197096187CEDA78C9C1C021C294A0689198538")[..]);
+    }
 
     #[test]
-    fn k512_8bit()     { assert_eq!(&kupyna_512(&[0xFF])[..], &h("871B18CF754B72740307A97B449ABEB32B64444CC0D5A4D65830AE5456837A72D8458F12C8F06C98C616ABE11897F86263B5CB77C420FB375374BEC52B6D0292")[..]); }
+    fn k512_8bit() {
+        assert_eq!(&kupyna_512(&[0xFF])[..], &h("871B18CF754B72740307A97B449ABEB32B64444CC0D5A4D65830AE5456837A72D8458F12C8F06C98C616ABE11897F86263B5CB77C420FB375374BEC52B6D0292")[..]);
+    }
 
     #[test]
-    fn k512_512bit()   { assert_eq!(&kupyna_512(&m2()[..64])[..], &h("3813E2109118CDFB5A6D5E72F7208DCCC80A2DFB3AFDFB02F46992B5EDBE536B3560DD1D7E29C6F53978AF58B444E37BA685C0DD910533BA5D78EFFFC13DE62A")[..]); }
+    fn k512_512bit() {
+        assert_eq!(&kupyna_512(&m2()[..64])[..], &h("3813E2109118CDFB5A6D5E72F7208DCCC80A2DFB3AFDFB02F46992B5EDBE536B3560DD1D7E29C6F53978AF58B444E37BA685C0DD910533BA5D78EFFFC13DE62A")[..]);
+    }
 
     #[test]
-    fn k512_1024bit()  { assert_eq!(&kupyna_512(&m2()[..128])[..], &h("76ED1AC28B1D0143013FFA87213B4090B356441263C13E03FA060A8CADA32B979635657F256B15D5FCA4A174DE029F0B1B4387C878FCC1C00E8705D783FD7FFE")[..]); }
+    fn k512_1024bit() {
+        assert_eq!(&kupyna_512(&m2()[..128])[..], &h("76ED1AC28B1D0143013FFA87213B4090B356441263C13E03FA060A8CADA32B979635657F256B15D5FCA4A174DE029F0B1B4387C878FCC1C00E8705D783FD7FFE")[..]);
+    }
 
     #[test]
-    fn k512_1536bit()  { assert_eq!(&kupyna_512(&m2()[..192])[..], &h("B189BFE987F682F5F167F0D7FA565330E126B6E592B1C55D44299064EF95B1A57F3C2D0ECF17869D1D199EBBD02E8857FB8ADD67A8C31F56CD82C016CF743121")[..]); }
+    fn k512_1536bit() {
+        assert_eq!(&kupyna_512(&m2()[..192])[..], &h("B189BFE987F682F5F167F0D7FA565330E126B6E592B1C55D44299064EF95B1A57F3C2D0ECF17869D1D199EBBD02E8857FB8ADD67A8C31F56CD82C016CF743121")[..]);
+    }
 
     #[test]
-    fn k512_2048bit()  { assert_eq!(&kupyna_512(&m2()[..256])[..], &h("0DD03D7350C409CB3C29C25893A0724F6B133FA8B9EB90A64D1A8FA93B56556611EB187D715A956B107E3BFC76482298133A9CE8CBC0BD5E1436A5B197284F7E")[..]); }
+    fn k512_2048bit() {
+        assert_eq!(&kupyna_512(&m2()[..256])[..], &h("0DD03D7350C409CB3C29C25893A0724F6B133FA8B9EB90A64D1A8FA93B56556611EB187D715A956B107E3BFC76482298133A9CE8CBC0BD5E1436A5B197284F7E")[..]);
+    }
 
     // ── Functional tests ──
 

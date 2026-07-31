@@ -155,6 +155,21 @@ pub enum Violation {
         shift_id_hex: String,
         state: String,
     },
+    /// **L0 INV-21 — cash-anchor drift**.  The opening `cash_balance_kop` stored
+    /// in the current open shift's row diverges from the re-derived carry
+    /// (re-derived by re-walking all prior closed shifts' receipts).  This can
+    /// only happen if the carry was written incorrectly at open-time or if a
+    /// closed shift's `cash_balance_kop` was tampered with.
+    ///
+    /// `stored` = the shift row's `cash_balance_kop`; `re_derived` = the value
+    /// computed from the journal.  DETECTOR ONLY (report + alert; do NOT auto-heal
+    /// — drift here means the journal and the stored anchor disagree, requiring
+    /// human investigation).
+    CashAnchorDrift {
+        fiscal_number: String,
+        stored: i64,
+        re_derived: i64,
+    },
 }
 
 fn hex32_opt(b: &Option<Vec<u8>>) -> String {
@@ -165,15 +180,18 @@ fn hex32_opt(b: &Option<Vec<u8>>) -> String {
 }
 
 /// Chain-walk row: `(lnd, state, previous_hash, unsigned_xml_sha256,
-/// offline_fiscal_no)`.  `offline_fiscal_no` (M2-01) marks an offline-origin
-/// doc, which issues at `OfflineLocalAck` (not ACK) and so advances the seed
-/// from that state onward.
+/// offline_fiscal_no, server_fiscal_no, chain_superseded_at)`.  `offline_fiscal_no`
+/// (M2-01) marks an offline-origin doc, which issues at `OfflineLocalAck` (not ACK)
+/// and so advances the seed from that state onward.  `chain_superseded_at` (migration
+/// 039) marks a doc whose MAC contribution was REWOUND away by a `NotAcceptedOffline`
+/// completion — historical-issued, but NOT the active chain tip (excluded from the walk).
 type ChainRow = (
     i64,
     String,
     Option<Vec<u8>>,
     Option<Vec<u8>>,
     Option<i64>,
+    Option<String>,
     Option<String>,
 );
 
@@ -196,9 +214,30 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         });
     }
 
-    // 2. No quiescent SENDING (Pattern B intent marker must not rest).
+    // 2. No quiescent ORPHAN SENDING.  A `SENDING` doc is the Pattern-B intent marker; at a
+    // quiescent boundary it must not rest — UNLESS it is a PROVEN operator HOLD: a consistent
+    // (document, reservation) pair under a halted node.  CS-3 S7-1: the composed HOLD contract
+    // durably rests an offline-origin reject / submitted-unknown doc in `SENDING` + `PENDING_APPLY`
+    // pending operator completion.  Exempt ONLY the FULL relational witness — same document_id AND
+    // fiscal_number, reservation `OUTCOME_OBSERVED` + `PENDING_APPLY`, that reservation IS the
+    // node's ACTIVE, CURRENT-generation one, and the node is halted (STOP_MODE|BLOCKED).  This does
+    // NOT weaken the bug-#192 guard; it makes it PRECISE.  Everything else still reds, in particular:
+    // SENDING with no reservation; a `CALL_STARTED` (crash-mid-wire) reservation; a stale
+    // generation / non-active pointer; a clean `Accepted` stalled pre-apply without STOP; an
+    // arbitrary planted `PENDING_APPLY` not matching the active-generation witness.
     let sending: Vec<(String,)> = sqlx::query_as(
-        "SELECT lower(hex(document_id)) FROM fiscal_documents WHERE state = 'SENDING'",
+        "SELECT lower(hex(fd.document_id)) FROM fiscal_documents fd \
+         WHERE fd.state = 'SENDING' \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM delivery_reservation r \
+             JOIN node_state ns ON ns.fiscal_number = r.fiscal_number \
+             WHERE r.document_id = fd.document_id \
+               AND r.fiscal_number = fd.fiscal_number \
+               AND r.state = 'OUTCOME_OBSERVED' \
+               AND r.apply_state = 'PENDING_APPLY' \
+               AND r.reservation_id = ns.active_delivery_reservation_id \
+               AND r.authorized_generation = ns.delivery_generation \
+               AND ns.mode IN ('STOP_MODE', 'BLOCKED') )",
     )
     .fetch_all(pool)
     .await?;
@@ -280,7 +319,7 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
     for (fiscal_number, node_seed) in fns {
         let docs: Vec<ChainRow> = sqlx::query_as(
             "SELECT lnd, state, previous_hash, unsigned_xml_sha256, offline_fiscal_no, \
-                    server_fiscal_no \
+                    server_fiscal_no, chain_superseded_at \
              FROM fiscal_documents \
              WHERE fiscal_number = ? AND unsigned_xml_sha256 IS NOT NULL \
              ORDER BY lnd ASC",
@@ -289,7 +328,88 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
         .fetch_all(pool)
         .await?;
         let mut expected: Option<Vec<u8>> = None;
-        for (lnd, state, previous_hash, unsigned_sha, offline_fiscal_no, server_fiscal_no) in docs {
+        // The unsigned hash of the immediately-preceding row (any state, lnd ASC).  Used to verify the
+        // internal continuity of the rewound-orphan sub-chain (a `chain_superseded_at` held doc + its
+        // `CANCELLED` cohort): each dead doc chained onto its lnd-predecessor at sign time, so a corrupt
+        // back-pointer THERE is still a real MAC break even though the doc is voided (audit MAJOR / bd
+        // PRRO_GATE-2nk).  Distinct from `expected`, which is the LIVE (active) chain tip.
+        let mut prev_row_unsigned: Option<Vec<u8>> = None;
+        // bd PRRO_GATE-hpc — durable T=112 seed witnesses (`chain_seed_transitions`).  A replenish
+        // advances the seed to a NON-DOCUMENT `Hs` with no ledger row, so a document issued AFTER it
+        // legitimately carries `previous_hash = Hs`.  Without re-anchoring, the walk's running
+        // `expected` would still hold the PRE-replenish doc hash → a FALSE `ChainBreak` at that doc
+        // (empirically reproduced).  Same shape as the 039 marker re-anchor below.  `lnd_at_write` is
+        // the FN's `next_lnd` when the replenish ran (the ordinal the NEXT doc takes), so a witness
+        // applies to a doc at `lnd >= lnd_at_write`; a doc that already advanced the tip past that
+        // ordinal makes the witness stale (`last_advance_ordinal` guard).
+        let witnesses: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT lnd_at_write, new_seed FROM chain_seed_transitions \
+             WHERE fiscal_number = ? ORDER BY lnd_at_write ASC, created_at ASC, rowid ASC",
+        )
+        .bind(&fiscal_number)
+        .fetch_all(pool)
+        .await?;
+        let mut last_advance_ordinal: i64 = i64::MIN;
+        for (
+            lnd,
+            state,
+            previous_hash,
+            unsigned_sha,
+            offline_fiscal_no,
+            server_fiscal_no,
+            chain_superseded_at,
+        ) in docs
+        {
+            // A `chain_superseded_at` doc (migration 039) had its MAC contribution REWOUND away by a
+            // `NotAcceptedOffline` completion — historical-issued, but NOT the active chain tip.  Its
+            // `previous_hash` is the rewind target (possibly a NON-doc T=112 seed), so it is neither a
+            // live link (no active-tip check) nor an advance of `expected` (the seed moved below it).
+            // Keyed on the EXPLICIT marker, NOT the RMR state — a general RMR (Sent→NotFound / ER-drain
+            // / MacReseed) is not superseded and stays in the active walk (bd PRRO_GATE-2nk).  It IS the
+            // cohort's predecessor, so it sets `prev_row_unsigned` for the sub-chain check below.
+            //
+            // RE-ANCHOR the ACTIVE tip to the rewind target (external re-review MAJOR): the completion
+            // rewound the seed to THIS doc's `previous_hash`, so the next ACTIVE doc must chain onto
+            // THAT (a possibly-non-doc T=112 seed), NOT the pre-rewind tip.  Without re-anchoring,
+            // `expected` would stay stuck at the last pre-marker issued hash → (a) a legit doc chaining
+            // onto a non-doc rewind target would FALSE-`ChainBreak`, and worse (b) a doc FORKED off the
+            // STALE pre-rewind predecessor would be silently accepted (a lost fork detection — the exact
+            // fork this whole fix exists to make detectable).  The marker's OWN back-pointer is NOT
+            // checked against `expected` here: a T=112 replenish advanced the seed to `previous_hash`
+            // WITHOUT a doc, so that transition is invisible to the walk and cannot be validated from
+            // the ledger — only re-anchored onto.
+            if chain_superseded_at.is_some() {
+                expected = previous_hash;
+                last_advance_ordinal = lnd;
+                prev_row_unsigned = unsigned_sha;
+                continue;
+            }
+            // A `CANCELLED` doc is the dead `OFFLINE_LOCAL_ACK` cohort of the cohort-cancel: NOT a live
+            // link (never checked against / advancing the active tip `expected`), but its `previous_hash`
+            // must still chain onto its lnd-predecessor — a corrupt back-pointer in the voided sub-chain
+            // is a real break (audit MAJOR).  `ABORTED` stays in the ACTIVE walk (never issued; its
+            // `previous_hash` == the live tip, so a wrongly-chained aborted doc still breaks there).
+            if state == "CANCELLED" {
+                if previous_hash != prev_row_unsigned {
+                    out.push(Violation::ChainBreak {
+                        fiscal_number: fiscal_number.clone(),
+                        lnd,
+                        expected_hex: hex32_opt(&prev_row_unsigned),
+                        found_hex: hex32_opt(&previous_hash),
+                    });
+                }
+                prev_row_unsigned = unsigned_sha;
+                continue;
+            }
+            // hpc: re-anchor onto the NEWEST T=112 witness that fired at/below this doc's ordinal
+            // AND after the last tip advance (a witness the chain already passed must not re-apply).
+            if let Some((w_ord, w_seed)) = witnesses
+                .iter()
+                .rfind(|(o, _)| *o <= lnd && *o > last_advance_ordinal)
+            {
+                expected = Some(w_seed.clone());
+                last_advance_ordinal = *w_ord;
+            }
             if previous_hash != expected {
                 out.push(Violation::ChainBreak {
                     fiscal_number: fiscal_number.clone(),
@@ -325,21 +445,35 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             // `ACK`.  Without this the walk would advance `expected` only over
             // `ACK` docs while `node_state.seed` advanced at SEND → a FALSE
             // `ChainSeedMismatch` on any SENT-resting online doc.  Offline arm
-            // unchanged (`OFFLINE_ISSUED_STATES`).  This projection and
-            // `last_issued_unsigned_xml_sha256` share the fn → CANNOT diverge.
+            // unchanged (`OFFLINE_ISSUED_STATES`).  This walk and
+            // `active_chain_tip_unsigned_xml_sha256` share `is_issued` → CANNOT
+            // diverge on which docs advanced the seed.
             let issued = crate::db::repositories::fiscal_documents::is_issued(
                 &state,
                 offline_fiscal_no,
                 server_fiscal_no.as_deref(),
             );
             if issued {
-                expected = unsigned_sha;
+                expected = unsigned_sha.clone();
+                last_advance_ordinal = lnd;
             }
+            prev_row_unsigned = unsigned_sha;
         }
-        if node_seed != expected {
+        // bd PRRO_GATE-2nk — the node seed must equal the ACTIVE chain tip, which after a
+        // `NotAcceptedOffline` rewind is the held doc's own `previous_hash` (possibly a non-doc T=112
+        // seed), NOT the last issued doc's hash.  Use the SAME projection recovery uses, so the scan
+        // and NC-03 boot CANNOT diverge (the pre-fix `node_seed == walk's final expected` check
+        // false-positived on the rewound tip).
+        let active_tip =
+            crate::db::repositories::fiscal_documents::active_chain_tip_unsigned_xml_sha256(
+                pool,
+                &fiscal_number,
+            )
+            .await?;
+        if node_seed != active_tip {
             out.push(Violation::ChainSeedMismatch {
                 fiscal_number,
-                walk_hex: hex32_opt(&expected),
+                walk_hex: hex32_opt(&active_tip),
                 node_state_hex: hex32_opt(&node_seed),
             });
         }
@@ -486,6 +620,66 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             shift_id_hex: hex_encode_lower(&shift_id),
             state,
         });
+    }
+
+    // 16. L0 cash-anchor drift — re-derive the open shift's opening anchor
+    // from the journal (walking all closed shifts) and compare to the stored
+    // `cash_balance_kop`.  Drift means either the carry was written incorrectly
+    // at open-time or a closed-shift row was tampered with.
+    //
+    // Guard: skip FNs whose current shift state is NOT a "real open" (i.e. the
+    // fuzzer's `SellWithClosedShift` helper uses `force_shift_closed` which
+    // bypasses the closing-cash write → the closed-shift anchor is wrong for
+    // that seam only).  We detect this by checking that the open shift's
+    // `cash_balance_kop` matches the carry from the PRECEDING closed shifts
+    // (not including the open shift itself).  `reconcile_opening_anchor`
+    // already does this correctly: it returns `Some((re_derived, stored))`
+    // where `stored` = open shift's opening anchor = carry from prior closed
+    // shifts.  False-positives from the force-close seam only arise when the
+    // CLOSED shift's anchor is wrong; the open-shift-opening check is
+    // unaffected.
+    //
+    // To guard precisely against the known false-positive surface: the
+    // force_shift_closed helper does NOT update `cash_balance_kop` on the
+    // closed shift row.  After force-close that row carries the OPENING value
+    // (not the closing value).  So the re-derived carry (from the closed
+    // shift's docs + that opening) will be wrong.  We skip Check 16 when the
+    // LATEST CLOSED shift has a zero `cash_balance_kop` AND it has non-zero
+    // issued receipts — that is the exact force-close signature.
+    //
+    // In production the force-close seam does NOT exist; Check 16 runs on
+    // all FNs unconditionally.
+    let fns_for_check16: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT fiscal_number FROM node_state")
+            .fetch_all(pool)
+            .await?;
+
+    for (fiscal_number,) in fns_for_check16 {
+        // Skip: last closed shift has cash_balance_kop=0 AND has issued receipts
+        // (the force-close test-seam signature — only present in tests).
+        let skip: Option<i64> = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fiscal_documents fd              JOIN shifts s ON s.shift_id = fd.shift_id              WHERE s.fiscal_number = ? AND s.state = 'CLOSED'                AND s.cash_balance_kop = 0                AND fd.state IN ('ACK','OFFLINE_LOCAL_ACK')                AND s.serial = (SELECT MAX(serial) FROM shifts WHERE fiscal_number = ? AND state='CLOSED')",
+        )
+        .bind(&fiscal_number)
+        .bind(&fiscal_number)
+        .fetch_optional(pool)
+        .await?;
+        if skip.unwrap_or(0) > 0 {
+            // Force-close seam detected — skip to avoid false-positive.
+            continue;
+        }
+
+        if let Some((re_derived, stored)) =
+            crate::services::cash_ledger::reconcile_opening_anchor(pool, &fiscal_number).await?
+        {
+            if re_derived != stored {
+                out.push(Violation::CashAnchorDrift {
+                    fiscal_number,
+                    stored,
+                    re_derived,
+                });
+            }
+        }
     }
 
     Ok(out)

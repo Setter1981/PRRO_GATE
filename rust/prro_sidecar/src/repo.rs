@@ -25,7 +25,7 @@ impl rusqlite::types::FromSql for FiscalMode {
         match String::column_result(value)?.as_str() {
             "prod" => Ok(Self::Prod),
             "test" => Ok(Self::Test),
-            other  => Err(rusqlite::types::FromSqlError::Other(Box::new(
+            other => Err(rusqlite::types::FromSqlError::Other(Box::new(
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("invalid fiscal_mode {other:?}; expected 'prod' or 'test'"),
@@ -38,7 +38,7 @@ impl rusqlite::types::FromSql for FiscalMode {
 impl rusqlite::types::FromSql for CredentialsMode {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         match String::column_result(value)?.as_str() {
-            "plain"    => Ok(Self::Plain),
+            "plain" => Ok(Self::Plain),
             "xor_soft" => Ok(Self::XorSoft),
             other => Err(rusqlite::types::FromSqlError::Other(Box::new(
                 std::io::Error::new(
@@ -54,43 +54,43 @@ impl rusqlite::types::FromSql for CredentialsMode {
 
 #[derive(Debug, Clone)]
 pub struct FnConfig {
-    pub fiscal_number:          String,
-    pub tax_number:             String,
-    pub fiscal_mode:            FiscalMode,
+    pub fiscal_number: String,
+    pub tax_number: String,
+    pub fiscal_mode: FiscalMode,
     pub national_check_enabled: bool,
-    pub offline_enabled:        bool,
-    pub tsp_enabled:            bool,
-    pub org_name:               Option<String>,
-    pub org_address:            Option<String>,
+    pub offline_enabled: bool,
+    pub tsp_enabled: bool,
+    pub org_name: Option<String>,
+    pub org_address: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct OperatorRow {
-    pub id:               i64,
-    pub fiscal_number:    String,
-    pub operator_name:    Option<String>,
-    pub operator_inn:     String,
-    pub jks_path:         String,
+    pub id: i64,
+    pub fiscal_number: String,
+    pub operator_name: Option<String>,
+    pub operator_inn: String,
+    pub jks_path: String,
     /// XOR-soft hex or plain text — as stored; caller decodes via credentials module.
-    pub jks_password:     String,
+    pub jks_password: String,
     /// Per-row password encoding mode — overrides global config.security.credentials_mode.
     pub credentials_mode: CredentialsMode,
 }
 
 #[derive(Debug, Clone)]
 pub struct LicenseRow {
-    pub id:               i64,
-    pub tin:              String,
+    pub id: i64,
+    pub tin: String,
     /// Raw JSON array of allowed fiscal numbers, e.g. `["3001234567","3001234568"]`.
     /// Use `fn_numbers()` for a typed view — kept as String to stay thin at query time.
-    pub fn_numbers_json:  String,
-    pub issued_at:        String,
-    pub expires_at:       String,
-    pub tier:             String,
-    pub org_name:         Option<String>,
+    pub fn_numbers_json: String,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub tier: String,
+    pub org_name: Option<String>,
     pub demo_limits_json: Option<String>,
-    pub payload_b64:      String,
-    pub signature_b64:    String,
+    pub payload_b64: String,
+    pub signature_b64: String,
 }
 
 impl LicenseRow {
@@ -103,17 +103,17 @@ impl LicenseRow {
 
 #[derive(Debug, Clone)]
 pub struct CertMetadata {
-    pub fiscal_number:    String,
+    pub fiscal_number: String,
     pub cert_fingerprint: String,
-    pub ski_hex:          String,
-    pub subject_dn:       Option<String>,
-    pub issuer_dn:        Option<String>,
-    pub valid_from:       Option<String>,
+    pub ski_hex: String,
+    pub subject_dn: Option<String>,
+    pub issuer_dn: Option<String>,
+    pub valid_from: Option<String>,
     /// ISO-8601 UTC. The `operator_certs` table has no `active` column —
     /// callers MUST call `is_valid_at(now)` before using this cert for
     /// signing; signing with an expired cert is a fiscal protocol violation.
-    pub valid_to:         Option<String>,
-    pub source:           String,
+    pub valid_to: Option<String>,
+    pub source: String,
 }
 
 impl CertMetadata {
@@ -125,14 +125,22 @@ impl CertMetadata {
         };
         if let Some(valid_to_str) = self.valid_to.as_deref() {
             match parse(valid_to_str) {
-                Some(vt) => { if now > vt { return false; } }
-                None     => return false, // present but unparseable → fail-closed
+                Some(vt) => {
+                    if now > vt {
+                        return false;
+                    }
+                }
+                None => return false, // present but unparseable → fail-closed
             }
         }
         if let Some(valid_from_str) = self.valid_from.as_deref() {
             match parse(valid_from_str) {
-                Some(vf) => { if now < vf { return false; } }
-                None     => return false, // present but unparseable → fail-closed
+                Some(vf) => {
+                    if now < vf {
+                        return false;
+                    }
+                }
+                None => return false, // present but unparseable → fail-closed
             }
         }
         true
@@ -153,9 +161,9 @@ pub enum AuditSeverity {
 impl AuditSeverity {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Info     => "INFO",
-            Self::Warning  => "WARNING",
-            Self::Error    => "ERROR",
+            Self::Info => "INFO",
+            Self::Warning => "WARNING",
+            Self::Error => "ERROR",
             Self::Critical => "CRITICAL",
         }
     }
@@ -168,10 +176,10 @@ impl rusqlite::types::ToSql for AuditSeverity {
 }
 
 pub struct AuditEntry<'a> {
-    pub entity_type:        &'a str,
-    pub entity_id:          &'a str,
-    pub event_type:         &'a str,
-    pub severity:           AuditSeverity,
+    pub entity_type: &'a str,
+    pub entity_id: &'a str,
+    pub event_type: &'a str,
+    pub severity: AuditSeverity,
     pub event_payload_json: Option<&'a str>,
 }
 
@@ -250,11 +258,13 @@ impl Repo {
         // F1 migration: add 'ambiguous' to sidecar_requests CHECK constraint.
         // SQLite does not support ALTER COLUMN; detect old constraint via schema text,
         // then recreate the table preserving all rows.
-        let old_sql: String = conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sidecar_requests'",
-            [],
-            |r| r.get(0),
-        ).unwrap_or_default();
+        let old_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='sidecar_requests'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
         if !old_sql.is_empty() && !old_sql.contains("'ambiguous'") {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS _sr_new;
@@ -280,17 +290,22 @@ impl Repo {
         // F2: add identity-binding columns to DBs that predate this change.
         conn.execute_batch(
             "ALTER TABLE sidecar_requests ADD COLUMN operation_type_key TEXT NOT NULL DEFAULT '';",
-        ).ok();
+        )
+        .ok();
         conn.execute_batch(
             "ALTER TABLE sidecar_requests ADD COLUMN payload_sha256_key TEXT NOT NULL DEFAULT '';",
-        ).ok();
+        )
+        .ok();
         // R3: business_ts is fiscally significant (drives Check.date_time in signed XML).
         // Empty business_ts_key means a pre-R3 row; those skip the ts identity check
         // for backward compat (same pattern as empty op/sha in F4-fix).
         conn.execute_batch(
             "ALTER TABLE sidecar_requests ADD COLUMN business_ts_key TEXT NOT NULL DEFAULT '';",
-        ).ok();
-        Ok(Self { conn: Mutex::new(conn) })
+        )
+        .ok();
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Acquire the DB lock; maps PoisonError to SidecarError::Internal so callers
@@ -313,14 +328,14 @@ impl Repo {
             params![fiscal_number],
             |row| {
                 Ok(FnConfig {
-                    fiscal_number:          row.get(0)?,
-                    tax_number:             row.get(1)?,
-                    fiscal_mode:            row.get(2)?,
+                    fiscal_number: row.get(0)?,
+                    tax_number: row.get(1)?,
+                    fiscal_mode: row.get(2)?,
                     national_check_enabled: row.get::<_, i32>(3)? != 0,
-                    offline_enabled:        row.get::<_, i32>(4)? != 0,
-                    tsp_enabled:            row.get::<_, i32>(5)? != 0,
-                    org_name:               row.get(6)?,
-                    org_address:            row.get(7)?,
+                    offline_enabled: row.get::<_, i32>(4)? != 0,
+                    tsp_enabled: row.get::<_, i32>(5)? != 0,
+                    org_name: row.get(6)?,
+                    org_address: row.get(7)?,
                 })
             },
         )
@@ -347,12 +362,12 @@ impl Repo {
             params![fiscal_number],
             |row| {
                 Ok(OperatorRow {
-                    id:               row.get(0)?,
-                    fiscal_number:    row.get(1)?,
-                    operator_name:    row.get(2)?,
-                    operator_inn:     row.get(3)?,
-                    jks_path:         row.get(4)?,
-                    jks_password:     row.get(5)?,
+                    id: row.get(0)?,
+                    fiscal_number: row.get(1)?,
+                    operator_name: row.get(2)?,
+                    operator_inn: row.get(3)?,
+                    jks_path: row.get(4)?,
+                    jks_password: row.get(5)?,
                     credentials_mode: row.get(6)?,
                 })
             },
@@ -376,16 +391,16 @@ impl Repo {
             [],
             |row| {
                 Ok(LicenseRow {
-                    id:               row.get(0)?,
-                    tin:              row.get(1)?,
-                    fn_numbers_json:  row.get(2)?,
-                    issued_at:        row.get(3)?,
-                    expires_at:       row.get(4)?,
-                    tier:             row.get(5)?,
-                    org_name:         row.get(6)?,
+                    id: row.get(0)?,
+                    tin: row.get(1)?,
+                    fn_numbers_json: row.get(2)?,
+                    issued_at: row.get(3)?,
+                    expires_at: row.get(4)?,
+                    tier: row.get(5)?,
+                    org_name: row.get(6)?,
                     demo_limits_json: row.get(7)?,
-                    payload_b64:      row.get(8)?,
-                    signature_b64:    row.get(9)?,
+                    payload_b64: row.get(8)?,
+                    signature_b64: row.get(9)?,
                 })
             },
         )
@@ -411,14 +426,14 @@ impl Repo {
             params![fiscal_number],
             |row| {
                 Ok(CertMetadata {
-                    fiscal_number:    row.get(0)?,
+                    fiscal_number: row.get(0)?,
                     cert_fingerprint: row.get(1)?,
-                    ski_hex:          row.get(2)?,
-                    subject_dn:       row.get(3)?,
-                    issuer_dn:        row.get(4)?,
-                    valid_from:       row.get(5)?,
-                    valid_to:         row.get(6)?,
-                    source:           row.get(7)?,
+                    ski_hex: row.get(2)?,
+                    subject_dn: row.get(3)?,
+                    issuer_dn: row.get(4)?,
+                    valid_from: row.get(5)?,
+                    valid_to: row.get(6)?,
+                    source: row.get(7)?,
                 })
             },
         )
@@ -488,7 +503,11 @@ impl Repo {
     /// Mark a fiscal number as hash-chain-degraded with the pending hash that
     /// could not be persisted after a successful DPS response.
     /// Re-degradation resets retry_count — each degradation event starts fresh.
-    pub fn set_degraded(&self, fiscal_number: &str, pending_hash: &str) -> Result<(), SidecarError> {
+    pub fn set_degraded(
+        &self,
+        fiscal_number: &str,
+        pending_hash: &str,
+    ) -> Result<(), SidecarError> {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO fn_degraded (fiscal_number, pending_hash)
@@ -522,19 +541,30 @@ impl Repo {
             "SELECT fiscal_number, pending_hash, retry_count FROM fn_degraded ORDER BY degraded_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i32>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)?,
+            ))
         })?;
         let mut result = Vec::new();
-        for row in rows { result.push(row?); }
+        for row in rows {
+            result.push(row?);
+        }
         Ok(result)
     }
 
     /// On success: store pending_hash as previous_hash + DELETE fn_degraded (one transaction).
     /// On failure: increment retry_count + last_retry_at (best-effort, only when ROLLBACK succeeds).
     /// Caller must pass the same hash that was stored in fn_degraded by set_degraded().
-    pub fn reconcile_chain(&self, fiscal_number: &str, pending_hash: &str) -> Result<(), SidecarError> {
+    pub fn reconcile_chain(
+        &self,
+        fiscal_number: &str,
+        pending_hash: &str,
+    ) -> Result<(), SidecarError> {
         let conn = self.lock()?;
-        conn.execute_batch("BEGIN IMMEDIATE").map_err(SidecarError::Db)?;
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(SidecarError::Db)?;
         let store_result = conn.execute(
             "INSERT INTO local_sequences (fiscal_number, previous_hash) VALUES (?1, ?2)
              ON CONFLICT(fiscal_number) DO UPDATE SET previous_hash = excluded.previous_hash",
@@ -625,7 +655,16 @@ impl Repo {
                          operation_type_key, payload_sha256_key, business_ts_key
                  FROM sidecar_requests WHERE idempotency_key = ?1",
                 rusqlite::params![key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .optional()
             .map_err(SidecarError::Db)?;
@@ -637,7 +676,13 @@ impl Repo {
                          (idempotency_key, fiscal_number, operation_type_key,
                           payload_sha256_key, business_ts_key, status, response_json)
                      VALUES (?1, ?2, ?3, ?4, ?5, 'pending', '')",
-                    rusqlite::params![key, fiscal_number, operation_type, payload_sha256, business_ts],
+                    rusqlite::params![
+                        key,
+                        fiscal_number,
+                        operation_type,
+                        payload_sha256,
+                        business_ts
+                    ],
                 )?;
                 Ok(PendingInsertResult::Inserted)
             }
@@ -678,7 +723,7 @@ impl Repo {
                     )));
                 }
                 match s.as_str() {
-                    "pending"   => Ok(PendingInsertResult::DuplicatePending),
+                    "pending" => Ok(PendingInsertResult::DuplicatePending),
                     // F1: ambiguous = timed-out in-flight; block new allocations.
                     "ambiguous" => Ok(PendingInsertResult::DuplicateAmbiguous),
                     // rejected or unknown: allow fresh retry.
@@ -692,7 +737,13 @@ impl Repo {
                                  (idempotency_key, fiscal_number, operation_type_key,
                                   payload_sha256_key, business_ts_key, status, response_json)
                              VALUES (?1, ?2, ?3, ?4, ?5, 'pending', '')",
-                            rusqlite::params![key, fiscal_number, operation_type, payload_sha256, business_ts],
+                            rusqlite::params![
+                                key,
+                                fiscal_number,
+                                operation_type,
+                                payload_sha256,
+                                business_ts
+                            ],
                         )?;
                         Ok(PendingInsertResult::Inserted)
                     }
@@ -881,7 +932,9 @@ mod tests {
              );",
         )
         .unwrap();
-        Repo { conn: Mutex::new(conn) }
+        Repo {
+            conn: Mutex::new(conn),
+        }
     }
 
     fn insert_fn(repo: &Repo, fn_: &str) {
@@ -1034,10 +1087,10 @@ mod tests {
     fn audit_log_insert_ok() {
         let repo = make_repo();
         repo.audit_log_insert(&AuditEntry {
-            entity_type:        "license",
-            entity_id:          "1",
-            event_type:         "VERIFIED",
-            severity:           AuditSeverity::Info,
+            entity_type: "license",
+            entity_id: "1",
+            event_type: "VERIFIED",
+            severity: AuditSeverity::Info,
             event_payload_json: Some(r#"{"tier":"pro"}"#),
         })
         .unwrap();
@@ -1051,9 +1104,9 @@ mod tests {
     #[test]
     fn audit_severity_as_str_matches_db_constraint() {
         // Verify the enum serializes to the exact strings the DB CHECK allows.
-        assert_eq!(AuditSeverity::Info.as_str(),     "INFO");
-        assert_eq!(AuditSeverity::Warning.as_str(),  "WARNING");
-        assert_eq!(AuditSeverity::Error.as_str(),    "ERROR");
+        assert_eq!(AuditSeverity::Info.as_str(), "INFO");
+        assert_eq!(AuditSeverity::Warning.as_str(), "WARNING");
+        assert_eq!(AuditSeverity::Error.as_str(), "ERROR");
         assert_eq!(AuditSeverity::Critical.as_str(), "CRITICAL");
     }
 
@@ -1080,10 +1133,16 @@ mod tests {
     #[test]
     fn fn_numbers_invalid_json_returns_error() {
         let mut row = LicenseRow {
-            id: 1, tin: "x".into(), fn_numbers_json: "not-json".into(),
-            issued_at: "".into(), expires_at: "".into(), tier: "demo".into(),
-            org_name: None, demo_limits_json: None,
-            payload_b64: "x".into(), signature_b64: "y".into(),
+            id: 1,
+            tin: "x".into(),
+            fn_numbers_json: "not-json".into(),
+            issued_at: "".into(),
+            expires_at: "".into(),
+            tier: "demo".into(),
+            org_name: None,
+            demo_limits_json: None,
+            payload_b64: "x".into(),
+            signature_b64: "y".into(),
         };
         assert!(row.fn_numbers().is_err());
         // Also covers an object instead of array
@@ -1112,10 +1171,14 @@ mod tests {
         // Bypass the DB CHECK constraint via a raw table to verify FromSql itself.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (v TEXT)").unwrap();
-        conn.execute("INSERT INTO t VALUES ('garbage')", []).unwrap();
+        conn.execute("INSERT INTO t VALUES ('garbage')", [])
+            .unwrap();
         let result: rusqlite::Result<FiscalMode> =
             conn.query_row("SELECT v FROM t", [], |r| r.get(0));
-        assert!(result.is_err(), "FromSql must reject unknown fiscal_mode value");
+        assert!(
+            result.is_err(),
+            "FromSql must reject unknown fiscal_mode value"
+        );
     }
 
     // ── Operator active flag ──────────────────────────────────────────────────
@@ -1131,10 +1194,14 @@ mod tests {
                      (fiscal_number, operator_inn, jks_path, jks_password, active)
                  VALUES ('3001234567', '1111111111', '/k/op.jks', 'pw', 0)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let err = repo.load_active_operator("3001234567").unwrap_err();
-        assert!(matches!(err, SidecarError::NotFound(_)), "inactive operator must not be returned");
+        assert!(
+            matches!(err, SidecarError::NotFound(_)),
+            "inactive operator must not be returned"
+        );
     }
 
     // ── License unique-active constraint ──────────────────────────────────────
@@ -1153,7 +1220,10 @@ mod tests {
              VALUES ('2222222222', '[]', '2026-01-01', '2027-01-01', 'pro', 'x', 'y', 1)",
             [],
         );
-        assert!(result.is_err(), "UNIQUE INDEX ix_licenses_active_single must prevent two active licenses");
+        assert!(
+            result.is_err(),
+            "UNIQUE INDEX ix_licenses_active_single must prevent two active licenses"
+        );
     }
 
     // ── audit_log ─────────────────────────────────────────────────────────────
@@ -1162,17 +1232,21 @@ mod tests {
     fn audit_log_insert_with_null_payload() {
         let repo = make_repo();
         repo.audit_log_insert(&AuditEntry {
-            entity_type:        "sidecar",
-            entity_id:          "boot",
-            event_type:         "STARTUP",
-            severity:           AuditSeverity::Info,
+            entity_type: "sidecar",
+            entity_id: "boot",
+            event_type: "STARTUP",
+            severity: AuditSeverity::Info,
             event_payload_json: None,
-        }).unwrap();
+        })
+        .unwrap();
         let conn = repo.conn.lock().unwrap();
         let payload: Option<String> = conn
             .query_row("SELECT event_payload_json FROM audit_log", [], |r| r.get(0))
             .unwrap();
-        assert!(payload.is_none(), "event_payload_json must be NULL when not provided");
+        assert!(
+            payload.is_none(),
+            "event_payload_json must be NULL when not provided"
+        );
     }
 
     // ── CertMetadata nullable fields ──────────────────────────────────────────
@@ -1188,15 +1262,16 @@ mod tests {
                      (fiscal_number, cert_fingerprint, ski_hex, cert_der, fetched_at, source)
                  VALUES ('3001234567', 'fp', 'ski64', X'00', '2025-01-01', 'cmp')",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let meta = repo.load_operator_cert_metadata("3001234567").unwrap();
         assert_eq!(meta.cert_fingerprint, "fp");
         assert_eq!(meta.source, "cmp");
         assert!(meta.subject_dn.is_none(), "subject_dn must be None");
-        assert!(meta.issuer_dn.is_none(),  "issuer_dn must be None");
+        assert!(meta.issuer_dn.is_none(), "issuer_dn must be None");
         assert!(meta.valid_from.is_none(), "valid_from must be None");
-        assert!(meta.valid_to.is_none(),   "valid_to must be None");
+        assert!(meta.valid_to.is_none(), "valid_to must be None");
     }
 
     #[test]
@@ -1219,17 +1294,22 @@ mod tests {
                      (fiscal_number, operator_name, operator_inn, jks_path, jks_password, active)
                  VALUES ('3001234567', 'Перший', '1111111111', '/k/first.jks', 'aaa', 1)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO sidecar_operators
                      (fiscal_number, operator_name, operator_inn, jks_path, jks_password, active)
                  VALUES ('3001234567', 'Другий', '2222222222', '/k/second.jks', 'bbb', 1)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let op = repo.load_active_operator("3001234567").unwrap();
         // The second insert has a higher id — must win.
-        assert_eq!(op.operator_inn, "2222222222", "ORDER BY id DESC must return last inserted");
+        assert_eq!(
+            op.operator_inn, "2222222222",
+            "ORDER BY id DESC must return last inserted"
+        );
     }
 
     // ── FiscalMode::Prod from DB ──────────────────────────────────────────────
@@ -1245,7 +1325,8 @@ mod tests {
                       national_check_enabled, offline_enabled, tsp_enabled)
                  VALUES ('FN_PROD', '1234567890', 'prod', 0, 1, 0)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let cfg = repo.load_fn_config("FN_PROD").unwrap();
         assert_eq!(cfg.fiscal_mode, FiscalMode::Prod);
@@ -1256,111 +1337,144 @@ mod tests {
     #[test]
     fn cert_is_valid_at_within_valid_window() {
         let meta = CertMetadata {
-            fiscal_number:    "FN1".into(),
+            fiscal_number: "FN1".into(),
             cert_fingerprint: "fp".into(),
-            ski_hex:    "aa".into(),
-            source:     "local".into(),
+            ski_hex: "aa".into(),
+            source: "local".into(),
             valid_from: Some("2026-01-01T00:00:00Z".into()),
-            valid_to:   Some("2027-01-01T00:00:00Z".into()),
+            valid_to: Some("2027-01-01T00:00:00Z".into()),
             subject_dn: None,
-            issuer_dn:  None,
+            issuer_dn: None,
         };
-        let now = time::OffsetDateTime::parse("2026-06-01T00:00:00Z",
-            &time::format_description::well_known::Rfc3339).unwrap();
-        assert!(meta.is_valid_at(now), "now within [valid_from, valid_to] must be true");
+        let now = time::OffsetDateTime::parse(
+            "2026-06-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(
+            meta.is_valid_at(now),
+            "now within [valid_from, valid_to] must be true"
+        );
     }
 
     #[test]
     fn cert_is_valid_at_expired() {
         let meta = CertMetadata {
-            fiscal_number:    "FN1".into(),
+            fiscal_number: "FN1".into(),
             cert_fingerprint: "fp".into(),
-            ski_hex:    "aa".into(),
-            source:     "local".into(),
+            ski_hex: "aa".into(),
+            source: "local".into(),
             valid_from: Some("2025-01-01T00:00:00Z".into()),
-            valid_to:   Some("2026-01-01T00:00:00Z".into()),
+            valid_to: Some("2026-01-01T00:00:00Z".into()),
             subject_dn: None,
-            issuer_dn:  None,
+            issuer_dn: None,
         };
-        let now = time::OffsetDateTime::parse("2026-01-02T00:00:00Z",
-            &time::format_description::well_known::Rfc3339).unwrap();
+        let now = time::OffsetDateTime::parse(
+            "2026-01-02T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
         assert!(!meta.is_valid_at(now), "now > valid_to must be false");
     }
 
     #[test]
     fn cert_is_valid_at_exact_expiry_boundary_invalid() {
         let meta = CertMetadata {
-            fiscal_number:    "FN1".into(),
+            fiscal_number: "FN1".into(),
             cert_fingerprint: "fp".into(),
-            ski_hex:    "aa".into(),
-            source:     "local".into(),
+            ski_hex: "aa".into(),
+            source: "local".into(),
             valid_from: None,
-            valid_to:   Some("2026-04-20T12:00:00Z".into()),
+            valid_to: Some("2026-04-20T12:00:00Z".into()),
             subject_dn: None,
-            issuer_dn:  None,
+            issuer_dn: None,
         };
         // Exactly at valid_to — the condition is now > valid_to (exclusive)
         // so exactly AT valid_to should still be valid (not yet expired)
-        let now_at = time::OffsetDateTime::parse("2026-04-20T12:00:00Z",
-            &time::format_description::well_known::Rfc3339).unwrap();
-        assert!(meta.is_valid_at(now_at), "exactly at valid_to should still be valid (> not >=)");
+        let now_at = time::OffsetDateTime::parse(
+            "2026-04-20T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(
+            meta.is_valid_at(now_at),
+            "exactly at valid_to should still be valid (> not >=)"
+        );
         // One second past must be invalid
-        let now_past = time::OffsetDateTime::parse("2026-04-20T12:00:01Z",
-            &time::format_description::well_known::Rfc3339).unwrap();
-        assert!(!meta.is_valid_at(now_past), "one second past valid_to must be invalid");
+        let now_past = time::OffsetDateTime::parse(
+            "2026-04-20T12:00:01Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(
+            !meta.is_valid_at(now_past),
+            "one second past valid_to must be invalid"
+        );
     }
 
     #[test]
     fn cert_is_valid_at_not_yet_valid() {
         let meta = CertMetadata {
-            fiscal_number:    "FN1".into(),
+            fiscal_number: "FN1".into(),
             cert_fingerprint: "fp".into(),
-            ski_hex:    "aa".into(),
-            source:     "local".into(),
+            ski_hex: "aa".into(),
+            source: "local".into(),
             valid_from: Some("2027-01-01T00:00:00Z".into()),
-            valid_to:   None,
+            valid_to: None,
             subject_dn: None,
-            issuer_dn:  None,
+            issuer_dn: None,
         };
-        let now = time::OffsetDateTime::parse("2026-12-31T23:59:59Z",
-            &time::format_description::well_known::Rfc3339).unwrap();
+        let now = time::OffsetDateTime::parse(
+            "2026-12-31T23:59:59Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
         assert!(!meta.is_valid_at(now), "now < valid_from must be false");
     }
 
     #[test]
     fn cert_is_valid_at_no_dates_always_valid() {
         let meta = CertMetadata {
-            fiscal_number:    "FN1".into(),
+            fiscal_number: "FN1".into(),
             cert_fingerprint: "fp".into(),
-            ski_hex:    "aa".into(),
-            source:     "local".into(),
+            ski_hex: "aa".into(),
+            source: "local".into(),
             valid_from: None,
-            valid_to:   None,
+            valid_to: None,
             subject_dn: None,
-            issuer_dn:  None,
+            issuer_dn: None,
         };
-        let now_past   = time::OffsetDateTime::UNIX_EPOCH;
-        let now_future = time::OffsetDateTime::parse("2099-12-31T23:59:59Z",
-            &time::format_description::well_known::Rfc3339).unwrap();
-        assert!(meta.is_valid_at(now_past),   "no dates: valid at UNIX epoch");
-        assert!(meta.is_valid_at(now_future), "no dates: valid in far future");
+        let now_past = time::OffsetDateTime::UNIX_EPOCH;
+        let now_future = time::OffsetDateTime::parse(
+            "2099-12-31T23:59:59Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(meta.is_valid_at(now_past), "no dates: valid at UNIX epoch");
+        assert!(
+            meta.is_valid_at(now_future),
+            "no dates: valid in far future"
+        );
     }
 
     #[test]
     fn cert_is_valid_at_unparseable_valid_to_fails_closed() {
         // Corrupted DB value: valid_to is not ISO-8601 → fail-closed (treat as invalid).
         let meta = CertMetadata {
-            fiscal_number:    "FN1".into(),
+            fiscal_number: "FN1".into(),
             cert_fingerprint: "fp".into(),
-            ski_hex:    "aa".into(),
-            source:     "local".into(),
+            ski_hex: "aa".into(),
+            source: "local".into(),
             valid_from: None,
-            valid_to:   Some("not-a-date".into()),
+            valid_to: Some("not-a-date".into()),
             subject_dn: None,
-            issuer_dn:  None,
+            issuer_dn: None,
         };
         let now = time::OffsetDateTime::now_utc();
-        assert!(!meta.is_valid_at(now), "unparseable valid_to must block access (fail-closed)");
+        assert!(
+            !meta.is_valid_at(now),
+            "unparseable valid_to must block access (fail-closed)"
+        );
     }
 
     // ── Multiple active operators — ORDER BY id DESC determinism (3 rows) ─────
@@ -1376,24 +1490,30 @@ mod tests {
                      (fiscal_number, operator_inn, jks_path, jks_password, operator_name, active)
                  VALUES ('FN1', '11111', 'a.jks', 'pw1', 'Operator1', 1)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO sidecar_operators
                      (fiscal_number, operator_inn, jks_path, jks_password, operator_name, active)
                  VALUES ('FN1', '22222', 'b.jks', 'pw2', 'Operator2', 1)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO sidecar_operators
                      (fiscal_number, operator_inn, jks_path, jks_password, operator_name, active)
                  VALUES ('FN1', '33333', 'c.jks', 'pw3', 'Operator3', 1)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let op = repo.load_active_operator("FN1").unwrap();
         // ORDER BY id DESC → last inserted (id=3, Operator3) must win
-        assert_eq!(op.operator_name.as_deref(), Some("Operator3"),
-            "ORDER BY id DESC must return highest-id row among multiple active operators");
+        assert_eq!(
+            op.operator_name.as_deref(),
+            Some("Operator3"),
+            "ORDER BY id DESC must return highest-id row among multiple active operators"
+        );
         assert_eq!(op.jks_path, "c.jks");
     }
 
@@ -1402,16 +1522,16 @@ mod tests {
     #[test]
     fn fn_numbers_empty_array_parses_to_empty_vec() {
         let row = LicenseRow {
-            id:               1,
-            tin:              "1234567890".into(),
-            fn_numbers_json:  "[]".into(),
-            issued_at:        "2026-01-01T00:00:00Z".into(),
-            expires_at:       "2027-01-01T00:00:00Z".into(),
-            tier:             "demo".into(),
-            org_name:         None,
+            id: 1,
+            tin: "1234567890".into(),
+            fn_numbers_json: "[]".into(),
+            issued_at: "2026-01-01T00:00:00Z".into(),
+            expires_at: "2027-01-01T00:00:00Z".into(),
+            tier: "demo".into(),
+            org_name: None,
             demo_limits_json: None,
-            payload_b64:      "x".into(),
-            signature_b64:    "y".into(),
+            payload_b64: "x".into(),
+            signature_b64: "y".into(),
         };
         let fns = row.fn_numbers().unwrap();
         assert!(fns.is_empty(), "[] must parse to empty Vec");
@@ -1420,19 +1540,22 @@ mod tests {
     #[test]
     fn fn_numbers_json_with_numeric_elements_returns_error() {
         let row = LicenseRow {
-            id:               1,
-            tin:              "1234567890".into(),
-            fn_numbers_json:  "[1, 2, 3]".into(),
-            issued_at:        "2026-01-01T00:00:00Z".into(),
-            expires_at:       "2027-01-01T00:00:00Z".into(),
-            tier:             "demo".into(),
-            org_name:         None,
+            id: 1,
+            tin: "1234567890".into(),
+            fn_numbers_json: "[1, 2, 3]".into(),
+            issued_at: "2026-01-01T00:00:00Z".into(),
+            expires_at: "2027-01-01T00:00:00Z".into(),
+            tier: "demo".into(),
+            org_name: None,
             demo_limits_json: None,
-            payload_b64:      "x".into(),
-            signature_b64:    "y".into(),
+            payload_b64: "x".into(),
+            signature_b64: "y".into(),
         };
         let result = row.fn_numbers();
-        assert!(result.is_err(), "numeric array elements must fail serde_json::from_str::<Vec<String>>");
+        assert!(
+            result.is_err(),
+            "numeric array elements must fail serde_json::from_str::<Vec<String>>"
+        );
     }
 
     // ── local_sequences / next_local_number ──────────────────────────────────
@@ -1461,7 +1584,10 @@ mod tests {
         repo.next_local_number("FN_X").unwrap();
         repo.next_local_number("FN_X").unwrap();
         let y = repo.next_local_number("FN_Y").unwrap();
-        assert_eq!(y, 1, "FN_Y counter must start at 1 regardless of FN_X count");
+        assert_eq!(
+            y, 1,
+            "FN_Y counter must start at 1 regardless of FN_X count"
+        );
     }
 
     // ── previous_hash ─────────────────────────────────────────────────────────
@@ -1470,7 +1596,10 @@ mod tests {
     fn load_previous_hash_returns_empty_string_for_unknown_fn() {
         let repo = make_repo();
         let h = repo.load_previous_hash("NO_SUCH_FN").unwrap();
-        assert!(h.is_empty(), "unknown FN must return empty string, not error");
+        assert!(
+            h.is_empty(),
+            "unknown FN must return empty string, not error"
+        );
     }
 
     #[test]
@@ -1496,7 +1625,10 @@ mod tests {
         repo.store_previous_hash("FN_MIX", "some_hash").unwrap();
         repo.next_local_number("FN_MIX").unwrap();
         let h = repo.load_previous_hash("FN_MIX").unwrap();
-        assert_eq!(h, "some_hash", "next_local_number must not clobber previous_hash");
+        assert_eq!(
+            h, "some_hash",
+            "next_local_number must not clobber previous_hash"
+        );
     }
 
     // M-4: store_previous_hash must not touch `last`
@@ -1511,10 +1643,16 @@ mod tests {
         repo.store_previous_hash("FN_SEQ", "hash_abc").unwrap();
         // Next increment must continue from 3 → 4, not reset to 1.
         let n = repo.next_local_number("FN_SEQ").unwrap();
-        assert_eq!(n, 4, "store_previous_hash must not modify last (expected 4, got {n})");
+        assert_eq!(
+            n, 4,
+            "store_previous_hash must not modify last (expected 4, got {n})"
+        );
         // And the hash must still be there.
         let h = repo.load_previous_hash("FN_SEQ").unwrap();
-        assert_eq!(h, "hash_abc", "previous_hash must survive next_local_number call");
+        assert_eq!(
+            h, "hash_abc",
+            "previous_hash must survive next_local_number call"
+        );
     }
 
     // next_local_number: RETURNING guarantees read-your-own-write
@@ -1524,8 +1662,10 @@ mod tests {
         // Call three times — RETURNING value must match what a subsequent SELECT would see.
         for expected in 1_i32..=5 {
             let returned = repo.next_local_number("FN_RET").unwrap();
-            assert_eq!(returned, expected,
-                "RETURNING must equal post-UPSERT last (expected {expected}, got {returned})");
+            assert_eq!(
+                returned, expected,
+                "RETURNING must equal post-UPSERT last (expected {expected}, got {returned})"
+            );
         }
     }
 
@@ -1542,11 +1682,15 @@ mod tests {
                 "INSERT INTO local_sequences (fiscal_number, last, previous_hash)
                  VALUES ('FN_GAP', 5, '')",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         // Must succeed (not error) — caller gets empty string and can decide what to do.
         let h = repo.load_previous_hash("FN_GAP").unwrap();
-        assert!(h.is_empty(), "gap condition must still return Ok(\"\"), not error");
+        assert!(
+            h.is_empty(),
+            "gap condition must still return Ok(\"\"), not error"
+        );
     }
 
     // ── load_cert_der_for_fn ──────────────────────────────────────────────────
@@ -1607,7 +1751,9 @@ mod tests {
     #[test]
     fn load_tsp_url_by_issuer_dn_matches_pattern() {
         let repo = make_repo_with_ca_endpoints();
-        let url = repo.load_tsp_url_by_issuer_dn("CN=АЦСК ІДДС, OU=Trust").unwrap();
+        let url = repo
+            .load_tsp_url_by_issuer_dn("CN=АЦСК ІДДС, OU=Trust")
+            .unwrap();
         assert_eq!(url, "http://acsk.gov.ua/tsp/");
     }
 
@@ -1618,7 +1764,10 @@ mod tests {
         let repo = make_repo_with_ca_endpoints();
         // Construct a DN that matches both patterns — verify the lower priority number wins.
         let url = repo.load_tsp_url_by_issuer_dn("АЦСК ІДДС").unwrap();
-        assert_eq!(url, "http://acsk.gov.ua/tsp/", "priority=10 must win over priority=20");
+        assert_eq!(
+            url, "http://acsk.gov.ua/tsp/",
+            "priority=10 must win over priority=20"
+        );
     }
 
     #[test]
@@ -1698,7 +1847,8 @@ mod tests {
         let _ = std::thread::spawn(move || {
             let _guard = repo2.conn.lock().unwrap();
             panic!("deliberate poison");
-        }).join(); // join returns Err because thread panicked
+        })
+        .join(); // join returns Err because thread panicked
 
         // Now the mutex is poisoned — any lock() call through the public API must
         // surface as SidecarError::Internal (not a panic, not a hang).
@@ -1717,25 +1867,33 @@ mod tests {
     #[test]
     fn insert_pending_fresh_key_returns_inserted() {
         let repo = make_repo();
-        let r = repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
+        let r = repo
+            .insert_pending_request("key1", "FN001", OP, SHA, "")
+            .unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
     #[test]
     fn insert_pending_same_key_returns_duplicate_pending() {
         let repo = make_repo();
-        repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
-        let r = repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("key1", "FN001", OP, SHA, "")
+            .unwrap();
+        let r = repo
+            .insert_pending_request("key1", "FN001", OP, SHA, "")
+            .unwrap();
         assert!(matches!(r, PendingInsertResult::DuplicatePending));
     }
 
     #[test]
     fn accept_request_then_replay_returns_cached_json() {
         let repo = make_repo();
-        repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("key1", "FN001", OP, SHA, "")
+            .unwrap();
         repo.accept_request("key1", r#"{"status":1}"#).unwrap();
 
-        let r = repo.insert_pending_request("key1", "FN001", OP, SHA, "").unwrap();
+        let r = repo
+            .insert_pending_request("key1", "FN001", OP, SHA, "")
+            .unwrap();
         match r {
             PendingInsertResult::DuplicateAccepted(json) => {
                 assert_eq!(json, r#"{"status":1}"#);
@@ -1748,28 +1906,37 @@ mod tests {
     fn cleanup_stale_pending_transitions_to_ambiguous() {
         let repo = make_repo();
         // Insert row and immediately backdate it past the cleanup window.
-        repo.insert_pending_request("stale_key", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("stale_key", "FN001", OP, SHA, "")
+            .unwrap();
         {
             let conn = repo.conn.lock().unwrap();
             conn.execute(
                 "UPDATE sidecar_requests SET created_at = datetime('now', '-300 seconds')
                  WHERE idempotency_key = 'stale_key'",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         // Fresh key should NOT be affected.
-        repo.insert_pending_request("fresh_key", "FN001", OP, SHA, "").unwrap();
+        repo.insert_pending_request("fresh_key", "FN001", OP, SHA, "")
+            .unwrap();
 
         let updated = repo.cleanup_stale_pending(120).unwrap();
         assert_eq!(updated, 1, "only the stale row should be transitioned");
 
         // F1: stale key is now ambiguous, not deleted.
-        let r = repo.insert_pending_request("stale_key", "FN001", OP, SHA, "").unwrap();
-        assert!(matches!(r, PendingInsertResult::DuplicateAmbiguous),
-            "stale key must return DuplicateAmbiguous after cleanup, got {r:?}");
+        let r = repo
+            .insert_pending_request("stale_key", "FN001", OP, SHA, "")
+            .unwrap();
+        assert!(
+            matches!(r, PendingInsertResult::DuplicateAmbiguous),
+            "stale key must return DuplicateAmbiguous after cleanup, got {r:?}"
+        );
 
         // fresh_key still pending
-        let r2 = repo.insert_pending_request("fresh_key", "FN001", OP, SHA, "").unwrap();
+        let r2 = repo
+            .insert_pending_request("fresh_key", "FN001", OP, SHA, "")
+            .unwrap();
         assert!(matches!(r2, PendingInsertResult::DuplicatePending));
     }
 
@@ -1785,10 +1952,13 @@ mod tests {
                       status, response_json)
                  VALUES ('key1', 'FN001', 'SELL', 'aaaaaa', 'rejected', '')",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         // A new insert_pending should succeed (rejected → allow retry).
-        let r = repo.insert_pending_request("key1", "FN001", "SELL", "aaaaaa", "").unwrap();
+        let r = repo
+            .insert_pending_request("key1", "FN001", "SELL", "aaaaaa", "")
+            .unwrap();
         assert!(matches!(r, PendingInsertResult::Inserted));
     }
 
@@ -1796,13 +1966,22 @@ mod tests {
     #[test]
     fn insert_pending_different_identity_returns_hard_conflict() {
         let repo = make_repo();
-        repo.insert_pending_request("key1", "FN001", "SELL", SHA, "").unwrap();
-        let r = repo.insert_pending_request("key1", "FN002", "SELL", SHA, "").unwrap();
-        assert!(matches!(r, PendingInsertResult::HardConflict(_)),
-            "different fiscal_number must return HardConflict, got {r:?}");
-        let r2 = repo.insert_pending_request("key1", "FN001", "RETURN", SHA, "").unwrap();
-        assert!(matches!(r2, PendingInsertResult::HardConflict(_)),
-            "different operation_type must return HardConflict, got {r2:?}");
+        repo.insert_pending_request("key1", "FN001", "SELL", SHA, "")
+            .unwrap();
+        let r = repo
+            .insert_pending_request("key1", "FN002", "SELL", SHA, "")
+            .unwrap();
+        assert!(
+            matches!(r, PendingInsertResult::HardConflict(_)),
+            "different fiscal_number must return HardConflict, got {r:?}"
+        );
+        let r2 = repo
+            .insert_pending_request("key1", "FN001", "RETURN", SHA, "")
+            .unwrap();
+        assert!(
+            matches!(r2, PendingInsertResult::HardConflict(_)),
+            "different operation_type must return HardConflict, got {r2:?}"
+        );
     }
 
     // F1: ambiguous rows block new local_number allocation.
@@ -1817,10 +1996,15 @@ mod tests {
                       payload_sha256_key, status, response_json)
                  VALUES ('key1', 'FN001', 'SELL', 'aaaaaa', 'ambiguous', '')",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
-        let r = repo.insert_pending_request("key1", "FN001", "SELL", "aaaaaa", "").unwrap();
-        assert!(matches!(r, PendingInsertResult::DuplicateAmbiguous),
-            "ambiguous row must return DuplicateAmbiguous, got {r:?}");
+        let r = repo
+            .insert_pending_request("key1", "FN001", "SELL", "aaaaaa", "")
+            .unwrap();
+        assert!(
+            matches!(r, PendingInsertResult::DuplicateAmbiguous),
+            "ambiguous row must return DuplicateAmbiguous, got {r:?}"
+        );
     }
 }
