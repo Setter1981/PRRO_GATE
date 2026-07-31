@@ -84,7 +84,15 @@ pub const HEAD_SHA: &str = "f2628ba";
 /// bd PRRO_GATE-x5o re-anchor (2026-07-30): the fuzzer-model cash-reversal fix edits the frozen
 /// `invariant_fuzzer/model.rs`, an adjudicated change (prod was right; the model was under-counting a
 /// cohort-cancel). Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-pub const LIVE_DRIFT_BASE_SHA: &str = "9fc1125f";
+///
+/// bd PRRO_GATE-hpc/2ds re-anchor (2026-07-31): the generative `Replenish` (T=112) symbol edits the
+/// frozen `invariant_fuzzer/{interp,model}.rs` — the fixture now owns a real `App` (the T=112 service
+/// requires one) and the model gains the S7-2 `fence_active` precondition. BOTH are adjudicated
+/// prod-was-right changes, the second found by the fuzzer itself at `FUZZ_CASES=4096` and shrunk to
+/// `[Crash(Send), Replenish(Granted)]`. Production is FROZEN in that slice (zero `src/` diff), so this
+/// is a test-side contract addition, not a behaviour change. Additions-only — 0 removals, no
+/// supersession entry needed. Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
+pub const LIVE_DRIFT_BASE_SHA: &str = "6eadc156";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is
