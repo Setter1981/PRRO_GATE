@@ -1,153 +1,241 @@
-# SPEC — the peer-tip axis: making `-12` a CONSEQUENCE instead of a script leaf
+# SPEC rev2 — the peer-tip axis: modelling the second party of the MAC chain
 
-**Date:** 2026-07-31
-**Status:** DRAFT — design only, no code written yet.
-**Unblocks:** `bd PRRO_GATE-2ds` (the ambiguous-T112 generator leaf), and `PRRO_GATE-5hc` (the
-MacRecovery **success** path, which is generatively untested for the same underlying reason).
-**Origin:** the 2026-07-31 handoff recorded the leaf as blocked because "the model has no remote-tip
-axis, and without one `Ambiguous` is locally indistinguishable from `ServerReject` — the symbol would
-be vacuous coverage, worse than none."
+**Date:** 2026-07-31 (rev2 — same day; rev1 was adversarially reviewed by a 5-agent
+verify/attack pass before any code, and did not survive it intact)
+**Status:** DRAFT for operator review — design only, no code written.
+**Unblocks:** `bd PRRO_GATE-2ds` (ambiguous-T112 generator leaf) and `bd PRRO_GATE-5hc`
+(the MacRecovery **success** path — which, it turns out, closes one phase *earlier* than 2ds).
+**Rev1 → rev2 in one line:** the movers table was wrong in three rows and missing at least six,
+the "derived invariant" was falsified as stated, and the ordering assumption behind the override
+had zero evidence — one live data point cuts *against* it. Everything below is grounded
+file:line; the claims marked **[N=1]** rest on a single live observation and say so.
 
 ---
 
-## 1. What is actually missing
+## 1. What is missing (unchanged from rev1, still true)
 
-Not a symbol. **The fuzzer does not model the second party at all.**
+Not a symbol — **the second party**. A DPS reply is dictated by `DpsScript`, so the oracle checks
+our *reaction* to `-12` but never that `-12` *arises* exactly when the chains disagree. Three
+things are stuck on this at once: the ambiguous-T112 leaf (`2ds`), `-12` fidelity, and the
+MacReseed success path (`5hc` — guard-B's corroboration disjunct
+`delivery_reservation.rs:1437-1447` is exercised only by directed tests; the stub's `store` is the
+constant `DPS_RECOVERY_TIP`, `op.rs:29-41`, with "Nothing consumes it yet" in its own comment).
+The class is not hypothetical: `3uo` was a P1 trap living in exactly this seam.
 
-Today a DPS reply is *dictated* by `DpsScript`: the generator picks `[BadHashPrev]` and the stub
-returns `-12`, regardless of whether the chain actually diverged. So the oracle checks **our reaction
-to `-12`** but never checks **that `-12` arises exactly when it should**. The interesting half of the
-contract — *the peer disagrees with us about the chain* — is unmodelled.
+## 2. What the axis is — and what it is NOT (tautology verdict, accepted)
 
-That gap is why three things are stuck at once:
+The adversarial pass sustained a tautology attack against rev1's central claim, and rev2 accepts
+it: for the **plain online path**, chain continuity is *already* proven per-op by
+`check_doc_against_mutation` (`oracle.rs:207-212`: the real doc's `previous_hash` IS the prior
+real tip) and referentially by the scanner chain walk (`invariant_scan.rs:393,413`). A derived
+`-12` there detects nothing new, and rev1's "derived invariant" — *whenever our_seed ≠ peer_tip
+the next online send MUST earn -12* — is **false as stated** anyway: after any offline
+`OFFLINE_LOCAL_ACK` issuance the node seed is legitimately ahead of the peer for the whole
+backlog, and the drain sends succeed (`model.rs:1490-1502`). The implementable rule is
+**per-DOCUMENT**: *a send whose `previous_hash` ≠ peer_tip earns `-12`*.
 
-| stuck thing | why the peer-tip axis is the blocker |
-|---|---|
-| ambiguous T=112 (`2ds`) | the whole point is "DPS moved its tip, we never heard" — unrepresentable without a peer tip |
-| `-12` fidelity | today a free script leaf; should be a **derived** outcome of tip divergence |
-| MacRecovery **success** (`5hc`) | an operator `MacReseed` succeeds only when the supplied seed matches what the peer actually has — no peer, no success path |
+So, honestly framed:
 
-And the class is not hypothetical: `PRRO_GATE-3uo` was a **P1 trap** living in exactly this seam —
-after an ambiguous T=112 the peer's tip moved, ours did not, guard-B then accepted *only the value
-known to be wrong*, and every turn of the loop looked like a successful operator action.
+- **The axis is coverage machinery, not a new correctness oracle.** Its production-facing value
+  is the *trajectories* it makes generatively reachable, each with a real oracle at the end:
+  1. divergence → `-12` → **corroborated MacReseed → convergence → next send SUCCEEDS**
+     (the `5hc` success path; today unreachable);
+  2. **ambiguous T=112** → follow-on derived `-12` (`2ds`; today unrepresentable);
+  3. **operator-claim vs peer-truth**: `OperatorComplete(Accepted)` when the peer did NOT take
+     the doc (and the converse) — today the claim is applied unconditionally
+     (`model.rs:567-587`) and NO check ties it to any later wire consequence;
+  4. `-12`-during-**boot**: a reboot re-drives SIGNED sends with a stale `previous_hash` — a
+     MacRecovery-in-boot path nothing exercises today.
+- **Plus one negative fidelity property**: on every agreeing run, *no spurious `-12`* — which is
+  precisely the empirical load test of the movers table (§4).
+- The per-document rule above is the **stub's construction rule**, not a pinned production
+  invariant. The pins that matter are the trajectory pins.
 
-## 2. Constraints discovered while designing (checked, not assumed)
+## 3. Mechanics (verified feasible, with three corrections from the pass)
 
-1. **The stub cannot read the chain off the wire.** `CheckEnvelope` (`transports/dps/dto.rs:32-53`)
-   carries `rro_fn`, `date_time`, `check_sign`, `local_number`, `check_type`, `id_offline`,
-   `id_cancel` — no XML, no `previous_hash`. And `DetCrypto::sign_cms_detached`
-   (`tests/common/mod.rs:244-249`) returns the constant `b"RECOVERED-CMS"`, so `check_sign` carries
-   no information at all. **A peer that validates the hash "as the real DPS does" is not
-   constructible without changing the crypto stub**, and changing it would ripple through every test
-   that pins those bytes.
-2. **The stub is per-operation and stateless across ops.** `FuzzCtx::new_dps` (`interp.rs:530`)
-   builds a fresh `ScriptedDps` for every op; only the call counters survive, via `Arc`
-   (`send_calls` / `last_calls`). So peer state must live in `FuzzCtx` and be handed in the same way
-   — the pattern already exists.
-3. **The information the peer needs IS in the DB.** Production persists `previous_hash` on the row at
-   pin time and `unsigned_xml_sha256` at persist time. Those are exactly "what went on the wire" and
-   "what the peer's tip becomes if it accepts".
+`FuzzCtx` owns `PeerState { tip: Option<TipVal> }`; the stub gets a pool handle and the
+`PeerState` Arc-style — the exact pattern the wire counters already use (`interp.rs:530-532`,
+`scripted_dps.rs:70-71`). All of the following was **CONFIRMED** by the verify pass:
 
-## 3. Options, and the one to take
+- **Timing is safe.** `previous_hash` (pin-tx) and `unsigned_xml_sha256` (3-PERSIST tx) are
+  committed before stage 4's wire call, which runs outside any write tx (invariant #1;
+  `stage_sign.rs:273-557` → `stage_send.rs:1916-1941` → `submit.rs:87`). A stub-side
+  `SELECT previous_hash, unsigned_xml_sha256 WHERE fiscal_number=? AND lnd=?` sees committed
+  rows; `(fiscal_number, lnd)` is UNIQUE (`ux_fd_fn_lnd`). The race attack was tried and
+  refuted (skeptic 1, verdict NONE).
+- **Correction 1 — ShiftOpen lookup.** `build_send_envelope` hard-overrides `local_number=0` for
+  `WireArtifactKind::ShiftOpen` in BOTH lanes (`stage_send.rs:461-465`). The stub resolves a
+  ShiftOpen by `id_offline` (offline lane) or by the FN's unique `SENDING`-state row (online —
+  single-writer guarantees uniqueness).
+- **Correction 2 — the override lane.** `send_chk_observed` already has an observation-override
+  queue consulted BEFORE `scripted_observation` (`scripted_dps.rs:203-206`, built for
+  `UnknownStatus` real-decode). A `-12` override must compose with that lane, not bypass it.
+- **Correction 3 — T=112 surfaces.** `ask_offline_codes` is a separate stub queue that does NOT
+  increment `send_calls` (`scripted_dps.rs:249-261`) — peer bookkeeping for T=112 must key on its
+  own call log, not the send counter. On the GRANTED arm the harness receives `request_xml` +
+  `new_seed_hex` in `ReplenishSummary` (`offline_code_replenish.rs:419-425`) — **no
+  reconstruction problem**; rev1's worry was misplaced. On the AMBIGUOUS arm nothing is returned
+  and nothing persisted (`Err` before Step 6, line 326 — the `3uo` finding), so the peer's new
+  tip is a **synthetic value `S`** that later appears only in `-12 store` fields and MacReseed
+  corroboration — consistent by construction.
+- `DetCrypto` makes `check_sign` a constant, so a hash-validating peer stays unconstructible —
+  the DB-read peer is the only faithful option (unchanged from rev1, re-confirmed).
+- Genesis: fuzzer fixtures never call `init_chain_seed` → peer starts `None`; `None == None`
+  is a match.
 
-**(a) Fully truthful peer** — stub reconstructs the chain from the envelope. **Rejected:** not
-constructible per constraint 1, and buying it means editing `DetCrypto`'s pinned bytes.
+## 4. The movers table, rev2 — per-CALL, not per-script
 
-**(b) Model-only axis** — the model tracks a peer tip; the generator is constrained to emit scripts
-consistent with it. **Rejected as the primary mechanism:** consistency would be enforced by the
-generator, i.e. by the same side that predicts. The oracle would be checking the generator's
-arithmetic, not production's behaviour.
+Rev1's table was per-*script*; the pass proved the tip moves per-**wire-call**: in
+`[Ack, NotFound]` the send-Ack IS the acceptance moment (the doc merely rests SENT awaiting
+quittance — the "NotFound" tail is actually the K4 **empty-quittance** reply, `interp.rs:2798`,
+temporally plausible for a peer that accepted). So: **the peer tip moves on the `send_chk` reply;
+`last_chk` never moves it.**
 
-**(c) Peer state in the harness, fed from the REAL ledger — RECOMMENDED.**
-`FuzzCtx` owns `PeerState { tip: Option<[u8;32]> }`. On a send, the stub resolves the outgoing
-document's `previous_hash` **from the real DB** (by `local_number` / `request_id`) and compares it to
-`peer.tip`:
+| # | event (per wire call / completion) | our seed | peer tip | evidence |
+|---|---|---|---|---|
+| 1 | online doc send, accepting reply (`Ack…`, incl. `[Ack, NotFound]`) | advances at `Sending→Sent` CAS | advances at the stub reply | `model.rs:1370-1372`; order observable only via crash (row 12) |
+| 2 | online doc send, pre-SENT reject (`[Reject]`) | holds (D2) | holds (parsed & refused) | `fiscal_documents.rs:256` |
+| 3 | online doc send, HELD (ambiguous / transient after CALL_STARTED) | holds | **generator-chosen `Took`/`NotTook`** | §5 |
+| 4 | **forced `[BadHashPrev]` leaf** (kept — see §6) | holds; doc `SENDING`, node STOP | **peer tip := the `store` value it declares** (`DPS_RECOVERY_TIP` or current peer tip) | `op.rs:29-41`, `interp.rs:2831-2838` |
+| 5 | offline issuance (`OFFLINE_LOCAL_ACK`, incl. lazy B10 BEGIN) | advances | holds (no wire) | `model.rs:1474-1481,1502` |
+| 6 | drain send of a backlog doc, accepted | holds (advanced at OLA) | advances per doc | `model.rs:1626` |
+| 7 | **drain-finalize END (DocType=10) mint+send** | **advances** (it is an ONLINE issuance) | advances on accept | `model.rs:1687` — **rev1's drain row was wrong here** |
+| 8 | drain send, `[Reject]` (edges 6/14) | holds (kept — no rollback at drain) | holds | `backlog_drain.rs:923-925`; shift→RMR, node STOP |
+| 9 | drain send, `[Superseded]` / held | holds | generator-chosen (row 3 applies to the DRAIN lane too — rev1 scoped it to online only, wrongly) | `model.rs:1735-1748` |
+| 10 | **boot/reboot-driven sends** (SIGNED re-drives, full drain, END mint) | per rows 1-9 | per rows 1-9 — **the override and movers MUST reach boot's response feed** (today a hardcoded all-Ack loop, `interp.rs:1695-1721`) | FATAL #2 of the pass |
+| 11 | `OperatorComplete(Accepted)`, ONLINE-origin hold | **advances at completion** to the held doc's own `unsigned_xml_sha256`; sfn is operator-supplied | holds (no wire) — consistency vs the row-3 choice is §5's adjudication point | `delivery_reservation.rs:1463-1474` |
+| 11b | `OperatorComplete(Accepted)`, OFFLINE-origin hold | holds (zero seed writes) | holds | `delivery_reservation.rs:1463` (`if online`) |
+| 11c | `OperatorComplete(NotAccepted)` | holds; doc→RMR | holds | `delivery_reservation.rs:1484-1488` |
+| 11d | `OperatorComplete(NotAcceptedOffline)` | **REWINDS** to the held doc's `previous_hash` (possibly a non-doc T=112 value) + OLA-cohort cancel | holds | `delivery_reservation.rs:1489-1534`; sole caller of the rewind primitive (`:1506`) |
+| 11e | `OperatorComplete(MacReseed(seed))` | **set to `seed`** (guard-B: `seed == active_tip` OR corroborated by the recorded `store`) | holds | `delivery_reservation.rs:1437-1447` |
+| 12 | `Crash(Send)` — killed inside the wire await | holds (nothing committed) | **out-of-script generator choice** — the script leaf is NEVER consumed (counter+spy precede the hang, pop follows it, `scripted_dps.rs:168-186`) | MAJOR #7 |
+| 12b | `Crash(Kvt1)` — send-Ack consumed, killed at the `last_chk` hang | **advances** (Sent committed) | **advances** (Ack consumed) | `interp.rs:1488-1491` — advance/advance hidden inside a Fault-class op |
+| 12c | `Crash(Sign)` / `Crash(OfflineAck)` — no wire reached | per their commit points | holds | `interp.rs:1533-1605` |
+| 13 | T=112 GRANTED | advances to `sha256(request_xml)` (real, from `ReplenishSummary`) | **advances to the SAME value — a CONVERGENCE event** | §7; live **[N=1]** |
+| 13b | T=112 AMBIGUOUS (reply lost) | holds (nothing persisted) | advances to synthetic `S` | the `2ds` divergence |
+| 13c | T=112 while a fence/reservation is active | refused in-envelope (seed holds) — note the wire call itself DOES happen even in STOP_MODE (no node-mode gate, `offline_code_replenish.rs:173-229`) | §7 | verify Q6 |
+| 14 | **totality clause**: every op not named above — `XReport`, `L5Probe`, refused/inert mints (D5 gate, mode refusals, closed shift, `DuplicateIdemKey` replays), `GoOffline`, session open/close bookkeeping — moves NEITHER tip | holds | holds | model apply arms enumerated in the verify pass |
 
-- **match** → the script executes as written; on an accepting leaf the peer tip advances to that
-  document's `unsigned_xml_sha256`;
-- **mismatch** → the stub returns `-12` with the LIVE-captured shape
-  `ERROR_BAD_HASH_PREV  store <peer.tip> chk <doc.previous_hash>` — **overriding the script**.
+Ordering inside row 1 (peer moves at the reply, we move at the later CAS) is observable exactly
+once: `Crash(Send)`/`Crash(Kvt1)` land between the two — which is why rows 12/12b are not
+optional decoration but the ordering witnesses.
 
-Independence is preserved: the peer is part of the ENVIRONMENT (it derives its answer from what
-production actually wrote), while the model predicts production's REACTION from its own independent
-state. They are not the same source, so a divergence still REDs.
+## 5. Ambiguity and the operator — where divergences are MANUFACTURED
 
-> Note on `store`: the `3uo` fix corroborates an operator-supplied seed against the `store` field
-> recorded in `transport_trace`. Feeding the peer's real tip into that field is what finally makes the
-> MacReseed **success** path (`5hc`) generatively reachable — today the stub's `store` is a constant.
+Rev1's "peer is definite, we are ignorant" survives, with the missing half filled in:
 
-## 4. The axis contract — who moves the peer tip
+- **The choice lives on the leaf, out-of-script for crashes.** A NEW appended `WireResponse`
+  variant (append-last — the corpus-preservation rule, `op.rs:53-60`, `strategy.rs:116-118`
+  forbids changing existing arities or inserting arms) carries `peer: Took|NotTook` for held
+  leaves; `Crash(Send)` gets the choice as a separate generator dimension because its script
+  leaf is provably never consumed.
+- **`OperatorComplete` is the adjudication point.** Nothing constrains the operator's claim to
+  the peer's earlier branch — and that is a feature *for the online origin*: `Accepted`-vs-
+  `NotTook` and `NotAccepted`-vs-`Took` manufacture exactly the real-world "operator guessed
+  wrong" divergences, which then MUST earn the derived `-12` and be recoverable via corroborated
+  MacReseed. These are trajectory pins of phase C.
+- **The OFFLINE origin is the exception, and phase C.1 CONSTRAINS it.** The pass proved
+  (MAJOR #6): `NotAcceptedOffline` after peer-`Took` rewinds our seed while the peer keeps the
+  doc — and the resulting divergence has **no exit**: every later drain send earns `-12`, the
+  hold is offline-origin, and MacReseed is fail-closed refused for offline origin
+  (`MacReseedNotOfflineDefined`, `delivery_reservation.rs:1378-1380`). Until production grows a
+  recovery story for that state, the generator constrains offline-hold completions to the peer
+  truth. The unconstrained mode is phase D — and it is likely to file a **production** finding,
+  because the operator CAN make that mistake in reality.
 
-This table is the load-bearing part. A partial implementation (some movers wired, some not) is
-**worse than none**: the model would then lie confidently, which is precisely the failure mode the
-`-12` fault bucket had.
+## 6. The forced `[BadHashPrev]` leaf — kept, and made consistent
 
-| event | our seed | peer tip | note |
-|---|---|---|---|
-| online issuance accepted (`Sending → Sent`) | advances | advances | advance-at-SEND; the two stay equal |
-| online **pre-SENT** reject (`Rejected`) | unchanged | unchanged | D2: lnd consumed, no seed advance |
-| online **HELD** (ambiguous / transient after CALL_STARTED) | unchanged | **INDETERMINATE** | the peer may or may not have taken it — see §5 |
-| offline issuance (`OFFLINE_LOCAL_ACK`) | advances | unchanged | the peer learns only at drain |
-| drain accepted | unchanged (already advanced) | advances | |
-| T=112 granted (reply received) | advances (non-doc seed) | advances | live-proven: T=112 moves the chain |
-| **T=112 ambiguous (reply lost)** | **unchanged** | **advances** | ← the divergence this whole slice exists for |
-| operator `MacReseed(seed)` | set to `seed` | unchanged | succeeds iff corroborated by the peer |
+The blast-radius inventory found **every** existing `-12` test drives the forced leaf at
+*matching* tips (fresh-FN genesis or post-Ack), so a derived-only `-12` breaks all of them —
+the leaf stays, as reaction-coverage. Rev2 adds the one rule that makes it consistent instead of
+Byzantine: **when the forced leaf fires, the peer tip := the `store` value the message declares.**
+The peer has stated its tip; from then on everything is ordinary axis behaviour: a
+`MacReseed(local tip)` via disjunct (i) does NOT converge (faithfully — the real DPS would `-12`
+again), while a corroborated `MacReseed(store)` DOES, and the next send succeeds. That closes
+`5hc`'s success path **in phase B, without any ambiguity machinery** — the single biggest
+scope win of the review.
 
-**Derived invariant:** whenever `our_seed != peer_tip`, the next online send MUST earn `-12`. That is
-the statement worth pinning, and it is unprovable today.
+## 7. Two decisions forced by evidence
 
-## 5. The honest hard part
+- **T=112 granted is a convergence, not a chain-check.** The live H2 capture **[N=1]**: after an
+  ambiguous T=112 (peer advanced, we stale), the FRESH follow-up T=112 was **ACCEPTED** and
+  returned the same codes. So the peer does not `-12` a T=112 on a stale embedded tip — it
+  accepts and re-bases; both tips land on `sha256(new request_xml)` and the divergence HEALS.
+  This deletes rev1's implied "T=112 is chain-checked" and dissolves the ask-codes-`-12` problem
+  (MAJOR #9) — the surface needs convergence semantics, not an override. Corollary worth pinning:
+  **a granted T=112 is a legitimate divergence-healing move available even in STOP_MODE** (the
+  service has no node-mode gate; only persist is fence-gated).
+- **The chain-check-first ordering is UNVERIFIED — do not hard-code it.** No repo evidence
+  orders DPS's chain check vs business validation, and `FRESH_WEBCHECK_ANALYSIS.md:52` records an
+  unresolved `-15`/`-12` pairing anomaly. Resolution: while diverged, the **generator does not
+  emit business-reject leaves** — the ambiguous ordering simply never arises; the override
+  applies to the leaves that remain. A live probe ("business-invalid doc on a diverged chain —
+  which error wins?") goes to the backlog; if it ever runs, the constraint can be lifted.
 
-The HELD row above is not a detail — it is the whole difficulty. "Ambiguous" means *we do not know*
-whether the peer took it. A single scalar `peer.tip` cannot express "moved or not, unknown to us",
-and collapsing it to a guess (always-moved / never-moved) would make the model assert something the
-system genuinely cannot know.
+## 8. Model side — this is a representation change, and rev1 undercosted it
 
-Two candidate shapes, to be decided BEFORE any code:
+Three verified clashes (MAJOR #8), each with its resolution:
 
-- **Peer is definite, we are ignorant.** `peer.tip` is always a concrete value (the peer really did
-  or did not accept — the harness chooses which when generating the ambiguity), and the *uncertainty
-  lives on our side*: the model must predict that production HOLDS and does not assume either way.
-  Closer to reality; the generator picks the branch, so both are exercised.
-- **Peer tip is a set** of possible values until resolved. More faithful to the epistemics, much
-  heavier, and probably unnecessary — production never inspects the peer tip directly, it only
-  observes the reply to the *next* send.
+1. **The rewind marker.** `NotAcceptedOffline` sets model `seed = None` as a structural marker
+   (`model.rs:557`) — unusable for a peer comparison exactly where it matters. The model must
+   restore the *symbolic* pre-cohort value, which requires retaining a per-advance symbolic
+   history (who advanced to what: `Doc(lnd)` / `T112(ordinal)` / `PeerDeclared(store)`).
+2. **The MacReseed arm.** Model sets `seed := synth(held_lnd)` (`model.rs:586`); prod installs
+   the OPERATOR'S seed — which in the corroborated path is the PEER'S tip, a non-doc value. The
+   arm becomes `seed := model.peer_tip`. Without this, step-4's very first trajectory diverges
+   spuriously.
+3. **Fault re-sync.** After any Fault op the model re-adopts from the DB
+   (`adopt_fault_deferred`, `model.rs:1791-1933`) — but the peer tip is ENVIRONMENT state with
+   no DB row. A `FuzzCtx → model` sync channel (the `sync_fence_active` pattern,
+   `model.rs:1965-1974`) is required.
 
-**Recommendation: the first.** It keeps the axis a scalar, exercises both worlds, and puts the
-uncertainty exactly where production carries it.
+Convergence rule for the synthetic algebra: **every converging event assigns ONE fresh symbol to
+both sides** (granted T=112, corroborated MacReseed); symbols are namespaced (`synth(lnd)`
+per-doc, negative ordinals for T=112, the `PeerDeclared` constants) so aliasing is impossible.
 
-## 6. Implementation order (each step independently green)
+## 9. Phasing, rev2 — each phase independently green, teeth named
 
-1. **Axis, inert.** Add `PeerState` to `FuzzCtx` + the model field. Wire the movers for the
-   *agreeing* cases only (accept → both advance). Nothing changes behaviourally; the whole existing
-   suite must stay green. **This step is the load test of §4**: if any existing script starts earning
-   a `-12`, our understanding of who moves what is wrong, and it is better to learn it here.
-2. **Peer override for `-12`.** The stub returns `-12` on mismatch, overriding the script. Now the
-   derived invariant of §4 is enforceable. Existing tests should be unaffected (they never diverge);
-   any that break are findings, not noise.
-3. **Ambiguous T=112 leaf.** Generator symbol: the peer grants and advances, the reply is lost. The
-   model predicts our seed unchanged, peer advanced. The follow-on send then earns `-12` *derivedly*.
-4. **MacReseed success path (`5hc`).** With a real peer tip in `store`, the corroborated-seed branch
-   becomes reachable; pin both halves (correct seed accepted, foreign seed refused) as `3uo` did
-   directionally.
+**Phase A — the axis, observed but silent.** `PeerState` in `FuzzCtx`; stub pool handle;
+per-CALL movers for ALL wire surfaces including boot/drain/END and the forced-leaf
+`peer := store` rule; NO override. New harness assert after every op: *absent any
+divergence-creating event, `peer_tip == real active tip`*. This is the empirical load test of
+§4 — rev1's "inert" step asserted nothing.
+*Tooth:* flip one mover (offline issuance advances the peer) → the assert REDs across the suite.
 
-## 7. Teeth plan (per step, revert-canary, empirical)
+**Phase B — derived `-12` + the `5hc` close.** Override on doc-send mismatch (`store` = peer tip
+bytes); generator withholds business-reject leaves while diverged (§7). Divergence source in this
+phase: the forced leaf's declared tip. Trajectory pin: forced `-12` → `MacReseed(local)` refused
+to converge → derived `-12` → corroborated `MacReseed(store)` → **next send SUCCEEDS**.
+*Tooth:* peer ignores the mismatch → the trajectory pin REDs.
+*Deliverable:* `PRRO_GATE-5hc` closes here.
 
-- step 1 — flip one mover the wrong way (e.g. offline issuance advances the peer tip): the agreeing
-  suite must RED.
-- step 2 — make the peer ignore the mismatch: the derived-`-12` pin must RED.
-- step 3 — make the ambiguous leaf advance OUR seed too: the divergence pin must RED.
-- step 4 — accept an uncorroborated seed: the `3uo` half must RED.
+**Phase C — the model mirror + annotated ambiguity.** §8's representation change; appended
+peer-truth leaf variants; `Crash(Send)` out-of-script choice; C.1 constrains offline-hold
+completions to peer truth (§5). Trajectory pins: operator-wrong-claim (online) earns `-12` and
+recovers; `Crash(Kvt1)` advance/advance re-syncs.
+*Tooth:* model MacReseed arm left at `synth(held_lnd)` → spurious divergence, RED.
 
-Each canary must be run and its RED output recorded, per the standing rule that teeth are proven
-empirically, not asserted.
+**Phase D — ambiguous T=112 (`2ds`).** `ReplenishLeaf::Ambiguous` appended (its exclusion
+comment cites RULING 2 §4's "known-red until a live capture lands" — **stale**, the capture
+landed in #351; the true blocker was this axis — fix the comment here). Trajectory pin:
+`[T112-ambiguous, OnlineSell → derived -12, MacReseed(corroborated S), OnlineSell → success]`,
+plus the healing variant `[T112-ambiguous, T112-granted → converged, OnlineSell → success]`
+**[N=1 live-anchored]**. Unconstrained offline-operator mode, expected to file a prod finding
+(§5).
+*Tooth:* the ambiguous leaf advancing OUR seed too → divergence pin REDs.
 
-## 8. Cost, stated plainly
+**Out of scope, stated:** `last_chk` stays fully scripted — the `[Ack, NotFound]` tail is the K4
+empty-quittance hold ("accepted, quittance lagging"), which is temporally plausible, and nine
+directed pins plus both generator slices depend on the held-at-SENT shape. A quittance-readiness
+axis is a possible phase E, not assumed. A Byzantine peer (self-contradicting) stays excluded —
+with one honest caveat from the pass: a scripted `last_chk` CAN still contradict the chosen peer
+truth (Took + probe-NotFound); phase C's generator avoids emitting that combination, same policy
+as §7.
 
-This is a **slice, not a follow-up**: a new state axis touched by seven movers, a stub that stops
-being purely scripted, and a generator symbol. The §4 table is where it is won or lost. Steps 1-2
-carry the risk (they can invalidate assumptions about who advances what); steps 3-4 are then small.
+## 10. Cost, restated after review
 
-Also note what this does NOT buy: it does not model a Byzantine peer (a DPS that lies or contradicts
-itself) — that stays in the existing backlog item, and nothing here assumes the peer is honest beyond
-"it applies our own advance rules".
+Rev1 said "seven movers"; the true count is **~14 event families, several per-CALL**, plus a
+model representation change (§8) that rev1 did not cost at all. Phases A and B are still the
+risk-bearers; C is where the model work lives; D is small once C exists. The two FATALs of the
+review (OperatorComplete rows, boot-driven sends) are both phase-A scope — which is exactly why
+phase A's assert exists before any override or model work is attempted.
