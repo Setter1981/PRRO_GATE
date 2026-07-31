@@ -142,3 +142,98 @@ A green local `nextest` is not a green CI here — that has bitten before (#313)
    **no remote-tip axis** in the model (`remote_tip|dps_tip|peer_tip|server_tip` → 0 hits in
    `model.rs` + `interp.rs`). Adding one is a slice, not a follow-up.
 4. Then CS-4 — spec #6 + the thin per-FN coordinator, routing exactly one command through it.
+
+---
+
+# ADDENDUM — the same session continued: the peer-tip axis shipped, and found a P1
+
+Everything in §1-§7 above was written BEFORE this part. What follows supersedes §7's "Next" list:
+items 1-3 are now done or superseded.
+
+## A. All six branches are pushed, with PRs open
+
+| PR | branch | base | state |
+|---|---|---|---|
+| #358 | `fix/q5u-deterministic-sign-defect` | main | CI 4/4 |
+| #359 | `fuzzer/minus12-into-oracle` | main | CI 4/4 |
+| #360 | `docs/adr-dps-rpc-surface` | main | needed a clippy fix — see §E |
+| #361 | `docs/handoff-2026-07-31-session2` | main | this document |
+| #362 | `spec/fuzzer-peer-tip-axis` | main | rev2 + rev2.1 |
+| #363 | `fuzzer/peer-tip-phase-a` | **#359** | phase A |
+
+**#363 is stacked on #359 deliberately** — both carry a `LIVE_DRIFT_BASE_SHA` re-anchor, and
+branching phase A from `main` would red the provenance leg the moment either merged. Merge order:
+#358 → #359 → #363, with #360/#361/#362 independent.
+
+## B. The peer-tip axis: spec rev1 → rev2 → phase A
+
+§7 item 3 said the ambiguous-T112 leaf is blocked on a missing remote-tip axis. That axis now
+exists in its first phase, and the road to it is worth reading as a method note:
+
+1. **rev1** (my design) was put through a 5-agent verify/attack pass before any code. It did not
+   survive: **two FATALs** (the movers table omitted `OperatorComplete` entirely — the only legal
+   exit from every HELD state — and omitted that a restart is a wire-SENDING op), a factually wrong
+   drain row, a "derived invariant" that was **false as stated**, and an ordering assumption with
+   zero evidence.
+2. **rev2** accepted a sustained tautology attack: for the plain online path, chain continuity is
+   ALREADY proven by `check_doc_against_mutation` + the scanner. The axis is **coverage
+   machinery**, not a new correctness oracle — its value is the trajectories it makes reachable.
+   Biggest scope win found by the review: keeping the forced `[BadHashPrev]` leaf and adding one
+   rule (*peer tip := the declared `store` value*) closes `5hc`'s success path **in phase B, with
+   no ambiguity machinery at all**.
+3. **Phase A** (PR #363) ships the axis as a read-only observer plus one assertion: *while the run
+   has not diverged, every outgoing document's `previous_hash` already equals the peer's tip*.
+   Deliberately NOT rev1's "inert" step — an inert step asserts nothing and would have shipped both
+   blind spots below.
+
+## C. Phase A paid off three times in one evening
+
+1. **It caught my own omission on its first run.** T=112 rides `ask_offline_codes`, a stub queue
+   that does not even increment `send_calls`, so the send-side observer never saw it and the peer
+   fell a replenish behind.
+2. **`bd PRRO_GATE-knk` (P1)** — a granted T=112 while an UNDRAINED offline backlog rests strands
+   that backlog on the pre-T112 chain. Three ops:
+   `[OfflineServiceIn, Replenish(Granted), GoOnline([Ack,Ack])]`. Adjudicated by four lenses that
+   SPLIT (2 PROD_DEFECT / 1 NEEDS_LIVE_PROBE / 1 HARNESS_ARTIFACT), then settled by checking three
+   facts directly: offline docs ARE chained on the wire (`emit_mac`); our own live smoke already
+   recorded a drained offline doc REJECTED for a mismatched MAC and polls around it
+   (`live_dps_extended_smoke.rs:2603-2612`) — but only for the opposite order; and the reference
+   client cannot hit it at all because WebCheck **re-anchors** each document from a live `lastChk`
+   at send time (`SendingOfflineChecks.cs:40,47-48`) where we **freeze** `previous_hash` at sign.
+   **Open node is severity, not existence** — whether DPS accepts that T=112 at all. Five-step live
+   probe is in the bd. **This needs the operator: it is a live run.**
+3. **`bd PRRO_GATE-01g` (P2)** — surfaced during the 2048-case run from the PRE-EXISTING `release`
+   differential. **Triaged: it reproduces on the parent branch WITHOUT the axis**, identical
+   message, so the axis is exonerated. Adjudication prod-vs-model was still in flight at handoff.
+
+Both findings are pinned `#[ignore]`d against the FUTURE contract, not papered over.
+
+## D. Two reusable lessons about the fuzzer corpus
+
+- **Committing a seed to `invariant_fuzzer.regressions` perturbs the whole subsequent search**,
+  because corpus entries replay FIRST. That is how `01g` got surfaced. Useful, but it means a new
+  failure after adding seeds must be triaged against the parent branch before blaming your own
+  change.
+- **Never commit a RED seed.** The corpus replays at EVERY scale including the PR gate
+  (`FUZZ_CASES=256`), so a red seed reddens everything. Pin it `#[ignore]`d with the sequence
+  inline (the NC-02 pattern) and keep the seed in the ticket.
+
+## E. A CI lesson I re-learned the hard way
+
+#360 went red on `fmt + clippy (gnu)` — a required check — for `doc list item overindented`
+(`doc_overindented_list_items`, deny-level). Cause: the pin file lives only on that branch, and I
+had run fmt + the full suite + the inventory gate there, but **not clippy**. My own pre-push
+checklist says fmt+clippy+inventory+nextest **per branch**. A green local `nextest` is not a green
+CI, and neither is a green clippy on a different branch.
+
+## F. Revised Next
+
+1. Merge in order: #358 → #359 → #363; #360/#361/#362 independent. Close `q5u`, `0ps` in bd after.
+2. **`knk` live probe** (operator-gated: needs the key + `PRRO_LIVE_DPS=1`). Five steps in the bd.
+   It decides which of the two defect shapes we have, and therefore which fix.
+3. Finish `01g` adjudication, then fix whichever side is wrong. Do NOT weaken the oracle.
+4. Phase B of the axis (derived `-12` + `5hc` closes) — only once the movers table has settled on
+   green across a few full runs.
+5. `5hc` can then be closed; `2ds` (ambiguous T=112) is phase D.
+6. CS-4 remains the roadmap item after that.
+
