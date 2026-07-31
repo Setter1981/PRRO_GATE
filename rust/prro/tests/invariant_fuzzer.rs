@@ -5779,3 +5779,57 @@ fn l5_probe_valid_then_ordinary_sell_composes() {
         "valid probe SELL + ordinary SELL → two issued docs"
     );
 }
+
+// ─── `-12`: the oracle the fault bucket never gave it ──────────────────────
+//
+// `-12` classifies as `ExpectedOutcome::Fault` → `OpClass::FaultOrRecovery`,
+// which `check_differential` answers with a bare `Ok(())`. The per-op
+// differential therefore asserts NOTHING about a `-12` outcome. The global
+// `invariant_scan` still catches a broken or forked chain, but a regression in
+// the HELD contract itself — the node not halting, the reservation not being
+// created, the doc not resting SENDING — passes silently.
+//
+// That bucket made sense while `-12` was believed to be a non-deterministic
+// recovery. It is not: CS-3 S7-1 (R3) retired the inline MAC-recovery
+// orchestrator, and the contract is now fully deterministic — a
+// `MacReseedPending` HELD, node `STOP_MODE`, doc `SENDING` under a
+// `PENDING_APPLY` reservation, no second wire. A deterministic contract belongs
+// in the oracle, not in the fault bucket.
+//
+// This pin is the first step: it asserts the real contract directly, so the
+// behaviour is covered from the fuzzer side even before `-12` is lifted out of
+// `Fault`. bd `PRRO_GATE-3uo` carries the rest.
+
+/// The REAL `-12` contract, pinned from the fuzzer's own interpreter.
+///
+/// An earlier version of this test asserted that `-12` recovers to ACK on a
+/// second wire. It was written against the stale `error_routing.rs` comment
+/// ("bounded ONE auto-recovery") and asserted a contract production had already
+/// retired — it failed with the doc resting at `SENDING`, which is CORRECT
+/// behaviour, not a defect. Kept in the history as the reason this pin exists.
+#[tokio::test]
+async fn minus_12_holds_the_node_and_rests_the_doc_sending() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::bad_hash_prev())).await;
+
+    assert_eq!(
+        ctx.read_doc_states_by_lnd().await,
+        vec![(1, "SENDING".to_string())],
+        "a `-12` must leave the doc resting SENDING under the hold — NOT advanced, \
+         and NOT rolled back to a terminal reject"
+    );
+    assert_eq!(
+        ctx.read_node_mode().await,
+        NodeMode::StopMode,
+        "a `-12` must halt the node into STOP_MODE: the chain cannot continue \
+         until an operator resolves the hold"
+    );
+    assert_eq!(
+        ctx.read_mac_recovery_attempts(1).await,
+        Some(0),
+        "the MAC-recovery counter must stay 0 — S7-1 retired the inline \
+         orchestrator, so there is NO automatic second attempt. A non-zero value \
+         means an auto-retry came back; re-check `bd PRRO_GATE-3uo` before \
+         relaxing this."
+    );
+}
