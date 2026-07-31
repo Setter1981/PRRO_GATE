@@ -194,3 +194,187 @@ fn prro_test_leg_carries_test_support_feature() {
          seam would be silently disabled.\n  leg = {leg:?}",
     );
 }
+
+// ─── CS-1R4 addendum (2026-07-31): the docs-only fast path ──────────────────
+//
+// The `scope` step lets the required leg skip its expensive work when EVERY
+// changed path is inert. That is safe only because the job still RUNS and still
+// REPORTS the required context — the #305 bypass was a job that never reported,
+// which branch protection counts as satisfied.
+//
+// These assertions pin the properties that keep the two apart. They are the
+// teeth: turning the fast path into a bypass now fails a test instead of
+// shipping. Like the rest of this file they are CODEOWNERS-gated.
+
+/// Raw text of the required workflow.
+fn workflow_text() -> String {
+    let path = repo_root().join(".github/workflows/rust-prro.yml");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read workflow {}: {e}", path.display()))
+}
+
+/// The `scope` step must default to HEAVY and clear it on exactly ONE path.
+///
+/// `heavy=true` is the initialiser; `heavy=false` may appear exactly once — the
+/// single branch where every changed path matched the inert allowlist. A second
+/// `heavy=false`, or a `heavy=true` initialiser that disappears, means some
+/// path now skips the integrity legs by omission rather than by decision.
+#[test]
+fn scope_step_is_fail_closed() {
+    let text = workflow_text();
+    assert!(
+        text.contains("id: scope"),
+        "CS-1R4 fast path: the `scope` step is gone, but steps still reference \
+         `steps.scope.outputs.heavy` — or the fast path was removed without \
+         removing these teeth."
+    );
+    assert!(
+        text.contains("heavy=true\n"),
+        "CS-1R4 fast path: the `scope` step no longer INITIALISES `heavy=true`. \
+         Fail-closed depends on that default: every error path (no base sha, base \
+         absent, git diff failure, empty diff) leaves it untouched."
+    );
+    // Count in EXECUTABLE lines only — never in comments. Same discipline as
+    // `workflow_cargo_lines` above: a comment cannot satisfy a property, and it
+    // must not be able to break one either (the prose above this step discusses
+    // `heavy=false` by name).
+    let clears = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| l.contains("heavy=false"))
+        .count();
+    assert_eq!(
+        clears, 1,
+        "CS-1R4 fast path: expected EXACTLY ONE `heavy=false` (the sole inert-allowlist \
+         branch), found {clears}. More than one means another path can skip the \
+         integrity legs; zero means the fast path is dead code."
+    );
+    assert!(
+        text.contains("--name-only --no-renames"),
+        "CS-1R4 fast path: the change set must be computed with `--no-renames` so a \
+         rename is split into BOTH endpoints. Following renames would let a file moved \
+         OUT of `rust/` look like a docs-only change."
+    );
+}
+
+/// The inert allowlist must never admit a path that can influence a build or a
+/// gate. `docs/cs1r/**` is the subtle one: it *is* under `docs/`, but the CS-1
+/// inventory manifests live there, so it must be classified NON-inert.
+#[test]
+fn scope_allowlist_excludes_everything_that_can_move_a_gate() {
+    let text = workflow_text();
+    let scope = text
+        .split("id: scope")
+        .nth(1)
+        .expect("scope step present")
+        .split("\n      - name:")
+        .next()
+        .expect("scope step body");
+
+    assert!(
+        scope.contains("docs/cs1r/*) inert=false"),
+        "CS-1R4 fast path: `docs/cs1r/**` must be NON-inert — the CS-1 inventory \
+         manifests live there, so a change under it can move the gate even though \
+         the path looks like documentation."
+    );
+    // A `*)` catch-all setting inert=false is what makes the list an ALLOWLIST
+    // rather than a denylist: anything unrecognised is heavy.
+    assert!(
+        scope.contains("*)           inert=false") || scope.contains("*) inert=false"),
+        "CS-1R4 fast path: the `case` lost its catch-all `*) inert=false` arm. Without \
+         it the classifier becomes a DENYLIST and any path nobody thought of would be \
+         treated as inert — the #305 failure mode in a new costume."
+    );
+    for forbidden in ["rust/", ".github/", "scripts/", "Cargo", ".sqlx"] {
+        assert!(
+            !scope.contains(&format!("{forbidden}*) ;;"))
+                && !scope.contains(&format!("{forbidden}*)      ;;")),
+            "CS-1R4 fast path: `{forbidden}` was added to the inert allowlist. That path \
+             influences the build or a gate; a change under it MUST run the integrity legs."
+        );
+    }
+}
+
+/// Every cargo leg must be gated on the scope decision — and the job itself must
+/// stay unconditional, because a skipped JOB is the bypass CS-1R4 removed.
+#[test]
+fn cargo_legs_are_scope_gated_and_the_job_stays_unconditional() {
+    let text = workflow_text();
+    let job = text
+        .split("\n  build:")
+        .nth(1)
+        .expect("the `build` job is present");
+    let header = job.split("steps:").next().expect("job header");
+    assert!(
+        !header.contains("\n    if:") && !header.contains("\n    needs:"),
+        "CS-1R4: the required job grew an `if:`/`needs:` gate. A SKIPPED required check \
+         counts as SATISFIED by branch protection — that is the #305 bypass. The job must \
+         always run; only its inner steps may be conditional.\n  header = {header:?}"
+    );
+    let gated = text.matches("steps.scope.outputs.heavy == 'true'").count();
+    let cargo_legs = workflow_cargo_lines().len();
+    assert!(
+        gated >= cargo_legs,
+        "CS-1R4 fast path: {cargo_legs} cargo legs but only {gated} scope gates. A cargo \
+         leg that runs unconditionally is not a safety problem, but the mismatch means the \
+         two lists drifted — re-check which legs are gated and why."
+    );
+}
+
+/// Execute the classifier THE WORKFLOW ACTUALLY RUNS against a table of paths.
+///
+/// The `case` block is extracted verbatim from the YAML and executed by `bash`,
+/// so this tests the shipped text rather than a Rust re-implementation of it —
+/// a re-implementation could agree with itself while the workflow drifted.
+///
+/// The table is the point. `docs/cs1r/**` and a `.md` OUTSIDE the repo root are
+/// the two cases a reader is most likely to get wrong, and both must be HEAVY.
+#[test]
+fn scope_classifier_decides_correctly_on_a_table_of_paths() {
+    let text = workflow_text();
+    let case_block = {
+        let start = text
+            .find("            inert=true")
+            .expect("classifier `inert=true` preamble present");
+        let end = text[start..]
+            .find("            done <<< \"$files\"")
+            .expect("classifier loop terminator present");
+        &text[start..start + end]
+    };
+
+    // `docs/a.md` etc. are newline-joined into `$files`, exactly as in the job.
+    let cases: &[(&str, bool)] = &[
+        ("docs/a.md\ndocs/b/c.md\nREADME.md", true),
+        (".beads/issues.json", true),
+        ("docs/cs1r/inventory/manifest.test-support.tsv", false),
+        ("docs/a.md\nrust/prro/src/lib.rs", false),
+        (".github/workflows/rust-prro.yml", false),
+        ("scripts/cs1r/mint_manifests.sh", false),
+        ("rust/Cargo.toml", false),
+        ("rust/prro/.sqlx/query-abc.json", false),
+        ("rust/notes.md", false),
+        ("docs/a.md\n.github/CODEOWNERS", false),
+    ];
+
+    for (files, expect_inert) in cases {
+        let script = format!(
+            "set -u\nfiles='{files}'\n{case_block}\n            done <<< \"$files\"\n\
+             if $inert; then echo INERT; else echo HEAVY; fi\n"
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run the extracted classifier under bash");
+        let got = String::from_utf8_lossy(&out.stdout);
+        let got = got.trim();
+        let want = if *expect_inert { "INERT" } else { "HEAVY" };
+        assert_eq!(
+            got,
+            want,
+            "CS-1R4 fast path: the workflow's own classifier misclassified.\n  \
+             files:\n{files}\n  expected {want}, got {got:?}\n  stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
