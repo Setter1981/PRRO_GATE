@@ -74,6 +74,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prro_crypto::cms::builder::{CmsBuildOptions, CmsSigner};
 use prro_crypto::cms::profile::CmsProfile;
+use prro_crypto::cms::signed_data::extract_econtent;
 use prro_crypto::cms::signer::DstuInProcessSigner;
 use prro_crypto::core::curve::Curve;
 use prro_crypto::core::field::FieldEl;
@@ -112,11 +113,8 @@ const TEST_HOST_MARKER: &str = "cabinet.tax.gov.ua";
 
 const TIMEOUT_SECS: u64 = 15;
 
-/// How long the forwarder waits for the client to go quiet after it has pushed
-/// the request through, before tearing the connection down. Long enough that a
-/// fragmented write is not mistaken for "done", short enough that DPS has not
-/// finished replying.
-const KILL_QUIET_MS: u64 = 120;
+// (the quiet-period trigger was removed after the first live run — see the
+// forwarder: DPS answered inside the window and the kill never fired)
 /// Minimum client→server application bytes before the tear-down is armed. A
 /// signed T=112 is several KB, so this cannot fire during the TLS handshake.
 const KILL_MIN_CLIENT_BYTES: u64 = 1024;
@@ -381,8 +379,18 @@ async fn spawn_kill_forwarder(
             }
         });
 
-        // server → client: relay, and record whether the server began replying
-        // AFTER the request was through (the "DPS processed it" witness).
+        // server → client: relay the handshake, then KILL on the first reply
+        // byte that arrives after the request was relayed.
+        //
+        // The first live run learned this the hard way. The tear-down was
+        // originally armed on "the client has gone quiet for KILL_QUIET_MS",
+        // and DPS answered inside that window — the RPC completed normally
+        // (`killed=false`, 4493 B relayed back) and the ambiguous case was
+        // never produced. Replying-time is the correct trigger: it is BOTH the
+        // strongest available witness that DPS PROCESSED the request (not
+        // merely received it) AND the exact instant to drop, so the response
+        // never reaches the client.
+        let killed_flag = report.killed.clone();
         let down = tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
             loop {
@@ -391,34 +399,32 @@ async fn spawn_kill_forwarder(
                     Ok(n) => n,
                 };
                 if request_through_down.load(Ordering::SeqCst) {
+                    s2c.fetch_add(n as u64, Ordering::SeqCst);
                     server_replied.store(true, Ordering::SeqCst);
+                    killed_flag.store(true, Ordering::SeqCst);
+                    // Deliberately NOT forwarded — this is the lost response.
+                    break;
                 }
                 if cw.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
                 s2c.fetch_add(n as u64, Ordering::SeqCst);
             }
+            // `cw` / `sr` drop here → FIN both ways → the in-flight RPC fails
+            // with a transport error and the response is never delivered.
         });
 
-        // Arm the tear-down: wait for the request to be through, then for the
-        // client to go quiet, then drop both halves.
+        // Tear the other half down once the kill has fired (or the connection
+        // ended on its own). Bounded so a stalled peer cannot hang the test.
         let watch = report.clone();
-        loop {
-            if watch.request_through.load(Ordering::SeqCst) {
-                let before = watch.client_to_server.load(Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(KILL_QUIET_MS)).await;
-                if watch.client_to_server.load(Ordering::SeqCst) == before {
-                    break;
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..(TIMEOUT_SECS * 100) {
+            if watch.killed.load(Ordering::SeqCst) || down.is_finished() {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        watch.killed.store(true, Ordering::SeqCst);
         up.abort();
         down.abort();
-        // Both halves drop here → FIN in each direction → the in-flight RPC
-        // fails with a transport error and the response is never delivered.
     });
 
     local_port
@@ -478,12 +484,18 @@ async fn live_capture_ambiguous_t112_connection_kill() {
     let fn_sign = sign_fn_blob(&ek, &fiscal_number);
 
     // Chain tip → MAC for the request. Empty data_sign = genesis.
+    // MAC = sha256-hex of the **CMS-STRIPPED** previous check bytes, not of the
+    // raw `data_sign`. Getting this wrong is not subtle-but-harmless: the first
+    // live run hashed `data_sign` directly and every phase drew `-12`
+    // ERROR_BAD_HASH_PREV, so no phase ever reached the code path under test.
+    // Empty for a genesis FN.
     let mac_of = |ack: &prro::transports::dps::dto::CheckAck| -> String {
         if ack.data_sign.is_empty() {
-            String::new()
-        } else {
-            hex_lower(&Sha256::digest(&ack.data_sign))
+            return String::new();
         }
+        let inner =
+            extract_econtent(&ack.data_sign).unwrap_or_else(|e| panic!("CMS-strip data_sign: {e}"));
+        hex_lower(&Sha256::digest(&inner))
     };
 
     let tip0 = channel
