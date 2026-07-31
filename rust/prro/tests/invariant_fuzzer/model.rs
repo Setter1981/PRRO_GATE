@@ -1846,10 +1846,29 @@ impl RefModel {
         // is LATER issued (operator completion / drain), the real seed advances onto
         // its hash while the model already sat there → the op's real seed-advance
         // would spuriously read as "no model advance" (fuzzer online seed-advance
-        // finding, task #18).  Fall back to `max(lnd)` only when the seed matches no
-        // doc (e.g. a MacReseed rebase — generator-excluded).
+        // finding, task #18).
+        //
+        // bd `PRRO_GATE-01g` — the `max(lnd)` fallback RE-ARMED that exact trap.
+        // The comment here used to end "fall back to max(lnd) only when the seed
+        // matches no doc (e.g. a MacReseed rebase — generator-excluded)". That
+        // premise was true when task #18 was written and STOPPED being true when the
+        // generative `Replenish` symbol landed (bd hpc): a granted T=112 advances the
+        // real seed to `sha256(request_xml)`, a NON-DOCUMENT value that matches no
+        // row — so the lookup missed, the fallback aliased the placeholder onto
+        // `max(lnd)` = the HELD doc, and the model was already sitting on the tip the
+        // later completion would move to. Found generatively as
+        // `[Replenish(Granted), SellWithClosedShift, OnlineShiftOpen([Superseded]),
+        // Reboot, OperatorComplete(Accepted)]`; adjudicated PROD-RIGHT (prod's
+        // completion-time advance is A.3 advance-at-SEND deferred until the
+        // ambiguity resolves, and `invariant_scan` is clean at every boundary).
+        //
+        // A non-document real tip is one the model CANNOT compute (it builds no XML),
+        // exactly like the `apply_replenish` advance that produced it — which is why
+        // that advance is recorded structurally on a NEGATIVE ordinal. So the correct
+        // adoption is to KEEP whatever structural marker the model already holds,
+        // never to alias it onto a document ordinal.
         let real_seed = Self::read_seed_fixture(pool).await;
-        let tip_lnd: i64 = match &real_seed {
+        let tip_lnd: Option<i64> = match &real_seed {
             Some(seed) => sqlx::query_scalar::<_, i64>(
                 "SELECT lnd FROM fiscal_documents WHERE unsigned_xml_sha256 = ? \
                  ORDER BY lnd DESC LIMIT 1",
@@ -1857,11 +1876,19 @@ impl RefModel {
             .bind(&seed[..])
             .fetch_optional(pool)
             .await
-            .unwrap()
-            .unwrap_or_else(|| self.docs.keys().copied().max().unwrap_or(0)),
-            None => 0,
+            .unwrap(),
+            None => None,
         };
-        self.seed = real_seed.as_ref().map(|_| synth_unsigned_hash(tip_lnd));
+        match (&real_seed, tip_lnd) {
+            // The real tip IS a document — adopt its ordinal (task #18's rule).
+            (Some(_), Some(lnd)) => self.seed = Some(synth_unsigned_hash(lnd)),
+            // Real tip present but matching no document: NON-DOCUMENT (a T=112
+            // replenish seed today; a MacReseed rebase later). Keep the structural
+            // marker rather than inventing a document ordinal for it.
+            (Some(_), None) => {}
+            // No real seed at all → genesis.
+            (None, _) => self.seed = None,
+        }
 
         // offline session + codes ← real.
         self.session = sqlx::query_scalar::<_, prro::db::types::DbOfflineSessionState>(
