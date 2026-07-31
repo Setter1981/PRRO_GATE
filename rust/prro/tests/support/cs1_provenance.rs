@@ -92,7 +92,13 @@ pub const HEAD_SHA: &str = "f2628ba";
 /// `[Crash(Send), Replenish(Granted)]`. Production is FROZEN in that slice (zero `src/` diff), so this
 /// is a test-side contract addition, not a behaviour change. Additions-only — 0 removals, no
 /// supersession entry needed. Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-pub const LIVE_DRIFT_BASE_SHA: &str = "6eadc156";
+///
+/// bd `PRRO_GATE-3uo` fuzzer follow-up re-anchor (2026-07-31): the `-12` slice edits the frozen
+/// `invariant_fuzzer/{interp,op}.rs` + `invariant_fuzzer.rs`. Adjudicated: the stub's `-12` gains the
+/// LIVE-captured `store <hash>` shape (bd `PRRO_GATE-2ds`), the retry machinery written against a
+/// RETIRED contract is removed, and the REAL HELD contract gets a pin. Production is FROZEN (zero
+/// `src/` diff). Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
+pub const LIVE_DRIFT_BASE_SHA: &str = "fa296155";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is
