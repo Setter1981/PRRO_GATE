@@ -19,10 +19,9 @@
 //!    (C-i live proof 2026-07-07: DPS chain tip econtent == our request XML
 //!    verbatim; sha256 confirmed against the cabinet.)
 //! 7. On DPS server reject: NO persist, NO seed advance, typed error surfaced.
-//!    On ambiguous transport error/timeout: NO retry, NO persist — T=112 is
-//!    non-idempotent server-side (each call issues fresh codes AND advances
-//!    DPS's chain); a lost response = harmless server-side range leak; chain
-//!    self-heals via mac-recovery on the next doc.
+//!    On ambiguous transport error/timeout: NO retry, NO persist (see the
+//!    UNRESOLVED note at the ambiguous arm in `replenish` — the *behaviour* is
+//!    settled; what a lost response COSTS on the DPS side is NOT).
 //!
 //! ## Invariant preservation
 //!
@@ -239,11 +238,53 @@ impl OfflineCodeReplenishService {
                 return Err(ReplenishError::DpsServer { code, message });
             }
             Err(e) => {
-                // Step 7 (transport error/timeout): ambiguous.
-                // T=112 is non-idempotent server-side: each call issues fresh
-                // codes AND advances DPS's chain. A lost response = harmless
-                // server-side range leak; chain self-heals via mac-recovery.
-                // NO retry, NO persist.
+                // Step 7 (transport error/timeout): ambiguous — we cannot tell
+                // whether DPS processed the request. NO retry, NO persist: a
+                // byte-identical resend risks double-allocation on an endpoint
+                // that is not proven idempotent (RULING 2 §1,
+                // `docs/RULINGS_2026-07-10_SHIFT_T112_AUTOZ.md`).
+                //
+                // ── UNRESOLVED: what a lost response COSTS on the DPS side ──
+                // Two mutually exclusive hypotheses are on record, and until
+                // 2026-07-31 BOTH were written down as if they were fact:
+                //   (H1) each call allocates a FRESH range → a lost response
+                //        leaks that range server-side (asserted right here).
+                //   (H2) DPS RE-ISSUES allocated-but-unconsumed codes on the
+                //        next T=112, so nothing is stranded and a fresh request
+                //        re-obtains them (asserted by RULING 2 §2, grounded in
+                //        "the same opaque codes returned across our runs" —
+                //        consistent with H2 but NOT exclusive of H1, because no
+                //        run in that campaign ever lost a response mid-call).
+                // Not academic: under H1 a flapping link burns a range per
+                // break, eating the offline code-reserve floor (bd
+                // PRRO_GATE-255) and the monthly allocation. Under H2 the
+                // ambiguous case is free.
+                // SETTLED ONLY BY the RULING 2 §4 live capture (kill the
+                // connection mid-call on the test cabinet, then record what a
+                // fresh T=112 returns) — bd PRRO_GATE-2ds. Until then the
+                // fuzzer deliberately does NOT emit an ambiguous T=112 leaf.
+                //
+                // ── The chain fork, and why it self-heals WITHOUT an operator ──
+                // If DPS did process, its tip advanced to sha256(request.xml)
+                // while ours did not (we return before Step 6), so the next
+                // fiscal send carries a stale previous_hash and earns `-12`
+                // ERROR_BAD_HASH_PREV. That routes to the AUTOMATIC bounded
+                // `MacRecovery` (`write_path::error_routing`), NOT to an
+                // operator MacReseed: `mac_recovery::run_mac_recovery` extracts
+                // the expected hash from the DPS error message itself and
+                // re-drives attempt #2. So the MacReseed guard-B tip check
+                // (`delivery_reservation` — the operator seed must equal
+                // `active_chain_tip`) is never consulted here and CANNOT
+                // deadlock this path, even though this arm writes no durable
+                // seed witness (the bd PRRO_GATE-hpc witness is written only on
+                // the SUCCESS path below). Verified, not assumed — the opposite
+                // looked plausible.
+                // CAVEAT, honest: that self-heal parses a literal `"store "`
+                // tag out of a DPS message — a format inherited from the Python
+                // reference and NOT yet observed from live DPS. It fails loud
+                // (`HashNotExtractable`) rather than corrupting, but a loud
+                // failure is still a stuck FN. The §4 capture yields a real
+                // `-12` and should confirm the parse.
                 return Err(ReplenishError::DpsTransport(e.to_string()));
             }
         };
