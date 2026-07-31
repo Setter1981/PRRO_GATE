@@ -123,11 +123,109 @@ jobs:
         with:
           tool: nextest@0.9.137
 
+      # ── CS-1R4 addendum (2026-07-31): the docs-only fast path ─────────────
+      #
+      # The CS-1R4 comment at the top of this file accepted "a few minutes of CI
+      # on rare docs-only PRs". They are not rare — landing accumulated docs is a
+      # routine move here, and each one paid ~25 min for a leg that compiled
+      # nothing new. This step buys that back WITHOUT reopening the #305 bypass
+      # class, and the distinction is the whole point:
+      #
+      #   THE BYPASS (removed by CS-1R4, must never return): the JOB is skipped,
+      #   so the required context NEVER REPORTS — and branch protection treats a
+      #   missing required check as satisfied. A PR touching an uncovered path
+      #   sailed through.
+      #
+      #   THIS (safe): the job ALWAYS runs and ALWAYS reports the required
+      #   context. It decides INTERNALLY whether the expensive legs apply. There
+      #   is no `paths:` filter, no dispatch job, no `if:` on the job itself, and
+      #   nothing GitHub-provided to spoof — the change set is computed HERE, in
+      #   the job, from git.
+      #
+      # FAIL-CLOSED BY CONSTRUCTION: `heavy` starts `true` and is only ever
+      # cleared on the ONE path where every changed file matched the inert
+      # allowlist. No usable base sha, a base not present in the checkout, a
+      # failed `git diff`, an EMPTY diff, or any unrecognised path all leave it
+      # `true`. There is no branch that sets `heavy=false` by omission.
+      #
+      # THE ALLOWLIST IS DELIBERATELY TINY, and everything that can influence a
+      # build or a gate is excluded ON PURPOSE: `rust/**`, `.github/**`,
+      # `scripts/**`, `Cargo.*`, `**/.sqlx/**`, and `docs/cs1r/**` (the CS-1
+      # inventory manifests live there — a docs path that CAN move the gate).
+      # Renames are split into both endpoints (`--no-renames`), so moving a file
+      # OUT of `rust/` still trips the non-inert arm.
+      #
+      # WIDENING THIS LIST IS A WORKFLOW DIFF, hence CODEOWNERS-gated
+      # (`.github/CODEOWNERS: /.github/workflows/**`) — the same owner review the
+      # CS-1R4 design relies on. `cs1r4_integrity_job_coverage.rs` additionally
+      # PINS the properties above, so quietly turning this into a bypass fails a
+      # test rather than shipping.
+      - name: Scope — do the heavy legs apply? (FAIL-CLOSED)
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          heavy=true
+          reason='default — fail-closed'
+          files=''
+          case "$EVENT_NAME" in
+            pull_request) base="${PR_BASE_SHA:-}" ;;
+            push)         base="${PUSH_BASE_SHA:-}" ;;
+            *)            base='' ;;
+          esac
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            reason="no usable base sha for event '$EVENT_NAME'"
+          elif ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            reason="base sha $base not present in this checkout"
+          elif ! files="$(git diff --name-only --no-renames "$base" HEAD 2>/dev/null)"; then
+            reason='git diff against the base failed'
+          elif [ -z "$files" ]; then
+            reason='empty diff — refusing to treat as inert'
+          else
+            inert=true
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                docs/cs1r/*) inert=false ;;
+                docs/*)      ;;
+                .beads/*)    ;;
+                *.md)        case "$f" in */*) inert=false ;; esac ;;
+                *)           inert=false ;;
+              esac
+              if ! $inert; then reason="non-inert path: $f"; break; fi
+            done <<< "$files"
+            if $inert; then
+              heavy=false
+              reason='every changed path is inert (docs/** except docs/cs1r/**, .beads/**, root *.md)'
+            fi
+          fi
+          echo "heavy=$heavy" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Integrity-leg scope"
+            echo ""
+            echo "- heavy legs: **$heavy**"
+            echo "- reason: $reason"
+            echo ""
+            echo "<details><summary>changed files vs base</summary>"
+            echo ""
+            echo '```'
+            echo "${files:-<none>}"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "scope: heavy=$heavy ($reason)"
+
       - name: Build
+        if: steps.scope.outputs.heavy == 'true'
         working-directory: rust
         run: cargo build -p prro --target x86_64-unknown-linux-gnu --locked
 
       - name: Compile-only check — W4-Z3 live-dps smoke harness (never executed)
+        if: steps.scope.outputs.heavy == 'true'
         working-directory: rust
         # The live-dps test target is gated `#![cfg(feature = "live-dps")]` and
         # hits the REAL DPS server, so it is NEVER run in CI.  This step only
@@ -136,6 +234,7 @@ jobs:
         run: cargo test -p prro --target x86_64-unknown-linux-gnu --features live-dps --test live_dps_extended_smoke --no-run --locked
 
       - name: Test
+        if: steps.scope.outputs.heavy == 'true'
         working-directory: rust
         # --features test-support: required by integration tests that
         # call `boot_phase::run_boot_reconciliation` via the W2
@@ -144,6 +243,7 @@ jobs:
         run: cargo nextest run -p prro --target x86_64-unknown-linux-gnu --features test-support --locked
 
       - name: Test prro_crypto (vectors, dudect CT, backend differential)
+        if: steps.scope.outputs.heavy == 'true'
         working-directory: rust
         # Audit CRY-3 (2026-06-10): the crypto crate's OWN suite (DSTU/GOST
         # vectors, the dudect constant-time statistical tests, the
@@ -153,6 +253,7 @@ jobs:
         run: cargo nextest run -p prro_crypto --target x86_64-unknown-linux-gnu --locked
 
       - name: Test prro-domain (RP-CS1-1 purity gate + RP-CS1-4 contract-DAG + testkit graph-absence)
+        if: steps.scope.outputs.heavy == 'true'
         working-directory: rust
         # CS-1 skeleton (contract §8 / RP-CS1-6): the `prro-domain` crate carries
         # the cargo-metadata purity gate (sqlx/tonic/tokio/axum/prost/hyper/reqwest
@@ -172,10 +273,12 @@ jobs:
       # build + test (all five ship test targets: crypto_v2 21 src, sidecar
       # 1 int+10 src, maria304 10 int+27 src, escpos/escpos_daemon 1 int each).
       - name: Build CS-1R matrix members (crypto_v2 / sidecar / maria304 / escpos / escpos_daemon)
+        if: steps.scope.outputs.heavy == 'true'
         working-directory: rust
         run: cargo build -p prro_crypto_v2 -p prro_sidecar -p maria304_driver -p prro_escpos -p prro_escpos_daemon --target x86_64-unknown-linux-gnu --locked
 
       - name: Test CS-1R matrix members (crypto_v2 / sidecar / maria304 / escpos / escpos_daemon)
+        if: steps.scope.outputs.heavy == 'true'
         working-directory: rust
         run: cargo nextest run -p prro_crypto_v2 -p prro_sidecar -p maria304_driver -p prro_escpos -p prro_escpos_daemon --target x86_64-unknown-linux-gnu --locked
 
@@ -186,11 +289,11 @@ jobs:
       # scripts/cs1r/mint_manifests.sh (CI never auto-mints).
       - name: CS-1R R1.2 inventory gate (three-way, --pr base)
         run: bash scripts/cs1r/inventory_gate.sh --pr "${{ github.event.pull_request.base.sha }}"
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.scope.outputs.heavy == 'true'
 
       - name: CS-1R R1.2 inventory gate (controls 1+3, push)
         run: bash scripts/cs1r/inventory_gate.sh
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.scope.outputs.heavy == 'true'
 
       # Phase-2 U2 (spec §4 / F2): the fuzzer above writes a regression seed to
       # the pinned file on a find. Surface it so a find is never silently
