@@ -1352,6 +1352,7 @@ test-support	prro	prro::invariant_fuzzer	fault_resync_then_next_op_is_differenti
 test-support	prro	prro::invariant_fuzzer	fence_integrity_catches_foreign_pointer_over_a_resting_hold	false
 test-support	prro	prro::invariant_fuzzer	fence_integrity_catches_stale_generation_over_a_resting_hold	false
 test-support	prro	prro::invariant_fuzzer	fuzz_cases_reads_env_with_256_default	false
+test-support	prro	prro::invariant_fuzzer	generator_emits_both_replenish_leaves	false
 test-support	prro	prro::invariant_fuzzer	generator_emits_online_and_offline_returns	false
 test-support	prro	prro::invariant_fuzzer	generator_emits_unknown_status_on_sell_and_shift_lanes	false
 test-support	prro	prro::invariant_fuzzer	harness_crash_reboot_enforces_no_resend_postcond	false
@@ -1365,6 +1366,10 @@ test-support	prro	prro::invariant_fuzzer	harness_offline_seeded	false
 test-support	prro	prro::invariant_fuzzer	harness_online_operator_accepted_after_badhashprev_hold_seed_advance	false
 test-support	prro	prro::invariant_fuzzer	harness_online_seeded	false
 test-support	prro	prro::invariant_fuzzer	harness_recovered_go_online_full_snapshot_verified	false
+test-support	prro	prro::invariant_fuzzer	harness_replenish_server_reject_persists_nothing	false
+test-support	prro	prro::invariant_fuzzer	harness_replenish_survives_crash_and_reboot	false
+test-support	prro	prro::invariant_fuzzer	harness_replenish_then_offline_sell_chains_onto_the_non_doc_seed	false
+test-support	prro	prro::invariant_fuzzer	harness_two_replenishes_in_a_row_resolve_to_the_latest	false
 test-support	prro	prro::invariant_fuzzer	held_online_return_survives_reboot_with_no_resend_or_reissue	false
 test-support	prro	prro::invariant_fuzzer	held_reservation_survives_reboot_then_operator_releases	false
 test-support	prro	prro::invariant_fuzzer	held_witness_catches_routing_class_divergence	false
@@ -1430,6 +1435,7 @@ test-support	prro	prro::invariant_fuzzer	oracle::tests::z_aggregation_oracle_cat
 test-support	prro	prro::invariant_fuzzer	regression_offline_shiftopen_resets_cash_on_hand	false
 test-support	prro	prro::invariant_fuzzer	release_witness_accepted_clears_fence_and_stop	false
 test-support	prro	prro::invariant_fuzzer	released_witness_refuses_origin_contradicting_completion	false
+test-support	prro	prro::invariant_fuzzer	replenish_refused_after_crash_at_send	false
 test-support	prro	prro::invariant_fuzzer	rmr_tombstone_blocks_fiscal_shift_z_and_recovery_reentry	false
 test-support	prro	prro::invariant_fuzzer	scan_gate_suppresses_going_online_transient_then_clean_on_settle	false
 test-support	prro	prro::invariant_fuzzer	scan_skips_mid_crash_sending_transient	false

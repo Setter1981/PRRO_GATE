@@ -89,6 +89,25 @@ impl DpsScript {
     }
 }
 
+/// bd `PRRO_GATE-2ds` / `PRRO_GATE-hpc` — the DECIDED outcomes of a T=112
+/// `ask_offline_codes` replenish.
+///
+/// **Deliberately only two leaves.** `RULING 2` §4
+/// (`docs/RULINGS_2026-07-10_SHIFT_T112_AUTOZ.md`) pins the ambiguous /
+/// transport-timeout branch as **known-red until a live capture lands**
+/// (bd `PRRO_GATE-2ds`, blocked on the operator), so the generator MUST NOT emit
+/// it: doing so would pin a contract that has no evidence behind it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplenishLeaf {
+    /// DPS grants a code window.  Prod persists the codes (`INSERT OR IGNORE`),
+    /// advances the chain seed to `sha256(request_xml)` — a NON-DOCUMENT seed —
+    /// and appends the durable witness row (migration 040), all in ONE
+    /// `with_immediate` envelope.  Allocates NO `lnd`.
+    Granted,
+    /// DPS refuses server-side: NO codes persisted, NO seed advance, NO witness.
+    ServerReject,
+}
+
 /// Operation alphabet (spec §5).  Wire-hitting ops carry a [`DpsScript`]; there
 /// is intentionally NO `go_offline` op — the offline lane is fixture-seeded
 /// (spec §5).  Invalid / re-entry / replay ops are first-class so the generator
@@ -171,6 +190,14 @@ pub enum Op {
     GoOnlineWithoutBacklog,
     OfflineSellDuringGoingOnline,
     SellWithClosedShift,
+    /// T=112 offline-code replenish — the ONLY op that moves the MAC chain seed
+    /// WITHOUT minting a document.  Drives the REAL
+    /// `OfflineCodeReplenishService`, so the durable witness (migration 040) and
+    /// the `active_chain_tip` fold that bd `PRRO_GATE-hpc` added are exercised
+    /// generatively rather than by directed tests alone.  Allocates no `lnd`,
+    /// which is exactly what makes the witness's `lnd_at_write` ordering frame
+    /// meaningful.
+    Replenish(ReplenishLeaf),
     /// CS-3 operator-completion — the SOLE legal exit from a `PENDING_APPLY` + `STOP_MODE` HELD
     /// reservation (the eternal-BRICK guard).  Drives the real `admin::resolve_operator_pending`
     /// seam against the doc held by the most-recent wire op; a no-op when no held reservation rests.
