@@ -4,11 +4,10 @@
 //! The three we do not implement were each deferred by an explicit decision
 //! recorded in `docs/superpowers/specs/2026-07-31-adr-dps-rpc-surface.md`:
 //!
-//!   - `sendChk` (API v1)          — DEFERRED; we are v2-only, and an `apiver=1`
-//!                                   config is REFUSED, never silently migrated.
-//!   - `delLastChk` / `delLastChkId` — DEFERRED to `PRRO_GATE-2pz` (P3); they are
-//!                                   DESTRUCTIVE admin ops and our ledger
-//!                                   invariants assume append-only.
+//! - `sendChk` (API v1) — DEFERRED; we are v2-only, and an `apiver=1` config is
+//!   REFUSED, never silently migrated.
+//! - `delLastChk` / `delLastChkId` — DEFERRED to `PRRO_GATE-2pz` (P3); they are
+//!   DESTRUCTIVE admin ops and our ledger invariants assume append-only.
 //!
 //! This is the tooth on that decision.  Adding any of them — or dropping one of
 //! the five — turns this RED, so the ADR gets revisited instead of the surface
