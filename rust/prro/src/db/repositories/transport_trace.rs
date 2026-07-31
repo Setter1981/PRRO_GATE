@@ -369,6 +369,46 @@ pub async fn list_for_document(
 /// (the row is INSERTed at 4-pre allocation; `completed_at` is set
 /// later at 4-b but that's not required to satisfy this query under
 /// hardening pass 2).
+/// bd `PRRO_GATE-3uo` — the raw DPS `error_message` of the document's latest
+/// attempt, read INSIDE the caller's write transaction.
+///
+/// Exists for one consumer: the MacReseed **guard-B** corroboration path. After
+/// an ambiguous T=112, DPS's chain tip is unrepresentable locally — no document
+/// carries it and the ambiguous arm discards the request XML whose `sha256` it
+/// is — so `active_chain_tip_unsigned_xml_sha256` can never equal the value the
+/// operator must supply. DPS, however, NAMES its expected tip in the `store`
+/// field of the `-12` that created the hold, and that message is durably
+/// recorded here by the very attempt that failed (`stage_send` →
+/// [`AttemptCompletion::error_message`]). This lets guard-B ask the PEER instead
+/// of only asking ourselves.
+///
+/// **tx-bound on purpose.** guard-B runs inside `complete_operator_pending`'s
+/// `BEGIN IMMEDIATE`; a pool-bound read would see a different snapshot and could
+/// race the very hold it is adjudicating. The sibling
+/// [`last_attempt_retry_class_for`] is pool-bound because its caller (the
+/// dispatcher loop) deliberately reads outside a write lock — the two are not
+/// interchangeable.
+pub async fn last_attempt_error_message_tx(
+    tx: &mut WriteTxConn<'_>,
+    doc_id: DocumentId,
+) -> sqlx::Result<Option<String>> {
+    let opt: Option<Option<String>> = sqlx::query_scalar(
+        // ordering-justified: `attempt_no` is allocated `COALESCE(MAX(attempt_no),0)+1` per
+        // `document_id` inside a BEGIN IMMEDIATE envelope (`allocate_and_insert_tx`), so it is
+        // unique per document BY THE ALLOCATOR and the ordering is total — there is no tie to
+        // break. Same justification as `last_attempt_retry_class_for`; the index
+        // `transport_trace(document_id, attempt_no DESC, …)` is NOT unique, so the guarantee
+        // rests on the allocator plus the write lease, not on the schema.
+        "SELECT error_message FROM transport_trace \
+         WHERE document_id = ? \
+         ORDER BY attempt_no DESC LIMIT 1",
+    )
+    .bind(DbDocumentId(doc_id))
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(opt.flatten())
+}
+
 pub async fn last_attempt_retry_class_for(
     pool: &sqlx::SqlitePool,
     doc_id: DocumentId,

@@ -1284,7 +1284,7 @@ live-dps	prro	prro::goldens_byte_equiv	xml_z_report_byte_equivalent_doubles_as_c
 live-dps	prro	prro::goldens_byte_equiv	xml_z_report_extended_byte_equivalent	false
 live-dps	prro	prro::handler_503_on_missing_operator	missing_operator_yields_registry_none_and_audit_for_configured_fn	false
 live-dps	prro	prro::hpc_t112_nc03	after_sell_recovers_hsell_not_stale_hs	false
-live-dps	prro	prro::hpc_t112_nc03	ambiguous_t112_leaves_the_minus_12_hold_unresolvable	false
+live-dps	prro	prro::hpc_t112_nc03	ambiguous_t112_hold_is_resolvable_only_by_a_peer_corroborated_seed	false
 live-dps	prro	prro::hpc_t112_nc03	crash_atomicity_all_three_coexist_on_success	false
 live-dps	prro	prro::hpc_t112_nc03	guard_b_accepts_reseed_to_hs_rejects_hp	false
 live-dps	prro	prro::hpc_t112_nc03	invariant_scan_clean_after_standalone_replenish	false

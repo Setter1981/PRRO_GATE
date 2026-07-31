@@ -1406,8 +1406,45 @@ pub async fn complete_operator_pending(
             )
             .await
             .map_err(CompletionError::Db)?;
+        // bd PRRO_GATE-3uo — the expected tip is not always LOCALLY REPRESENTABLE.
+        //
+        // After an ambiguous T=112 (connection lost mid-call, DPS processed it —
+        // live-captured 2026-07-31, bd PRRO_GATE-2ds) DPS advanced its tip to
+        // `sha256(request_xml)` while we advanced nothing: the ambiguous arm
+        // returns before the persist envelope, so there is no witness, no doc
+        // carries the value, and the request XML is discarded. `active_chain_tip`
+        // therefore stays at the STALE tip and can NEVER equal the seed the
+        // operator must supply.
+        //
+        // Before this disjunct existed, that was not a deadlock but a TRAP:
+        // guard-B accepted ONLY the stale value (the one known to be wrong) and
+        // refused the correct one, so the single action the operator was
+        // permitted re-installed the stale tip, the next send earned `-12` again,
+        // and the node returned to STOP_MODE — a loop with no exit in which every
+        // turn looked like the operator had done something.
+        //
+        // The way out is that DPS NAMES its expected tip, in the `store` field of
+        // the very `-12` that created this hold, and `stage_send` records that
+        // message durably on the attempt. So: accept a seed the PEER corroborates.
+        //
+        // This does NOT weaken the 2026-07-24 hardening (PR #338) that this guard
+        // exists for — it strengthens it. Before, the operator seed had to match
+        // one value we computed; now it must match that OR something DPS actually
+        // said over an authenticated channel. A hand-typed or stale seed matching
+        // NEITHER is still refused, which is the whole point of the guard: a wrong
+        // seed silently re-bases the chain and surfaces only later as a
+        // `ChainSeedMismatch`.
         if expected_tip.as_deref() != Some(&seed[..]) {
-            return Err(CompletionError::MacReseedSeedMismatch);
+            let corroborated =
+                crate::db::repositories::transport_trace::last_attempt_error_message_tx(tx, doc_id)
+                    .await
+                    .map_err(CompletionError::Db)?
+                    .as_deref()
+                    .and_then(crate::services::write_path::mac_recovery::regex_extract_store_hash)
+                    .is_some_and(|peer_tip| peer_tip == *seed);
+            if !corroborated {
+                return Err(CompletionError::MacReseedSeedMismatch);
+            }
         }
     }
 

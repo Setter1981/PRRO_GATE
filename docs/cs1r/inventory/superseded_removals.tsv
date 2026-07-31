@@ -20,3 +20,4 @@
 # Their supersession records live in those commits + this file's git history. The registry is
 # currently EMPTY (no removals pending vs origin/main); the gate handles that (see the
 # empty-registry guard in inventory_gate.sh + the teeth in inventory_gate_teeth.sh).
+prro::hpc_t112_nc03	ambiguous_t112_leaves_the_minus_12_hold_unresolvable	prro::hpc_t112_nc03	ambiguous_t112_hold_is_resolvable_only_by_a_peer_corroborated_seed	bd PRRO_GATE-3uo: the same scenario, INVERTED by the fix. The retired test pinned the TRAP (guard-B accepted only the known-wrong stale seed and refused the correct one). The replacement pins the EXIT and keeps both halves: a peer-corroborated seed is accepted, an arbitrary one is still refused (the #338 hardening). Renamed because the old name asserts the opposite of the fixed behaviour and would read as a lie.
