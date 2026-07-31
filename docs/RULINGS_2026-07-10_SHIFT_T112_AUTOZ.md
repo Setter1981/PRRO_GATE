@@ -26,11 +26,33 @@
 
 **Ruling.**
 1. **No byte-identical resend and no in-line retry loop.** Same doctrine as the drain `-8` decision: WebCheck's `Thread.Sleep×18` is a crude client; we do not copy mechanisms, only calibrate tolerances. A byte-identical T=112 resend risks double-allocation on an unproven-idempotent endpoint.
-2. **Recovery = the NEXT replenish attempt is a FRESH request (new DI, new TS) on the service's normal cadence.** Grounds: live campaign evidence shows DPS re-issues allocated-but-unconsumed codes on subsequent T=112 calls (the same opaque codes returned across our runs), so a lost response does not strand the codes — a fresh request re-obtains them. The pool inserts are dedup-by-value, so re-issued codes are idempotent locally.
+2. **Recovery = the NEXT replenish attempt is a FRESH request (new DI, new TS) on the service's normal cadence.** The pool inserts are dedup-by-value, so re-issued codes are idempotent locally.
+
+   > **CORRECTION 2026-07-31 — this clause overstated its evidence.** It originally continued: *"Grounds: live campaign evidence shows DPS re-issues allocated-but-unconsumed codes on subsequent T=112 calls (the same opaque codes returned across our runs), so a lost response does not strand the codes — a fresh request re-obtains them."* The observation is real; the conclusion does not follow. **No run in that campaign ever lost a response mid-call**, so the ambiguous case was never exercised. Two hypotheses remain live and mutually exclusive:
+   > - **(H1)** each T=112 allocates a **fresh** range → a lost response **leaks** it server-side. This is what `offline_code_replenish.rs` asserted, in its own comment, also as fact.
+   > - **(H2)** DPS **re-issues allocated-but-unconsumed** codes → the ambiguous case is free.
+   >
+   > Two places in the repo stated opposite things, both as settled fact. Neither is proven. It matters: under H1 a flapping link burns a range per break, eating the offline code-reserve floor (bd `PRRO_GATE-255`) and the monthly allocation; under H2 it costs nothing. **Only the §4 capture settles it.** The ruling's *operational* conclusion (fresh request; no byte-identical resend) holds either way — it is the *cost* claim that was unfounded.
+
 3. **The lost-response chain-tip hazard is handled by the existing settle discipline:** after an ambiguous T=112 the local tip may lag DPS's. The next fiscal send discovers this via the normal chain rules; no special-case tip adoption. The fuzzer (W3-1) models local vs remote tips separately and pins exactly this: an ambiguous T=112 followed by a fiscal doc must recover (fresh tip discovery), never silently fork.
-4. **Known-red stands until captured evidence:** the live campaign should capture one real ambiguous/timeout T=112 on the test cabinet (kill the connection mid-call) and record what a subsequent fresh T=112 returns. If evidence contradicts (2) — e.g. DPS double-allocates windows — this ruling reopens. Until then the generator does NOT emit ambiguous-T112; the model/impl contract above is pinned by directed tests when W3 lands.
+
+   > **Mechanism named, 2026-07-31.** This clause said *how safe*, never *by what*. The stale `previous_hash` earns Server `-12` `ERROR_BAD_HASH_PREV`, which routes to the **automatic bounded `MacRecovery`** (`error_routing.rs`) — **not** to an operator `MacReseed`. `mac_recovery::run_mac_recovery` extracts DPS's expected hash **from the error message itself** and re-drives attempt #2.
+   >
+   > Worth stating explicitly, because the opposite looked plausible and was checked: the MacReseed **guard-B** tip check (`delivery_reservation.rs` — the operator seed must equal `active_chain_tip`) is **never consulted** on this path. So an ambiguous T=112 cannot deadlock recovery even though its arm writes **no durable seed witness** — the witness that `bd PRRO_GATE-hpc` made durable is written only on the SUCCESS path.
+   >
+   > **Residual risk, NOT closed:** that self-heal parses a literal `"store "` tag out of a DPS message — a format inherited from the Python reference and **not yet observed from live DPS**. It fails loud (`HashNotExtractable`) on drift rather than corrupting, but a loud failure is still a stuck FN needing an operator. The §4 capture produces a real `-12` and should confirm the parse — so the capture settles **two** unknowns, not one.
+4. **Known-red stands until captured evidence** *(capture design added 2026-07-31 — see the note under §4 below)*: the live campaign should capture one real ambiguous/timeout T=112 on the test cabinet (kill the connection mid-call) and record what a subsequent fresh T=112 returns. If evidence contradicts (2) — e.g. DPS double-allocates windows — this ruling reopens. Until then the generator does NOT emit ambiguous-T112; the model/impl contract above is pinned by directed tests when W3 lands.
 
 **Consequences:** current prod behavior (no in-line retry) is CONFIRMED correct — no prod change; W3-1/W3-2 get their contract; a live-campaign capture item is added.
+
+> **§4 capture design (2026-07-31).** What blocks this is NOT operator availability — the infrastructure already exists: `live_smoke_8_ask_offline_codes` sends a raw T=112 to live DPS and brackets it to reveal whether the MAC chain advanced; the kill-switch (`PRRO_LIVE_DPS=1`), the host allowlist and the test FN are all in place. Two things are missing:
+>
+> 1. **A deterministic mid-call connection kill.** The honest mechanism is a local TCP proxy that forwards the request to DPS and then drops the connection *before* the response — that guarantees the ambiguous shape (DPS received it; we did not hear back). A short client-side timeout is NOT equivalent: it cannot establish that the request actually reached DPS, which is the whole point.
+> 2. **Acceptance that the experiment itself may burn a real code range** on the test FN — which is precisely the unknown being measured (H1 vs H2 above). Under H1 each attempt costs a range, so the run is not free and repeats are not free.
+>
+> The capture must record, in order: (a) the codes returned by a normal T=112; (b) the kill; (c) what a **fresh** T=112 returns — the *same* opaque codes (→H2) or a *new* range (→H1); (d) the MAC tip before/after; and (e) the raw text of the `-12` earned by the next fiscal send, to confirm the `"store "` hash extraction against a real DPS message.
+>
+> **Status:** designed, not run. Tracked as bd `PRRO_GATE-2ds`.
 
 ---
 
