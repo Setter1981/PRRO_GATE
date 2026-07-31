@@ -471,9 +471,20 @@ the ONLY op that **moves the MAC chain seed without minting a document**, so the
 replenish while the FN holds an active delivery reservation.** The generator composed
 `[… → held reservation → Replenish]` and prod refused with `fn_fence_active_tx` (`FN … has an active
 delivery reservation`), which the model had predicted as `granted`. Adjudicated in prod's favour and
-taught to the model as an explicit precondition (`held_reservation.is_some() → granted: false`) rather
-than weakened in production. The known-narrow gap (a CALL_STARTED crash residue can leave the fence
-raised without a model-visible hold) is documented at the check, not papered over.
+taught to the model as an explicit precondition rather than weakened in production. The first cut gated
+on `held_reservation.is_some()` and recorded a known-narrow gap at the check: a `CALL_STARTED` crash
+residue raises the fence with no model-visible hold.
+
+**That gap failed loudly on the very first 4096 run** — `harness_online_seeded` RED, shrunk by proptest
+to `[Crash(Send), Replenish(Granted)]`. Prod's predicate is a three-way disjunction
+(`state IN ('RESERVED_NOT_STARTED','CALL_STARTED') OR (state='OUTCOME_OBSERVED' AND
+apply_state='PENDING_APPLY')`) and `held_reservation` syncs only the third. **Prod correct again** — the
+chain seed must not advance while a delivery outcome on the same chain is unknown. Fixed with a
+reality-synced `RefModel::fence_active` that **reuses prod's `pub const`
+`ACTIVE_FENCE_STATE_PREDICATE`** instead of hand-copying it (a copy could drift from what
+`fn_fence_active_tx` enforces; the const is itself pinned to migration 035 by
+`fence_predicate_byte_identity`). Pinned by `replenish_refused_after_crash_at_send` (canary verified
+RED) + the persisted proptest seed.
 
 - **Oracle:** `OpClass::Replenish` differential arm; `RealOutcome::Replenished { inserted, deduped,
   new_seed }` is rejected by the no-mutation classes. The `run_harness` carve-out is narrow and

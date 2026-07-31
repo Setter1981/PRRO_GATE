@@ -142,19 +142,75 @@ minted, no code consumed, pool delta `== inserted`, and `inserted + deduped >= 1
 `inserted`/`deduped` split is what keeps the `INSERT OR IGNORE` dedup honest (§3) without asserting a
 blind `+n`.
 
-### The finding: the S7-2 fence refuses a replenish under an active reservation
+### Finding 1: the S7-2 fence refuses a replenish under an active reservation
 
 The generator composed `[… → held reservation → Replenish]` and production refused
 (`fn_fence_active_tx`: *FN … has an active delivery reservation*) where the model predicted `granted`.
 **Adjudicated prod = correct** — the S7-2 fence exists precisely so a seed-moving operation cannot
-interleave with an unresolved delivery. Taught to the model as an explicit precondition
-(`held_reservation.is_some() → granted: false`); production was NOT weakened.
+interleave with an unresolved delivery. Taught to the model as an explicit precondition; production was
+NOT weakened.
 
-Known-narrow gap, documented at the check rather than papered over: a CALL_STARTED crash can leave the
-fence raised with no model-visible hold, so a future sequence could see prod refuse where the model
-still says granted. That would be a REAL finding about fence-residue recovery, not a model bug — it is
-left to fail loudly.
+The first cut gated the model on `held_reservation.is_some()` and recorded, at the check, a
+known-narrow gap: a `CALL_STARTED` crash can raise the fence with no model-visible hold, so prod could
+refuse where the model still said granted — left to fail loudly rather than papered over.
+
+### Finding 2: it failed loudly on the very first 4096 run
+
+`harness_online_seeded` went RED at `FUZZ_CASES=4096` and proptest shrank it to a two-op minimum:
+
+```
+[Crash(Send), Replenish(Granted)]
+```
+
+Exactly the documented gap. `Crash(Send)` leaves a `CALL_STARTED` delivery reservation, which satisfies
+the FIRST disjunct of prod's predicate:
+
+```
+state IN ('RESERVED_NOT_STARTED','CALL_STARTED')
+OR (state = 'OUTCOME_OBSERVED' AND apply_state = 'PENDING_APPLY')
+```
+
+while `held_reservation` syncs only the THIRD. **Adjudicated prod = correct again** — the MAC chain
+seed must not advance while a delivery outcome on the same chain is unknown.
+
+Fix: a new reality-synced `RefModel::fence_active`, widened to prod's predicate by **reusing the
+`pub const` `ACTIVE_FENCE_STATE_PREDICATE`** rather than hand-copying it. A duplicated predicate could
+drift from the one `fn_fence_active_tx` actually enforces and the model would then mispredict every
+fenced op forever; the const itself is not trusted blindly, because `fence_predicate_byte_identity`
+(`tests/fn_fence_active.rs`) pins it byte-for-byte against the migration 035 index + trigger.
+`sync_fence_active` runs **after** `sync_held_reservation`, never instead of it — the two answer
+different questions and both have consumers.
+
+Pinned by `replenish_refused_after_crash_at_send` (revert-canary verified RED: re-gating on
+`held_reservation.is_some()` fails the tooth) plus proptest's persisted seed in
+`invariant_fuzzer.regressions`.
+
+**Honest scope limit**, recorded at the field: gating on a reality-synced predicate means this harness
+verifies *given the fence state, the fenced op behaves correctly* — it does NOT independently verify
+that the fence rises when it should. That remains the job of `tests/fn_fence_active.rs`.
+
+**Operational note (not a defect, worth knowing):** while a `CALL_STARTED` residue rests, T=112 is
+refused. That is fail-closed and safe, but it means a node that crashed mid-send cannot top up offline
+codes until the reservation resolves. Worth confirming there is a live (non-boot) path that resolves
+the residue — filed as `bd PRRO_GATE-972` rather than expanded into this slice. (The fence is INACTIVE in production until the S7-1 cutover completes, so this is forward-looking.)
 
 ### Capstone measurement (§1 point 4)
 
-MEASUREMENT_PLACEHOLDER
+§2 flagged the per-case `App::boot` cost as the thing that MUST be measured before this lands. Measured,
+same machine, `FUZZ_CASES=4096`, whole `invariant_fuzzer` binary, `nextest` wall (not process wall — the
+baseline's process wall includes a cold cargo build of a fresh worktree):
+
+| | commit | tests | nextest wall |
+|---|---|---|---|
+| **before** | merge-base `3355527b` — fixture has no `App`, no Replenish arm | 165 | **1205.7 s** |
+| **after** | branch tip — `FuzzCtx` owns an `App`, Replenish emitted | 171 | **1191.9 s** |
+
+**Conclusion: the `App::boot`-per-case cost is within run-to-run noise** (−1.1%), while the suite does 6
+more tests *and* carries a new generator arm. The §2 worry does not materialise.
+
+Stated honestly: one run each, and the machine was not otherwise idle, so this supports "no material
+regression" — it does NOT support a claim that the change made anything faster.
+
+**Nightly:** 4096 costs ~20 min of the fuzzer binary. That leaves headroom, so §6 step 5 (raise N) is
+viable; the design's preference for 2 × 4096 shards over one 8192 job still stands, since the wall-clock
+is dominated by the two seeded harness tests running serially.
