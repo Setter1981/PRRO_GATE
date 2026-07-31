@@ -206,6 +206,14 @@ pub struct FuzzCtx {
     pub app: prro::App,
     sign_ctx: SigningContext,
     fn_sign: CheckSignBlob,
+    /// FIDELITY WRINKLE, documented rather than hidden (design §2): this is the gate `inline::run`
+    /// takes, and it is a DIFFERENT mutex from the one `app.acquire_fn_gate` takes.  Unifying them is
+    /// not possible through the public API — `App` exposes only `acquire_fn_gate() -> OwnedMutexGuard`,
+    /// never the `Arc<Mutex<_>>` itself (`app.rs:402`), and `Inner` is private.  This is SOUND here
+    /// because the harness drives ops strictly sequentially (one op fully completes before the next
+    /// starts), so no two writers are ever in flight and the two locks are never contended.  It does
+    /// mean the fuzzer does NOT exercise invariant #2 (one FN = one writer) as a concurrency property —
+    /// that stays the job of the dedicated concurrency tests, not this harness.
     gate: Arc<tokio::sync::Mutex<()>>,
     fn_id: String,
     send_calls: Arc<AtomicUsize>,

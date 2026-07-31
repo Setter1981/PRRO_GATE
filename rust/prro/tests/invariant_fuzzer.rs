@@ -2204,6 +2204,33 @@ async fn harness_two_replenishes_in_a_row_resolve_to_the_latest() {
     .await;
 }
 
+/// **The 4096 counterexample, pinned.** `[Crash(Send), Replenish(Granted)]` — shrunk by proptest from
+/// the first large-N capstone of the Replenish symbol (seed persisted in
+/// `invariant_fuzzer.regressions`).
+///
+/// A crash at the Send stage leaves a `CALL_STARTED` delivery reservation. That state raises prod's
+/// S7-2 fence (`ACTIVE_FENCE_STATE_PREDICATE`) but produces NO operator-completable `PENDING_APPLY`
+/// hold — so a model gated on `held_reservation` predicted `granted` while prod correctly REFUSED.
+/// Adjudicated prod = correct: the MAC chain seed must not advance while a delivery outcome on the
+/// same chain is still unknown.
+///
+/// Revert-canary: re-gate `apply_replenish` on `held_reservation.is_some()` instead of `fence_active`
+/// (or drop the `sync_fence_active` call in `run_harness`) and this goes RED.
+#[tokio::test]
+async fn replenish_refused_after_crash_at_send() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[
+            Op::Crash(Stage::Send),
+            Op::Replenish(ReplenishLeaf::Granted),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 // ── CS-3 (C-iii) NotAcceptedOffline RELEASE: OLA-cohort cancel + chain rewind + fork guard ────────
 
 /// Build the C-iii cohort: an offline-open-shift FN with a HELD offline-origin doc (the drain-rejected
@@ -4008,6 +4035,12 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // The release OUTCOME stays independently predicted; only "is a completable hold resting +
         // its origin" is state-synced (the `adopt_fault_deferred` pattern for docs/mode).
         model.sync_held_reservation(&ctx.pool).await;
+        // CS-3 S7-2 — and re-sync the WIDER active-reservation FENCE (in-flight
+        // RESERVED_NOT_STARTED / CALL_STARTED too, not just the completable PENDING_APPLY hold).
+        // A crash mid-wire raises the fence with no hold; that is what `[Crash(Send), Replenish]`
+        // exposed at 4096. Must run after `sync_held_reservation`, never instead of it — they answer
+        // two different questions and both have consumers.
+        model.sync_fence_active(&ctx.pool).await;
 
         // Mode-INDEPENDENT AUD-K8-1 teeth (bounded-postcond on wire calls).
         // A drain re-tick on a `RequiresManualReconciliation` FN must make NO new

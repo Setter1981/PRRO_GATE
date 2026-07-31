@@ -116,3 +116,45 @@ A replenish is unlike every existing op: it **mints no document**, allocates **n
 3. `Op::Replenish` + interp + model + generator + teeth.
 4. Measure the capstone wall-clock before/after and record it here.
 5. Only then consider raising nightly N (and prefer 2 × 4096 shards over one 8192 job).
+
+---
+
+## 7. As-built (2026-07-31, branch `feat/fuzzer-replenish-symbol`)
+
+**§2 fixture.** Taken as designed: `FuzzCtx` owns a real `prro::App`; `pool` / `pool_secure` are clones
+of `app.db()` / `app.db_secure()`, so every pre-existing op runs against the SAME database. `App::boot`
+spawns no background tasks (the loops live in `runtime::supervisor::run`, started only by `serve`), so
+determinism is unaffected.
+
+**§2 "two gates" — NOT unified, documented instead.** The public API exposes only
+`App::acquire_fn_gate() -> OwnedMutexGuard<()>` (`app.rs:402`), never the `Arc<Mutex<_>>`, and `Inner`
+is private — so `inline::run`'s gate cannot be routed through the App's. This is sound because the
+harness drives ops strictly sequentially (one op fully completes before the next begins), so the two
+locks are never contended. The honest consequence, recorded at the `gate` field in `interp.rs`: this
+harness does **not** exercise invariant #2 (one FN = one writer) as a *concurrency* property — that
+remains the job of the dedicated concurrency tests.
+
+**§3 model.** As designed, plus ONE contract the design did not anticipate — see below.
+
+**§4 oracle.** Implemented as a narrow, asserted `run_harness` carve-out rather than a new global
+outcome shape: per Replenish op it asserts the seed moved **iff** granted, `next_lnd` unchanged, no doc
+minted, no code consumed, pool delta `== inserted`, and `inserted + deduped >= 1`. The
+`inserted`/`deduped` split is what keeps the `INSERT OR IGNORE` dedup honest (§3) without asserting a
+blind `+n`.
+
+### The finding: the S7-2 fence refuses a replenish under an active reservation
+
+The generator composed `[… → held reservation → Replenish]` and production refused
+(`fn_fence_active_tx`: *FN … has an active delivery reservation*) where the model predicted `granted`.
+**Adjudicated prod = correct** — the S7-2 fence exists precisely so a seed-moving operation cannot
+interleave with an unresolved delivery. Taught to the model as an explicit precondition
+(`held_reservation.is_some() → granted: false`); production was NOT weakened.
+
+Known-narrow gap, documented at the check rather than papered over: a CALL_STARTED crash can leave the
+fence raised with no model-visible hold, so a future sequence could see prod refuse where the model
+still says granted. That would be a REAL finding about fence-residue recovery, not a model bug — it is
+left to fail loudly.
+
+### Capstone measurement (§1 point 4)
+
+MEASUREMENT_PLACEHOLDER

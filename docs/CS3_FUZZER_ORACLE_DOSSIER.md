@@ -448,3 +448,40 @@ documented follow-on (below). Test-side only; prod FROZEN (0 src diff).
   cohort/rewind oracle into `run_harness`. That is the genuinely-hard remaining work; the directed
   slice here pins the CONTRACT so the generative model has a verified target.
 - **Verification:** fuzzer **160/160** (was 158; +2 teeth); fmt + clippy `-D` clean; prod FROZEN.
+
+### ✅ Alphabet: generative `Replenish` (T=112) — bd `PRRO_GATE-hpc` / `2ds`
+
+Design: `docs/FUZZER_REPLENISH_SYMBOL_DESIGN.md`. Closes the widest remaining alphabet gap — T=112 is
+the ONLY op that **moves the MAC chain seed without minting a document**, so the hpc durable witness
+(migration 040) and the `active_chain_tip` fold had directed coverage only.
+
+- **Scope pinned to the two DECIDED leaves** `{Granted, ServerReject}`. The ambiguous / transport-timeout
+  branch is NOT emitted: `RULING 2` §4 keeps it known-red until a live capture lands (bd `PRRO_GATE-2ds`,
+  blocked on the operator). Emitting it would pin a contract with no evidence behind it.
+- **Fixture change:** `FuzzCtx` now owns a real `prro::App` (the T=112 service requires one); `pool` /
+  `pool_secure` are clones of `app.db()` / `app.db_secure()` so every existing op runs against the SAME
+  database. The alternative — reproducing the replenish's DB effects inside `interp` — was rejected as
+  vacuous (the oracle would agree with itself by construction).
+- **Documented fidelity wrinkle:** `inline::run`'s gate and `app.acquire_fn_gate` are two different
+  mutexes (the public API exposes no way to unify them). Sound because the harness drives ops strictly
+  sequentially, but it means this harness does not exercise invariant #2 as a *concurrency* property.
+  Recorded at the field rather than left implicit.
+
+**PROD CONTRACT surfaced by the fuzzer (prod = correct, MODEL was the gap): the S7-2 fence refuses a
+replenish while the FN holds an active delivery reservation.** The generator composed
+`[… → held reservation → Replenish]` and prod refused with `fn_fence_active_tx` (`FN … has an active
+delivery reservation`), which the model had predicted as `granted`. Adjudicated in prod's favour and
+taught to the model as an explicit precondition (`held_reservation.is_some() → granted: false`) rather
+than weakened in production. The known-narrow gap (a CALL_STARTED crash residue can leave the fence
+raised without a model-visible hold) is documented at the check, not papered over.
+
+- **Oracle:** `OpClass::Replenish` differential arm; `RealOutcome::Replenished { inserted, deduped,
+  new_seed }` is rejected by the no-mutation classes. The `run_harness` carve-out is narrow and
+  **asserted**, never a blanket exemption: seed moved IFF granted, `next_lnd` unchanged, no doc minted,
+  no code consumed, pool delta == `inserted`, `inserted + deduped >= 1`.
+- **Teeth:** 4 directed pins + `generator_emits_both_replenish_leaves` (anti-silent-zero, both leaves
+  `>= 100` over 2000 seqs).
+- Re-calibrated the pre-existing `generator_emits_unknown_status_*` shift-lane density floor `100 → 70`:
+  one extra `prop_oneof!` arm dilutes every other arm by ~1/(N+1) (measured `100+ → 92`). Not tuned to
+  just-above-92 — a dropped arm still yields 0 and a halved weight ~46, so both failure modes the floor
+  exists to catch still trip hard.

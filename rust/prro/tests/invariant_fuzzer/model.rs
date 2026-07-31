@@ -194,6 +194,23 @@ pub struct RefModel {
     /// stays INDEPENDENTLY predicted + checked — only this precondition is state-synced (the pattern
     /// of `adopt_fault_deferred`, which syncs `docs`/`mode`/`session` from reality).
     pub held_reservation: Option<(i64, bool)>,
+
+    /// CS-3 S7-2 — is the FN's **active-reservation fence** raised?  This is a STRICTLY WIDER
+    /// predicate than `held_reservation.is_some()` and the two must not be conflated:
+    /// `held_reservation` is only the `OUTCOME_OBSERVED` + `PENDING_APPLY` window (an
+    /// operator-completable hold), while the fence also covers the IN-FLIGHT states
+    /// `RESERVED_NOT_STARTED` / `CALL_STARTED` — an unresolved delivery with no completable hold.
+    ///
+    /// Found by the fuzzer at `FUZZ_CASES=4096`, shrunk to `[Crash(Send), Replenish(Granted)]`: a
+    /// crash at the Send stage leaves `CALL_STARTED` residue, prod's T=112 refuses (correctly — the
+    /// chain seed must not move while a delivery outcome is unknown), and a model gated on
+    /// `held_reservation` predicted `granted`.  Adjudicated PROD = CORRECT.
+    ///
+    /// Like `held_reservation` this is a reality-synced PRECONDITION, not an independent prediction
+    /// (`sync_fence_active`, after every op).  The honest consequence: the harness verifies *given the
+    /// fence state, the fenced op behaves correctly* — it does NOT independently verify that the fence
+    /// rises in the right circumstances.  That is the job of `tests/fn_fence_active.rs`.
+    pub fence_active: bool,
 }
 
 /// L0 — the cash amount used by every SELL/RETURN in the fuzzer fixture.
@@ -223,6 +240,7 @@ impl RefModel {
             cash_by_lnd: BTreeMap::new(), // L0: opening = 0 (first shift; carry is L3/L4)
             carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
+            fence_active: false,
         }
     }
 
@@ -245,6 +263,7 @@ impl RefModel {
             cash_by_lnd: BTreeMap::new(), // L0: no open shift → no cash-on-hand
             carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
+            fence_active: false,
         }
     }
 
@@ -269,6 +288,7 @@ impl RefModel {
             cash_by_lnd: BTreeMap::new(), // L0: opening = 0 (first shift)
             carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
+            fence_active: false,
         }
     }
 
@@ -291,6 +311,7 @@ impl RefModel {
             cash_by_lnd: BTreeMap::new(), // L0: no open shift
             carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
+            fence_active: false,
         }
     }
 
@@ -591,13 +612,15 @@ impl RefModel {
         // mid-flight on the same chain. The model must predict that refusal or the differential
         // diverges the moment the generator lands a Replenish after a held-producing op.
         //
-        // KNOWN NARROW GAP (documented, not silently ignored): the model tracks only the
-        // PENDING_APPLY hold (`held_reservation`, re-synced from reality after every op), whereas
-        // prod's predicate also covers RESERVED_NOT_STARTED / CALL_STARTED. A crash that leaves a
-        // reservation resting mid-wire could therefore make prod refuse where the model expects a
-        // grant; if that composition is reachable the fuzzer will surface it and it gets adjudicated
-        // like any other divergence — it is NOT papered over here.
-        if self.held_reservation.is_some() {
+        // The gate is `fence_active`, NOT `held_reservation.is_some()`. That distinction was found the
+        // hard way: the first cut gated on the hold, and the 4096 capstone shrank a failure to
+        // `[Crash(Send), Replenish(Granted)]` — a crash at Send leaves `CALL_STARTED` residue, which
+        // raises prod's fence but produces NO completable hold, so the model predicted `granted` while
+        // prod refused. Adjudicated PROD = CORRECT (the seed must not move while a delivery outcome is
+        // unknown); the model was widened to prod's own predicate. That seed is pinned in
+        // `invariant_fuzzer.regressions` and in the directed tooth
+        // `replenish_refused_after_crash_at_send`.
+        if self.fence_active {
             return ExpectedOutcome::Replenish { granted: false };
         }
         match leaf {
@@ -1926,6 +1949,28 @@ impl RefModel {
         .await
         .unwrap()
         .map(|(lnd, offline_fiscal_no)| (lnd, offline_fiscal_no.is_none()));
+    }
+
+    /// CS-3 S7-2 — RE-SYNC `fence_active` from the real `delivery_reservation` table, using
+    /// **production's own** `ACTIVE_FENCE_STATE_PREDICATE` const rather than a hand-copied predicate.
+    ///
+    /// Reusing the const is deliberate: a duplicated predicate here could silently drift from the one
+    /// `fn_fence_active_tx` actually enforces, and the model would then mispredict every fenced op
+    /// forever. The const itself is not trusted blindly — `fence_predicate_byte_identity`
+    /// (`tests/fn_fence_active.rs`) pins it byte-for-byte against the migration 035 index + trigger,
+    /// so drift fails CI there, at the right layer.
+    ///
+    /// Not FN-scoped: the fuzzer fixture is single-FN by construction, and the partial-unique index
+    /// guarantees at most one active row per FN anyway.
+    pub async fn sync_fence_active(&mut self, pool: &SqlitePool) {
+        let pred = prro::db::repositories::delivery_reservation::ACTIVE_FENCE_STATE_PREDICATE;
+        let active: i64 = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM delivery_reservation WHERE {pred})"
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        self.fence_active = active == 1;
     }
 
     /// **U1 A1 funnel wrapper — `read_seed_fixture`.**  The tagged primitive for
