@@ -52,7 +52,7 @@ use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckSignBlob, StatusSnapshot};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
-use crate::common::scripted_dps::ScriptedDps;
+use crate::common::scripted_dps::{PeerLedger, PeerMismatch, ScriptedDps};
 use crate::common::{det_signing_ctx, drain_test_guard};
 use crate::op::{
     DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, Stage, WireResponse,
@@ -222,6 +222,14 @@ pub struct FuzzCtx {
     /// The last successfully-issued inbox row — replayed (idempotent no-op) by
     /// `DuplicateIdemKey` so a replay mints no NEW doc.
     last_row: Option<InboxRow>,
+    /// Peer-tip axis PHASE A (spec `2026-07-31-spec-fuzzer-peer-tip-axis.md`):
+    /// the harness's model of the DPS peer's chain tip.  Observes every wire
+    /// send and records a mismatch whenever an outgoing document's
+    /// `previous_hash` disagrees with the peer BEFORE any divergence-creating
+    /// event.  Phase A changes NO reply — it exists to load-test the movers
+    /// table, which is the part of the design that has to be right before an
+    /// override or a model mirror is built on it.
+    peer: Arc<PeerLedger>,
 }
 
 impl FuzzCtx {
@@ -236,6 +244,7 @@ impl FuzzCtx {
         let (app, _tempdir) = boot_fuzz_app(None).await;
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
+        let peer_pool = pool.clone();
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Online, shift_id).await;
@@ -252,6 +261,7 @@ impl FuzzCtx {
             last_calls: Arc::new(AtomicUsize::new(0)),
             seq: 0,
             last_row: None,
+            peer: PeerLedger::new(peer_pool, FN.to_string()),
         }
     }
 
@@ -261,6 +271,7 @@ impl FuzzCtx {
         let (app, _tempdir) = boot_fuzz_app(Some(base)).await;
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
+        let peer_pool = pool.clone();
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Online, shift_id).await;
@@ -277,6 +288,7 @@ impl FuzzCtx {
             last_calls: Arc::new(AtomicUsize::new(0)),
             seq: 0,
             last_row: None,
+            peer: PeerLedger::new(peer_pool, FN.to_string()),
         }
     }
 
@@ -286,6 +298,7 @@ impl FuzzCtx {
         let (app, _tempdir) = boot_fuzz_app(None).await;
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
+        let peer_pool = pool.clone();
         seed_fn_config(&pool).await;
         seed_node_state_with_shift(&pool, NodeMode::Online, ShiftState::Closed, None).await;
         Self {
@@ -301,6 +314,7 @@ impl FuzzCtx {
             last_calls: Arc::new(AtomicUsize::new(0)),
             seq: 0,
             last_row: None,
+            peer: PeerLedger::new(peer_pool, FN.to_string()),
         }
     }
 
@@ -311,6 +325,7 @@ impl FuzzCtx {
         let (app, _tempdir) = boot_fuzz_app(None).await;
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
+        let peer_pool = pool.clone();
         seed_fn_config(&pool).await;
         let shift_id = seed_open_shift(&pool).await;
         seed_node_state(&pool, NodeMode::Offline, shift_id).await;
@@ -331,6 +346,7 @@ impl FuzzCtx {
             last_calls: Arc::new(AtomicUsize::new(0)),
             seq: 0,
             last_row: None,
+            peer: PeerLedger::new(peer_pool, FN.to_string()),
         }
     }
 
@@ -340,6 +356,7 @@ impl FuzzCtx {
         let (app, _tempdir) = boot_fuzz_app(None).await;
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
+        let peer_pool = pool.clone();
         seed_fn_config(&pool).await;
         seed_node_state_with_shift(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
         seed_open_offline_session(&pool).await;
@@ -359,6 +376,7 @@ impl FuzzCtx {
             last_calls: Arc::new(AtomicUsize::new(0)),
             seq: 0,
             last_row: None,
+            peer: PeerLedger::new(peer_pool, FN.to_string()),
         }
     }
 
@@ -529,6 +547,66 @@ impl FuzzCtx {
 
     fn new_dps(&self) -> ScriptedDps {
         ScriptedDps::new(Arc::clone(&self.send_calls), Arc::clone(&self.last_calls))
+            .with_peer(Arc::clone(&self.peer))
+    }
+
+    // ─── Peer-tip axis phase A: the harness surface ─────────────────────
+    //
+    // Read by `drive_sequence` after every op.  A mismatch on a run that never
+    // diverged means the movers table (spec §4) is wrong — that is the whole
+    // point of phase A, and it fires before any override exists to mask it.
+
+    /// Wire sends where the outgoing document's chain link disagreed with the
+    /// peer while the run was still agreeing.  MUST stay empty.
+    pub fn peer_mismatches(&self) -> Vec<PeerMismatch> {
+        self.peer.mismatches()
+    }
+
+    /// `Some(reason)` once a legitimate divergence-creating event has happened.
+    pub fn peer_diverged(&self) -> Option<String> {
+        self.peer.diverged()
+    }
+
+    /// Sends the peer could not attribute to a `SENDING` row.  Diagnostic: a
+    /// growing count means the resolver is blind somewhere (a doc kind that does
+    /// not rest in `SENDING` at wire time), which would make the assertion
+    /// vacuous rather than wrong — so the harness asserts on it too.
+    pub fn peer_unresolved_sends(&self) -> usize {
+        self.peer.unresolved_sends()
+    }
+
+    /// The peer's current tip, for diagnostics in a failure message.
+    pub fn peer_tip_hex(&self) -> Option<String> {
+        self.peer.tip_hex()
+    }
+
+    /// Mark a NO-WIRE event that legitimately moves our seed without the peer
+    /// seeing anything (operator completions), or whose delivery is unknowable
+    /// (a crash parked inside the wire call).  After this the peer stops
+    /// asserting — phases C/D replace it with a modelled peer truth.
+    pub fn peer_mark_diverged(&self, reason: &str) {
+        self.peer.mark_diverged(reason);
+    }
+
+    /// Peer-tip axis: a granted T=112 CONVERGES both sides onto the same fresh
+    /// non-document seed.  Reported by the interpreter because the replenish
+    /// rides `ask_offline_codes`, which the send-side observer never sees.
+    pub fn peer_converge_to(&self, tip: Option<Vec<u8>>) {
+        self.peer.converge_to(tip);
+    }
+
+    /// Offline documents that are locally issued but NOT yet delivered — the
+    /// backlog a drain still owes DPS.  `bd PRRO_GATE-knk` turns on whether this
+    /// is zero when a T=112 moves the chain.
+    pub async fn undrained_offline_backlog(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fiscal_documents \
+             WHERE fiscal_number = ? AND fs_mode = 'OFFLINE' AND state = 'OFFLINE_LOCAL_ACK'",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
     }
 
     async fn seed_inbox_sell(&mut self) -> InboxRow {
@@ -1353,7 +1431,19 @@ async fn operator_complete(ctx: &mut FuzzCtx, kind: OperatorResolutionKind) -> R
     )
     .await
     {
-        Ok(_) => RealOutcome::Released(ctx.read_release_witness(&rid).await),
+        Ok(_) => {
+            // Peer-tip axis phase A.  A completion moves OUR side with no wire
+            // call, so the peer cannot follow: `Accepted` (online origin)
+            // advances the seed to the held doc's own hash, `NotAcceptedOffline`
+            // REWINDS it and cancels the cohort, `MacReseed` re-bases it to the
+            // operator's value.  Whether that AGREES with the peer is exactly
+            // the operator-claim-vs-peer-truth question phase C models; phase A
+            // records the event and stops asserting rather than guessing.
+            ctx.peer_mark_diverged(&format!(
+                "operator completion ({kind:?}) moved our seed with no wire call"
+            ));
+            RealOutcome::Released(ctx.read_release_witness(&rid).await)
+        }
         Err(e) => RealOutcome::Refused(format!("{e:?}")),
     }
 }
@@ -1513,10 +1603,27 @@ async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
     drop(guard);
 
     match completed {
-        None => RealOutcome::Crashed {
-            stage,
-            committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
-        },
+        None => {
+            // Peer-tip axis phase A.  `Crash(Send)` parks INSIDE `send_chk`
+            // AFTER the envelope was handed over but BEFORE the reply is
+            // popped, so the peer definitively RECEIVED the document and
+            // nothing in the script ever says whether it took it — the choice
+            // is out-of-script by construction, which is why phase C gives it
+            // its own generator dimension.  (`Crash(Kvt1)` is different: the
+            // send-Ack IS consumed first, so the peer advanced and so did we —
+            // no divergence, and the stub's own reply handling already booked
+            // it.)
+            if stage == Stage::Send {
+                ctx.peer_mark_diverged(
+                    "Crash(Send): envelope delivered, reply never consumed — \
+                     peer acceptance unknowable",
+                );
+            }
+            RealOutcome::Crashed {
+                stage,
+                committed_state: ctx.observe_doc_state_by_request_id(&row.request_id).await,
+            }
+        }
         Some(Ok(_)) => {
             if begin_doc_count(ctx).await > begin_before {
                 // Offline crash-completed sell interposed a BEGIN → two-doc delta.
@@ -2205,6 +2312,38 @@ async fn replenish(ctx: &mut FuzzCtx, leaf: ReplenishLeaf) -> RealOutcome {
                     u8::from_str_radix(&summary.new_seed_hex[i * 2..i * 2 + 2], 16).unwrap_or(0)
                 })
                 .collect::<Vec<u8>>();
+            // Peer-tip axis phase A — CONVERGENCE, *conditionally*.
+            //
+            // With an EMPTY backlog a granted T=112 advances the chain to
+            // `sha256(request_xml)` — a NON-document seed — on BOTH sides: the
+            // peer processed the very request whose hash we adopted.  Without
+            // this mover the peer falls a replenish behind and the next ordinary
+            // send looks like a divergence, which is exactly how phase A caught
+            // the omission on its first run.
+            //
+            // With a NON-EMPTY undrained backlog it is NOT a convergence — it is
+            // `bd PRRO_GATE-knk` (P1): the backlog is already minted and FROZEN
+            // on the pre-T112 chain, so moving the peer forward strands it.  Our
+            // own live smoke observed a drained offline doc being rejected for a
+            // mismatched MAC (`live_dps_extended_smoke.rs:2603-2612`) and works
+            // around it by polling — but that workaround only covers the
+            // T=112-then-offline order; this is the reverse, where no poll can
+            // help.  The reference client never hits it because it RE-ANCHORS at
+            // drain (`SendingOfflineChecks.cs:40,47-48` substitutes DPS's current
+            // tip into the `mmmaaaccc` placeholder); we freeze at sign time.
+            //
+            // Phase A records it and stops asserting rather than pretending to
+            // know which side is wrong — the open node is whether DPS would even
+            // ACCEPT this T=112 (its `<MAC>` is a value DPS has never seen).  The
+            // `#[ignore]`d pin `knk_t112_during_backlog_...` reproduces it.
+            if ctx.undrained_offline_backlog().await > 0 {
+                ctx.peer_mark_diverged(
+                    "bd PRRO_GATE-knk: T=112 advanced the chain while an undrained \
+                     offline backlog rests — the backlog is frozen on the pre-T112 chain",
+                );
+            } else {
+                ctx.peer_converge_to(Some(new_seed.clone()));
+            }
             RealOutcome::Replenished {
                 inserted: summary.inserted,
                 deduped: summary.deduped,

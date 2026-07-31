@@ -4202,6 +4202,41 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         if !matches!(class, oracle::OpClass::FaultOrRecovery) {
             model.adopt_precondition(&ctx.pool).await;
         }
+
+        // ── Peer-tip axis PHASE A: the movers-table load test ──────────────
+        //
+        // Spec `2026-07-31-spec-fuzzer-peer-tip-axis.md` §9.  The harness models
+        // the DPS peer's chain tip and advances it per WIRE CALL (accepting
+        // reply ⇒ the peer took that document).  Phase A overrides NOTHING; it
+        // asserts one property:
+        //
+        //     while the run has not diverged, EVERY outgoing document's
+        //     `previous_hash` already equals the peer's tip.
+        //
+        // That is exactly what makes the movers table (spec §4) falsifiable.
+        // Wire a mover wrong — say "an offline issuance advances the peer" —
+        // and the two sides desynchronise; the very next send records a mismatch
+        // on a run where nothing legitimately diverged, and this fires.
+        //
+        // Note the offline lane is NOT an exception, which is the subtle part:
+        // an OLA issuance advances OUR seed only, so the node seed runs ahead of
+        // the peer for the whole backlog — yet each DRAINED document chains onto
+        // its own predecessor, so per-document the two sides stay in step. That
+        // is the per-DOCUMENT formulation of the rule; the per-node-seed one is
+        // false, and phase A is what proves the difference empirically.
+        if let Some(reason) = ctx.peer_diverged() {
+            let _ = reason; // divergence is legitimate from here on
+        } else {
+            let mismatches = ctx.peer_mismatches();
+            assert!(
+                mismatches.is_empty(),
+                "peer-tip axis (phase A) on {op:?}: {} outgoing document(s) disagreed with the \
+                 peer's tip on a run that never diverged — the movers table (spec §4) is wrong, \
+                 or production regressed. peer_tip={:?} mismatches={mismatches:#?}",
+                mismatches.len(),
+                ctx.peer_tip_hex()
+            );
+        }
     }
 
     // A2/A4: terminal liveness + scan.  The per-op scan is suppressed mid-crash
@@ -5832,4 +5867,199 @@ async fn minus_12_holds_the_node_and_rests_the_doc_sending() {
          means an auto-retry came back; re-check `bd PRRO_GATE-3uo` before \
          relaxing this."
     );
+}
+
+// ─── Peer-tip axis, PHASE A — directed pins on the observer itself ──────
+//
+// Spec `docs/superpowers/specs/2026-07-31-spec-fuzzer-peer-tip-axis.md` §9.
+// The capstone assertion (`run_harness`) proves the movers table over RANDOM
+// sequences; these two pin the OBSERVER, so a future refactor cannot make that
+// assertion vacuous by quietly breaking the mechanism instead of the table.
+//
+// Why both directions are needed: an observer that never records a mismatch
+// passes every capstone forever while proving nothing. `peer_axis_records_a_...`
+// is the tooth on the tooth.
+
+/// POSITIVE — on an agreeing run the peer tracks our chain exactly: after an
+/// accepted online SELL the peer's tip IS the real MAC tip, and nothing is
+/// recorded as a mismatch or left unattributed.
+///
+/// The `unresolved_sends == 0` half is load-bearing: the peer identifies the
+/// outgoing document by "the FN's SENDING row" (an lnd lookup would MISS the
+/// shift-lifecycle docs, whose envelopes hard-override `local_number = 0`). If
+/// some doc kind stopped resting in `SENDING` at wire time, the peer would
+/// silently observe nothing and the capstone assertion would go vacuous —
+/// passing while checking nothing. This catches that.
+#[tokio::test]
+async fn peer_axis_tracks_the_chain_on_an_agreeing_run() {
+    let ctx = run_harness(
+        &[
+            Op::OnlineSell(DpsScript::ack_path()),
+            Op::OnlineSell(DpsScript::ack_path()),
+        ],
+        interp::FuzzCtx::new_online_open_shift().await,
+        RefModel::new_online_open_shift(),
+    )
+    .await;
+
+    assert!(
+        ctx.peer_diverged().is_none(),
+        "two accepted online sells diverge nothing; got {:?}",
+        ctx.peer_diverged()
+    );
+    assert!(
+        ctx.peer_mismatches().is_empty(),
+        "an agreeing run must record NO mismatch; got {:#?}",
+        ctx.peer_mismatches()
+    );
+    assert_eq!(
+        ctx.peer_unresolved_sends(),
+        0,
+        "every wire send must be attributable to the FN's SENDING row — an \
+         unresolved send makes the capstone assertion VACUOUS, not merely noisy"
+    );
+    let real_tip = ctx
+        .read_seed()
+        .await
+        .map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+    assert_eq!(
+        ctx.peer_tip_hex(),
+        real_tip,
+        "after accepted sends the peer's tip must equal OUR real MAC tip — the \
+         two sides agree exactly while nothing has diverged"
+    );
+}
+
+/// NEGATIVE — the observer really bites. Force the peer off our chain (the
+/// mechanical equivalent of a mis-wired mover, or of a peer that took a document
+/// we never learned about), then drive one more accepted send: the outgoing
+/// document's `previous_hash` no longer matches, and that MUST be recorded.
+///
+/// This is the tooth for the capstone assertion: if the recorder ever stops
+/// recording, `run_harness`'s check passes silently forever.
+#[tokio::test]
+async fn peer_axis_records_a_mismatch_when_the_peer_is_off_chain() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // One accepted send so the peer and we are in step and non-genesis.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.peer_mismatches().is_empty(),
+        "still agreeing after one sell"
+    );
+
+    // Shove the peer onto a tip nobody issued.
+    ctx.peer_converge_to(Some(vec![0xEE; 32]));
+
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+
+    let mismatches = ctx.peer_mismatches();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "an off-chain peer MUST record exactly one mismatch on the next send; \
+         got {mismatches:#?}"
+    );
+    assert_eq!(
+        mismatches[0].peer_tip.as_deref(),
+        Some("ee".repeat(32).as_str()),
+        "the record must carry the peer tip that disagreed (operator forensics)"
+    );
+    assert_eq!(
+        mismatches[0].doc_type, "SELL",
+        "and the document kind that hit it"
+    );
+}
+
+/// `bd PRRO_GATE-knk` (P1) — RED PIN, `#[ignore]`d: a granted T=112 while an
+/// UNDRAINED offline backlog rests strands that backlog on the pre-T112 chain.
+///
+/// Found generatively by the peer-tip axis (phase A); proptest shrank it to the
+/// three ops below. What it pins is the FUTURE contract — that the peer and our
+/// chain still agree when the drain runs — so it is RED today by construction.
+///
+/// Why the finding survives the obvious refutations (each checked, not assumed):
+///   - offline documents ARE chained on the wire: `emit_mac` puts the hash
+///     INSIDE `<MAC ID='code'>previous_hash</MAC>` (`xml/mod.rs:1673-1684`);
+///   - DPS demonstrably rejects a drained offline doc whose MAC is not its tip —
+///     observed LIVE and worked around with a 20-attempt poll in our own
+///     `live_dps_extended_smoke.rs:2603-2612`. That workaround reasons about the
+///     T=112-then-offline order and calls it "a live-timing artifact, NOT a code
+///     bug", which may be true THERE; this is the reverse order, where the
+///     backlog is already minted and frozen and no poll can reconcile it;
+///   - the reference client cannot hit this at all: WebCheck stores offline
+///     checks with the literal `<MAC>mmmaaaccc</MAC>` placeholder
+///     (`All.cs:1493-1498`) and substitutes DPS's CURRENT tip from a live
+///     `lastChk` at SEND time (`SendingOfflineChecks.cs:40,47-48`). It
+///     RE-ANCHORS per document; we freeze `previous_hash` at sign time.
+///
+/// The one open node is severity, not existence: whether DPS would ACCEPT this
+/// T=112 at all (its embedded `<MAC>` is a value DPS has never seen). Accept ⇒
+/// the whole legally-issued backlog is unsendable; reject ⇒ the operator simply
+/// cannot replenish while a backlog rests, with nothing telling them to drain
+/// first. The bd carries the five-step live probe that decides it.
+///
+/// UN-IGNORE when the probe has run and a fix landed (fence the replenish, or
+/// re-anchor at drain like the reference client).
+#[tokio::test]
+#[ignore = "bd PRRO_GATE-knk: RED pin for a P1 under adjudication — pins the FUTURE contract (drain still agrees with the peer after a mid-backlog T=112); needs a live probe + fix first"]
+async fn knk_t112_during_backlog_must_not_strand_the_drain() {
+    let ctx = run_harness(
+        &[
+            Op::OfflineServiceIn,
+            Op::Replenish(ReplenishLeaf::Granted),
+            Op::GoOnline(DpsScript::ack_path()),
+        ],
+        interp::FuzzCtx::new_offline_open_shift(3).await,
+        RefModel::new_offline_open_shift(3),
+    )
+    .await;
+
+    assert!(
+        ctx.peer_mismatches().is_empty(),
+        "knk: after a mid-backlog T=112 the drain must still present documents the peer can \
+         chain — got {:#?}",
+        ctx.peer_mismatches()
+    );
+}
+
+/// `bd PRRO_GATE-01g` — RED PIN, `#[ignore]`d: after a restart, an
+/// `OperatorComplete(Accepted)` advances the REAL chain seed while the model
+/// predicts no advance.
+///
+/// Found by the 2048-case run while landing the peer-tip axis, and NOT by the
+/// axis itself — this is the pre-existing `release` differential
+/// (`real seed-advance (true) must match the model's (false)`). The axis merely
+/// perturbed the proptest stream (two new corpus seeds replay first), which
+/// pushed the generator into this region.
+///
+/// Mechanism, per the adjudication of the movers table: production advances the
+/// seed AT COMPLETION TIME for an ONLINE-origin held doc
+/// (`delivery_reservation.rs:1463-1474`, the `if online` arm) — a mover distinct
+/// from the ordinary `Sending → Sent` CAS. The model's completion arm does not
+/// reproduce that once recovery has re-adopted state from the DB.
+///
+/// NOT yet adjudicated prod-vs-model: the honest reading is that the MODEL is
+/// most likely wrong (prod's completion-time advance is documented and
+/// deliberate), but this repo has twice ruled the opposite way, so it deserves
+/// the same treatment the other findings got rather than a guess. Also
+/// unverified: whether it reproduces on the parent branch WITHOUT the axis — the
+/// corpus perturbation makes that a real question, and it is the first thing to
+/// check.
+///
+/// UN-IGNORE once adjudicated and fixed.
+#[tokio::test]
+#[ignore = "bd PRRO_GATE-01g: RED pin — OperatorComplete(Accepted) after recovery advances the real seed but not the model's; needs prod-vs-model adjudication (and a check that it reproduces without the peer-tip axis)"]
+async fn p01g_operator_accepted_after_restart_seed_advance_must_match_the_model() {
+    run_harness(
+        &[
+            Op::Replenish(ReplenishLeaf::Granted),
+            Op::SellWithClosedShift,
+            Op::OnlineShiftOpen(DpsScript(vec![WireResponse::Superseded])),
+            Op::Reboot,
+            Op::OperatorComplete(OperatorResolutionKind::Accepted),
+        ],
+        interp::FuzzCtx::new_online_open_shift().await,
+        RefModel::new_online_open_shift(),
+    )
+    .await;
 }
