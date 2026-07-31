@@ -1228,6 +1228,9 @@ live-dps	prro	prro::dps_decode_fuzz	fuzz_extract_econtent_mutated_live	false
 live-dps	prro	prro::dps_decode_fuzz	fuzz_extract_econtent_truncated	false
 live-dps	prro	prro::dps_decode_fuzz	fuzz_parse_offline_codes_xml_arbitrary	false
 live-dps	prro	prro::dps_decode_fuzz	fuzz_parse_offline_codes_xml_mutated_valid	false
+live-dps	prro	prro::dps_rpc_surface_pin	the_deferred_rpcs_are_absent	false
+live-dps	prro	prro::dps_rpc_surface_pin	the_dps_rpc_surface_is_exactly_the_five_decided_ones	false
+live-dps	prro	prro::dps_rpc_surface_pin	the_only_submit_rpc_is_the_v2_one	false
 live-dps	prro	prro::epz	pin_derive_cash_on_hand_with_epz_term	false
 live-dps	prro	prro::epz	pin_epz_ledger_subtracts	false
 live-dps	prro	prro::epz	pin_epz_over_drawer_refused_pre_inbox	false
