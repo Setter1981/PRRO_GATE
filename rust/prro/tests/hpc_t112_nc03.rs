@@ -566,3 +566,74 @@ async fn scan_clean_when_a_doc_chains_onto_the_t112_witness() {
         "a doc chaining onto the T=112 witness seed is a LEGITIMATE link — no ChainBreak; got {v:#?}"
     );
 }
+
+/// **Does an ambiguous T=112 leave the `-12` hold UNRESOLVABLE?**
+///
+/// This is the mirror of `guard_b_accepts_reseed_to_hs_rejects_hp`. There the
+/// T=112 SUCCEEDED, so it wrote a `chain_seed_transitions` witness, the active
+/// tip became `Hs`, and the operator could reseed to `Hs`.
+///
+/// Here the T=112 is AMBIGUOUS: `OfflineCodeReplenishService::replenish` returns
+/// `Err(DpsTransport)` BEFORE the persist envelope, so there are no codes, no
+/// seed advance and — the load-bearing part — **no witness**. Locally the tip
+/// stays `Hp`. DPS, which processed the request before the connection died
+/// (live-captured 2026-07-31: it had begun replying), moved to `Hs`.
+///
+/// The next fiscal send therefore carries the stale `Hp`, earns `-12`, and after
+/// CS-3 S7-1 (R3) that is a `MacReseedPending` HELD — node STOP_MODE, doc resting
+/// SENDING. There is no automatic second wire any more; only an operator
+/// `MacReseed` can clear it.
+///
+/// So the question this test answers is narrow and decisive: **can the operator
+/// supply the value DPS actually expects?**
+#[tokio::test]
+async fn ambiguous_t112_leaves_the_minus_12_hold_unresolvable() {
+    let (_dir, app) = boot_app().await;
+    let pool = app.db();
+    let hp = [0x11u8; 32];
+    // FN at next_lnd = 5, prior issued doc Hp at lnd 4 — same as the sibling test.
+    seed_fn(&app, 5, Some(hp)).await;
+    seed_issued_offline_doc(pool, 4, None, hp).await;
+
+    // NO replenish call: the ambiguous arm persists nothing, so no witness row
+    // exists and the active chain tip is still Hp.
+    // Hs = sha256(request_xml) — the tip DPS now holds. No local row carries it,
+    // and none can: the ambiguous arm discards the request XML.
+    let hs = [0x22u8; 32];
+
+    let held_doc = seed_sending_doc(pool, 0xEE, 6).await;
+    held_macreseed_pending(pool, 0x01, held_doc, FN).await;
+
+    // (a) The CORRECT seed — what DPS expects and what its own `-12` message
+    //     names in the `store` field.
+    let with_correct = complete(pool, 0x01, OperatorResolution::MacReseed { seed: hs }).await;
+
+    // (b) The STALE seed — the value we already know is wrong.
+    let with_stale = complete(pool, 0x01, OperatorResolution::MacReseed { seed: hp }).await;
+
+    println!(
+        "operator supplies Hs (DPS's actual tip): {:?}",
+        with_correct.as_ref().err().map(|e| e.to_string())
+    );
+    println!(
+        "operator supplies Hp (the stale local tip): {:?}",
+        with_stale
+            .as_ref()
+            .map(|r| r.applied)
+            .map_err(|e| e.to_string())
+    );
+
+    assert!(
+        with_correct.as_ref().is_err_and(|e| is_completion_err(e, |c| matches!(
+            c,
+            CompletionError::MacReseedSeedMismatch
+        ))),
+        "DEADLOCK NOT REPRODUCED: guard-B accepted the correct seed Hs even with no witness. \
+         Re-check the premise — something else must be feeding the active chain tip. Got {with_correct:?}"
+    );
+    assert!(
+        with_stale.as_ref().is_ok_and(|r| r.applied),
+        "the stale Hp should be the ONLY seed guard-B accepts here (it equals the active tip); \
+         if this also fails the hold is unresolvable by ANY value. Got {with_stale:?}"
+    );
+}

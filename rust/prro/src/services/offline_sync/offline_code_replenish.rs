@@ -265,7 +265,43 @@ impl OfflineCodeReplenishService {
                 // implies, and one observation is thin ground for a generative
                 // pin. Re-enabling it is tracked, not automatic.
                 //
-                // ── The chain fork, and why it self-heals WITHOUT an operator ──
+                // ── The chain fork, and why it does NOT self-heal ──
+                //
+                // RETRACTION 2026-07-31 (same day it was written): the text
+                // below claimed `-12` routes to the AUTOMATIC bounded
+                // MacRecovery, that guard-B is never consulted, and that this
+                // path cannot deadlock. All false post-CS-3 S7-1, which RETIRED
+                // the inline MAC-orchestrator loop. `-12` is now a
+                // MacReseedPending HELD (node STOP_MODE, doc rests SENDING under
+                // PENDING_APPLY, NO second wire) — pins
+                // `minus_12_bad_hash_prev_records_held_stop_no_second_wire` and
+                // `rc05_bad_hash_prev_held_stop_mode`. So `-12` IS the operator
+                // MacReseed path and guard-B IS consulted.
+                //
+                // The deadlock is real and worse than a deadlock. Proven by
+                // `hpc_t112_nc03::ambiguous_t112_leaves_the_minus_12_hold_unresolvable`:
+                // guard-B accepts ONLY the stale Hp (the value known to be
+                // wrong) and refuses Hs (the tip DPS actually holds), because
+                // this arm writes no witness so `active_chain_tip` stays Hp.
+                // The one action the operator may take re-installs the stale
+                // tip, so the next send earns `-12` again — a loop with no exit.
+                // Tracked as bd PRRO_GATE-3uo (P1). The sibling test
+                // `guard_b_accepts_reseed_to_hs_rejects_hp` passes precisely
+                // because there the T=112 SUCCEEDED and wrote the witness.
+                //
+                // Note for whoever fixes it: DO NOT add a write here. It looked
+                // like this arm had to capture `sha256(request.xml)` (which IS
+                // `Hs`) before dropping the request — but `Hs` is NOT lost.
+                // DPS names it in the `store` field of the `-12`, and that
+                // message is persisted verbatim by the very attempt that creates
+                // the hold: `stage_send` → `AttemptCompletion.error_message` →
+                // `transport_trace` (160 bytes live, against a 512-byte cap, so
+                // never truncated). The fix belongs in guard-B — accept a seed
+                // CORROBORATED by that recorded `store`, in addition to
+                // `active_chain_tip`. An unrelated seed still fails closed.
+                //
+                // The retracted text follows, kept so the error is legible:
+                // ── (RETRACTED) why it self-heals WITHOUT an operator ──
                 // If DPS did process, its tip advanced to sha256(request.xml)
                 // while ours did not (we return before Step 6), so the next
                 // fiscal send carries a stale previous_hash and earns `-12`
