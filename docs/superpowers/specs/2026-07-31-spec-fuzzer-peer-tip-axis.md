@@ -111,7 +111,8 @@ temporally plausible for a peer that accepted). So: **the peer tip moves on the 
 | 12 | `Crash(Send)` — killed inside the wire await | holds (nothing committed) | **out-of-script generator choice** — the script leaf is NEVER consumed (counter+spy precede the hang, pop follows it, `scripted_dps.rs:168-186`) | MAJOR #7 |
 | 12b | `Crash(Kvt1)` — send-Ack consumed, killed at the `last_chk` hang | **advances** (Sent committed) | **advances** (Ack consumed) | `interp.rs:1488-1491` — advance/advance hidden inside a Fault-class op |
 | 12c | `Crash(Sign)` / `Crash(OfflineAck)` — no wire reached | per their commit points | holds | `interp.rs:1533-1605` |
-| 13 | T=112 GRANTED | advances to `sha256(request_xml)` (real, from `ReplenishSummary`) | **advances to the SAME value — a CONVERGENCE event** | §7; live **[N=1]** |
+| 13 | T=112 GRANTED, **backlog EMPTY** | advances to `sha256(request_xml)` (real, from `ReplenishSummary`) | **advances to the SAME value — a CONVERGENCE event** | §7; live **[N=1]** |
+| 13a | T=112 GRANTED, **backlog NON-EMPTY** | advances | **DIVERGES** — the undrained backlog is already frozen on the pre-T112 chain | `bd PRRO_GATE-knk` (P1) — found by phase A itself; see §7 |
 | 13b | T=112 AMBIGUOUS (reply lost) | holds (nothing persisted) | advances to synthetic `S` | the `2ds` divergence |
 | 13c | T=112 while a fence/reservation is active | refused in-envelope (seed holds) — note the wire call itself DOES happen even in STOP_MODE (no node-mode gate, `offline_code_replenish.rs:173-229`) | §7 | verify Q6 |
 | 14 | **totality clause**: every op not named above — `XReport`, `L5Probe`, refused/inert mints (D5 gate, mode refusals, closed shift, `DuplicateIdemKey` replays), `GoOffline`, session open/close bookkeeping — moves NEITHER tip | holds | holds | model apply arms enumerated in the verify pass |
@@ -165,6 +166,22 @@ scope win of the review.
   (MAJOR #9) — the surface needs convergence semantics, not an override. Corollary worth pinning:
   **a granted T=112 is a legitimate divergence-healing move available even in STOP_MODE** (the
   service has no node-mode gate; only persist is fence-gated).
+
+  > **CORRECTED BY PHASE A (2026-07-31, same day).** "Convergence" holds only with an **EMPTY**
+  > backlog. Phase A's assertion found the other half within one run: with an **undrained** offline
+  > backlog the replenish advances the chain while the backlog stays frozen on the pre-T112 link,
+  > so it DIVERGES instead of converging — `bd PRRO_GATE-knk` (P1), shrunk to
+  > `[OfflineServiceIn, Replenish(Granted), GoOnline([Ack,Ack])]`. Three grounded facts settled it
+  > against my own initial reading: offline docs ARE chained on the wire (`emit_mac` puts the hash
+  > inside `<MAC ID='code'>previous_hash</MAC>`); our own live smoke already recorded a drained
+  > offline doc REJECTED for a mismatched MAC and polls around it
+  > (`live_dps_extended_smoke.rs:2603-2612`) — but only for the T=112-then-offline order, not this
+  > reverse one; and the reference client cannot hit it at all because it **re-anchors** each
+  > document from a live `lastChk` at send time (`SendingOfflineChecks.cs:40,47-48`) where we
+  > **freeze** `previous_hash` at sign time. What stays open is severity, not existence: whether
+  > DPS would accept that T=112 at all, since its `<MAC>` is a value DPS has never seen — the
+  > earlier [N=1] involved a merely STALE (previously-seen) tip, which is not the same input class.
+  > The bd carries the five-step live probe.
 - **The chain-check-first ordering is UNVERIFIED — do not hard-code it.** No repo evidence
   orders DPS's chain check vs business validation, and `FRESH_WEBCHECK_ANALYSIS.md:52` records an
   unresolved `-15`/`-12` pairing anomaly. Resolution: while diverged, the **generator does not
@@ -194,6 +211,15 @@ both sides** (granted T=112, corroborated MacReseed); symbols are namespaced (`s
 per-doc, negative ordinals for T=112, the `PeerDeclared` constants) so aliasing is impossible.
 
 ## 9. Phasing, rev2 — each phase independently green, teeth named
+
+> **PHASE A HAS SHIPPED** (PR #363, branch `fuzzer/peer-tip-phase-a`). It behaved as designed: the
+> assertion caught a missing mover on its FIRST run (T=112 rides `ask_offline_codes`, a queue the
+> send-side observer cannot see, so the peer fell a replenish behind), and then found
+> `bd PRRO_GATE-knk` (P1) generatively. A third finding, `bd PRRO_GATE-01g`, surfaced during the
+> 2048-case run from the PRE-EXISTING `release` differential — verified to reproduce on the parent
+> branch without the axis, so the axis is exonerated; the corpus seeds it added perturb the proptest
+> stream, which is how the region got explored. Both findings are pinned `#[ignore]`d against the
+> FUTURE contract rather than papered over.
 
 **Phase A — the axis, observed but silent.** `PeerState` in `FuzzCtx`; stub pool handle;
 per-CALL movers for ALL wire surfaces including boot/drain/END and the forced-leaf
