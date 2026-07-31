@@ -567,73 +567,113 @@ async fn scan_clean_when_a_doc_chains_onto_the_t112_witness() {
     );
 }
 
-/// **Does an ambiguous T=112 leave the `-12` hold UNRESOLVABLE?**
+/// bd `PRRO_GATE-3uo` — **the trap, and its exit.**
 ///
-/// This is the mirror of `guard_b_accepts_reseed_to_hs_rejects_hp`. There the
-/// T=112 SUCCEEDED, so it wrote a `chain_seed_transitions` witness, the active
-/// tip became `Hs`, and the operator could reseed to `Hs`.
+/// After an ambiguous T=112 (connection lost mid-call, DPS processed it) DPS's
+/// tip is `Hs` while ours stays `Hp`: the ambiguous arm returns before the
+/// persist envelope, so no witness is written, no document carries `Hs`, and the
+/// request XML whose `sha256` it is gets discarded. `active_chain_tip` can
+/// therefore never equal the seed the operator must supply.
 ///
-/// Here the T=112 is AMBIGUOUS: `OfflineCodeReplenishService::replenish` returns
-/// `Err(DpsTransport)` BEFORE the persist envelope, so there are no codes, no
-/// seed advance and — the load-bearing part — **no witness**. Locally the tip
-/// stays `Hp`. DPS, which processed the request before the connection died
-/// (live-captured 2026-07-31: it had begun replying), moved to `Hs`.
+/// This test first pinned that as a TRAP — guard-B accepted ONLY the stale `Hp`
+/// (the value known to be wrong) and refused the correct `Hs`, so the operator's
+/// one permitted action re-installed the stale tip and the next send earned
+/// `-12` again. It is now inverted, per the instruction recorded on the bd: the
+/// fix must make the CORRECT seed acceptable without making an arbitrary one
+/// acceptable, so both halves are asserted here forever.
 ///
-/// The next fiscal send therefore carries the stale `Hp`, earns `-12`, and after
-/// CS-3 S7-1 (R3) that is a `MacReseedPending` HELD — node STOP_MODE, doc resting
-/// SENDING. There is no automatic second wire any more; only an operator
-/// `MacReseed` can clear it.
-///
-/// So the question this test answers is narrow and decisive: **can the operator
-/// supply the value DPS actually expects?**
+/// The exit is that DPS NAMES `Hs` in the `store` field of the `-12` that
+/// created the hold, and `stage_send` records that message durably on the
+/// attempt — so guard-B can ask the peer instead of only asking itself.
 #[tokio::test]
-async fn ambiguous_t112_leaves_the_minus_12_hold_unresolvable() {
+async fn ambiguous_t112_hold_is_resolvable_only_by_a_peer_corroborated_seed() {
+    use prro::db::repositories::transport_trace::{
+        allocate_and_insert_tx, complete_tx, AttemptCompletion, NewAttempt, OutcomeKind,
+    };
+
     let (_dir, app) = boot_app().await;
     let pool = app.db();
     let hp = [0x11u8; 32];
-    // FN at next_lnd = 5, prior issued doc Hp at lnd 4 — same as the sibling test.
     seed_fn(&app, 5, Some(hp)).await;
     seed_issued_offline_doc(pool, 4, None, hp).await;
 
-    // NO replenish call: the ambiguous arm persists nothing, so no witness row
-    // exists and the active chain tip is still Hp.
-    // Hs = sha256(request_xml) — the tip DPS now holds. No local row carries it,
-    // and none can: the ambiguous arm discards the request XML.
+    // NO replenish: the ambiguous arm persists nothing, so there is no witness
+    // and the active chain tip is still Hp. Hs is the tip DPS now holds.
     let hs = [0x22u8; 32];
+    let unrelated = [0x33u8; 32];
 
     let held_doc = seed_sending_doc(pool, 0xEE, 6).await;
     held_macreseed_pending(pool, 0x01, held_doc, FN).await;
 
-    // (a) The CORRECT seed — what DPS expects and what its own `-12` message
-    //     names in the `store` field.
-    let with_correct = complete(pool, 0x01, OperatorResolution::MacReseed { seed: hs }).await;
-
-    // (b) The STALE seed — the value we already know is wrong.
-    let with_stale = complete(pool, 0x01, OperatorResolution::MacReseed { seed: hp }).await;
-
-    println!(
-        "operator supplies Hs (DPS's actual tip): {:?}",
-        with_correct.as_ref().err().map(|e| e.to_string())
+    // Record the attempt that earned the `-12`, exactly as `stage_send` does —
+    // the message shape is the LIVE one captured 2026-07-31 (bd PRRO_GATE-2ds),
+    // two spaces after the code name.
+    let msg = format!(
+        "ERROR_BAD_HASH_PREV  store {} chk {}",
+        hs.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        hp.iter().map(|b| format!("{b:02x}")).collect::<String>(),
     );
-    println!(
-        "operator supplies Hp (the stale local tip): {:?}",
-        with_stale
+    with_immediate(pool, {
+        let msg = msg.clone();
+        move |tx| {
+            Box::pin(async move {
+                let no = allocate_and_insert_tx(
+                    tx,
+                    held_doc,
+                    NewAttempt {
+                        backend_profile_id: "dps".into(),
+                        transport_profile_id: "grpc".into(),
+                        request_envelope_sha256: [0u8; 32],
+                        is_probe: false,
+                    },
+                )
+                .await?;
+                complete_tx(
+                    tx,
+                    held_doc,
+                    no,
+                    AttemptCompletion {
+                        wire_call_started_at: "2026-07-31T00:00:00Z".into(),
+                        wire_call_finished_at: "2026-07-31T00:00:01Z".into(),
+                        outcome_kind: OutcomeKind::RetryableMacHashMismatch,
+                        server_fiscal_no: None,
+                        server_status_code: Some(-12),
+                        error_kind: Some("Server".into()),
+                        error_message: Some(msg),
+                        retry_class: None,
+                    },
+                )
+                .await?;
+                Ok(())
+            })
+        }
+    })
+    .await
+    .expect("seed the -12 attempt");
+
+    // (a) An UNRELATED seed: corroborated by nothing — must still fail closed.
+    //     This is the #338 hardening and it must survive the fix intact.
+    let bogus = complete(
+        pool,
+        0x01,
+        OperatorResolution::MacReseed { seed: unrelated },
+    )
+    .await;
+    assert!(
+        bogus
             .as_ref()
-            .map(|r| r.applied)
-            .map_err(|e| e.to_string())
+            .is_err_and(|e| is_completion_err(e, |c| matches!(
+                c,
+                CompletionError::MacReseedSeedMismatch
+            ))),
+        "an arbitrary operator seed must STILL be refused — it matches neither the active tip \
+         nor anything DPS said. Got {bogus:?}"
     );
 
-    assert!(
-        with_correct.as_ref().is_err_and(|e| is_completion_err(e, |c| matches!(
-            c,
-            CompletionError::MacReseedSeedMismatch
-        ))),
-        "DEADLOCK NOT REPRODUCED: guard-B accepted the correct seed Hs even with no witness. \
-         Re-check the premise — something else must be feeding the active chain tip. Got {with_correct:?}"
-    );
-    assert!(
-        with_stale.as_ref().is_ok_and(|r| r.applied),
-        "the stale Hp should be the ONLY seed guard-B accepts here (it equals the active tip); \
-         if this also fails the hold is unresolvable by ANY value. Got {with_stale:?}"
-    );
+    // (b) The CORRECT seed Hs: not the active tip, but named by DPS in the
+    //     recorded `-12`. This is what used to be impossible.
+    let good = complete(pool, 0x01, OperatorResolution::MacReseed { seed: hs })
+        .await
+        .expect("a peer-corroborated seed must be ACCEPTED — this is the exit from the trap");
+    assert!(good.applied, "the corroborated MacReseed must apply");
 }
