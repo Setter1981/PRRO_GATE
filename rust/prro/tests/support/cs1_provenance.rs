@@ -107,7 +107,15 @@ pub const HEAD_SHA: &str = "f2628ba";
 /// Production is FROZEN in that slice (the only `src/` diff is two corrected docstrings, no
 /// behaviour). Removals inside a file's body, NOT test removals — 0 manifest removals, so no
 /// supersession entry. Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-pub const LIVE_DRIFT_BASE_SHA: &str = "8750a6f6";
+/// Peer-tip axis PHASE A re-anchor (2026-07-31, spec
+/// `2026-07-31-spec-fuzzer-peer-tip-axis.md`): modelling the DPS peer's chain tip edits the frozen
+/// `invariant_fuzzer/interp.rs` + `invariant_fuzzer.rs`. Adjudicated: the harness gains a read-only
+/// OBSERVER (it overrides no reply) plus the assertion that makes the movers table falsifiable, and
+/// it immediately found `bd PRRO_GATE-knk` (P1) generatively. Production is FROZEN in this slice
+/// (zero `src/` diff). Additions-only — the two new directed pins and two `#[ignore]`d RED pins add
+/// tests, remove none, so no supersession entry. Live-drift leg only; the immutable
+/// `f2c17b1..f2628ba` proof is UNTOUCHED.
+pub const LIVE_DRIFT_BASE_SHA: &str = "4cb8dc3b";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is
