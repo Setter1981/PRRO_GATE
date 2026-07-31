@@ -38,13 +38,34 @@
 
 3. **The lost-response chain-tip hazard is handled by the existing settle discipline:** after an ambiguous T=112 the local tip may lag DPS's. The next fiscal send discovers this via the normal chain rules; no special-case tip adoption. The fuzzer (W3-1) models local vs remote tips separately and pins exactly this: an ambiguous T=112 followed by a fiscal doc must recover (fresh tip discovery), never silently fork.
 
-   > **Mechanism named, 2026-07-31.** This clause said *how safe*, never *by what*. The stale `previous_hash` earns Server `-12` `ERROR_BAD_HASH_PREV`, which routes to the **automatic bounded `MacRecovery`** (`error_routing.rs`) — **not** to an operator `MacReseed`. `mac_recovery::run_mac_recovery` extracts DPS's expected hash **from the error message itself** and re-drives attempt #2.
+   > ~~**Mechanism named, 2026-07-31.**~~ **RETRACTED THE SAME DAY — it was wrong, and it was wrong in the dangerous direction.** The retracted text claimed the stale `previous_hash` earns `-12` which routes to the *automatic bounded* `MacRecovery`, that `run_mac_recovery` re-drives attempt #2, and therefore that the MacReseed **guard-B** tip check is *never consulted* and an ambiguous T=112 *cannot deadlock*.
    >
-   > Worth stating explicitly, because the opposite looked plausible and was checked: the MacReseed **guard-B** tip check (`delivery_reservation.rs` — the operator seed must equal `active_chain_tip`) is **never consulted** on this path. So an ambiguous T=112 cannot deadlock recovery even though its arm writes **no durable seed witness** — the witness that `bd PRRO_GATE-hpc` made durable is written only on the SUCCESS path.
+   > **Every part of that is false post-CS-3 S7-1.** It was derived from the comment at `error_routing.rs:95` ("bounded ONE auto-recovery"), which is **stale**: S7-1 (R3) RETIRED the inline MAC-orchestrator loop along with its `mac_fx01..03` / `fx17` fixtures. The live contract is a `MacReseedPending` **HELD** — node → `STOP_MODE`, doc rests `SENDING` under a `PENDING_APPLY` reservation, **no second wire**. Pins: `write_path_stage4_send::minus_12_bad_hash_prev_records_held_stop_no_second_wire`, `record_outcome::rc05_bad_hash_prev_held_stop_mode`.
+   >
+   > So the `-12` path *is* the operator `MacReseed` path, and guard-B **is** consulted — the exact opposite of the retracted claim.
+   >
+   > **The deadlock the retraction was denying is real, and worse than a deadlock.** Proven by `hpc_t112_nc03::ambiguous_t112_leaves_the_minus_12_hold_unresolvable`:
+   > ```
+   > operator supplies Hs (DPS's actual tip): MacReseed seed does not match the expected chain tip
+   > operator supplies Hp (the stale local tip): Ok(applied = true)
+   > ```
+   > guard-B accepts **only the value known to be wrong** and refuses the only value that would repair the chain. The one action the operator is permitted re-installs the stale tip, so the next send earns `-12` again and the node returns to `STOP_MODE` — a loop with no exit, in which every turn looks like the operator did something. Tracked as **`bd PRRO_GATE-3uo` (P1)**.
+   >
+   > The cause is isolated by the sibling test `guard_b_accepts_reseed_to_hs_rejects_hp`, which PASSES: there the T=112 *succeeded*, so it wrote a `chain_seed_transitions` witness and the active tip **is** `Hs`. The ambiguous arm writes no witness — and it discards the request XML whose `sha256` **is** `Hs`, so the value becomes locally unrepresentable forever.
+   >
+   > **Method note, recorded because the error is instructive:** the false claim was checked against a *comment* rather than against the *pins*. Two independent statements in this repo described the `-12` contract, one of them stale, and the stale one was the one that read like an authority. The pins were right and were three greps away.
    >
    > **Residual risk, NOT closed:** that self-heal parses a literal `"store "` tag out of a DPS message — a format inherited from the Python reference and **not yet observed from live DPS**. It fails loud (`HashNotExtractable`) on drift rather than corrupting, but a loud failure is still a stuck FN needing an operator. The §4 capture produces a real `-12` and should confirm the parse — so the capture settles **two** unknowns, not one.
    >
-   > **DISCHARGED 2026-07-31.** The capture forced a real `-12` and ran the production extractor against it: `regex_extract_store_hash` **parsed a live DPS message**, twice across two runs on different hashes. The Python-inherited format *is* what live DPS sends. Live shape, for the record — note the **two** spaces after the code name:
+   > **DISCHARGED 2026-07-31 — with a caveat added the same day.** The capture forced a real `-12` and ran the production extractor against it: `regex_extract_store_hash` **parsed a live DPS message**, twice across two runs on different hashes. The Python-inherited format *is* what live DPS sends.
+   >
+   > **Caveat:** the parse is confirmed, but its ORCHESTRATOR is currently **unreachable from production**. Outside its own module, `run_mac_recovery` appears only in *comments* — there is no live call site after S7-1 retired the inline loop. What survives is the CLASSIFICATION (`RetryClass::MacRecovery`) and the constructed `MacRecoveryHint`, which carries the raw error text.
+   >
+   > **The text IS durably persisted — verified.** `stage_send.rs:1393` writes it into `AttemptCompletion.error_message` (`transport_trace.rs:117`), capped at 512 bytes (`CHECK`, `001_baseline.sql:633`, enforced upstream by `truncate_msg`). The live `-12` measures **160 bytes**, so the `store` field survives intact with 3× headroom, and `transport_trace::last_attempt_retry_class_for` (`:372`) already establishes the per-doc last-attempt read pattern.
+   >
+   > That closes the question that decided the size of `bd PRRO_GATE-3uo`: **`Hs` is not lost.** It is recorded by the very attempt that created the hold. The fix therefore does NOT need a new write on the ambiguous `replenish` arm — it needs guard-B to accept a seed **corroborated by the recorded `store` field** in addition to `active_chain_tip`. An unrelated operator seed still fails closed, so the #338 hardening is not weakened; it is arguably strengthened, since the seed must now match something the peer actually said rather than nothing at all.
+   >
+   > Live shape, for the record — note the **two** spaces after the code name:
    > ```
    > ERROR_BAD_HASH_PREV  store <64 hex> chk <64 hex>
    > ```
