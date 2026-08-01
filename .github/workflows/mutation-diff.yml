@@ -43,7 +43,7 @@ jobs:
   # TEETH for the gate itself (FW-1). ALWAYS runs — it is seconds, needs no cargo
   # (the fixture stubs it), and it is the thing whose absence let the gate rot:
   # `scripts/mutation/run.sh` was VACUOUS and FAIL-OPEN for three weeks and no
-  # check noticed (bd PRRO_GATE-r4c). Proving the gate can still FAIL is cheap;
+  # check noticed (bd PRRO_GATE-1rw). Proving the gate can still FAIL is cheap;
   # discovering that it cannot was not. Deliberately NOT gated on `changes`: a PR
   # that touches nothing mutation-relevant is exactly when nobody would look.
   gate-teeth:
@@ -70,7 +70,7 @@ jobs:
   # out-of-path, so a missing base sha, a failed fetch or an empty diff silently
   # SKIPPED the heavy leg — and a skipped required check reads as satisfied. That
   # is the same fail-open shape as the three defects inside run.sh itself
-  # (bd PRRO_GATE-r4c). `heavy` now DEFAULTS to true and is only lowered when a
+  # (bd PRRO_GATE-1rw). `heavy` now DEFAULTS to true and is only lowered when a
   # non-empty diff was actually obtained and matched nothing; every failure to
   # establish scope keeps the heavy leg on. `reason` is surfaced in the step
   # summary so a skip is always attributable.

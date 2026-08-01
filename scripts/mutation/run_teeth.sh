@@ -5,7 +5,7 @@
 # 2026-07-24; the mutation gate had nothing, and it rotted silently. On
 # 2026-08-01 it turned out to be VACUOUS and FAIL-OPEN — three independent
 # defects, each of which made it report a confident `OK` while testing zero
-# mutants (bd PRRO_GATE-r4c):
+# mutants (bd PRRO_GATE-1rw):
 #
 #   1. `--in-diff` matched NOTHING. cargo-mutants runs from the cargo workspace
 #      (`rust/`) and matches diff paths against `prro/src/...`, but `git diff`
