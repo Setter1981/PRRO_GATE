@@ -575,13 +575,13 @@ async fn seed_offline_doc(pool: &sqlx::SqlitePool, doc_byte: u8, lnd: i64, state
          VALUES (?, ?, ?, ?, 'SELL', ?, 'b1', 't1', 'OFFLINE', \
             '2026-08-01T10:00:00Z', '{}', ?, ?, ?)",
     )
-    .bind(&vec![doc_byte; 16])
-    .bind(&vec![doc_byte ^ 0xFF; 16])
+    .bind(vec![doc_byte; 16])
+    .bind(vec![doc_byte ^ 0xFF; 16])
     .bind(FN)
     .bind(lnd)
     .bind(state)
     .bind(&[0u8; 32][..])
-    .bind(&vec![doc_byte; 32])
+    .bind(vec![doc_byte; 32])
     .bind(lnd)
     .execute(pool)
     .await
@@ -728,11 +728,11 @@ async fn knk_d_another_fns_backlog_does_not_block_this_fn() {
          VALUES (?, ?, ?, 1, 'SELL', 'OFFLINE_LOCAL_ACK', 'b1', 't1', 'OFFLINE', \
             '2026-08-01T10:00:00Z', '{}', ?, ?, 1)",
     )
-    .bind(&vec![0x61u8; 16])
-    .bind(&vec![0x9Eu8; 16])
+    .bind(vec![0x61u8; 16])
+    .bind(vec![0x9Eu8; 16])
     .bind(other)
     .bind(&[0u8; 32][..])
-    .bind(&vec![0x61u8; 32])
+    .bind(vec![0x61u8; 32])
     .execute(app.db())
     .await
     .expect("seed other FN's backlog");
