@@ -91,10 +91,17 @@ fi
 # ── 4. the mutation gate's own teeth ─────────────────────────────────────────
 # Seconds, no cargo. Proves the gate can still FAIL (bd PRRO_GATE-1rw).
 step "mutation gate teeth"
-if bash scripts/mutation/run_teeth.sh >/dev/null 2>&1; then
-  ok "gate teeth 8/8"
+# Report the count the teeth script ITSELF prints. The first version hardcoded
+# "8/8" and went on claiming it after T9 landed — a status line that cannot be
+# wrong is a status line that tells you nothing.
+TEETH_OUT="$(bash scripts/mutation/run_teeth.sh 2>&1)"
+TEETH_RC=$?
+TEETH_TALLY="$(printf '%s' "$TEETH_OUT" | grep -oE '[0-9]+ passed, [0-9]+ failed' | tail -1)"
+if [ "$TEETH_RC" -eq 0 ]; then
+  ok "gate teeth — ${TEETH_TALLY:-passed}"
 else
-  fail "mutation gate teeth — run 'bash scripts/mutation/run_teeth.sh' for detail"
+  printf '%s\n' "$TEETH_OUT" | grep -E '^(✅|❌)' | sed 's/^/     /'
+  fail "mutation gate teeth — ${TEETH_TALLY:-failed}"
 fi
 
 # ── 5. executable bits on scripts CI invokes ─────────────────────────────────
