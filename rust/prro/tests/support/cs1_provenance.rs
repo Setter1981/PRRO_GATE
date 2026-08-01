@@ -98,7 +98,16 @@ pub const HEAD_SHA: &str = "f2628ba";
 /// LIVE-captured `store <hash>` shape (bd `PRRO_GATE-2ds`), the retry machinery written against a
 /// RETIRED contract is removed, and the REAL HELD contract gets a pin. Production is FROZEN (zero
 /// `src/` diff). Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-pub const LIVE_DRIFT_BASE_SHA: &str = "fa296155";
+/// bd `PRRO_GATE-5hc` / `-12`-into-the-oracle re-anchor (2026-07-31): promoting `-12` out of the
+/// assertion-free `FaultOrRecovery` bucket edits the frozen `invariant_fuzzer/model.rs` — five early
+/// `return ExpectedOutcome::Fault` bails DELETED, nothing added. Adjudicated: the bails were written
+/// against the W10.4 auto-recovery orchestrator that S7-1 R3 retired, and the real contract (doc
+/// rests `Sending`, node STOP_MODE, seed unmoved) already falls out of the shared HELD path. The
+/// removal was proven to have TEETH in both directions — a lying model REDs now and passed before.
+/// Production is FROZEN in that slice (the only `src/` diff is two corrected docstrings, no
+/// behaviour). Removals inside a file's body, NOT test removals — 0 manifest removals, so no
+/// supersession entry. Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
+pub const LIVE_DRIFT_BASE_SHA: &str = "8750a6f6";
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is
