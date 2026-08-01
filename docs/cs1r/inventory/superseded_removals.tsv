@@ -20,3 +20,4 @@
 # Their supersession records live in those commits + this file's git history. The registry is
 # currently EMPTY (no removals pending vs origin/main); the gate handles that (see the
 # empty-registry guard in inventory_gate.sh + the teeth in inventory_gate_teeth.sh).
+prro::invariant_fuzzer	p01g_operator_accepted_after_restart_seed_advance_must_match_the_model	prro::invariant_fuzzer	p01g_operator_accepted_after_restart_seed_advance_must_match_the_model	bd PRRO_GATE-01g: the pin is UN-ignored, not deleted — the manifest identity carries the ignored flag, so RED-pin(true) -> regression-pin(false) reads as a removal. Same module, same test name; the defect it pinned is fixed in this PR.

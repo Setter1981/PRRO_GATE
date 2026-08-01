@@ -73,8 +73,19 @@ pub enum RetryClass {
     /// Server{-12} hash-not-extractable fallback (resolved by stage_send,
     /// not the routing fn).
     TerminalReject,
-    /// Transient — re-driven via Pattern B `(ErrorRetryable → Sending → wire)`.
-    /// Applies to: Transport, Server{-3}.
+    /// Transient — Transport, Server{-3}.
+    ///
+    /// **The name is historical: nothing auto-retries this today.**  CS-3 S7-1
+    /// (R6) deleted `ErRedriveDecision::Redrive` — a re-drive would be a SECOND
+    /// wire for an already-`CALL_STARTED` doc, i.e. a double issue — so a
+    /// transient outcome after the call started is a recorded HOLD
+    /// (`SubmittedUnknown`): the doc RESTS `Sending`, the node halts to
+    /// STOP_MODE, and resolution is an operator/probe decision.  Pinned by
+    /// `shift_life_matrix` (`-3 ERROR_SAVE (transient → HELD)`).  The tag now
+    /// only classifies the LAST attempt for `evaluate_er_redrive`, which
+    /// collapses it into `EscalateManual { TransientRetry }`.
+    /// See `bd PRRO_GATE-6bj` for the evidence-based reconciliation that
+    /// replaces the retired retry loop.
     TransientRetry,
     /// Authorization sub-class for FN-config errors (-13 / -14).
     /// Routed to `ErrorRetryable` with audit `STAGE_SEND_FN_NOT_REGISTERED`;
@@ -92,10 +103,20 @@ pub enum RetryClass {
     /// routes to ErrorRetryable + emits `probe_hint`; **W9 performs
     /// the actual probe** (out of W10 scope, freeze §6).
     ProbeRequired,
-    /// Server `-12` ERROR_BAD_HASH_PREV — bounded ONE auto-recovery.
-    /// Routing fn emits `mac_recovery_hint`; stage_send invokes the
-    /// orchestrator (W10.4); on success the worker re-enters 4-pre/
-    /// 4a/4b for attempt #2.
+    /// Server `-12` ERROR_BAD_HASH_PREV.
+    ///
+    /// **There is NO automatic second attempt.**  The W10.4 orchestrator that
+    /// re-signed and re-entered 4-pre/4a/4b was RETIRED by CS-3 S7-1 (R3); the
+    /// routing fn still emits `mac_recovery_hint`, but the outcome is a
+    /// `MacReseedPending` HOLD — doc resting `Sending`, node STOP_MODE,
+    /// `mac_recovery_attempts` staying 0 — cleared only by an operator
+    /// `MacReseed`.  Pinned by
+    /// `write_path_stage4_send::minus_12_bad_hash_prev_records_held_stop_no_second_wire`,
+    /// `record_outcome::rc05_bad_hash_prev_held_stop_mode` and
+    /// `invariant_fuzzer::minus_12_holds_the_node_and_rests_the_doc_sending`.
+    /// The stale "one auto re-sign + retry" wording that used to live here is
+    /// what kept the fuzzer's `-12` in the assertion-free fault bucket, and is
+    /// what the 2026-07-31 handoff warns to read the PINS about, not this file.
     MacRecovery,
     /// `Server{-6}` ERROR_NOT_PREV_ZREPORT — operator-recoverable,
     /// not auto-retried.  Routed via ErrorRetryable →
