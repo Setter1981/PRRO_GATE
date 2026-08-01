@@ -52,8 +52,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Invoked through `bash`, matching how rust-prro.yml invokes the CS-1R
+      # inventory gate. Belt and braces: the exec bit is set in git, but relying
+      # on it alone already cost this job one red run, and `inventory_gate_teeth.sh`
+      # sits at 100644 to this day without anyone noticing — precisely because
+      # nothing in CI ever executed it.
       - name: teeth — the gate must still bite (scripts/mutation/run_teeth.sh)
-        run: scripts/mutation/run_teeth.sh
+        run: bash scripts/mutation/run_teeth.sh
 
   # Detect whether the PR touches mutation-relevant paths. The pattern list MUST
   # mirror the push-trigger `paths` above. On push events this reports true
