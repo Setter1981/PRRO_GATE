@@ -475,7 +475,7 @@ pub async fn run(
     // Single source of truth — drift between W6 sign + recovery
     // re-sign is no longer possible.
     let (unsigned_xml, unsigned_xml_sha256, signed_payload) =
-        build_canonical_and_sign_no_tx(NoTxBuildSignInputs {
+        match build_canonical_and_sign_no_tx(NoTxBuildSignInputs {
             ctx,
             wire_artifact_kind,
             fn_id: &fn_id,
@@ -504,7 +504,41 @@ pub async fn run(
             //   - Pre-W4-Z2a back-compat: None
             tax_resolution: tax_resolution_snapshot,
         })
-        .await?;
+        .await
+        {
+            Ok(built) => built,
+            // q5u (P1) — a DETERMINISTIC config / payload defect must TERMINATE
+            // the doc here.  `TaxSummary` declares its own contract on the type
+            // ("NEVER retry"): the same payload signed against the same PINNED
+            // snapshot fails identically on every tick (boot recovery signs
+            // against the pinned snapshot, never current config — locked rule
+            // #9), so a doc left PREPARED is re-dispatched forever with no
+            // operator-visible terminal state.  That is the #192 class: no doc
+            // may rest non-terminal at a quiescent boundary.
+            //
+            // IN-STAGE, not at the dispatcher.  The UNCOVERED caller is BOOT:
+            // `inline::terminalise_inbox` already aborts any dangling
+            // {PREPARED,SIGNED} doc for the request (the ledger-only pin), so
+            // the live path was never the hole — verified, not inferred.  The
+            // discriminator lives here because THIS is where the contract is
+            // declared (on `SignError`), one site serves every caller, and the
+            // audit can name the actual cause instead of the generic
+            // `INLINE_REFUSED_DOC_ABORTED`.  Every OTHER `SignError` keeps
+            // today's behaviour — notably `Crypto`, where a sidecar outage IS
+            // transient and MUST retry.
+            //
+            // Shift-class safety: `TaxSummary` is reachable ONLY from
+            // `check_payload_from`, i.e. SELL / RETURN.  SHIFT_OPEN and Z carry
+            // no `CalcTaxError` path (the Z's `<TXS>` arrives pre-aggregated),
+            // so aborting here can never pre-empt `terminalise_inbox`'s
+            // `aborted_shift_class` RMR escalation (spec §16.7 family 1).
+            Err(err) => {
+                if let SignError::TaxSummary(cause) = &err {
+                    abort_deterministic_defect(pool, doc_id, &fn_id, cause).await;
+                }
+                return Err(err);
+            }
+        };
 
     // ─── Stage 3-PERSIST ──────────────────────────────────────────────
     //
@@ -758,6 +792,93 @@ struct NoTxBuildSignInputs<'a> {
 /// Single source of truth — adding validation / fixing a date bug
 /// is a one-place edit; both W6 sign and recovery re-sign pick up
 /// the change automatically (R-W10.4-step2b-review MED 1 close).
+/// q5u (P1) — terminate a `PREPARED` doc whose sign failed on a DETERMINISTIC
+/// config / payload defect.  `PREPARED → Aborted` is an explicitly legal edge
+/// (`fiscal_documents.rs`) and `Aborted` is the established non-issued terminal
+/// for a pre-issuance refusal (#192): nothing reached the wire, no `lnd` is
+/// re-used, and the chain seed is untouched, so the doc drops out of the issued
+/// chain cleanly.  NOT `Rejected` — that is reserved for a DPS terminal reject
+/// of a doc that was actually sent.
+///
+/// Runs in its OWN short envelope (the pin-tx committed long ago; the NO-TX
+/// build owns no lock).  Pure SQLite — no crypto, no network (invariant #1).
+///
+/// Best-effort by design: if the abort itself fails (DB down mid-boot) the doc
+/// stays `PREPARED` and the next tick re-attempts it — strictly no worse than
+/// the pre-fix behaviour, and never at the cost of the original sign error,
+/// which the caller still receives verbatim.  A non-`Applied` CAS is a benign
+/// no-op (a concurrent/earlier pass already terminalised the doc).
+async fn abort_deterministic_defect(
+    pool: &SqlitePool,
+    doc_id: DocumentId,
+    fn_id: &str,
+    cause: &crate::xml::CalcTaxError,
+) {
+    let doc_hex = super::types::hex_encode_lower(doc_id.as_bytes());
+    let payload = serde_json::json!({
+        "document_id": doc_hex,
+        "fiscal_number": fn_id,
+        "from": "PREPARED",
+        "reason": "DeterministicSignDefect",
+        "cause": cause.to_string(),
+        "rationale":
+            "tax-summary derivation is deterministic for a pinned snapshot + \
+             frozen payload — a retry can never succeed, so the doc is \
+             terminated instead of resting PREPARED for every later tick to \
+             re-dispatch (#192 class: no non-terminal quiescent rest)",
+    })
+    .to_string();
+    let doc_hex_for_tx = doc_hex.clone();
+
+    let outcome: Result<TransitionOutcome, anyhow::Error> = with_immediate(pool, move |tx| {
+        Box::pin(async move {
+            let applied =
+                fd::transition_state(tx, doc_id, DocState::Prepared, DocState::Aborted).await?;
+            if applied != TransitionOutcome::Applied {
+                return Ok::<TransitionOutcome, anyhow::Error>(applied);
+            }
+            audit_log::append_tx(
+                tx,
+                "fiscal_document",
+                &doc_hex_for_tx,
+                "SIGN_DETERMINISTIC_DEFECT_ABORTED",
+                Severity::Warning,
+                None,
+                Some(&payload),
+            )
+            .await?;
+            Ok(applied)
+        })
+    })
+    .await;
+
+    match outcome {
+        Ok(TransitionOutcome::Applied) => {
+            tracing::warn!(
+                document_id = %doc_hex,
+                fiscal_number = %fn_id,
+                cause = %cause,
+                "stage 3-NO-TX deterministic defect — doc aborted (never retried)"
+            );
+        }
+        Ok(other) => {
+            tracing::info!(
+                document_id = %doc_hex,
+                cas = ?other,
+                "stage 3-NO-TX deterministic defect — doc already off PREPARED, abort is a no-op"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                document_id = %doc_hex,
+                error = %e,
+                "stage 3-NO-TX deterministic defect — ABORT FAILED; doc stays PREPARED \
+                 and the next pass will re-attempt the abort"
+            );
+        }
+    }
+}
+
 async fn build_canonical_and_sign_no_tx(
     inputs: NoTxBuildSignInputs<'_>,
 ) -> Result<(Vec<u8>, [u8; 32], SignedCmsBytes), SignError> {
