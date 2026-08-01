@@ -79,8 +79,34 @@ jobs:
     # nextest RUNTIME parallelism is untouched (the OOM is at LINK, before any
     # test runs). If serial build later hits the step timeout, raise the timeout
     # before reintroducing parallelism.
+    # 2026-08-01 — `mold` + `-j2`, replacing the `-j1` + `lld` combination above.
+    #
+    # The serialisation was the right call against a NON-DETERMINISTIC required
+    # check, but it is expensive: linking ~220 test binaries one at a time is why
+    # this leg costs 16-26 minutes while the same 2362 tests run locally in ~170
+    # SECONDS. The tests are not the cost; the links are.
+    #
+    # `mold` attacks the actual constraint rather than working around it: its peak
+    # RSS per link is a fraction of `lld`'s (it does not build the full symbol
+    # graph in memory the same way), which is exactly the quantity that was
+    # OOM-ing this 7 GB runner. So the parallelism can come back — conservatively,
+    # `-j2` rather than `nproc`, because the failure this replaces was
+    # intermittent and a regression would again show up as a flaky REQUIRED check.
+    #
+    # `line-tables-only` below STAYS. It is an independent peak-memory cap and
+    # removing it would confound this change with a second variable.
+    #
+    # IF THIS REGRESSES: the signature is the documented
+    # `ld terminated with signal 7 [Bus error]` on an unrelated binary. Revert in
+    # this order — first `CARGO_BUILD_JOBS` back to "1" (keeping mold, which is
+    # still faster per link), and only then the linker itself.
+    #
+    # MEASURING IT: the first run after this lands is a FULL rebuild (RUSTFLAGS is
+    # part of the cache key), so compare the SECOND run against the 16-26 min
+    # baseline, not the first.
     env:
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "2"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       # Peak-link-memory cap (bd PRRO_GATE-hpc, 2026-07-30). `-j1` above serialises
       # the links but does NOT bound the peak of a SINGLE link, and debug info is the
       # dominant contributor: once this PR added the ~201st test binary the
@@ -107,6 +133,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: x86_64-unknown-linux-gnu
+
+      # `mold` from the distro rather than a third-party action: every action in
+      # these workflows is SHA-pinned, and apt keeps that supply-chain surface at
+      # the runner image instead of adding another pinned repo to audit.
+      # FAIL-CLOSED: if the install or the version probe fails the job stops here,
+      # because RUSTFLAGS below names `-fuse-ld=mold` unconditionally — a missing
+      # binary would otherwise surface as an opaque link error much later.
+      - name: install mold (linker — see the -j2 rationale in this job's env)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold
+          mold --version
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
