@@ -58,6 +58,29 @@ command -v cargo-mutants >/dev/null 2>&1 || {
 # every repo-reading test later fails `NotFound`.
 export CARGO_TARGET_DIR="$ROOT/rust/target-mutants"
 
+# ── And keep the SCRATCH off the RAM disk (same ticket, second half) ─────────
+#
+# cargo-mutants copies the whole tree into `$TMPDIR` per run, and the tests it
+# then drives create a per-case SQLite database each. This project's dev boxes
+# deliberately put `TMPDIR` on a tmpfs for test speed — which is fine for a
+# 3-minute suite and catastrophic for a run that copies the tree and executes
+# 2000+ temp-DB tests per mutant.
+#
+# Observed 2026-08-01: `/dev/shm` (3.6 GB) hit 100% with ~3900 orphaned
+# `.tmpXXXXXX` directories left by runs that were KILLED — `tempfile` cleans on
+# Drop, never on SIGKILL, and an OOM or an interrupted gate is exactly a SIGKILL.
+# A full RAM disk then fails UNRELATED things: nextest aborted mid-report with
+# `error writing to output`, and tests failed for want of space in ways that read
+# like code defects. Same shape as the target-dir poisoning above — a wrong answer
+# that looks like a real one.
+#
+# So the gate owns its scratch too, and puts it under the build directory that is
+# already gitignored and already disposable. Slower per mutant than tmpfs; a
+# mutation run is hours regardless, and the alternative is taking the whole box
+# down with it.
+export TMPDIR="$CARGO_TARGET_DIR/scratch"
+mkdir -p "$TMPDIR"
+
 MUT_ARGS=(-j "$JOBS")
 case "$MODE" in
   full) ;;

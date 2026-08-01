@@ -56,6 +56,7 @@ write_stub_cargo() {
 # T8 witness: record whether the gate isolated the build directory before
 # invoking us (bd PRRO_GATE-9g5 — a shared target dir gets MUTATED artifacts).
 printf '%s\n' "${CARGO_TARGET_DIR:-<unset>}" > "${TEETH_TARGET_WITNESS:-/dev/null}"
+printf '%s\n' "${TMPDIR:-<unset>}" > "${TEETH_TMPDIR_WITNESS:-/dev/null}"
 out="mutants.out"
 mkdir -p "$out"
 : > "$out/caught.txt"
@@ -142,8 +143,10 @@ run_case() {
   # rather than merely happening to run in a clean environment.
   ( cd "$R" && PATH="$R/bin:$PATH" TEETH_SCENARIO="$scenario" \
       CARGO_TARGET_DIR="$R/shared-target" TEETH_TARGET_WITNESS="$R/target_witness" \
+      TMPDIR="$R/ramdisk-pretend" TEETH_TMPDIR_WITNESS="$R/tmpdir_witness" \
       bash scripts/mutation/run.sh diff 1 ) > "$R/out.log" 2>&1 || rc=$?
   LAST_TARGET_WITNESS="$(cat "$R/target_witness" 2>/dev/null || echo '<never-invoked>')"
+  LAST_TMPDIR_WITNESS="$(cat "$R/tmpdir_witness" 2>/dev/null || echo '<never-invoked>')"
   LAST_FIXTURE_ROOT="$R"
 
   if [ "$rc" -eq "$expect" ]; then
@@ -188,6 +191,24 @@ elif [ "$LAST_TARGET_WITNESS" = "<unset>" ] || case "$LAST_TARGET_WITNESS" in *s
   FAILED=$((FAILED + 1))
 else
   echo "✅ T8 gate isolates CARGO_TARGET_DIR ($LAST_TARGET_WITNESS)"
+  PASS=$((PASS + 1))
+fi
+
+# T9 — the gate must own its SCRATCH too (bd PRRO_GATE-9g5, second half).
+#
+# `run_case` hands the gate a TMPDIR of the caller's choosing, standing in for the
+# tmpfs these dev boxes use. If the gate passes it through, cargo-mutants copies
+# the tree and runs thousands of temp-DB tests on a RAM disk — which on 2026-08-01
+# filled `/dev/shm` to 100% with ~3900 orphaned dirs from SIGKILLed runs and made
+# UNRELATED tests fail for want of space.
+if [ "$LAST_TMPDIR_WITNESS" = "<never-invoked>" ]; then
+  echo "❌ T9 gate owns its scratch dir (cargo-mutants was never invoked)"
+  FAILED=$((FAILED + 1))
+elif [ "$LAST_TMPDIR_WITNESS" = "<unset>" ] || case "$LAST_TMPDIR_WITNESS" in *ramdisk-pretend) true ;; *) false ;; esac; then
+  echo "❌ T9 gate owns its scratch dir (leaked the caller's: $LAST_TMPDIR_WITNESS)"
+  FAILED=$((FAILED + 1))
+else
+  echo "✅ T9 gate owns its scratch dir ($LAST_TMPDIR_WITNESS)"
   PASS=$((PASS + 1))
 fi
 
