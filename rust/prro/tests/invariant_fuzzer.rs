@@ -6022,7 +6022,7 @@ async fn knk_t112_during_backlog_must_not_strand_the_drain() {
     );
 }
 
-/// `bd PRRO_GATE-01g` — RED PIN, `#[ignore]`d: after a restart, an
+/// `bd PRRO_GATE-01g` — REGRESSION PIN (was RED; fixed in this commit): after a restart, an
 /// `OperatorComplete(Accepted)` advances the REAL chain seed while the model
 /// predicts no advance.
 ///
@@ -6048,7 +6048,6 @@ async fn knk_t112_during_backlog_must_not_strand_the_drain() {
 ///
 /// UN-IGNORE once adjudicated and fixed.
 #[tokio::test]
-#[ignore = "bd PRRO_GATE-01g: RED pin — OperatorComplete(Accepted) after recovery advances the real seed but not the model's; needs prod-vs-model adjudication (and a check that it reproduces without the peer-tip axis)"]
 async fn p01g_operator_accepted_after_restart_seed_advance_must_match_the_model() {
     run_harness(
         &[
