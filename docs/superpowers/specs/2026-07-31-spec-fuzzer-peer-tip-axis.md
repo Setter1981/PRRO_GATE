@@ -182,6 +182,25 @@ scope win of the review.
   > DPS would accept that T=112 at all, since its `<MAC>` is a value DPS has never seen — the
   > earlier [N=1] involved a merely STALE (previously-seen) tip, which is not the same input class.
   > The bd carries the five-step live probe.
+  >
+  > **PROBE RAN 2026-08-01 — SETTLED, and the answer narrows the finding.** Handed a T=112 whose
+  > `<MAC>` is a value DPS has NEVER seen, DPS **refuses**:
+  > `-12 ERROR_BAD_HASH_PREV  store <its own tip> chk <ours>`, and its tip does **not** move
+  > (`live_probe_knk_t112_foreign_mac.rs`, TEST cabinet, FN 4000162280). So DPS **does**
+  > chain-check the replenish request, the "accepted → backlog unsendable" branch is refuted live,
+  > and `knk` drops to P2: what remains is that an operator cannot replenish with a diverged chain
+  > and nothing tells them to drain first.
+  >
+  > **The two live observations are about DIFFERENT INPUT CLASSES and both stand.** On a
+  > STALE-but-previously-seen tip (the H2 capture) DPS ACCEPTS and re-bases — which is what makes a
+  > granted replenish a divergence-HEALING move. On a NEVER-SEEN value it refuses. Neither may be
+  > restated as the general rule; the `[N=1]` marking on the earlier one is exactly what kept this
+  > from being built on.
+  >
+  > Consequence for the axis: `ReplenishLeaf::Granted` is a free generator choice today, so the
+  > model can emit a GRANTED replenish where production would earn `-12` — vacuous coverage, and
+  > the reason `knk` first looked like a P1. Constraining that leaf belongs to phase B, where the
+  > peer tip becomes authoritative.
 - **The chain-check-first ordering is UNVERIFIED — do not hard-code it.** No repo evidence
   orders DPS's chain check vs business validation, and `FRESH_WEBCHECK_ANALYSIS.md:52` records an
   unresolved `-15`/`-12` pairing anomaly. Resolution: while diverged, the **generator does not
