@@ -379,7 +379,7 @@ fn scope_classifier_decides_correctly_on_a_table_of_paths() {
     }
 }
 
-// ═══════════ bd PRRO_GATE-r4c — the SECOND scope detector ═══════════
+// ═══════════ bd PRRO_GATE-1rw — the SECOND scope detector ═══════════
 //
 // Everything above pins `rust-prro.yml`. `mutation-diff.yml` has an equivalent
 // detector deciding whether to run the required `mutation diff-gate` leg, and it
