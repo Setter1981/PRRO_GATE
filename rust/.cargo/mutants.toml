@@ -12,6 +12,28 @@
 additional_cargo_args = ["--features", "test-support"]
 test_tool = "nextest"
 
+# cargo-mutants tests each mutant in a COPY of the tree, and the copy carries no
+# `.git`. `cs1_test_provenance` is a git-archaeology gate — it shells `git show`
+# / `git hash-object` against real history — so it fails there unconditionally,
+# and a failing UNMUTATED baseline means cargo-mutants tests ZERO mutants and
+# bails. That is how the diff-gate came to report OK while doing nothing
+# (observed 2026-08-01; the vacuity guard in scripts/mutation/run.sh now refuses
+# to pass in that state).
+#
+# `cs1r4_integrity_job_coverage` is the same class one level out: it reads the
+# repo's `.github/workflows/`, which is ABOVE the `rust/` workspace and so is not
+# in the copy at all.
+#
+# Excluding both costs no oracle strength — and that is the criterion, not
+# convenience. Each is a REPO-ARCHAEOLOGY gate (git history, test-file ASTs, CI
+# YAML); neither executes `prro/src`, which is the only thing this run mutates,
+# so neither could ever kill one of these mutants. Behavioural coverage is
+# untouched. Anything that DOES exercise `prro/src` must never be added here.
+additional_cargo_test_args = [
+    "-E",
+    "not (binary(cs1_test_provenance) or binary(cs1r4_integrity_job_coverage))",
+]
+
 # ── FW-1 confirmed dead / deliberately-retained survivors ──
 # These functions have ZERO callers @ 3e2088b (verified via `git grep`) and are
 # NOT test-oracle gaps — mutating them cannot change any reachable fiscal

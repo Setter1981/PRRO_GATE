@@ -656,6 +656,35 @@ impl RefModel {
         if self.fence_active {
             return ExpectedOutcome::Replenish { granted: false };
         }
+        // bd PRRO_GATE-knk — prod refuses a replenish while an UNDRAINED offline backlog rests.
+        //
+        // An offline document advances OUR seed at `OFFLINE_LOCAL_ACK`, i.e. at local issuance,
+        // before DPS ever sees it. So while such a doc rests, the `<MAC>` the T=112 would carry is a
+        // value DPS has never accepted — and the live TEST-cabinet probe of 2026-08-01 settled that
+        // DPS chain-checks the request and answers `-12 ERROR_BAD_HASH_PREV` without moving its tip.
+        // Prod now refuses locally, BEFORE the wire, because reaching DPS costs a `MacReseedPending`
+        // → `STOP_MODE` the operator has no documented way out of.
+        //
+        // The predicate mirrors prod's FULL disjunction rather than just the obvious state: prod
+        // counts `offline_fiscal_no IS NOT NULL AND state IN ('OFFLINE_LOCAL_ACK','ERROR_RETRYABLE')`
+        // — `ErrorRetryable` is in because such a doc already crossed `OFFLINE_LOCAL_ACK` and still
+        // has no DPS acceptance. Gating BOTH arms on `offline_origin_lnds` mirrors the
+        // `offline_fiscal_no IS NOT NULL` clause, so an ONLINE-origin `ErrorRetryable` (which never
+        // advanced the seed — A.3 advances at the `Sending → Sent` CAS) does NOT block, exactly as
+        // in production.
+        //
+        // Note the shape this makes VISIBLE rather than hides: the generator's
+        // `ReplenishLeaf::Granted` was free-choice, so the harness used to model a granted replenish
+        // in a state where production would have earned `-12`. Prod refusing here is what removes
+        // that particular piece of vacuous coverage; the general `Granted`-leaf constraint against
+        // the PEER tip is still phase B's job.
+        let undrained_offline_backlog = self.docs.iter().any(|(lnd, st)| {
+            self.offline_origin_lnds.contains(lnd)
+                && matches!(st, DocState::OfflineLocalAck | DocState::ErrorRetryable)
+        });
+        if undrained_offline_backlog {
+            return ExpectedOutcome::Replenish { granted: false };
+        }
         match leaf {
             ReplenishLeaf::Granted => {
                 self.codes_issued += 1;

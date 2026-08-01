@@ -40,9 +40,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # TEETH for the gate itself (FW-1). ALWAYS runs — it is seconds, needs no cargo
+  # (the fixture stubs it), and it is the thing whose absence let the gate rot:
+  # `scripts/mutation/run.sh` was VACUOUS and FAIL-OPEN for three weeks and no
+  # check noticed (bd PRRO_GATE-r4c). Proving the gate can still FAIL is cheap;
+  # discovering that it cannot was not. Deliberately NOT gated on `changes`: a PR
+  # that touches nothing mutation-relevant is exactly when nobody would look.
+  gate-teeth:
+    name: mutation gate-teeth
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Invoked through `bash`, matching how rust-prro.yml invokes the CS-1R
+      # inventory gate. Belt and braces: the exec bit is set in git, but relying
+      # on it alone already cost this job one red run, and `inventory_gate_teeth.sh`
+      # sits at 100644 to this day without anyone noticing — precisely because
+      # nothing in CI ever executed it.
+      - name: teeth — the gate must still bite (scripts/mutation/run_teeth.sh)
+        run: bash scripts/mutation/run_teeth.sh
+
   # Detect whether the PR touches mutation-relevant paths. The pattern list MUST
   # mirror the push-trigger `paths` above. On push events this reports true
   # unconditionally (pushes are already path-filtered).
+  #
+  # FAIL-CLOSED, mirroring `rust-prro.yml`'s "Scope — do the heavy legs apply?"
+  # step. The two detectors used to disagree on every edge case: this one simply
+  # ran `git fetch` + `git diff` and treated ANY non-matching result as
+  # out-of-path, so a missing base sha, a failed fetch or an empty diff silently
+  # SKIPPED the heavy leg — and a skipped required check reads as satisfied. That
+  # is the same fail-open shape as the three defects inside run.sh itself
+  # (bd PRRO_GATE-r4c). `heavy` now DEFAULTS to true and is only lowered when a
+  # non-empty diff was actually obtained and matched nothing; every failure to
+  # establish scope keeps the heavy leg on. `reason` is surfaced in the step
+  # summary so a skip is always attributable.
   changes:
     name: detect mutation-relevant changes
     runs-on: ubuntu-latest
@@ -52,20 +83,45 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - id: filter
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "inpath=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          base="${{ github.event.pull_request.base.sha }}"
-          git fetch --no-tags --depth=1 origin "$base"
-          files=$(git diff --name-only "$base" HEAD)
-          echo "changed files:"; echo "$files"
-          if echo "$files" | grep -qE '^(rust/prro/src/|rust/\.cargo/mutants\.toml$|docs/mutation/baseline/survivors\.txt$|scripts/mutation/|\.github/workflows/mutation-diff\.yml$)'; then
-            echo "inpath=true" >> "$GITHUB_OUTPUT"
+          set -uo pipefail
+          inpath=true
+          reason='default — fail-closed'
+          files=''
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            reason="event '$EVENT_NAME' is already path-filtered at the trigger"
+          elif [ -z "${PR_BASE_SHA:-}" ] || [ "$PR_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            reason='no usable base sha'
+          elif ! git fetch --no-tags --depth=1 origin "$PR_BASE_SHA" 2>/dev/null; then
+            reason="could not fetch base sha $PR_BASE_SHA"
+          elif ! files="$(git diff --name-only --no-renames "$PR_BASE_SHA" HEAD 2>/dev/null)"; then
+            reason='git diff against the base failed'
+          elif [ -z "$files" ]; then
+            reason='empty diff — refusing to treat as out-of-path'
+          elif echo "$files" | grep -qE '^(rust/prro/src/|rust/\.cargo/mutants\.toml$|docs/mutation/baseline/survivors\.txt$|scripts/mutation/|\.github/workflows/mutation-diff\.yml$)'; then
+            reason='a mutation-relevant path changed'
           else
-            echo "inpath=false" >> "$GITHUB_OUTPUT"
+            inpath=false
+            reason='no mutation-relevant path in a non-empty diff'
           fi
+          echo "inpath=$inpath" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Mutation-gate scope"
+            echo ""
+            echo "- heavy leg: **$inpath**"
+            echo "- reason: $reason"
+            echo ""
+            echo "<details><summary>changed files vs base</summary>"
+            echo ""
+            echo '```'
+            echo "${files:-<none>}"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "scope: inpath=$inpath ($reason)"
 
   mutation-diff:
     # The REQUIRED-context job. SKIPPED (→ satisfied) on out-of-path PRs, so

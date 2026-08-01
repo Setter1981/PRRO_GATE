@@ -33,17 +33,64 @@ command -v cargo-mutants >/dev/null 2>&1 || {
   exit 127
 }
 
+# ── ISOLATE the build directory (bd PRRO_GATE-9g5, P1) ──────────────────────
+#
+# cargo-mutants tests each mutant by applying it to a COPY of the tree and
+# BUILDING it. With a shared `CARGO_TARGET_DIR` — which this project uses — those
+# builds land next to everything else, and the next ordinary `cargo nextest run`
+# links against whatever mutant was compiled last.
+#
+# That was caught red-handed on 2026-08-01: after a gate run, a directed fuzzer
+# tooth reported `model granted=false but real outcome was Replenished` — the
+# production guard had not fired, because the linked `prro` WAS one of the
+# mutants. The suite was faithfully reporting a real divergence against MUTATED
+# production code.
+#
+# This is nastier than it sounds, and it is why the gate owns the isolation
+# rather than trusting the caller's environment: the symptom is not obviously
+# bogus. It fails exactly the test covering the code you just wrote, with a
+# plausible message — and it can equally go GREEN against a mutant and be read as
+# verification. A local "all tests pass" taken after a mutation run means nothing
+# unless the target dir is known clean.
+#
+# The secondary cost of sharing was baked paths: `env!("CARGO_MANIFEST_DIR")` is
+# resolved at compile time, so binaries built in the copy carry its temp path and
+# every repo-reading test later fails `NotFound`.
+export CARGO_TARGET_DIR="$ROOT/rust/target-mutants"
+
 MUT_ARGS=(-j "$JOBS")
 case "$MODE" in
   full) ;;
   diff)
     git fetch origin main -q 2>/dev/null || true
-    # diff paths are relative to the cargo workspace (rust/), which is what
-    # cargo-mutants --in-diff expects.
-    git diff origin/main -- prro/src > /tmp/mutation.diff || true
+    # `--relative` is LOAD-BEARING, and its absence made this gate VACUOUS.
+    #
+    # cargo-mutants runs from the cargo workspace (`rust/`) and matches `--in-diff`
+    # paths against ITS view of the tree — `prro/src/...`. But `git diff` emits
+    # REPO-relative paths regardless of cwd, i.e. `a/rust/prro/src/...`. Nothing
+    # matched, so cargo-mutants logged "Diff changes no Rust source files", tested
+    # ZERO mutants, and the gate below happily reported OK — for every PR since this
+    # script was written. The comment that used to sit here asserted the paths were
+    # already workspace-relative; it was simply wrong, and it read as authoritative.
+    #
+    # Caught 2026-08-01 while checking why the gate reported "caught this run: 0" on
+    # two consecutive PRs. Verification if you ever doubt it: `cargo mutants --list
+    # --in-diff <file>` on a diff you KNOW touches mutable code must print mutants,
+    # not "no Rust source files". A silent zero is the failure signature.
+    git diff --relative origin/main -- prro/src > /tmp/mutation.diff || true
     if [ ! -s /tmp/mutation.diff ]; then
       echo "no prro/src diff vs origin/main — nothing to mutate."
       exit 0
+    fi
+    # Self-check for the failure above: every `+++ b/` path must be WORKSPACE-relative
+    # (`prro/src/...`). If `--relative` is ever dropped again they become `rust/prro/...`,
+    # cargo-mutants silently matches nothing, and the gate goes green without testing a
+    # single mutant. Fail loudly instead — a gate that cannot bite must not report OK.
+    if grep -q '^+++ b/rust/' /tmp/mutation.diff; then
+      echo "FATAL: diff paths are REPO-relative (rust/prro/...); cargo-mutants --in-diff" >&2
+      echo "       expects workspace-relative (prro/...) and would match NOTHING." >&2
+      echo "       The 'git diff' above lost its --relative flag." >&2
+      exit 2
     fi
     MUT_ARGS+=(--in-diff /tmp/mutation.diff)
     ;;
@@ -59,6 +106,38 @@ esac
 echo ">>> cargo mutants ${MUT_ARGS[*]}  (mode=$MODE, jobs=$JOBS)"
 # cargo-mutants exits non-zero when mutants survive; we do our own gating below.
 cargo mutants "${MUT_ARGS[@]}" || true
+
+# ── VACUITY GUARD: this gate used to be fail-OPEN ────────────────────────────
+#
+# The verdict below is derived purely from `missed.txt` vs the committed
+# baseline. An EMPTY `missed.txt` therefore reported OK — no matter WHY it was
+# empty. Three distinct failures all produced a confident green:
+#   1. `--in-diff` matched nothing (the missing `--relative`, guarded above);
+#   2. the UNMUTATED BASELINE failed, so cargo-mutants tested zero mutants and
+#      bailed — observed 2026-08-01, `cs1_test_provenance` cannot run inside
+#      cargo-mutants' copied tree because the copy carries no `.git`;
+#   3. the build broke outright.
+# For a project whose posture is fail-closed everywhere else, a gate that
+# reports success when it could not run is the wrong default. So: if mutants
+# were FOUND but none reached a verdict, refuse to pass.
+if [ -f "$OUT/outcomes.json" ]; then
+  python3 - "$OUT/outcomes.json" <<'PY' || exit 3
+import json, sys
+d = json.load(open(sys.argv[1]))
+total = d.get("total_mutants", 0)
+tested = sum(d.get(k, 0) for k in ("caught", "missed", "timeout", "unviable"))
+baseline_failed = any(
+    o.get("summary") == "Failure" and o.get("scenario") == "Baseline"
+    for o in d.get("outcomes", [])
+)
+if baseline_failed:
+    sys.exit("FATAL: the UNMUTATED baseline failed — zero mutants were tested. "
+             "The gate cannot bite; fix the baseline before trusting it.")
+if total > 0 and tested == 0:
+    sys.exit(f"FATAL: {total} mutants were found but NONE were tested. "
+             "The gate cannot bite.")
+PY
+fi
 
 # ── analysis vs the committed baseline ──────────────────────────────────────
 CUR_SURV="$OUT/missed.txt"

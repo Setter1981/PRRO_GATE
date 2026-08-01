@@ -2,3 +2,8 @@
 # cargo-mutants output (FW-1 mutation testing) — never commit
 mutants.out/
 mutants.out.old/
+
+# cargo-mutants' DEDICATED build directory (bd PRRO_GATE-9g5). The gate exports
+# CARGO_TARGET_DIR here so mutant builds can never land in the shared target dir
+# — a mutated `prro` sitting there gets linked by the next ordinary test run.
+target-mutants/
