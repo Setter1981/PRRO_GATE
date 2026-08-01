@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlx::SqlitePool;
 
 use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, WireResponse};
-use prro::db::models::enums::{DocState, NodeMode, OfflineSessionState, ShiftState};
+use prro::db::models::enums::{DocState, DocType, NodeMode, OfflineSessionState, ShiftState};
 
 /// U1 D3 — model-local FORK of the offline-origin "issued" set.  Deliberately a
 /// SEPARATE literal from the prod SSOT const
@@ -185,7 +185,12 @@ pub struct RefModel {
     pub carry_cash_kop: i64,
 
     /// CS-3 operator-completion (1b) — the FN's CS-3 `PENDING_APPLY` RESERVATION-hold as
-    /// `(held_lnd, online_origin)`, if any (the fence enforces ≤1).  This is a reality-tracked
+    /// `(held_lnd, online_origin, held_doc_type)`, if any (the fence enforces ≤1).  The document
+    /// TYPE joined the tuple under bd `PRRO_GATE-k3y`: prod applies a §3.4 shift-state edge when the
+    /// held document is shift-family, so the model cannot predict `shift_state` without it. It rides
+    /// the SAME tuple rather than a companion field deliberately — a second field would carry an
+    /// "always set together" convention, and this one is compiler-enforced instead.
+    /// This is a reality-tracked
     /// PRECONDITION (the "is a completable hold resting, and of which origin" state), RE-SYNCED by the
     /// harness from the real `delivery_reservation` table after every op via
     /// `sync_held_reservation` — NOT independently predicted per-op.  It is NARROWER than "a Sending
@@ -193,7 +198,7 @@ pub struct RefModel {
     /// reservation and is NOT operator-completable.  The release OUTCOME (`released_witness` axes)
     /// stays INDEPENDENTLY predicted + checked — only this precondition is state-synced (the pattern
     /// of `adopt_fault_deferred`, which syncs `docs`/`mode`/`session` from reality).
-    pub held_reservation: Option<(i64, bool)>,
+    pub held_reservation: Option<(i64, bool, DocType)>,
 
     /// CS-3 S7-2 — is the FN's **active-reservation fence** raised?  This is a STRICTLY WIDER
     /// predicate than `held_reservation.is_some()` and the two must not be conflated:
@@ -507,7 +512,7 @@ impl RefModel {
         // under STOP_MODE": a drain / crash transport failure can commit a doc SENDING + halt the node
         // WITHOUT a CS-3 reservation (verified — real `operator_complete` returns "no held reservation
         // rests" there), and such a doc is NOT operator-completable. Absent ⇒ inert no-op → Refused.
-        let Some((held_lnd, online_origin)) = self.held_reservation else {
+        let Some((held_lnd, online_origin, held_doc_type)) = self.held_reservation else {
             return ExpectedOutcome::Release(None);
         };
         // Active offline session (prod checks OPENING/OPEN/DRAINING). The current alphabet holds only
@@ -523,6 +528,26 @@ impl RefModel {
         ) else {
             // Origin cross-check contradiction: prod fail-closes BEFORE any mutation — hold intact.
             return ExpectedOutcome::Release(None);
+        };
+        // bd PRRO_GATE-k3y — the §3.4 operator SHIFT edge, applied by
+        // `operator_completion::complete_operator_resolution` in the SAME tx as the core. Before
+        // that ticket the admin CLI called the core directly, so prod moved no shift state and this
+        // model matched a BYPASS; the model is the reason the regression would have stayed
+        // invisible. Computed here (no mutation yet) because prod applies it FIRST — a projection
+        // refusal rolls the whole completion back, hold intact.
+        let shift_after = match operator_shift_edge(held_doc_type, online_origin, kind) {
+            // `MacReseedOnShiftFamily`: §3.4 has no cell for a chain-seed correction on a
+            // shift-family document. Prod errors out before touching anything.
+            ShiftEdge::Refused => return ExpectedOutcome::Release(None),
+            ShiftEdge::Move(from, to) => {
+                if self.shift_state != from {
+                    // Prod's `apply_shift_transition` CAS returns non-`Applied` →
+                    // `ShiftProjectionFailed` → the whole `BEGIN IMMEDIATE` rolls back.
+                    return ExpectedOutcome::Release(None);
+                }
+                Some(to)
+            }
+            ShiftEdge::NoEdge => None,
         };
         // bd PRRO_GATE-2nk (§5a) — OFFLINE-origin `NotAcceptedOffline` RELEASE: the gap-4b cohort-cancel
         // + chain rewind (delivery_reservation.rs offline_cohort_cleanup). Reached only for an offline
@@ -561,6 +586,10 @@ impl RefModel {
             // too (a cash-bearing held SELL, not just the DocType=9 BEGIN of this repro).
             self.uncount_cash(held_lnd);
             self.mode = node_mode_from_str(witness.node_mode); // GOING_ONLINE (active session drains)
+                                                               // k3y: an OFFLINE shift-family `NotAcceptedOffline` also rolls the OLPD/CLPD edge back.
+            if let Some(to) = shift_after {
+                self.shift_state = to;
+            }
             return ExpectedOutcome::Release(Some(witness));
         }
         // Release: transition the held doc, un-halt the node, advance the seed for the seed-movers.
@@ -570,6 +599,10 @@ impl RefModel {
         };
         self.docs.insert(held_lnd, new_doc_state);
         self.mode = node_mode_from_str(witness.node_mode);
+        // k3y: the §3.4 shift edge commits with the rest of the completion (ONE tx).
+        if let Some(to) = shift_after {
+            self.shift_state = to;
+        }
         // Seed advance mirrors prod completion: Accepted advances ONLY for an ONLINE-origin doc
         // (delivery_reservation.rs:1374 `if online`) — an OFFLINE-origin doc already advanced the
         // seed at issuance, so its Accepted completion leaves the tip untouched.  MacReseed is
@@ -1967,16 +2000,19 @@ impl RefModel {
     /// calls this after EVERY op so `held_reservation` reflects reality entering the next op (a drain
     /// can create a hold the pure model does not predict); the release OUTCOME stays independent.
     pub async fn sync_held_reservation(&mut self, pool: &SqlitePool) {
-        self.held_reservation = sqlx::query_as::<_, (i64, Option<i64>)>(
-            "SELECT fd.lnd, fd.offline_fiscal_no FROM delivery_reservation dr \
+        self.held_reservation =
+            sqlx::query_as::<_, (i64, Option<i64>, prro::db::types::DbDocType)>(
+                "SELECT fd.lnd, fd.offline_fiscal_no, fd.doc_type FROM delivery_reservation dr \
              JOIN fiscal_documents fd \
                ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
              WHERE dr.apply_state = 'PENDING_APPLY' LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await
-        .unwrap()
-        .map(|(lnd, offline_fiscal_no)| (lnd, offline_fiscal_no.is_none()));
+            )
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .map(|(lnd, offline_fiscal_no, doc_type)| {
+                (lnd, offline_fiscal_no.is_none(), doc_type.0)
+            });
     }
 
     /// CS-3 S7-2 — RE-SYNC `fence_active` from the real `delivery_reservation` table, using
@@ -2306,6 +2342,66 @@ pub fn released_witness(
         fence_held: false,
         doc_state,
     })
+}
+
+/// bd `PRRO_GATE-k3y` — the operator shift-state edge a completion applies to a SHIFT-FAMILY held
+/// document, per design §3.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftEdge {
+    /// No shift edge: a non-shift-family document, an OFFLINE **Accepted** shift-family document
+    /// (the drain finalize owns the forward edge, §4.1 edges 5/13), or an origin-mismatched
+    /// resolution (the core's origin cross-check is the authority and fails it closed anyway).
+    NoEdge,
+    /// Apply `from -> to`, CAS-guarded on `from`. A mismatch is a projection failure and the WHOLE
+    /// completion rolls back.
+    Move(ShiftState, ShiftState),
+    /// `MacReseed` on a shift-family document: §3.4 has no such cell — a `-12` chain-seed correction
+    /// is not defined for SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT. Fail-closed before any mutation.
+    Refused,
+}
+
+/// bd `PRRO_GATE-k3y` — INDEPENDENT re-derivation of the §3.4 shift-projection matrix that
+/// `operator_completion::complete_operator_resolution` applies.
+///
+/// Deliberately NOT importing production's `shift_projection`: this value is compared against
+/// reality by the U1 D2 `shift_state` differential, so importing the production matrix would make
+/// that assertion tautological and the oracle would lose the ability to catch a WRONG prod matrix.
+/// It is written from the spec, exactly like [`released_witness`] and
+/// [`macreseed_completion_releases`], whose directed teeth prove the real seam agrees.
+///
+/// Every cell is listed, including ones the current alphabet may not reach. That is the bd
+/// `PRRO_GATE-01g` lesson: an "unreachable, generator-excluded" note is written about the alphabet
+/// of its day and silently rots when a symbol is added.
+pub fn operator_shift_edge(
+    doc_type: DocType,
+    online: bool,
+    resolution: OperatorResolutionKind,
+) -> ShiftEdge {
+    use DocType::{ShiftClose, ShiftOpen, ZReport};
+    use OperatorResolutionKind as R;
+    use ShiftState::{
+        Closed, Closing, ClosingLocalPendingDrain, Opened, OpenedLocalPendingDrain, Opening,
+    };
+    match (doc_type, online, resolution) {
+        // ── online shift-family ──
+        (ShiftOpen, true, R::Accepted) => ShiftEdge::Move(Opening, Opened),
+        (ShiftOpen, true, R::NotAccepted) => ShiftEdge::Move(Opening, Closed),
+        (ShiftClose | ZReport, true, R::Accepted) => ShiftEdge::Move(Closing, Closed),
+        (ShiftClose | ZReport, true, R::NotAccepted) => ShiftEdge::Move(Closing, Opened),
+        // ── offline shift-family NOT-accepted rollback ──
+        (ShiftOpen, false, R::NotAcceptedOffline) => {
+            ShiftEdge::Move(OpenedLocalPendingDrain, Closed)
+        }
+        (ShiftClose | ZReport, false, R::NotAcceptedOffline) => {
+            ShiftEdge::Move(ClosingLocalPendingDrain, OpenedLocalPendingDrain)
+        }
+        // Offline shift-family Accepted: the drain finalize owns the forward edge, not the operator.
+        (ShiftOpen | ShiftClose | ZReport, false, R::Accepted) => ShiftEdge::NoEdge,
+        // MacReseed on any shift-family document has no §3.4 cell.
+        (ShiftOpen | ShiftClose | ZReport, _, R::MacReseed) => ShiftEdge::Refused,
+        // Non-shift-family, or an origin-mismatched resolution.
+        _ => ShiftEdge::NoEdge,
+    }
 }
 
 /// CS-3 MacReseed (task #18 (B)) — the INDEPENDENT model prediction of whether a `-12` MacReseed

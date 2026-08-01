@@ -1,9 +1,20 @@
 //! CS-3 gap 4a — the operator-completion orchestrator (design §3.4).
 //!
 //! The SOLE production caller of `delivery_reservation::complete_operator_pending`, and the sole
-//! caller of the operator-only shift rollback edge `Opening -> Closed` (shifts §4.1 edge 16). It
-//! resolves a PENDING reservation held under STOP_MODE (a SubmittedUnknown / crashed send) with a
-//! typed operator resolution, in the caller's ONE `BEGIN IMMEDIATE` (the admin path runs the
+//! caller of the operator-only shift rollback edge `Opening -> Closed` (shifts §4.1 edge 16). Its
+//! one production entry point is `admin::resolve_operator_pending` (the CLI
+//! `prro admin resolve-operator-pending`); the sole-caller claim is machine-checked by
+//! `tests/k3y_operator_completion_shift_projection.rs`, which drives that CLI seam and asserts the
+//! projection + audit this module owns.
+//!
+//! **bd PRRO_GATE-k3y (2026-08-01):** this paragraph previously asserted that role while the admin
+//! CLI called `complete_operator_pending` DIRECTLY, bypassing everything below. The claim read as
+//! authoritative and was false; the bypass silently dropped the shift projection and the Critical
+//! audit, and a later boot orphaned the DPS-accepted shift. If this module is ever again reachable
+//! only from tests, the named test goes RED — the claim is no longer maintained by hand.
+//!
+//! It resolves a PENDING reservation held under STOP_MODE (a SubmittedUnknown / crashed send) with
+//! a typed operator resolution, in the caller's ONE `BEGIN IMMEDIATE` (the admin path runs the
 //! `status_rro` probe OUTSIDE the tx first — invariant #1):
 //!
 //!   1. for an ONLINE shift-family document (SHIFT_OPEN / SHIFT_CLOSE / Z_REPORT) it applies the
@@ -17,10 +28,13 @@
 //!
 //! All of that is ONE transaction — a shift-projection or core failure rolls the whole thing back.
 //!
-//! Scope (gap 4a): ONLINE shift-family + regular documents. An OFFLINE-origin shift-family document
-//! or an offline not-accepted needs the OLPD/CLPD rollback + OLA cohort cleanup + predecessor-seed
-//! repair — the core returns `ShiftFamilyNotSupported` / `OfflineCohortCleanupRequired` (gap 4b),
-//! surfaced here unchanged.
+//! Scope (gap 4a): ONLINE shift-family + regular documents. An OFFLINE-origin not-accepted needs
+//! the OLPD/CLPD rollback + OLA cohort cleanup + predecessor-seed repair, which the core now
+//! performs itself (`NotAcceptedOffline`, bd PRRO_GATE-2nk) or refuses via its fork guards
+//! (`LaterSuccessorIssued` / `LaterSuccessorInFlight` / `LaterSuccessorInvalidState`); an
+//! origin-mismatched resolution is refused with `OriginMismatch`. Every one of those is surfaced
+//! here unchanged. (The names `ShiftFamilyNotSupported` / `OfflineCohortCleanupRequired` this
+//! paragraph used to cite are gone from `CompletionError` — corrected under bd PRRO_GATE-k3y.)
 
 use crate::db::models::enums::{DocType, Severity, ShiftState};
 use crate::db::models::ids::DocumentId;
