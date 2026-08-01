@@ -16,7 +16,10 @@
 # vs the CURRENT PR base (origin/main). A row is PRUNED here once its PR merges into main — a merged
 # removal is no longer a removal-vs-base and would read STALE. Pruned so far:
 #   * 15 CS-3 S7-1 (#336) rows — record in commit 224ad46;
-#   * 3 CS-3 Slice E Pin 2 (#337) rows — record in the #337 merge (origin/main 5360ecf4).
+#   * 3 CS-3 Slice E Pin 2 (#337) rows — record in the #337 merge (origin/main 5360ecf4);
+#   * 1 bd PRRO_GATE-01g row (#364) — the pin went from `#[ignore]`d RED to an active regression
+#     pin, and the manifest identity carries the ignored FLAG, so `true -> false` read as a
+#     removal. Pruned here once #364 merged (origin/main 1c0bac70).
 # Their supersession records live in those commits + this file's git history. The registry is
 # currently EMPTY (no removals pending vs origin/main); the gate handles that (see the
 # empty-registry guard in inventory_gate.sh + the teeth in inventory_gate_teeth.sh).

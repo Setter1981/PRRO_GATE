@@ -1398,6 +1398,7 @@ live-dps	prro	prro::invariant_fuzzer	interp::pin_hole2_serial_return_second_refu
 live-dps	prro	prro::invariant_fuzzer	interp::sell_with_closed_shift_is_refused	false
 live-dps	prro	prro::invariant_fuzzer	interp::valid_three_op_online_sell_sequence_all_reach_ack	false
 live-dps	prro	prro::invariant_fuzzer	invalid_and_reentry_ops_do_not_mutate	false
+live-dps	prro	prro::invariant_fuzzer	knk_t112_during_backlog_must_not_strand_the_drain	true
 live-dps	prro	prro::invariant_fuzzer	l5_probe_valid_sell_converts_and_issues	false
 live-dps	prro	prro::invariant_fuzzer	l5_probe_valid_then_ordinary_sell_composes	false
 live-dps	prro	prro::invariant_fuzzer	macreseed_completion_releases_iff_online_macreseed_hold_and_seed_matches_tip	false
@@ -1441,6 +1442,9 @@ live-dps	prro	prro::invariant_fuzzer	operator_complete_without_hold_is_inert	fal
 live-dps	prro	prro::invariant_fuzzer	oracle::tests::z_aggregation_oracle_accepts_independently_computed_taxable_payload	false
 live-dps	prro	prro::invariant_fuzzer	oracle::tests::z_aggregation_oracle_catches_payment_drift	false
 live-dps	prro	prro::invariant_fuzzer	oracle::tests::z_aggregation_oracle_catches_tax_drift	false
+live-dps	prro	prro::invariant_fuzzer	p01g_operator_accepted_after_restart_seed_advance_must_match_the_model	false
+live-dps	prro	prro::invariant_fuzzer	peer_axis_records_a_mismatch_when_the_peer_is_off_chain	false
+live-dps	prro	prro::invariant_fuzzer	peer_axis_tracks_the_chain_on_an_agreeing_run	false
 live-dps	prro	prro::invariant_fuzzer	regression_offline_shiftopen_resets_cash_on_hand	false
 live-dps	prro	prro::invariant_fuzzer	release_witness_accepted_clears_fence_and_stop	false
 live-dps	prro	prro::invariant_fuzzer	released_witness_refuses_origin_contradicting_completion	false

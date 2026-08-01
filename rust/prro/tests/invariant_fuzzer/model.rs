@@ -751,9 +751,9 @@ impl RefModel {
         if self.has_write_gate_blocker() {
             return ExpectedOutcome::NoMutation;
         }
-        if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
-            return ExpectedOutcome::Fault;
-        }
+        // `-12` is NOT fault-class — see the note on the same leaf in `apply_sell`:
+        // S7-1 R3 retired the auto re-sign, so the shared HELD path below predicts
+        // it exactly (doc rests `Sending`, node STOP_MODE, seed unmoved).
         let lnd = self.next_lnd;
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
@@ -901,9 +901,9 @@ impl RefModel {
         if self.has_write_gate_blocker() {
             return ExpectedOutcome::NoMutation;
         }
-        if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
-            return ExpectedOutcome::Fault;
-        }
+        // `-12` is NOT fault-class — see the note on the same leaf in `apply_sell`:
+        // S7-1 R3 retired the auto re-sign, so the shared HELD path below predicts
+        // it exactly (doc rests `Sending`, node STOP_MODE, seed unmoved).
         let lnd = self.next_lnd;
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
@@ -969,9 +969,9 @@ impl RefModel {
         if self.has_write_gate_blocker() {
             return ExpectedOutcome::NoMutation;
         }
-        if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
-            return ExpectedOutcome::Fault;
-        }
+        // `-12` is NOT fault-class — see the note on the same leaf in `apply_sell`:
+        // S7-1 R3 retired the auto re-sign, so the shared HELD path below predicts
+        // it exactly (doc rests `Sending`, node STOP_MODE, seed unmoved).
 
         let lnd = self.next_lnd;
         let previous_hash = self.seed;
@@ -1148,9 +1148,9 @@ impl RefModel {
         if self.has_z_quiescence_blocker() {
             return ExpectedOutcome::NoMutation;
         }
-        if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
-            return ExpectedOutcome::Fault;
-        }
+        // `-12` is NOT fault-class — see the note on the same leaf in `apply_sell`:
+        // S7-1 R3 retired the auto re-sign, so the shared HELD path below predicts
+        // it exactly (doc rests `Sending`, node STOP_MODE, seed unmoved).
         let lnd = self.next_lnd;
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
@@ -1342,16 +1342,17 @@ impl RefModel {
                 if self.has_write_gate_blocker() {
                     return ExpectedOutcome::NoMutation;
                 }
-                // Server{-12} ERROR_BAD_HASH_PREV routes to the bounded MAC-
-                // recovery path (error_routing.rs `RetryClass::MacRecovery`): one
-                // auto re-sign + retry.  With the fuzzer's single-shot stub the
-                // retry hits an empty queue → terminal DpsRejected — a fault-class
-                // outcome the pure model does not cleanly predict.  Defer to Fault
-                // (the harness re-syncs); the scan / mirror checks still run on the
-                // real DB afterwards, so invariant coverage is NOT lost.
-                if matches!(script.0.as_slice(), [WireResponse::BadHashPrev, ..]) {
-                    return ExpectedOutcome::Fault;
-                }
+                // Server{-12} ERROR_BAD_HASH_PREV used to bail to `Fault` here on the
+                // premise that the bounded MAC-recovery orchestrator fired "one auto
+                // re-sign + retry" whose second wire the single-shot stub could not
+                // serve.  CS-3 S7-1 R3 RETIRED that orchestrator: there is no second
+                // wire.  The contract is now deterministic and pinned
+                // (`invariant_fuzzer::minus_12_holds_the_node_and_rests_the_doc_sending`
+                // + `write_path_stage4_send::minus_12_bad_hash_prev_records_held_stop_no_second_wire`):
+                // the doc RESTS `Sending` under the hold, the node halts to STOP_MODE,
+                // the seed does NOT advance and the recovery counter stays 0.  Every
+                // one of those falls out of the shared HELD path below, so `-12` is an
+                // ordinary predictable mutation — no fault-bucket exemption.
                 let lnd = self.next_lnd;
                 let previous_hash = self.seed;
                 let unsigned_hash = synth_unsigned_hash(lnd);
@@ -1845,10 +1846,29 @@ impl RefModel {
         // is LATER issued (operator completion / drain), the real seed advances onto
         // its hash while the model already sat there → the op's real seed-advance
         // would spuriously read as "no model advance" (fuzzer online seed-advance
-        // finding, task #18).  Fall back to `max(lnd)` only when the seed matches no
-        // doc (e.g. a MacReseed rebase — generator-excluded).
+        // finding, task #18).
+        //
+        // bd `PRRO_GATE-01g` — the `max(lnd)` fallback RE-ARMED that exact trap.
+        // The comment here used to end "fall back to max(lnd) only when the seed
+        // matches no doc (e.g. a MacReseed rebase — generator-excluded)". That
+        // premise was true when task #18 was written and STOPPED being true when the
+        // generative `Replenish` symbol landed (bd hpc): a granted T=112 advances the
+        // real seed to `sha256(request_xml)`, a NON-DOCUMENT value that matches no
+        // row — so the lookup missed, the fallback aliased the placeholder onto
+        // `max(lnd)` = the HELD doc, and the model was already sitting on the tip the
+        // later completion would move to. Found generatively as
+        // `[Replenish(Granted), SellWithClosedShift, OnlineShiftOpen([Superseded]),
+        // Reboot, OperatorComplete(Accepted)]`; adjudicated PROD-RIGHT (prod's
+        // completion-time advance is A.3 advance-at-SEND deferred until the
+        // ambiguity resolves, and `invariant_scan` is clean at every boundary).
+        //
+        // A non-document real tip is one the model CANNOT compute (it builds no XML),
+        // exactly like the `apply_replenish` advance that produced it — which is why
+        // that advance is recorded structurally on a NEGATIVE ordinal. So the correct
+        // adoption is to KEEP whatever structural marker the model already holds,
+        // never to alias it onto a document ordinal.
         let real_seed = Self::read_seed_fixture(pool).await;
-        let tip_lnd: i64 = match &real_seed {
+        let tip_lnd: Option<i64> = match &real_seed {
             Some(seed) => sqlx::query_scalar::<_, i64>(
                 "SELECT lnd FROM fiscal_documents WHERE unsigned_xml_sha256 = ? \
                  ORDER BY lnd DESC LIMIT 1",
@@ -1856,11 +1876,19 @@ impl RefModel {
             .bind(&seed[..])
             .fetch_optional(pool)
             .await
-            .unwrap()
-            .unwrap_or_else(|| self.docs.keys().copied().max().unwrap_or(0)),
-            None => 0,
+            .unwrap(),
+            None => None,
         };
-        self.seed = real_seed.as_ref().map(|_| synth_unsigned_hash(tip_lnd));
+        match (&real_seed, tip_lnd) {
+            // The real tip IS a document — adopt its ordinal (task #18's rule).
+            (Some(_), Some(lnd)) => self.seed = Some(synth_unsigned_hash(lnd)),
+            // Real tip present but matching no document: NON-DOCUMENT (a T=112
+            // replenish seed today; a MacReseed rebase later). Keep the structural
+            // marker rather than inventing a document ordinal for it.
+            (Some(_), None) => {}
+            // No real seed at all → genesis.
+            (None, _) => self.seed = None,
+        }
 
         // offline session + codes ← real.
         self.session = sqlx::query_scalar::<_, prro::db::types::DbOfflineSessionState>(
