@@ -1258,6 +1258,53 @@ pub fn is_issued(
     }
 }
 
+/// bd `PRRO_GATE-knk` — how many offline-origin documents rest in a state that put OUR chain tip
+/// ahead of the peer's and that a drain would still pick up.
+///
+/// The state set is deliberately a SUBSET of [`OFFLINE_ISSUED_STATES`], and the exclusions ARE the
+/// design:
+///   - `SENT` / `KVT1` / `KVT2` are out because DPS DID accept those — its tip moved with ours, so
+///     there is no divergence to report;
+///   - `REJECTED` / `REQUIRES_MANUAL_RECONCILIATION` are out even though they DO diverge (our seed
+///     moved, DPS's did not). They are not drainable, so refusing on them would wedge the replenish
+///     permanently while telling the operator to "drain first" — advice that cannot be followed.
+///     Those belong to the `NotAcceptedOffline` cohort rewind (bd PRRO_GATE-2nk) and to the bounded
+///     `MacRecovery`, not to this guard;
+///   - `SENDING` is out because a doc mid-wire is owned by the S7-2 delivery-reservation fence,
+///     which refuses the replenish with its own diagnostic.
+///
+/// The set lives ONLY in the SQL below — deliberately not lifted into a `const` beside it, since a
+/// second copy with one consumer is a drift hazard and buys nothing.
+///
+/// **Why this gates the T=112 replenish.** The `<MAC>` a replenish sends is
+/// `node_state.last_known_unsigned_xml_sha256`, and an offline document advances that seed at
+/// `OFFLINE_LOCAL_ACK` — at LOCAL issuance, before DPS ever sees it. Settled against the live TEST
+/// cabinet on 2026-08-01 (`live_probe_knk_t112_foreign_mac.rs`): DPS chain-checks the T=112 request
+/// and answers a value it has never accepted with
+/// `-12 ERROR_BAD_HASH_PREV  store <its tip> chk <ours>`, leaving its tip unmoved. So while such a
+/// document rests, a replenish is guaranteed to fail — and it fails EXPENSIVELY: `-12` routes to
+/// `MacReseedPending` → node `STOP_MODE`.
+///
+/// Origin is keyed on `offline_fiscal_no IS NOT NULL`, the same discriminator [`is_issued`] uses,
+/// so this cannot drift from the seed-advance authority. An online-origin `ERROR_RETRYABLE` never
+/// advanced the seed (A.3 advances at the `Sending → Sent` CAS) and is correctly excluded.
+///
+/// Per-FN by construction: another register's backlog says nothing about this chain.
+pub async fn count_undrained_diverging_offline_docs(
+    pool: &SqlitePool,
+    fn_id: &str,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fiscal_documents \
+         WHERE fiscal_number = ? \
+           AND offline_fiscal_no IS NOT NULL \
+           AND state IN ('OFFLINE_LOCAL_ACK', 'ERROR_RETRYABLE')",
+    )
+    .bind(fn_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// **A.3 PR-C (D5 gate, design v3 §6 step 7)** — does an OLDER non-issued
 /// sibling rest on this FN?  The D4-complement predicate:
 ///

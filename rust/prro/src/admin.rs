@@ -181,6 +181,17 @@ pub enum AdminError {
     #[error("admin: request-offline-codes replenish failed: {0}")]
     ReplenishFailed(String),
 
+    /// bd `PRRO_GATE-knk` — `request-offline-codes` was REFUSED before the wire because an
+    /// undrained offline backlog rests, so the local chain tip is one DPS has never accepted.
+    ///
+    /// Deliberately NOT [`AdminError::ReplenishFailed`]: that is `EX_TEMPFAIL` (75), i.e. "transient,
+    /// retry" — and a retry here fails identically forever, so a wrapper script that retries on 75
+    /// would spin. This is a precondition the operator must clear, exactly like
+    /// [`AdminError::PendingResolutionRequired`], so it shares that variant's `EX_USAGE` (64).
+    /// Carries the service's own message verbatim, which names the remedy.
+    #[error("admin: request-offline-codes refused: {0}")]
+    ReplenishRefusedDrainFirst(String),
+
     /// B1 (part 2, §4.1) — `resolve-operator-pending`: the operator's `--fiscal-number` does not
     /// own the named reservation (a real reservation id belonging to ANOTHER FN). Fail-closed
     /// BEFORE any mutation — else the admin surface would silently resolve a reservation the
@@ -228,7 +239,8 @@ impl AdminError {
             | AdminError::NotInExpectedMode { .. }
             | AdminError::InvalidCodeRange { .. }
             | AdminError::CodeRangeOverlapsExistingPool { .. }
-            | AdminError::ReservationFnMismatch { .. } => 64,
+            | AdminError::ReservationFnMismatch { .. }
+            | AdminError::ReplenishRefusedDrainFirst(_) => 64,
             // EX_DATAERR (65): the operator's resolution is stale / invalid — nothing mutated.
             AdminError::ResolutionRefused { .. } => 65,
             // EX_UNAVAILABLE (69): the gated offline surface is not enabled yet.
@@ -1670,7 +1682,9 @@ pub async fn run_request_offline_codes(
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::session::SigningSession;
     use crate::runtime::key_loader::build_fn_sign;
-    use crate::services::offline_sync::offline_code_replenish::OfflineCodeReplenishService;
+    use crate::services::offline_sync::offline_code_replenish::{
+        OfflineCodeReplenishService, ReplenishError,
+    };
     use crate::services::write_path::stage_sign::SigningContext;
     use crate::transports::dps::channel::DpsChannel;
     use crate::transports::dps::grpc::GrpcDpsChannel;
@@ -1741,7 +1755,15 @@ pub async fn run_request_offline_codes(
     let summary = svc
         .replenish(fiscal_number, &tax_number, di, size)
         .await
-        .map_err(|e| AdminError::ReplenishFailed(e.to_string()))?;
+        .map_err(|e| {
+            // bd PRRO_GATE-knk — split the pre-wire "drain first" refusal out of the EX_TEMPFAIL
+            // bucket. It is a precondition the operator must clear, not something to retry.
+            if matches!(e, ReplenishError::UndrainedOfflineBacklog { .. }) {
+                AdminError::ReplenishRefusedDrainFirst(e.to_string())
+            } else {
+                AdminError::ReplenishFailed(e.to_string())
+            }
+        })?;
 
     Ok(ReplenishOutcome {
         fiscal_number: fiscal_number.to_string(),
@@ -2236,6 +2258,34 @@ mod tests {
         assert!(
             msg.contains("node_state row missing"),
             "message must carry detail"
+        );
+    }
+
+    /// bd PRRO_GATE-knk — the "drain first" refusal must NOT wear `EX_TEMPFAIL`.
+    ///
+    /// 75 means "transient, retry", and a retry here fails identically forever — a wrapper that
+    /// retries on 75 would spin against a permanent precondition. It must share the `EX_USAGE`
+    /// bucket with the other "clear this first" refusals, and it must carry the remedy in its text.
+    #[test]
+    fn replenish_drain_first_refusal_is_ex_usage_not_tempfail() {
+        let err = AdminError::ReplenishRefusedDrainFirst(
+            "replenish refused: FN 4000162280 has 3 undrained offline document(s) … DRAIN THE \
+             BACKLOG FIRST …"
+                .to_string(),
+        );
+        assert_eq!(
+            err.exit_code(),
+            64,
+            "a precondition the operator must clear is EX_USAGE, like PendingResolutionRequired"
+        );
+        assert_ne!(
+            err.exit_code(),
+            AdminError::ReplenishFailed(String::new()).exit_code(),
+            "it must NOT share the EX_TEMPFAIL 'retry me' code"
+        );
+        assert!(
+            format!("{err}").to_lowercase().contains("drain"),
+            "the operator-visible text must name the remedy"
         );
     }
 }

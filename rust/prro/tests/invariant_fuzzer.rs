@@ -2140,16 +2140,42 @@ async fn harness_generative_not_accepted_offline_cohort_cancel_and_rewind() {
 /// document, the durable witness (migration 040) records it, and the next issuance must chain onto
 /// `Hs` — with `invariant_scan` (driven by `assert_clean` inside `run_harness`) staying clean.
 /// Before the hpc scan re-anchor this exact shape produced a FALSE `ChainBreak`.
+///
+/// **bd PRRO_GATE-knk (2026-08-01) — the leading `OfflineSell` was REMOVED, deliberately.** It used
+/// to run `[OfflineSell, Replenish(Granted), OfflineSell]`, which is precisely the knk
+/// counterexample: an undrained offline document leaves our tip a value DPS has never accepted, so
+/// production now REFUSES that replenish before the wire. Left as it was, this test would still be
+/// green — and completely vacuous, since no `Hs` would ever be installed and nothing would chain
+/// onto it. Leading with the replenish keeps the stated subject reachable. The
+/// "witness must beat an existing DOCUMENT tip" half of the hpc contract is covered by the directed
+/// pins in `hpc_t112_nc03.rs`, whose predecessor document is DRAINED.
 #[tokio::test]
 async fn harness_replenish_then_offline_sell_chains_onto_the_non_doc_seed() {
     let ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
     let model = RefModel::new_offline_open_shift(4);
     let _ = run_harness(
-        &[
-            Op::OfflineSell,
-            Op::Replenish(ReplenishLeaf::Granted),
-            Op::OfflineSell,
-        ],
+        &[Op::Replenish(ReplenishLeaf::Granted), Op::OfflineSell],
+        ctx,
+        model,
+    )
+    .await;
+}
+
+/// bd `PRRO_GATE-knk` — the counterexample itself, pinned generatively: with an undrained offline
+/// document resting, a replenish must be REFUSED.
+///
+/// This is the exact sequence the peer-tip axis shrank to, and the live TEST-cabinet probe of
+/// 2026-08-01 confirmed DPS answers `-12 ERROR_BAD_HASH_PREV` to a `<MAC>` it has never accepted.
+/// Production refuses locally instead, so the node never reaches `MacReseedPending` → `STOP_MODE`.
+///
+/// It is also the CANARY for the test above: the two differ only by the leading `OfflineSell`, so
+/// if the harness could not tell a granted replenish from a refused one, they could not both pass.
+#[tokio::test]
+async fn harness_replenish_refused_while_an_offline_backlog_rests() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
+    let model = RefModel::new_offline_open_shift(4);
+    let _ = run_harness(
+        &[Op::OfflineSell, Op::Replenish(ReplenishLeaf::Granted)],
         ctx,
         model,
     )
@@ -2168,13 +2194,16 @@ async fn harness_replenish_server_reject_persists_nothing() {
 /// A replenish composed with a crash + reboot: the durable witness must survive recovery, so the
 /// post-reboot ledger stays clean.  Exercises the NC-03 path the hpc witness was built for,
 /// generatively rather than by a directed unit test.
+///
+/// bd `PRRO_GATE-knk`: the leading `OfflineSell` was removed for the same reason as the test above —
+/// it would now make the replenish a REFUSAL, so no witness would be written and "the witness
+/// survives the reboot" would assert nothing.
 #[tokio::test]
 async fn harness_replenish_survives_crash_and_reboot() {
     let ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
     let model = RefModel::new_offline_open_shift(4);
     let _ = run_harness(
         &[
-            Op::OfflineSell,
             Op::Replenish(ReplenishLeaf::Granted),
             Op::Crash(Stage::Sign),
             Op::Reboot,

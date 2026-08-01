@@ -146,15 +146,32 @@ async fn run_replenish(app: &App, di: u32) -> [u8; 32] {
     hs
 }
 
-/// Insert an ISSUED (offline OLA) fiscal_documents row for FN at `lnd`, chaining
+/// Insert an ISSUED offline `fiscal_documents` row for FN at `lnd`, in `state`, chaining
 /// `previous_hash` and carrying `unsigned_xml_sha256`.  `offline_fiscal_no` set →
 /// `is_issued` is true (the doc contributes to the active chain tip).  Mirrors the
 /// column list in `invariant_scan_chain_superseded.rs::seed_off`.
+///
+/// **bd PRRO_GATE-knk — `state` became a PARAMETER, and it is load-bearing.** It used to be a
+/// hardcoded `OFFLINE_LOCAL_ACK`, which made every PRE-replenish fixture in this file an UNDRAINED
+/// offline backlog. Production now refuses a replenish in that state, because an `OFFLINE_LOCAL_ACK`
+/// document advanced OUR seed while DPS has never seen it — and the live TEST-cabinet probe of
+/// 2026-08-01 confirmed DPS answers such a `<MAC>` with `-12 ERROR_BAD_HASH_PREV`. Those fixtures
+/// were therefore describing a state in which the replenish they perform could never have succeeded
+/// against a real DPS.
+///
+/// So the predecessor documents here now use [`DRAINED`] — an offline document that completed its
+/// drain. It supplies exactly the same chain tip (`is_issued` admits `ACK` for offline-origin), so
+/// every test keeps its subject; it just no longer asserts it from an unreachable precondition.
+/// Documents minted AFTER a replenish keep [`UNDRAINED`], which is production-faithful.
+const DRAINED: &str = "ACK";
+const UNDRAINED: &str = "OFFLINE_LOCAL_ACK";
+
 async fn seed_issued_offline_doc(
     pool: &sqlx::SqlitePool,
     lnd: i64,
     previous_hash: Option<[u8; 32]>,
     unsigned: [u8; 32],
+    state: &str,
 ) -> DocumentId {
     let doc_id = DocumentId::new();
     let request_id: [u8; 16] = *DocumentId::new().as_bytes();
@@ -163,13 +180,14 @@ async fn seed_issued_offline_doc(
             document_id, request_id, fiscal_number, lnd, doc_type, state, \
             backend_profile_id, transport_profile_id, fs_mode, business_ts, payload_json, \
             payload_sha256_canonical, previous_hash, unsigned_xml_sha256, offline_fiscal_no) \
-         VALUES (?, ?, ?, ?, 'SELL', 'OFFLINE_LOCAL_ACK', 'b', 't', 'OFFLINE', \
+         VALUES (?, ?, ?, ?, 'SELL', ?, 'b', 't', 'OFFLINE', \
             '2026-07-24T00:00:00Z', '{}', ?, ?, ?, ?)",
     )
     .bind(DbDocumentId(doc_id))
     .bind(&request_id[..])
     .bind(FN)
     .bind(lnd)
+    .bind(state)
     .bind(&[0u8; 32][..]) // payload_sha256_canonical
     .bind(previous_hash.map(|h| h.to_vec()))
     .bind(&unsigned[..])
@@ -189,7 +207,7 @@ async fn nc03_pre_sell_recovers_hs() {
     let (_dir, app) = boot_app().await;
     let hp = [0x11u8; 32];
     seed_fn(&app, 5, Some(hp)).await;
-    seed_issued_offline_doc(app.db(), 4, None, hp).await;
+    seed_issued_offline_doc(app.db(), 4, None, hp, DRAINED).await;
 
     // Sanity: before replenish the tip is the doc Hp.
     assert_eq!(
@@ -218,14 +236,14 @@ async fn after_sell_recovers_hsell_not_stale_hs() {
     let (_dir, app) = boot_app().await;
     let hp = [0x11u8; 32];
     seed_fn(&app, 5, Some(hp)).await;
-    seed_issued_offline_doc(app.db(), 4, None, hp).await;
+    seed_issued_offline_doc(app.db(), 4, None, hp, DRAINED).await;
 
     // Replenish: seed → Hs, witness lnd_at_write = 5.
     let hs = run_replenish(&app, 1).await;
 
     // An offline SELL then CONSUMES lnd 5, chains previous_hash = Hs, unsigned = Hsell.
     let hsell = [0x22u8; 32];
-    seed_issued_offline_doc(app.db(), 5, Some(hs), hsell).await;
+    seed_issued_offline_doc(app.db(), 5, Some(hs), hsell, UNDRAINED).await;
 
     // §4.2 strict `>`: doc.ord (5) == witness.lnd_at_write (5) → DOC wins → Hsell.
     assert_eq!(
@@ -287,7 +305,7 @@ async fn invariant_scan_clean_after_standalone_replenish() {
     let (_dir, app) = boot_app().await;
     let hp = [0x11u8; 32];
     seed_fn(&app, 5, Some(hp)).await;
-    seed_issued_offline_doc(app.db(), 4, None, hp).await;
+    seed_issued_offline_doc(app.db(), 4, None, hp, DRAINED).await;
 
     // Standalone replenish: node_seed → Hs; witness lnd_at_write = 5.
     let _hs = run_replenish(&app, 1).await;
@@ -441,7 +459,7 @@ async fn guard_b_accepts_reseed_to_hs_rejects_hp() {
     let hp = [0x11u8; 32];
     // FN at next_lnd = 5, prior issued doc Hp at lnd 4.
     seed_fn(&app, 5, Some(hp)).await;
-    seed_issued_offline_doc(pool, 4, None, hp).await;
+    seed_issued_offline_doc(pool, 4, None, hp, DRAINED).await;
     // Replenish → seed=Hs, witness lnd_at_write=5. Active tip is now Hs (witness-fed).
     let hs = run_replenish(&app, 1).await;
 
@@ -476,7 +494,7 @@ async fn tied_witnesses_same_second_recover_the_latest_seed() {
     let (_dir, app) = boot_app().await;
     let hp = [0x11u8; 32];
     seed_fn(&app, 5, Some(hp)).await;
-    seed_issued_offline_doc(app.db(), 4, None, hp).await;
+    seed_issued_offline_doc(app.db(), 4, None, hp, DRAINED).await;
 
     let a = [0xAAu8; 32];
     let b = [0xBBu8; 32];
@@ -550,12 +568,12 @@ async fn scan_clean_when_a_doc_chains_onto_the_t112_witness() {
     let (_dir, app) = boot_app().await;
     let hp = [0x11u8; 32];
     seed_fn(&app, 5, Some(hp)).await;
-    seed_issued_offline_doc(app.db(), 4, None, hp).await;
+    seed_issued_offline_doc(app.db(), 4, None, hp, DRAINED).await;
 
     let hs = run_replenish(&app, 1).await;
     // The next SELL consumes lnd 5 and chains onto the replenish seed Hs.
     let hsell = [0x22u8; 32];
-    seed_issued_offline_doc(app.db(), 5, Some(hs), hsell).await;
+    seed_issued_offline_doc(app.db(), 5, Some(hs), hsell, UNDRAINED).await;
     node_state::seed_prevhash(app.db(), FN, &hsell)
         .await
         .unwrap();
@@ -595,7 +613,7 @@ async fn ambiguous_t112_hold_is_resolvable_only_by_a_peer_corroborated_seed() {
     let pool = app.db();
     let hp = [0x11u8; 32];
     seed_fn(&app, 5, Some(hp)).await;
-    seed_issued_offline_doc(pool, 4, None, hp).await;
+    seed_issued_offline_doc(pool, 4, None, hp, DRAINED).await;
 
     // NO replenish: the ambiguous arm persists nothing, so there is no witness
     // and the active chain tip is still Hp. Hs is the tip DPS now holds.

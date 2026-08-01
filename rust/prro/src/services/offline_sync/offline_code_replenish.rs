@@ -94,6 +94,14 @@ pub enum ReplenishError {
     /// NO codes persisted; seed UNCHANGED; NO retry (T=112 is
     /// non-idempotent server-side — see module docs).
     DpsTransport(String),
+    /// bd `PRRO_GATE-knk` — an undrained offline backlog rests, so OUR chain tip is a value DPS
+    /// has never accepted and the T=112 is GUARANTEED to earn `-12 ERROR_BAD_HASH_PREV`. Refused
+    /// BEFORE the wire call: nothing signed, nothing sent, seed unchanged, node NOT pushed into
+    /// `STOP_MODE`. The remedy is to drain, and the message says so.
+    UndrainedOfflineBacklog {
+        fiscal_number: String,
+        undrained: i64,
+    },
     /// `node_state` row missing for the FN — structural breach (App boot
     /// must upsert the row before replenish is called).
     NodeStateMissing,
@@ -116,6 +124,17 @@ impl std::fmt::Display for ReplenishError {
                 write!(f, "DPS server error {code}: {message}")
             }
             ReplenishError::DpsTransport(msg) => write!(f, "DPS transport error: {msg}"),
+            ReplenishError::UndrainedOfflineBacklog {
+                fiscal_number,
+                undrained,
+            } => write!(
+                f,
+                "replenish refused: FN {fiscal_number} has {undrained} undrained offline \
+                 document(s), so the local chain tip is ahead of the one DPS holds — the T=112 \
+                 would earn -12 ERROR_BAD_HASH_PREV and put the node into STOP_MODE. DRAIN THE \
+                 BACKLOG FIRST (bring the node online and let the drain complete), then request \
+                 codes again."
+            ),
             ReplenishError::NodeStateMissing => write!(f, "node_state row missing for FN"),
             ReplenishError::SeedUpdateMissing => {
                 write!(
@@ -192,6 +211,49 @@ impl OfflineCodeReplenishService {
             None => String::new(),
             Some(arr) => arr.iter().map(|b| format!("{b:02x}")).collect(),
         };
+
+        // ── Step 2b: bd PRRO_GATE-knk — refuse on a diverged chain, BEFORE the wire ──
+        //
+        // The `<MAC>` built below is exactly `mac_hex`. An offline document advances that seed at
+        // `OFFLINE_LOCAL_ACK` — at LOCAL issuance, before DPS ever sees the document. So while an
+        // undrained offline backlog rests, `mac_hex` is a value DPS has never accepted.
+        //
+        // SETTLED LIVE 2026-08-01 against the TEST cabinet
+        // (`tests/live_probe_knk_t112_foreign_mac.rs`, FN 4000162280): DPS DOES chain-check the
+        // T=112 request. Handed a never-seen `<MAC>` it answers, verbatim,
+        //   Server { code: -12, message: "ERROR_BAD_HASH_PREV  store abc15386…5531 chk 6aa74325…dbac" }
+        // and its own tip does NOT move. The replenish is therefore not merely likely to fail — it
+        // is GUARANTEED to, and it fails expensively: `-12` routes to `MacReseedPending` → node
+        // `STOP_MODE`, with nothing anywhere telling the operator that the remedy is to drain.
+        //
+        // The wedge lands exactly when it hurts most: the pressure to replenish PEAKS at the end of
+        // an outage, when the backlog is largest. And the only production caller is the admin CLI,
+        // which requires `prro serve` to be STOPPED and does not reconcile — so
+        // "stop serve → request codes → start serve → drain" is the natural operator flow AND the
+        // counterexample's order, across a process boundary with the backlog durable in SQLite.
+        //
+        // This is a REFUSAL, not a chain fence: the earlier P1 reading (DPS accepts, its tip moves,
+        // the whole locally-issued backlog becomes unsendable) was REFUTED by that same probe.
+        //
+        // Placement is load-bearing and is what the `stub.calls().is_empty()` pins assert: BEFORE
+        // the XML build, the sign, and the DPS call. The S7-2 delivery-reservation fence below is
+        // NOT a substitute — it lives inside the persist envelope, i.e. it only fires once DPS has
+        // already answered `-12`. Invariant #1 is preserved: this is a read-only query outside any
+        // transaction; invariant #2 holds because it runs under the `acquire_fn_gate` lease taken
+        // in Step 1, so no document can cross `OFFLINE_LOCAL_ACK` between this count and the send.
+        let undrained =
+            crate::db::repositories::fiscal_documents::count_undrained_diverging_offline_docs(
+                pool,
+                fiscal_number,
+            )
+            .await
+            .map_err(ReplenishError::Db)?;
+        if undrained > 0 {
+            return Err(ReplenishError::UndrainedOfflineBacklog {
+                fiscal_number: fiscal_number.to_string(),
+                undrained,
+            });
+        }
 
         // ── Step 3: build T=112 request XML ──────────────────────────────
         let request = t112::build_t112_request(

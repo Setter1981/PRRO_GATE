@@ -355,6 +355,7 @@ test-support	prro	prro	admin::tests::go_offline_inner_refuses_non_online	false
 test-support	prro	prro	admin::tests::go_offline_via_open_door_flips_and_opens_session	false
 test-support	prro	prro	admin::tests::go_online_inner_flips_offline_to_going_online	false
 test-support	prro	prro	admin::tests::go_online_via_open_door_flips_to_going_online	false
+test-support	prro	prro	admin::tests::replenish_drain_first_refusal_is_ex_usage_not_tempfail	false
 test-support	prro	prro	admin::tests::replenish_error_maps_to_nonzero_exit_code	false
 test-support	prro	prro	admin::tests::request_offline_codes_missing_fn_config_returns_typed_error	false
 test-support	prro	prro	admin::tests::reset_stop_mode_happy_path_transitions_to_going_online	false
@@ -1375,6 +1376,7 @@ test-support	prro	prro::invariant_fuzzer	harness_offline_seeded	false
 test-support	prro	prro::invariant_fuzzer	harness_online_operator_accepted_after_badhashprev_hold_seed_advance	false
 test-support	prro	prro::invariant_fuzzer	harness_online_seeded	false
 test-support	prro	prro::invariant_fuzzer	harness_recovered_go_online_full_snapshot_verified	false
+test-support	prro	prro::invariant_fuzzer	harness_replenish_refused_while_an_offline_backlog_rests	false
 test-support	prro	prro::invariant_fuzzer	harness_replenish_server_reject_persists_nothing	false
 test-support	prro	prro::invariant_fuzzer	harness_replenish_survives_crash_and_reboot	false
 test-support	prro	prro::invariant_fuzzer	harness_replenish_then_offline_sell_chains_onto_the_non_doc_seed	false
@@ -1860,6 +1862,10 @@ test-support	prro	prro::node_state_mode_setters	set_mode_going_online_tx_flips_o
 test-support	prro	prro::node_state_mode_setters	set_mode_going_online_tx_guard_refuses_online	false
 test-support	prro	prro::node_state_mode_setters	set_mode_offline_tx_flips_online_to_offline_leaving_shift_state	false
 test-support	prro	prro::node_state_mode_setters	set_mode_offline_tx_guard_refuses_non_online	false
+test-support	prro	prro::offline_code_replenish	knk_a_replenish_refused_while_an_offline_local_ack_backlog_rests	false
+test-support	prro	prro::offline_code_replenish	knk_b_replenish_refused_while_an_offline_error_retryable_doc_rests	false
+test-support	prro	prro::offline_code_replenish	knk_c_replenish_proceeds_once_the_backlog_is_drained	false
+test-support	prro	prro::offline_code_replenish	knk_d_another_fns_backlog_does_not_block_this_fn	false
 test-support	prro	prro::offline_code_replenish	replenish_acquires_fn_gate	false
 test-support	prro	prro::offline_code_replenish	replenish_advances_chain_seed_to_request_hash	false
 test-support	prro	prro::offline_code_replenish	replenish_dps_call_outside_tx	false
