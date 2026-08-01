@@ -37,10 +37,12 @@
 //! promotion.
 
 use crate::db::repositories::delivery_reservation::{
-    complete_operator_pending, CompletionError, CompletionResult, ModeTarget, OperatorResolution,
-    ReservationId,
+    CompletionError, CompletionResult, ModeTarget, OperatorResolution, ReservationId,
 };
 use crate::db::tx::with_immediate;
+use crate::services::reconciliation::operator_completion::{
+    complete_operator_resolution, OperatorCompletionError,
+};
 use sqlx::SqlitePool;
 use std::path::Path;
 use thiserror::Error;
@@ -529,25 +531,39 @@ pub async fn resolve_operator_pending(
         Some(_) => {}
     }
 
-    // (2) Atomic completion. `complete_operator_pending` fails CLOSED (whole tx rolls back) on any
-    // stale-authority / origin / fork-guard breach — mapped to a typed AdminError below.
+    // (2) Atomic completion, through the ORCHESTRATOR (`complete_operator_resolution`) — not the
+    // repository core directly. bd PRRO_GATE-k3y: calling the core here skipped the two things the
+    // orchestrator owns — the shift-state projection (`apply_shift_transition`, the sole
+    // `node_state.shift_state` writer) and the Critical `OPERATOR_COMPLETION` audit. An
+    // operator-Accepted ONLINE SHIFT_OPEN therefore reached `SENT` (SFN stamped, seed advanced)
+    // while `shifts.state` stayed `OPENING`; the next boot after the document terminalised then saw
+    // a mid-transition shift with no pending work and applied branch (e2) orphan recovery — shift
+    // → `ERROR`, projection → `Closed` — while DPS held the shift OPEN. The orchestrator applies
+    // the §3.4 edge in the SAME `BEGIN IMMEDIATE` as the core, so a projection failure rolls the
+    // whole completion back rather than issuing with a divergent local view.
+    //
+    // Fails CLOSED (whole tx rolls back) on any stale-authority / origin / fork-guard / projection
+    // breach — mapped to a typed AdminError below.
     let fn_for_err = fiscal_number.to_string();
     let result: CompletionResult = with_immediate(pool, move |tx| {
         Box::pin(async move {
-            complete_operator_pending(tx, reservation_id, resolution)
+            complete_operator_resolution(tx, reservation_id, resolution)
                 .await
                 .map_err(anyhow::Error::from)
         })
     })
     .await
-    .map_err(|e| match e.downcast::<CompletionError>() {
+    .map_err(|e| match e.downcast::<OperatorCompletionError>() {
         // Infra DB error inside the envelope → EX_NOINPUT, not a stale-resolution refusal.
-        Ok(CompletionError::Db(dbe)) => {
+        Ok(OperatorCompletionError::Db(dbe)) => {
             AdminError::Infrastructure(format!("resolve envelope db: {dbe}"))
         }
-        Ok(ce) => AdminError::ResolutionRefused {
+        Ok(OperatorCompletionError::Completion(CompletionError::Db(dbe))) => {
+            AdminError::Infrastructure(format!("resolve envelope db: {dbe}"))
+        }
+        Ok(oce) => AdminError::ResolutionRefused {
             fiscal_number: fn_for_err.clone(),
-            reason: ce.to_string(),
+            reason: oce.to_string(),
         },
         Err(other) => AdminError::Infrastructure(format!("resolve envelope: {other}")),
     })?;

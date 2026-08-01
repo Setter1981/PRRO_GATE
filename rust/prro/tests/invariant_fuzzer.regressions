@@ -46,3 +46,4 @@ cc 086cdfa34597bf231af23ec26aac9a985155afd1f77b2f7dc77bd93e594e44b3 # shrinks to
 cc d67ca7d01761316bf72f1021a32982925e5c0f6b10bf5a84ced19aab91c9016a # shrinks to ops = [Crash(Send), Replenish(Granted)]
 cc f1fa46c1c12a5ec1601edf40822761a8470fc362349cab27c6914a95dd3b9def # shrinks to ops = [Replenish(Granted), Crash(Kvt1)]
 cc 1f3ba676be34985833e2631303d457cacec175d7d4420f4a6ecab0a328749232 # shrinks to ops = [OfflineServiceIn, Replenish(Granted), GoOnline(DpsScript([Ack, Ack]))]
+cc 5a42c3bcc8c5ad17d9cfb374769b7e31e97acf03dcdf9dcfaf69d3c889c29aff # shrinks to ops = [OnlineZReport(DpsScript([Superseded])), OperatorComplete(Accepted)]

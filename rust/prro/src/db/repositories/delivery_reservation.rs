@@ -1291,13 +1291,19 @@ pub enum CompletionError {
 /// 5. select the mode target — `GOING_ONLINE` iff an active OPEN/DRAINING offline session exists,
 ///    else `ONLINE` — and CAS the node out of STOP_MODE.
 ///
-/// **Fail-closed boundaries (Slice 5b):** a shift-family document → [`ShiftFamilyNotSupported`];
-/// an **offline** `NotAccepted` → [`OfflineCohortCleanupRequired`] (never half-applied — cancelling
-/// an OLA cohort or refusing is mandatory to avoid a fork). The `-11` BLOCKED branch + the
-/// admin-command probe wiring / `open_shift` agreement are also Slice 5b.
+/// **Fail-closed boundaries:** an origin-mismatched resolution → [`CompletionError::OriginMismatch`]
+/// (the DB row is the sole origin authority); an **offline** `NotAcceptedOffline` cancels the OLA
+/// cohort and rewinds the predecessor seed in this same tx, or refuses via the fork guards
+/// [`CompletionError::LaterSuccessorIssued`] / [`CompletionError::LaterSuccessorInFlight`] /
+/// [`CompletionError::LaterSuccessorInvalidState`] — never half-applied, since a partial cancel
+/// would fork the chain. The two names this paragraph used to cite
+/// (`ShiftFamilyNotSupported` / `OfflineCohortCleanupRequired`) no longer exist; a shift-family
+/// document is NOT refused here — its shift-state edge is applied one layer up, by
+/// `services::reconciliation::operator_completion::complete_operator_resolution` (bd
+/// PRRO_GATE-k3y).
 ///
-/// **INACTIVE (CS-3 Slice 5):** invoked by the extended `reset_stop_mode` admin path only after the
-/// whole-fence cutover (Slice 7); exercised by operator-completion tests today.
+/// **Callers:** reached in production only through that orchestrator, which the admin CLI
+/// `resolve-operator-pending` drives; called directly by operator-completion tests.
 pub async fn complete_operator_pending(
     tx: &mut WriteTxConn<'_>,
     reservation_id: ReservationId,
