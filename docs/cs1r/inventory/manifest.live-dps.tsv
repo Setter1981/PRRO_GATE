@@ -1450,6 +1450,7 @@ live-dps	prro	prro::invariant_fuzzer	oracle::tests::z_aggregation_oracle_catches
 live-dps	prro	prro::invariant_fuzzer	p01g_operator_accepted_after_restart_seed_advance_must_match_the_model	false
 live-dps	prro	prro::invariant_fuzzer	peer_axis_records_a_mismatch_when_the_peer_is_off_chain	false
 live-dps	prro	prro::invariant_fuzzer	peer_axis_tracks_the_chain_on_an_agreeing_run	false
+live-dps	prro	prro::invariant_fuzzer	phase_b_derived_minus12_punishes_a_wrong_reseed_then_the_corroborated_one_converges	true
 live-dps	prro	prro::invariant_fuzzer	regression_offline_shiftopen_resets_cash_on_hand	false
 live-dps	prro	prro::invariant_fuzzer	release_witness_accepted_clears_fence_and_stop	false
 live-dps	prro	prro::invariant_fuzzer	released_witness_refuses_origin_contradicting_completion	false

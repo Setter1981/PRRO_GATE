@@ -1740,6 +1740,147 @@ async fn macreseed_wrong_seed_refused_hold_intact_seed_unchanged() {
     );
 }
 
+// ═══════════ peer-tip axis PHASE B — the derived `-12` trajectory (bd PRRO_GATE-5hc) ═══════════
+//
+// RED-FIRST, WRITTEN BEFORE THE IMPLEMENTATION and `#[ignore]`d until it lands. It is committed
+// ignored rather than withheld so the contract phase B must satisfy is on record, reviewable, and
+// impossible to quietly redefine while implementing it. Remove the `#[ignore]` in the same commit
+// that adds the override; if it does not go green, the override is wrong.
+//
+// WHAT IS MISSING TODAY. Phase A already ships most of `5hc`: the stub emits the REAL wire shape
+// (`ERROR_BAD_HASH_PREV  store <64hex> chk <64hex>`, two spaces — live-captured 2026-07-31) with
+// `DPS_RECOVERY_TIP`, and `apply_reply` adopts that `store` as the peer's tip and marks the run
+// diverged (spec §4 row 4). The ONE thing absent is the DERIVED `-12`: the peer answering `-12` on
+// its own when the outgoing document's `previous_hash` does not equal its tip. Without it the
+// fuzzer models a DPS that forgets its own chain the moment it stops being told about it.
+//
+// WHY THAT MATTERS — it is the whole of `5hc`. The corroborated-MacReseed SUCCESS path is
+// generatively unreachable while every send after a divergence still gets an `Ack`: the operator's
+// FIRST guess is simply never punished, so the second, correct guess is never needed. This
+// trajectory is the shortest sequence that forces the punishment.
+//
+// THE TRAJECTORY (spec §9, phase B):
+//   1. issued sell            — both tips land on its hash; the chains AGREE
+//   2. forced `[BadHashPrev]` — hold + STOP_MODE; peer tip := `DPS_RECOVERY_TIP` → DIVERGED
+//   3. `MacReseed(local tip)` — guard-B disjunct (i) passes, so it RELEASES; but it reseeds to a
+//                               value the peer never had, so it does NOT converge. This is the
+//                               operator's plausible-and-wrong first move.
+//   4. next sell              — chains onto our tip ≠ peer tip ⇒ DERIVED `-12`, a fresh hold
+//                               ◀── THE RED: today this earns an `Ack` and no hold rests
+//   5. `MacReseed(store)`     — guard-B disjunct (ii), corroborated by the recorded `store`
+//   6. next sell              — chains onto the peer's own tip ⇒ SUCCEEDS
+//
+// Step 3 is deliberately the WRONG reseed. A test that went straight to step 5 would pass against a
+// peer with no memory at all, and prove nothing.
+#[tokio::test]
+#[ignore = "phase B: the derived -12 override is not implemented yet (bd PRRO_GATE-5hc) — \
+            remove this attribute in the commit that adds it"]
+async fn phase_b_derived_minus12_punishes_a_wrong_reseed_then_the_corroborated_one_converges() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+
+    // 1 — a predecessor issued sell. Both sides advance to its hash: the chains AGREE.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let local_tip = ctx
+        .last_issued_tip()
+        .await
+        .expect("a predecessor issued → tip is Some");
+
+    // 2 — the forced leaf. The peer NAMES its tip in `store`; from here the two legitimately differ.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::bad_hash_prev())).await;
+    assert!(
+        ctx.peer_diverged().is_some(),
+        "the forced -12 must mark the run diverged — the peer declared a tip we do not hold"
+    );
+    let peer_tip_after_forced = ctx
+        .peer_tip_hex()
+        .expect("the -12 named a store hash, so the peer has a tip");
+
+    // 3 — the operator's WRONG-but-legal first move: reseed to OUR last-issued tip. Guard-B
+    //     disjunct (i) admits it (seed == active tip), so it RELEASES — and leaves us diverged.
+    let out = interp::operator_complete_macreseed(&ctx, local_tip).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Released(_)),
+        "MacReseed(local tip) satisfies guard-B disjunct (i) and must release, got {out:?}"
+    );
+    assert_ne!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(hex_of(&local_tip).as_str()),
+        "step 3 must NOT converge — reseeding to our own tip cannot teach the peer anything"
+    );
+
+    // 4 — THE POINT OF PHASE B. The next document chains onto our tip, which the peer has never
+    //     accepted, so the peer must refuse it with a DERIVED -12 and a fresh MacReseedPending hold.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    // NOTE the predicate. `read_held_witness` returns the reservation row for a request id in ANY
+    // state — a SUCCESSFUL send has one too — so it cannot answer "does a hold rest". The first
+    // draft of this pin used it and went red on the wrong assertion, which is exactly why the
+    // RED-first step is run and read rather than assumed. `active_held_reservation` is the real
+    // predicate: the FN's completable `PENDING_APPLY` hold, the one an operator can act on.
+    assert!(
+        ctx.active_held_reservation().await.is_some(),
+        "phase B: a send whose previous_hash disagrees with the peer's tip must earn a DERIVED -12 \
+         and leave a completable hold. Today the stub replies with whatever the script says, so \
+         this run sails past a divergence a real DPS would have refused. \
+         peer_tip={peer_tip_after_forced} our_seed={:?}",
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+    let rid = ctx
+        .last_request_id()
+        .expect("the sell was attempted and recorded");
+    let held = ctx
+        .read_held_witness(&rid)
+        .await
+        .expect("the held send has a reservation row");
+    assert_eq!(
+        held.node_effect, "MacReseedPending",
+        "a derived -12 is still a -12: it must route to MacReseedPending, exactly like the forced \
+         leaf, or the operator has no defined next move"
+    );
+
+    // 5 — the CORROBORATED reseed: the seed the peer itself named. Guard-B disjunct (ii).
+    let store: [u8; 32] = hex_to_32(&peer_tip_after_forced);
+    let out = interp::operator_complete_macreseed(&ctx, store).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Released(_)),
+        "MacReseed(store) is corroborated by the recorded -12 and must release, got {out:?}"
+    );
+    assert_eq!(
+        ctx.read_seed().await.as_deref(),
+        Some(&store[..]),
+        "the corroborated reseed installs the peer's own tip — the two sides have CONVERGED"
+    );
+
+    // 6 — and the very next document goes through. This is `5hc`'s success path, generatively.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let rid = ctx.last_request_id().expect("the sell was attempted");
+    assert!(
+        ctx.read_held_witness(&rid).await.is_none(),
+        "after convergence the next send must SUCCEED — a hold here means the peer is still \
+         refusing, i.e. the reseed did not actually align the chains"
+    );
+    oracle::assert_clean(&ctx.pool).await;
+}
+
+fn hex_of(bytes: &[u8; 32]) -> String {
+    hex_of_slice(bytes)
+}
+
+fn hex_of_slice(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+fn hex_to_32(hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("32-byte lowercase hex");
+    }
+    out
+}
+
 // ── CS-3 held-leaf expansion: Superseded + BadHashPrev (Increment 3) ─────────
 
 /// CS-3 Increment 3 [pure] — the Superseded leaf's DURABLE routing class is `TransientRetry` (the
