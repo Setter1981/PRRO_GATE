@@ -100,14 +100,28 @@ fi
 # ── 5. executable bits on scripts CI invokes ─────────────────────────────────
 # A gate script committed 100644 is a gate CI cannot run — #370 shipped exactly
 # that, and `inventory_gate_teeth.sh` still sits at 100644 today.
-step "exec bits on scripts/**.sh"
-NOEXEC="$(git ls-files -s -- 'scripts/**/*.sh' 'scripts/*.sh' | awk '$1 == "100644" { print $4 }')"
-if [ -z "$NOEXEC" ]; then
-  ok "every committed script is executable"
+step "exec bit on scripts a workflow invokes DIRECTLY"
+# Only a DIRECT invocation needs the bit. Most gates are called as
+# `bash scripts/…`, which works at any mode — and five committed scripts are in
+# fact 100644 today for exactly that reason. Failing on those would make this a
+# nag, and a gate people learn to ignore is worse than no gate at all. So the
+# check is narrow: a workflow `run:` line that executes a script WITHOUT a
+# bash/sh prefix, where the file is not executable in git. That is precisely the
+# shape that turned #370's gate-teeth job red on its first run.
+DIRECT="$(grep -rhoE '^[[:space:]]*run:[[:space:]]+(\./)?scripts/[A-Za-z0-9_/.-]+\.sh' .github/workflows/ 2>/dev/null \
+  | sed -E 's/^[[:space:]]*run:[[:space:]]+(\.\/)?//' | sort -u)"
+BAD=""
+for s in $DIRECT; do
+  mode="$(git ls-files -s -- "$s" | awk '{print $1}')"
+  [ "$mode" = "100644" ] && BAD="$BAD$s"$'\n'
+done
+if [ -z "$BAD" ]; then
+  ok "$(echo "$DIRECT" | grep -c .) directly-invoked script(s), all executable"
 else
-  printf '   not executable in git:\n%s\n' "$(echo "$NOEXEC" | sed 's/^/     /')"
+  printf '   invoked directly by a workflow but NOT executable in git:\n%s' \
+    "$(echo "$BAD" | sed 's/^/     /')"
   printf '   fix: git update-index --chmod=+x <path>\n'
-  fail "a script CI invokes directly would not run"
+  fail "a directly-invoked script would not run in CI"
 fi
 
 # ── 6. the suite ─────────────────────────────────────────────────────────────
