@@ -65,66 +65,25 @@ use syn::{Expr, File, Type};
 pub const BASE_SHA: &str = "f2c17b1";
 /// head = CS-1 completion (immutable provenance endpoint).
 pub const HEAD_SHA: &str = "f2628ba";
-/// CS-3 S7-1 cutover re-baseline: the LIVE-drift leg's base/head endpoint. The immutable
-/// provenance leg (`BASE_SHA`->`HEAD_SHA`) is UNTOUCHED — the CS-1 refactor neutrality proof
-/// stays frozen at `f2c17b1..f2628ba` (historical). The cutover is an explicit, adjudicated
-/// contract change to the frozen test files (HELD/RMR/escalate), so ONLY the live-drift leg is
-/// re-anchored to the cutover commit: `git_show(LIVE_DRIFT_BASE_SHA, file) == worktree`, and it
-/// still fails RED on any FURTHER non-neutral drift vs this base. No carve-out, no weakening of
-/// the immutable proof. Re-anchor again (bump this) at the next adjudicated frozen-file change.
-///
-/// CS-3 fuzzer-oracle re-anchor (2026-07-25, bd PRRO_GATE-2nk): the fuzzer track made adjudicated
-/// additions to the frozen `invariant_fuzzer/{interp,model}.rs` (independent delivery-axis model +
-/// generative NotAcceptedOffline re-enable). ONLY those two of the 79 frozen files changed vs main;
-/// the live-drift leg re-anchors to the fuzzer-track tip; the immutable `f2c17b1..f2628ba` leg is
-/// UNTOUCHED. No supersession (0 removals — additions-only). FINAL CS-3 re-anchor to `b1fec955` (the
-/// tip after P3 fence-identity + P2 RETURN idem-replay): the earlier `f0824fad`/`041628a6` bumps were
-/// intermediate (before those two teeth); this is the single re-anchor at the TRUE CS-3 tip covering
-/// the frozen `invariant_fuzzer/{interp,model}.rs` + `tests/invariant_scan.rs` WRAPPERS edits.
-/// bd PRRO_GATE-x5o re-anchor (2026-07-30): the fuzzer-model cash-reversal fix edits the frozen
-/// `invariant_fuzzer/model.rs`, an adjudicated change (prod was right; the model was under-counting a
-/// cohort-cancel). Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-///
-/// bd PRRO_GATE-hpc/2ds re-anchor (2026-07-31): the generative `Replenish` (T=112) symbol edits the
-/// frozen `invariant_fuzzer/{interp,model}.rs` — the fixture now owns a real `App` (the T=112 service
-/// requires one) and the model gains the S7-2 `fence_active` precondition. BOTH are adjudicated
-/// prod-was-right changes, the second found by the fuzzer itself at `FUZZ_CASES=4096` and shrunk to
-/// `[Crash(Send), Replenish(Granted)]`. Production is FROZEN in that slice (zero `src/` diff), so this
-/// is a test-side contract addition, not a behaviour change. Additions-only — 0 removals, no
-/// supersession entry needed. Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-///
-/// bd `PRRO_GATE-3uo` fuzzer follow-up re-anchor (2026-07-31): the `-12` slice edits the frozen
-/// `invariant_fuzzer/{interp,op}.rs` + `invariant_fuzzer.rs`. Adjudicated: the stub's `-12` gains the
-/// LIVE-captured `store <hash>` shape (bd `PRRO_GATE-2ds`), the retry machinery written against a
-/// RETIRED contract is removed, and the REAL HELD contract gets a pin. Production is FROZEN (zero
-/// `src/` diff). Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-/// bd `PRRO_GATE-5hc` / `-12`-into-the-oracle re-anchor (2026-07-31): promoting `-12` out of the
-/// assertion-free `FaultOrRecovery` bucket edits the frozen `invariant_fuzzer/model.rs` — five early
-/// `return ExpectedOutcome::Fault` bails DELETED, nothing added. Adjudicated: the bails were written
-/// against the W10.4 auto-recovery orchestrator that S7-1 R3 retired, and the real contract (doc
-/// rests `Sending`, node STOP_MODE, seed unmoved) already falls out of the shared HELD path. The
-/// removal was proven to have TEETH in both directions — a lying model REDs now and passed before.
-/// Production is FROZEN in that slice (the only `src/` diff is two corrected docstrings, no
-/// behaviour). Removals inside a file's body, NOT test removals — 0 manifest removals, so no
-/// supersession entry. Live-drift leg only; the immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-/// Peer-tip axis PHASE A re-anchor (2026-07-31, spec
-/// `2026-07-31-spec-fuzzer-peer-tip-axis.md`): modelling the DPS peer's chain tip edits the frozen
-/// `invariant_fuzzer/interp.rs` + `invariant_fuzzer.rs`. Adjudicated: the harness gains a read-only
-/// OBSERVER (it overrides no reply) plus the assertion that makes the movers table falsifiable, and
-/// it immediately found `bd PRRO_GATE-knk` (P1) generatively. Production is FROZEN in this slice
-/// (zero `src/` diff). Additions-only — the two new directed pins and two `#[ignore]`d RED pins add
-/// tests, remove none, so no supersession entry. Live-drift leg only; the immutable
-/// `f2c17b1..f2628ba` proof is UNTOUCHED.
-/// bd `PRRO_GATE-01g` re-anchor (2026-07-31): the non-document-tip fix edits the frozen
-/// `invariant_fuzzer/model.rs` (+ un-`#[ignore]`s its pin in `invariant_fuzzer.rs`). Adjudicated
-/// PROD-RIGHT unanimously by three lenses incl. an adversarial verifier: production's
-/// completion-time seed advance IS A.3 advance-at-SEND deferred until the ambiguity resolves, and
-/// `invariant_scan` is clean at every boundary. The model was aliasing a NON-DOCUMENT tip (a
-/// granted T=112 seed) onto `max(lnd)`, re-arming the task-#18 trap that the surrounding comment
-/// had disarmed under a premise ("generator-excluded") the `Replenish` symbol invalidated.
-/// Production is FROZEN (zero `src/` diff); the oracle was NOT weakened. Live-drift leg only; the
-/// immutable `f2c17b1..f2628ba` proof is UNTOUCHED.
-pub const LIVE_DRIFT_BASE_SHA: &str = "c73099d6";
+// CS-1R5 — the live-drift ANCHOR IS GONE.
+//
+// This constant used to hold a git SHA that the live-drift leg shelled
+// `git show <SHA>:<path>` against for all 79 frozen files. It was re-anchored
+// eight times (CS-3 S7-1 cutover, the fuzzer-oracle track, `2nk`, `x5o`,
+// `hpc`/`2ds`, `3uo`, the `-12` oracle promotion, the peer-tip axis, `01g`) —
+// each time to a commit inside the branch that made the change.
+//
+// That was structurally unsound: a squash-merge does not put the branch's
+// commits into `main`, so every anchor was unreachable from `main` and the leg
+// worked only while the branch survived on the remote. Deleting a merged branch
+// would have broken the leg for EVERY later PR, and because `git_show`
+// hard-asserts, the failure would have been all 79 files at once with an opaque
+// `git show ... exited non-zero`.
+//
+// The leg now pins CONTENT instead: see `CANONICAL_FINGERPRINTS_FILE` and
+// `canonical_fingerprint`. The re-anchor ledger that used to live here is in
+// this file's git history. The IMMUTABLE leg below still uses `git show`, and
+// that is correct — `f2c17b1` and `f2628ba` are ancestors of `main`.
 
 /// The 15 `Db*` wrapper newtype identifiers introduced by CS-1 (`db/types.rs`).
 /// Used to recognize W1/W2/W3 nodes; NO other single-segment `Db…` ctor is
@@ -615,6 +574,18 @@ pub struct SqlxSig {
 /// longer asserts SQL-byte identity, so there is no diff↔set to load.
 pub const MANUAL_RESIDUAL_FINGERPRINT_FILE: &str = "docs/cs1r/pins/manual_residual_fingerprint.txt";
 pub const POST_CS1_CARVEOUT_FILE: &str = "docs/cs1r/pins/post_cs1_carveout.tsv";
+/// CS-1R5 — the CANONICAL-FINGERPRINT manifest: one row per frozen test file,
+/// `<ast_sha256> TAB <sqlx_sha256> TAB <path>`.
+///
+/// This REPLACES the git-SHA anchor the live-drift leg used to carry. The anchor
+/// was a commit INSIDE a feature branch; after a squash-merge it is unreachable
+/// from `main`, so the leg only worked while that branch survived on the remote —
+/// deleting a merged branch would have broken the leg for every later PR, and
+/// `git_show` hard-asserts, so the failure would have been all 79 files at once
+/// with an opaque message. Fingerprints remove the dependency on history
+/// REACHABILITY entirely; the immutable `f2c17b1..f2628ba` leg keeps using
+/// `git show` because BOTH of those commits are ancestors of `main`.
+pub const CANONICAL_FINGERPRINTS_FILE: &str = "docs/cs1r/pins/cs1_canonical_fingerprints.tsv";
 
 /// The one canonical pin directory. Every pin path MUST be exactly
 /// `<CANONICAL_PIN_DIR>/<basename>` for one of the two allowed basenames — enforced
@@ -628,10 +599,13 @@ pub const CANONICAL_PIN_DIR: &str = "docs/cs1r/pins";
 /// different directory — a second pin placed elsewhere can never be honored.
 fn pin_path(file_rel: &str) -> PathBuf {
     assert!(
-        file_rel == MANUAL_RESIDUAL_FINGERPRINT_FILE || file_rel == POST_CS1_CARVEOUT_FILE,
+        file_rel == MANUAL_RESIDUAL_FINGERPRINT_FILE
+            || file_rel == POST_CS1_CARVEOUT_FILE
+            || file_rel == CANONICAL_FINGERPRINTS_FILE,
         "pin loader refused a non-canonical pin path {file_rel:?}: the ONLY pin files are \
-         {MANUAL_RESIDUAL_FINGERPRINT_FILE:?} and {POST_CS1_CARVEOUT_FILE:?} under \
-         {CANONICAL_PIN_DIR:?}. A pin placed anywhere else is not read (finding-7)."
+         {MANUAL_RESIDUAL_FINGERPRINT_FILE:?}, {POST_CS1_CARVEOUT_FILE:?} and \
+         {CANONICAL_FINGERPRINTS_FILE:?} under {CANONICAL_PIN_DIR:?}. A pin placed anywhere \
+         else is not read (finding-7)."
     );
     // Belt-and-braces: the canonical file MUST live directly under the canonical dir.
     assert_eq!(
@@ -646,7 +620,7 @@ fn pin_path(file_rel: &str) -> PathBuf {
 
 /// Read a canonical pin data file's meaningful lines (drop `#` comments + blank
 /// lines). The path is resolved ONLY via [`pin_path`], so nothing off-canon loads.
-fn read_pin_lines(file_rel: &str) -> Vec<String> {
+pub fn read_pin_lines(file_rel: &str) -> Vec<String> {
     let path = pin_path(file_rel);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read pin file {}: {e}", path.display()));
@@ -1028,4 +1002,98 @@ pub fn manual_ruling_files() -> BTreeSet<String> {
     ["rust/prro/tests/live_dps_extended_smoke.rs".to_string()]
         .into_iter()
         .collect()
+}
+
+// ─── CS-1R5: canonical fingerprints (the live-drift anchor) ─────────────
+
+/// The CANONICAL form of one frozen test file, as a pair of hex sha256 digests:
+/// `(ast, sqlx)`.
+///
+/// Why two and not one: the canonicaliser DELETES the query-head turbofish
+/// (that is what lets `query_scalar(SQL)` and `query_scalar::<_, DbShiftState>(SQL)`
+/// compare equal across CS-1), so an AST-only digest would silently stop pinning
+/// the decode type and retire the A2c teeth. The sqlx digest carries the decode
+/// type — plus the SQL text, the ORDERED bind vector and the fetch mode — so both
+/// surfaces the old leg compared are covered, and they stay separable in the
+/// failure message.
+///
+/// ONE ADJUDICATED CONTRACT CHANGE vs the git-anchored leg: the old comparison
+/// used `decode_types_compatible`, where an EMPTY decode type matched anything
+/// (base inferred vs head explicit). That rule is NON-TRANSITIVE (`"" ~ A`,
+/// `"" ~ B`, but `A !~ B`), so it has no canonical quotient and cannot be
+/// expressed as a per-file value. Hashing the decode type verbatim is therefore
+/// STRICTLY STRICTER, never weaker: the only newly-RED edit is one that DELETES
+/// an explicit turbofish and reverts a query head to inference — which is a real
+/// change to the decode surface and deserves a re-mint.
+pub fn canonical_fingerprint(src: &str) -> Result<(String, String), String> {
+    let ast = normalize_source(src)?.to_string();
+    let file: File = syn::parse_file(src).map_err(|e| format!("parse error: {e}"))?;
+    let sqlx = encode_sqlx_sigs(&extract_sqlx_sigs(&file));
+    Ok((sha256_hex(ast.as_bytes()), sha256_hex(sqlx.as_bytes())))
+}
+
+/// Stable, explicit serialisation of the extracted sqlx signatures.
+///
+/// Hand-written rather than `{:?}`: a derived `Debug` rendering is not a stability
+/// contract, and a future field addition or a formatting change in the compiler
+/// would silently invalidate all 79 fingerprints while looking exactly like a real
+/// drift. Every field is emitted explicitly, in a fixed order, with separators
+/// that cannot occur in the values.
+fn encode_sqlx_sigs(sigs: &[SqlxSig]) -> String {
+    let mut out = String::new();
+    for s in sigs {
+        out.push_str(&s.enclosing_fn);
+        out.push('\u{1}');
+        out.push_str(&s.occurrence.to_string());
+        out.push('\u{1}');
+        out.push_str(&s.sql);
+        out.push('\u{1}');
+        out.push_str(&s.query_kind);
+        out.push('\u{1}');
+        out.push_str(&s.decode_type);
+        out.push('\u{1}');
+        out.push_str(&format!("{:?}", s.fetch_mode));
+        out.push('\u{1}');
+        for b in &s.binds {
+            out.push_str(b);
+            out.push('\u{2}');
+        }
+        out.push('\u{3}');
+    }
+    out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in d {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// The committed manifest, as `path -> (ast_sha, sqlx_sha)`.
+pub fn canonical_fingerprints() -> std::collections::BTreeMap<String, (String, String)> {
+    let mut m = std::collections::BTreeMap::new();
+    for line in read_pin_lines(CANONICAL_FINGERPRINTS_FILE) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            cols.len(),
+            3,
+            "malformed row in {CANONICAL_FINGERPRINTS_FILE}: expected \
+             `<ast_sha256> TAB <sqlx_sha256> TAB <path>`, got {line:?}"
+        );
+        let prev = m.insert(
+            cols[2].to_string(),
+            (cols[0].to_string(), cols[1].to_string()),
+        );
+        assert!(
+            prev.is_none(),
+            "duplicate row for {:?} in {CANONICAL_FINGERPRINTS_FILE}",
+            cols[2]
+        );
+    }
+    m
 }

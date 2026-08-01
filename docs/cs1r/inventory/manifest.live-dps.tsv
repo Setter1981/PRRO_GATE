@@ -1115,6 +1115,7 @@ live-dps	prro	prro::cs1_test_provenance	a4_runtime_sql_alias_removal_is_catalogu
 live-dps	prro	prro::cs1_test_provenance	cs1_immutable_provenance_base_vs_head	false
 live-dps	prro	prro::cs1_test_provenance	cs1_live_drift_base_vs_worktree	false
 live-dps	prro	prro::cs1_test_provenance	cs1_provenance_set_is_exactly_79	false
+live-dps	prro	prro::cs1_test_provenance	mint_canonical_fingerprints	true
 live-dps	prro	prro::cs1_test_provenance	pin_loader_reads_only_canonical_path	false
 live-dps	prro	prro::cs1_test_provenance	print_manual_residual_fingerprint	true
 live-dps	prro	prro::cs1r4_integrity_job_coverage	cargo_legs_are_scope_gated_and_the_job_stays_unconditional	false

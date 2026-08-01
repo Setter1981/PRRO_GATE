@@ -30,10 +30,10 @@ mod prov;
 use std::collections::BTreeSet;
 
 use prov::{
-    extract_sqlx_sigs, git_hash_object, git_show, manual_residual_fingerprint,
-    manual_residual_fingerprint_pin, manual_ruling_files, normalize_source, post_cs1_carveout,
-    repo_root, BASE_SHA, CANONICAL_PIN_DIR, HEAD_SHA, LIVE_DRIFT_BASE_SHA,
-    MANUAL_RESIDUAL_FINGERPRINT_FILE,
+    canonical_fingerprint, canonical_fingerprints, extract_sqlx_sigs, git_hash_object, git_show,
+    manual_residual_fingerprint, manual_residual_fingerprint_pin, manual_ruling_files,
+    normalize_source, post_cs1_carveout, repo_root, BASE_SHA, CANONICAL_FINGERPRINTS_FILE,
+    CANONICAL_PIN_DIR, HEAD_SHA, MANUAL_RESIDUAL_FINGERPRINT_FILE,
 };
 
 // CS-1R3 A2 — the pinned EXACT residual fingerprint of the sole manual-ruling file
@@ -262,89 +262,113 @@ fn cs1_immutable_provenance_base_vs_head() {
     assert_eq!(ast_manual, 1, "expected exactly 1 manual-ruling file");
 }
 
-/// LEG 2 — live-drift / teeth: base blob vs WORKING-TREE file. A mutation to a
-/// live file (any of the 5 R1.1 teeth) makes this RED.
+/// LEG 2 — live-drift / teeth: the WORKING-TREE file vs its CANONICAL FINGERPRINT.
+///
+/// CS-1R5: this leg no longer references git history. It used to shell
+/// `git show <LIVE_DRIFT_BASE_SHA>:<path>` for all 79 files, where the anchor was
+/// a commit INSIDE a feature branch — unreachable from `main` after a squash
+/// merge, so the leg silently depended on that branch never being deleted, and
+/// `git_show` hard-asserts, so losing the object would have failed all 79 files
+/// at once with an opaque message. The fingerprints in
+/// `docs/cs1r/pins/cs1_canonical_fingerprints.tsv` depend on CONTENT, not on
+/// reachability. (The IMMUTABLE leg still uses `git show`, correctly: `f2c17b1`
+/// and `f2628ba` are ancestors of `main`.)
+///
+/// The accept-set is unchanged: a whitelisted-neutral edit leaves the canonical
+/// AST identical, so its digest is identical; anything else diverges and is RED.
+/// One contract change is adjudicated in `canonical_fingerprint`'s doc: the decode
+/// type is now hashed verbatim instead of going through the non-transitive
+/// empty-is-wildcard rule — strictly stricter, never weaker.
 #[test]
 fn cs1_live_drift_base_vs_worktree() {
     let root = repo_root();
-    let manual = manual_ruling_files();
-    // CS-1R3 A2 — carve-outs + fingerprint loaded from the code-owner-gated pin
-    // DATA files (docs/cs1r/pins/), not constants next to this oracle.
+    // CS-1R3 A2 — carve-outs loaded from the code-owner-gated pin DATA file.
+    // The carve-out pin is a WORKTREE BLOB hash (`git hash-object`), which is
+    // already content-addressed and never depended on reachability.
     let carveout = post_cs1_carveout();
     let approved: std::collections::BTreeMap<&str, &str> = carveout
         .iter()
         .map(|(p, sha)| (p.as_str(), sha.as_str()))
         .collect();
-    let manual_fp = manual_residual_fingerprint_pin();
-    let mut ast_ok = 0usize;
-    let mut ast_manual = 0usize;
+    let pinned = canonical_fingerprints();
     let mut failures: Vec<String> = Vec::new();
+    let mut checked = 0usize;
 
     for path in CS1_MODIFIED_FILES {
-        // CS-3 S7-1 re-baseline: the live-drift leg compares vs the CUTOVER commit, not the
-        // frozen CS-1 base (the immutable leg still proves f2c17b1->f2628ba). A further
-        // non-neutral drift vs the cutover base is still RED.
-        let base_src = git_show(&root, LIVE_DRIFT_BASE_SHA, path);
-        let head_src = if let Some(&approved_sha) = approved.get(path) {
-            // CS-1R2 A2b — a carved-out file carries an APPROVED post-CS-1 delta
-            // (the oracle fix 32166cc) that is NOT a behaviour-neutral CS-1
-            // transform, so the CS-1 provenance AST/sqlx compare must stay on the
-            // frozen CS-1 endpoint (base ↔ f2628ba), NOT the oracle-fix blob. The
-            // hardening this replaces the OLD blanket "skip the worktree entirely"
-            // with: the worktree MUST equal the pinned approved blob SHA — any
-            // FURTHER drift (a mutation smuggled into this file) is RED. A future
-            // legitimate change re-pins POST_CS1_CARVEOUT with an artifact note.
-            let abs = root.join(path);
+        let abs = root.join(path);
+        let src = std::fs::read_to_string(&abs)
+            .unwrap_or_else(|e| panic!("read worktree file {}: {e}", abs.display()));
+
+        if let Some(&approved_sha) = approved.get(path) {
+            // A carved-out file carries an APPROVED post-CS-1 delta. The worktree
+            // MUST equal the pinned blob exactly — any FURTHER drift (a mutation
+            // smuggled in) is RED. A future legitimate change re-pins the
+            // carve-out SHA with an artifact note.
             let live_sha = git_hash_object(&root, &abs);
             if live_sha != approved_sha {
                 failures.push(format!(
-                    "{path}: worktree drifted from the APPROVED post-CS-1 blob \
-                     (oracle fix 32166cc). Any change to this carved-out file must \
-                     re-pin the carve-out SHA in docs/cs1r/pins/post_cs1_carveout.tsv with \
-                     an artifact note.\n  \
+                    "{path}: worktree drifted from the APPROVED post-CS-1 blob. Any change to \
+                     this carved-out file must re-pin the carve-out SHA in \
+                     docs/cs1r/pins/post_cs1_carveout.tsv with an artifact note.\n  \
                      approved sha={approved_sha}\n  worktree sha={live_sha}"
                 ));
             }
-            // AST/sqlx provenance compare stays on the live-drift frozen endpoint (the cutover).
-            git_show(&root, LIVE_DRIFT_BASE_SHA, path)
-        } else {
-            let abs = root.join(path);
-            std::fs::read_to_string(&abs)
-                .unwrap_or_else(|e| panic!("read worktree file {}: {e}", abs.display()))
-        };
-        check_one(
-            path,
-            &base_src,
-            &head_src,
-            &manual,
-            &manual_fp,
-            &mut ast_ok,
-            &mut ast_manual,
-            &mut failures,
-        );
+        }
 
-        // CS-1R2 A2c — decode-type teeth: pin the live (worktree, or frozen CS-1
-        // blob for a carveout file) EXPLICIT decode types against the FROZEN head
-        // blob. Both are post-CS-1 and explicit, so a mutation of a decode type to
-        // a DIFFERENT type (`::<_, DbShiftState>` → `::<_, DbDocState>`) diverges
-        // — the old gate blanket-stripped the whole turbofish and pinned it
-        // NOWHERE.
-        let head_blob_src = git_show(&root, LIVE_DRIFT_BASE_SHA, path);
-        pin_worktree_decode_types(path, &head_blob_src, &head_src, &mut failures);
+        let Some((want_ast, want_sqlx)) = pinned.get(*path) else {
+            failures.push(format!(
+                "{path}: NO row in {CANONICAL_FINGERPRINTS_FILE}. Every frozen file must be \
+                 pinned — re-mint with `mint_canonical_fingerprints -- --ignored`."
+            ));
+            continue;
+        };
+        let (got_ast, got_sqlx) = match canonical_fingerprint(&src) {
+            Ok(v) => v,
+            Err(e) => {
+                failures.push(format!("{path}: canonicalisation failed: {e}"));
+                continue;
+            }
+        };
+        checked += 1;
+
+        if &got_ast != want_ast {
+            failures.push(format!(
+                "{path}: CANONICAL AST fingerprint diverged — the file changed beyond the \
+                 whitelisted CS-1 transforms.\n  pinned   {want_ast}\n  worktree {got_ast}\n  \
+                 If the change is an adjudicated one, re-mint the manifest and SAY WHY in the PR."
+            ));
+        }
+        if &got_sqlx != want_sqlx {
+            failures.push(format!(
+                "{path}: SQLX-signature fingerprint diverged — an SQL edit, a bind swap/drop, a \
+                 fetch-mode change, or a DECODE-TYPE change.\n  pinned   {want_sqlx}\n  \
+                 worktree {got_sqlx}"
+            ));
+        }
+    }
+
+    // Totality: every pinned row must correspond to a frozen file, so a stale row
+    // (a file dropped from the set) cannot sit in the manifest unnoticed.
+    let frozen: std::collections::BTreeSet<&str> = CS1_MODIFIED_FILES.iter().copied().collect();
+    for path in pinned.keys() {
+        if !frozen.contains(path.as_str()) {
+            failures.push(format!(
+                "{CANONICAL_FINGERPRINTS_FILE} pins {path:?}, which is NOT in the frozen set — \
+                 a stale row. Re-mint."
+            ));
+        }
     }
 
     assert!(
         failures.is_empty(),
-        "live-drift (base→worktree) failures — a CS-1 test file diverged from its \
-         provenance-equivalent base beyond the whitelisted transforms:\n{}",
+        "live-drift (canonical fingerprints) failures — a CS-1 test file diverged from its \
+         pinned canonical form beyond the whitelisted transforms:\n{}",
         failures.join("\n\n")
     );
-    // CS-3 S7-1 re-baseline: the live-drift leg is re-anchored to the cutover commit, so every
-    // frozen file is AST-neutral vs its own live-drift base (all 79 -> ast_ok) and the former
-    // single manual-ruling residual (T7 `.0` in live_dps_extended_smoke.rs) is subsumed into the
-    // cutover base (ast_manual = 0). The IMMUTABLE leg's 78/1 split is unchanged (f2c17b1..f2628ba).
-    assert_eq!(ast_ok, 79);
-    assert_eq!(ast_manual, 0);
+    assert_eq!(
+        checked, 79,
+        "every frozen file must have been fingerprinted"
+    );
 }
 
 /// CS-1R2 A2a — MINT helper: prints the current residual fingerprint of every
@@ -585,45 +609,6 @@ fn check_one(
     }
 }
 
-/// CS-1R2 A2c — pin the worktree's EXPLICIT sqlx decode types against the frozen
-/// head blob. Both endpoints are post-CS-1 (both explicit where CS-1 pinned a
-/// type), so a live change of a decode type to a DIFFERENT explicit type is RED.
-/// Order-aligned by the `(enclosing_fn, occurrence)` identity carried in SqlxSig.
-fn pin_worktree_decode_types(
-    path: &str,
-    head_blob_src: &str,
-    worktree_src: &str,
-    failures: &mut Vec<String>,
-) {
-    let head_file = match syn::parse_file(head_blob_src) {
-        Ok(f) => f,
-        Err(_) => return, // parse errors already surfaced by check_one
-    };
-    let wt_file = match syn::parse_file(worktree_src) {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    let head_sigs = extract_sqlx_sigs(&head_file);
-    let wt_sigs = extract_sqlx_sigs(&wt_file);
-    if head_sigs.len() != wt_sigs.len() {
-        return; // a chain add/remove is caught by the base↔worktree sig compare
-    }
-    for (h, w) in head_sigs.iter().zip(wt_sigs.iter()) {
-        // both explicit (or both empty) → require exact equality; only wildcard
-        // when one is genuinely inferred (should not happen post-CS-1, but stays
-        // safe).
-        if !h.decode_type.is_empty() && !w.decode_type.is_empty() && h.decode_type != w.decode_type
-        {
-            failures.push(format!(
-                "{path}: sqlx DECODE-TYPE drift in fn `{}` (occ {}): head blob pins \
-                 `{}`, worktree has `{}` — a decode type was changed to a different \
-                 type (not a whitelisted inferred→explicit `Db*` transform).",
-                w.enclosing_fn, w.occurrence, h.decode_type, w.decode_type
-            ));
-        }
-    }
-}
-
 /// Show the first differing region of two normalized token strings.
 fn first_token_divergence(a: &str, b: &str) -> String {
     let at: Vec<&str> = a.split_whitespace().collect();
@@ -642,4 +627,63 @@ fn first_token_divergence(a: &str, b: &str) -> String {
         ctx(&at, i),
         ctx(&bt, i)
     )
+}
+
+/// CS-1R5 MINT (human-run, `#[ignore]`d) — regenerate the canonical-fingerprint
+/// manifest at the CURRENT worktree.
+///
+/// Same discipline as the inventory manifests: CI never auto-mints, because a
+/// drift is MEANT to turn the gate RED so a human adjudicates and re-mints on
+/// purpose. Run with:
+///
+///   cargo test -p prro --features test-support --test cs1_test_provenance \
+///       mint_canonical_fingerprints -- --ignored --nocapture
+#[test]
+#[ignore = "human-run mint: regenerates docs/cs1r/pins/cs1_canonical_fingerprints.tsv"]
+fn mint_canonical_fingerprints() {
+    let root = repo_root();
+    let mut rows: Vec<String> = Vec::new();
+    for path in CS1_MODIFIED_FILES {
+        let src =
+            std::fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let (ast, sqlx) =
+            canonical_fingerprint(&src).unwrap_or_else(|e| panic!("canonicalise {path}: {e}"));
+        rows.push(format!("{ast}\t{sqlx}\t{path}"));
+    }
+    rows.sort();
+    let header = "\
+# CS-1R5 — CANONICAL FINGERPRINTS of the 79 frozen CS-1 test files (DATA, code-owner-gated).
+#
+# Replaces the former `LIVE_DRIFT_BASE_SHA` git anchor. That anchor pointed at a commit INSIDE a
+# feature branch; after a squash-merge it is NOT reachable from `main`, so the live-drift leg only
+# worked while the branch survived on the remote — and `git show` hard-asserts, so losing it would
+# have failed all 79 files at once with an opaque message. A fingerprint depends on CONTENT, not on
+# history reachability.
+#
+# Columns (TAB-separated):
+#   <ast_sha256> <TAB> <sqlx_sha256> <TAB> <repo-relative path>
+#
+#   ast_sha256  — sha256 of `normalize_source(src).to_string()`: the file's AST after the
+#                 whitelisted CS-1 transforms (W1-W4 Db* unwrap, T3 enum `.as_str()`, T6 import
+#                 drop, T8 decode-annotation strip). A whitelisted-neutral edit does NOT change it;
+#                 anything else does.
+#   sqlx_sha256 — sha256 of the explicit, hand-written encoding of every sqlx signature in the file
+#                 (enclosing fn, occurrence, decode-annotation-stripped SQL, query kind, DECODE
+#                 TYPE, ordered bind vector, fetch mode). Carried separately because the
+#                 canonicaliser deletes the query-head turbofish, so an AST-only digest would stop
+#                 pinning the decode type.
+#
+# RE-MINT is legitimate ONLY for an adjudicated change to a frozen file, and the PR must say what
+# changed and why — exactly the discipline the old one-line re-anchor carried. A bulk re-mint with
+# no written rationale is the failure mode to watch for: prefer one re-mint per adjudicated change.
+";
+    let body = rows.join("\n");
+    let out = format!("{header}{body}\n");
+    let dest = root.join(CANONICAL_FINGERPRINTS_FILE);
+    std::fs::write(&dest, out).unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+    eprintln!(
+        "minted {} canonical fingerprints -> {}",
+        CS1_MODIFIED_FILES.len(),
+        dest.display()
+    );
 }
