@@ -378,3 +378,88 @@ fn scope_classifier_decides_correctly_on_a_table_of_paths() {
         );
     }
 }
+
+// ═══════════ bd PRRO_GATE-r4c — the SECOND scope detector ═══════════
+//
+// Everything above pins `rust-prro.yml`. `mutation-diff.yml` has an equivalent
+// detector deciding whether to run the required `mutation diff-gate` leg, and it
+// had NO pin — so the two silently drifted into opposite postures. `rust-prro.yml`
+// refuses to treat an empty diff as inert; `mutation-diff.yml` simply ran
+// `git fetch` + `git diff` and took ANY non-matching result as out-of-path, so a
+// missing base sha, a failed fetch or an empty diff SKIPPED the heavy leg — and a
+// skipped required check reads as satisfied.
+//
+// That asymmetry is exactly how the mutation gate came to be trusted while doing
+// nothing (the gate script's own three defects are pinned by
+// `scripts/mutation/run_teeth.sh`). One pinned detector and one unpinned one is
+// not a policy; these teeth make the second one a decision too.
+
+fn mutation_workflow_text() -> String {
+    let path = repo_root().join(".github/workflows/mutation-diff.yml");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read workflow {}: {e}", path.display()))
+}
+
+/// The mutation-gate scope detector must DEFAULT to running the heavy leg and
+/// lower that on exactly ONE path — the same property `scope_step_is_fail_closed`
+/// pins for `rust-prro.yml`.
+#[test]
+fn mutation_diff_scope_detector_is_fail_closed() {
+    let text = mutation_workflow_text();
+    assert!(
+        text.contains("inpath=true\n"),
+        "r4c: the mutation-gate detector no longer INITIALISES `inpath=true`. \
+         Fail-closed depends on that default: every path that cannot establish \
+         scope (no base sha, fetch failure, git diff failure, empty diff) must \
+         leave the heavy leg ON."
+    );
+    // Executable lines only — the prose above the step names `inpath=false`.
+    let clears = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| l.contains("inpath=false"))
+        .count();
+    assert_eq!(
+        clears, 1,
+        "r4c: expected EXACTLY ONE `inpath=false` (the sole 'non-empty diff matched \
+         nothing' branch), found {clears}. More than one means another path can skip \
+         the required mutation leg; zero means the fast path is dead code."
+    );
+    assert!(
+        text.contains("empty diff — refusing to treat as out-of-path"),
+        "r4c: the empty-diff branch lost its refusal. An empty diff means scope could \
+         not be established, NOT that the PR is out of path — treating the two as the \
+         same is what let the heavy leg skip silently."
+    );
+    assert!(
+        text.contains("--name-only --no-renames"),
+        "r4c: the change set must be computed with `--no-renames`, matching \
+         rust-prro.yml, so a rename is split into BOTH endpoints."
+    );
+}
+
+/// The gate's own teeth must run UNCONDITIONALLY.
+///
+/// `scripts/mutation/run.sh` was vacuous and fail-open for three weeks with no
+/// check noticing. The teeth are seconds and need no cargo, so there is no reason
+/// to gate them — and gating them on `changes` would silence them on exactly the
+/// PRs where nobody is looking at the mutation gate.
+#[test]
+fn mutation_gate_teeth_job_runs_unconditionally() {
+    let text = mutation_workflow_text();
+    let job = text
+        .split("\n  gate-teeth:")
+        .nth(1)
+        .expect("the `gate-teeth` job is present in mutation-diff.yml");
+    let header = job.split("steps:").next().expect("job header");
+    assert!(
+        !header.contains("\n    if:") && !header.contains("\n    needs:"),
+        "r4c: the gate-teeth job grew an `if:`/`needs:` gate. It must always run — \
+         proving the gate can still FAIL is the cheap half; discovering that it \
+         cannot was the expensive half.\n  header = {header:?}"
+    );
+    assert!(
+        job.contains("scripts/mutation/run_teeth.sh"),
+        "r4c: the gate-teeth job no longer invokes scripts/mutation/run_teeth.sh."
+    );
+}

@@ -33,6 +33,31 @@ command -v cargo-mutants >/dev/null 2>&1 || {
   exit 127
 }
 
+# ── ISOLATE the build directory (bd PRRO_GATE-9g5, P1) ──────────────────────
+#
+# cargo-mutants tests each mutant by applying it to a COPY of the tree and
+# BUILDING it. With a shared `CARGO_TARGET_DIR` — which this project uses — those
+# builds land next to everything else, and the next ordinary `cargo nextest run`
+# links against whatever mutant was compiled last.
+#
+# That was caught red-handed on 2026-08-01: after a gate run, a directed fuzzer
+# tooth reported `model granted=false but real outcome was Replenished` — the
+# production guard had not fired, because the linked `prro` WAS one of the
+# mutants. The suite was faithfully reporting a real divergence against MUTATED
+# production code.
+#
+# This is nastier than it sounds, and it is why the gate owns the isolation
+# rather than trusting the caller's environment: the symptom is not obviously
+# bogus. It fails exactly the test covering the code you just wrote, with a
+# plausible message — and it can equally go GREEN against a mutant and be read as
+# verification. A local "all tests pass" taken after a mutation run means nothing
+# unless the target dir is known clean.
+#
+# The secondary cost of sharing was baked paths: `env!("CARGO_MANIFEST_DIR")` is
+# resolved at compile time, so binaries built in the copy carry its temp path and
+# every repo-reading test later fails `NotFound`.
+export CARGO_TARGET_DIR="$ROOT/rust/target-mutants"
+
 MUT_ARGS=(-j "$JOBS")
 case "$MODE" in
   full) ;;
