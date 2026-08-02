@@ -46,6 +46,7 @@
 //! write-tx.
 
 use crate::db::models::ids::ShiftId;
+use crate::db::repositories::fiscal_documents::counted_in_turnover;
 use crate::db::tx::WriteTxConn;
 use crate::db::types::DbShiftId;
 use sqlx::SqlitePool;
@@ -60,9 +61,15 @@ use sqlx::SqlitePool;
 ///
 /// `cash_sell_kop`    = Σ sum_kop for type_code="0" payments on SELL receipts.
 /// `cash_return_kop`  = Σ sum_kop for type_code="0" payments on RETURN receipts.
-/// `service_in_kop`   = Σ amount_kop for SERVICE_IN docs (L3, issued ACK).
-/// `service_out_kop`  = Σ amount_kop for SERVICE_OUT docs (L3, issued ACK).
-/// `epz_out_kop`      = Σ sum for EPZ (cash-advance) docs (issued ACK / OLA).
+/// `service_in_kop`   = Σ amount_kop for SERVICE_IN docs (L3, turnover-counted).
+/// `service_out_kop`  = Σ amount_kop for SERVICE_OUT docs (L3, turnover-counted).
+/// `epz_out_kop`      = Σ sum for EPZ (cash-advance) docs (turnover-counted).
+///
+/// "turnover-counted" is
+/// [`counted_in_turnover`](crate::db::repositories::fiscal_documents::counted_in_turnover)
+/// — bd `PRRO_GATE-a6n`.  It replaced the literal `state IN ('ACK','OFFLINE_LOCAL_ACK')`,
+/// which read DELIVERY state as FISCAL validity and dropped an issued offline
+/// receipt from the drawer for the whole drain walk.
 ///
 /// EPZ (видача готівки за ЕПЗ) drives cash OUT of the drawer against a card
 /// charge — WebCheck `Nal()` (`All.cs:431-462`) carries the `− num5` EPZ term.
@@ -161,9 +168,9 @@ pub async fn aggregate_shift_cash(
 
 /// Aggregate EPZ (видача готівки за ЕПЗ) docs for a shift into `epz_out_kop`.
 ///
-/// Reads `fiscal_documents` with `doc_type = 'CASH_ADVANCE_EPZ'` and
-/// `state IN ('ACK','OFFLINE_LOCAL_ACK')` (same issued-set as SELL/RETURN /
-/// service-io).  `sum_kop` from the stored EPZ payload.  Mirrors
+/// Reads `fiscal_documents` with `doc_type = 'CASH_ADVANCE_EPZ'` filtered by
+/// [`counted_in_turnover`] (same turnover-set as SELL/RETURN / service-io).
+/// `sum_kop` from the stored EPZ payload.  Mirrors
 /// [`aggregate_shift_service_io`].
 ///
 /// Pure main-pool SELECT; no network/crypto (invariant #1).
@@ -172,11 +179,11 @@ pub async fn aggregate_shift_epz(
     fiscal_number: &str,
     shift_id: ShiftId,
 ) -> sqlx::Result<i64> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT payload_json FROM fiscal_documents \
+    let rows: Vec<(String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT payload_json, state, offline_fiscal_no, server_fiscal_no \
+         FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
            AND doc_type = 'CASH_ADVANCE_EPZ' \
-           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
          ORDER BY lnd",
     )
     .bind(fiscal_number)
@@ -185,7 +192,10 @@ pub async fn aggregate_shift_epz(
     .await?;
 
     let mut epz_out: i64 = 0;
-    for (payload_json,) in &rows {
+    for (payload_json, state, ofn, sfn) in &rows {
+        if !counted_in_turnover(state, *ofn, sfn.as_deref()) {
+            continue;
+        }
         let Ok(parsed) = serde_json::from_str::<StoredEpzPayload>(payload_json) else {
             continue; // malformed: skip
         };
@@ -201,7 +211,7 @@ pub async fn aggregate_shift_epz(
 ///
 /// Returns `(service_in_kop, service_out_kop)`.
 /// Reads from `fiscal_documents` with `doc_type IN ('SERVICE_IN','SERVICE_OUT')`
-/// and `state IN ('ACK','OFFLINE_LOCAL_ACK')` (same issued-set as SELL/RETURN).
+/// filtered by [`counted_in_turnover`] (same turnover-set as SELL/RETURN).
 ///
 /// Pure main-pool SELECT; no network/crypto (invariant #1).
 pub async fn aggregate_shift_service_io(
@@ -209,11 +219,11 @@ pub async fn aggregate_shift_service_io(
     fiscal_number: &str,
     shift_id: ShiftId,
 ) -> sqlx::Result<(i64, i64)> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT doc_type, payload_json FROM fiscal_documents \
+    let rows: Vec<(String, String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT doc_type, payload_json, state, offline_fiscal_no, server_fiscal_no \
+         FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
            AND doc_type IN ('SERVICE_IN','SERVICE_OUT') \
-           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
          ORDER BY lnd",
     )
     .bind(fiscal_number)
@@ -224,7 +234,10 @@ pub async fn aggregate_shift_service_io(
     let mut service_in: i64 = 0;
     let mut service_out: i64 = 0;
 
-    for (doc_type_str, payload_json) in &rows {
+    for (doc_type_str, payload_json, state, ofn, sfn) in &rows {
+        if !counted_in_turnover(state, *ofn, sfn.as_deref()) {
+            continue;
+        }
         let Ok(parsed) = serde_json::from_str::<StoredServiceIoPayload>(payload_json) else {
             continue; // malformed: skip
         };
@@ -260,11 +273,11 @@ pub async fn aggregate_shift_cash_tx(
     use crate::db::models::enums::DocType;
 
     // SELL / RETURN cash legs.
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT doc_type, payload_json FROM fiscal_documents \
+    let rows: Vec<(String, String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT doc_type, payload_json, state, offline_fiscal_no, server_fiscal_no \
+         FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
            AND doc_type IN ('SELL','RETURN') \
-           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
          ORDER BY lnd",
     )
     .bind(fiscal_number)
@@ -275,7 +288,10 @@ pub async fn aggregate_shift_cash_tx(
     let mut cash_sell: i64 = 0;
     let mut cash_return: i64 = 0;
 
-    for (doc_type_str, payload_json) in &rows {
+    for (doc_type_str, payload_json, state, ofn, sfn) in &rows {
+        if !counted_in_turnover(state, *ofn, sfn.as_deref()) {
+            continue;
+        }
         let Ok(parsed) = serde_json::from_str::<StoredCheckPayments>(payload_json) else {
             continue;
         };
@@ -296,11 +312,11 @@ pub async fn aggregate_shift_cash_tx(
     }
 
     // SERVICE_IN / SERVICE_OUT — in the same tx snapshot.
-    let svc_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT doc_type, payload_json FROM fiscal_documents \
+    let svc_rows: Vec<(String, String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT doc_type, payload_json, state, offline_fiscal_no, server_fiscal_no \
+         FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
            AND doc_type IN ('SERVICE_IN','SERVICE_OUT') \
-           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
          ORDER BY lnd",
     )
     .bind(fiscal_number)
@@ -310,7 +326,10 @@ pub async fn aggregate_shift_cash_tx(
 
     let mut service_in: i64 = 0;
     let mut service_out: i64 = 0;
-    for (doc_type_str, payload_json) in &svc_rows {
+    for (doc_type_str, payload_json, state, ofn, sfn) in &svc_rows {
+        if !counted_in_turnover(state, *ofn, sfn.as_deref()) {
+            continue;
+        }
         let Ok(parsed) = serde_json::from_str::<StoredServiceIoPayload>(payload_json) else {
             continue;
         };
@@ -325,11 +344,11 @@ pub async fn aggregate_shift_cash_tx(
     }
 
     // EPZ (CASH_ADVANCE_EPZ) — in the same tx snapshot.  Drives cash OUT.
-    let epz_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT payload_json FROM fiscal_documents \
+    let epz_rows: Vec<(String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT payload_json, state, offline_fiscal_no, server_fiscal_no \
+         FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
            AND doc_type = 'CASH_ADVANCE_EPZ' \
-           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
          ORDER BY lnd",
     )
     .bind(fiscal_number)
@@ -337,7 +356,10 @@ pub async fn aggregate_shift_cash_tx(
     .fetch_all(&mut **tx)
     .await?;
     let mut epz_out: i64 = 0;
-    for (payload_json,) in &epz_rows {
+    for (payload_json, state, ofn, sfn) in &epz_rows {
+        if !counted_in_turnover(state, *ofn, sfn.as_deref()) {
+            continue;
+        }
         let Ok(parsed) = serde_json::from_str::<StoredEpzPayload>(payload_json) else {
             continue;
         };
