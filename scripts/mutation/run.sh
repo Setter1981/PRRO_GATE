@@ -78,7 +78,15 @@ export CARGO_TARGET_DIR="$ROOT/rust/target-mutants"
 # already gitignored and already disposable. Slower per mutant than tmpfs; a
 # mutation run is hours regardless, and the alternative is taking the whole box
 # down with it.
-export TMPDIR="$CARGO_TARGET_DIR/scratch"
+# NOT under $CARGO_TARGET_DIR, and that mistake cost a CI round on #376: cargo-mutants
+# copies the WORKSPACE (`rust/`) into $TMPDIR, so a scratch dir inside `rust/` makes the
+# copy contain its own destination — it recursed
+# `target-mutants/scratch/cargo-mutants-*.tmp/target-mutants/scratch/…` until
+# `File name too long (os error 36)`. It did not show locally because the teeth use a
+# STUB cargo that copies nothing, and the last real run predated this export.
+#
+# So: outside the repo entirely, disk-backed, stable across runs.
+export TMPDIR="${XDG_CACHE_HOME:-$HOME/.cache}/prro-mutants-scratch"
 mkdir -p "$TMPDIR"
 
 MUT_ARGS=(-j "$JOBS")
@@ -128,7 +136,8 @@ esac
 
 echo ">>> cargo mutants ${MUT_ARGS[*]}  (mode=$MODE, jobs=$JOBS)"
 # cargo-mutants exits non-zero when mutants survive; we do our own gating below.
-cargo mutants "${MUT_ARGS[@]}" || true
+MUT_RC=0
+cargo mutants "${MUT_ARGS[@]}" || MUT_RC=$?
 
 # ── VACUITY GUARD: this gate used to be fail-OPEN ────────────────────────────
 #
@@ -143,6 +152,16 @@ cargo mutants "${MUT_ARGS[@]}" || true
 # For a project whose posture is fail-closed everywhere else, a gate that
 # reports success when it could not run is the wrong default. So: if mutants
 # were FOUND but none reached a verdict, refuse to pass.
+# cargo-mutants can die BEFORE writing outcomes.json (a copy failure, a broken build).
+# The guard below reads that file, so without this arm the whole vacuity check is skipped
+# and the verdict falls through to an empty missed.txt — i.e. fail-OPEN again, which is
+# exactly how #376 got a green 24-second "OK" out of a run that tested nothing.
+# cargo-mutants exits non-zero when mutants SURVIVE too, so a non-zero code alone is not
+# an error; the fatal combination is non-zero AND no outcomes to reason about.
+if [ "$MUT_RC" -ne 0 ] && [ ! -f "$OUT/outcomes.json" ]; then
+  echo "FATAL: cargo-mutants exited $MUT_RC and wrote no outcomes.json — it did not run." >&2
+  exit 4
+fi
 if [ -f "$OUT/outcomes.json" ]; then
   python3 - "$OUT/outcomes.json" <<'PY' || exit 3
 import json, sys

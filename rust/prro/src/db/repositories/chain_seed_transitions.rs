@@ -24,6 +24,23 @@ use crate::db::tx::WriteTxConn;
 /// own source string.
 pub const SOURCE_T112: &str = "T112";
 
+/// bd `PRRO_GATE-c88` — an operator `MacReseed` installed the chain seed.
+///
+/// The FOURTH mover of `node_state.last_known_unsigned_xml_sha256`, and the one that
+/// had no witness. Under guard-B disjunct (i) the operator seed EQUALS the last-issued
+/// tip, so the ledger walk agreed and the omission was invisible; under disjunct (ii) —
+/// the corroborated path, where the seed is the value DPS itself named in a `-12`
+/// `store` field — it is a NON-DOCUMENT seed exactly like a T=112, and without a witness
+/// the very next issued document reports a permanent `ChainBreak` after a SANCTIONED
+/// operator recovery.
+///
+/// Deliberately a distinct discriminator from [`SOURCE_T112`] rather than reusing it:
+/// the two are different operational events (an automatic replenish vs a human
+/// attesting a peer's tip), and a forensic query that cannot tell them apart is worth
+/// less than the column costs. `chain_seed_transitions.source` carries no CHECK
+/// constraint, so this needs no migration.
+pub const SOURCE_MAC_RESEED: &str = "MAC_RESEED";
+
 /// Append one durable seed-transition witness inside the caller's `with_immediate`
 /// envelope (tx-bound — the only way to obtain a `WriteTxConn`).
 ///

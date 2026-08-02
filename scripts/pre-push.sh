@@ -81,11 +81,18 @@ fi
 # Bites on CONTENT, not intent: editing a tracked test file — even comment-only —
 # drifts its SHA and fails the gate until the manifest is re-minted. That is what
 # it is for, and what caught a comment-only change on #371.
-step "CS-1R inventory gate"
-if bash scripts/cs1r/inventory_gate.sh; then
+step "CS-1R inventory gate (three-way, --pr $BASE)"
+# `--pr <base>` is NOT optional here, and leaving it off was a real gap: without it
+# only controls 1+3 run (live==committed, source-inventory drift) and CONTROL 2 —
+# additions-only vs the base — is skipped entirely. Control 2 is the one that fails
+# on a removed test identity, and the identity row carries the `ignored` FLAG, so
+# merely un-`#[ignore]`ing a test reads as a removal needing a supersession row.
+# That is exactly what this script waved through and CI then caught on #375.
+if bash scripts/cs1r/inventory_gate.sh --pr "$BASE"; then
   ok "inventory gate"
 else
-  fail "inventory gate — re-mint with 'bash scripts/cs1r/mint_manifests.sh', then review the diff"
+  fail "inventory gate — re-mint with 'bash scripts/cs1r/mint_manifests.sh'; a REMOVED identity \
+(incl. an un-\`#[ignore]\`d test) needs a row in docs/cs1r/inventory/superseded_removals.tsv"
 fi
 
 # ── 4. the mutation gate's own teeth ─────────────────────────────────────────

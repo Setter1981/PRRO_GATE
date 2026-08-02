@@ -40,8 +40,17 @@ def collect(root: str) -> list[tuple[str, str]]:
     rust = os.path.join(root, "rust")
     rows = []
     for dirpath, dirnames, filenames in os.walk(rust):
-        # skip build output dirs
-        dirnames[:] = [d for d in dirnames if d != "target"]
+        # Skip build output dirs. `target` AND `target-*`: a sibling build directory
+        # inside the workspace is a real configuration — bd PRRO_GATE-9g5 gave
+        # cargo-mutants its own `rust/target-mutants` so its MUTATED artifacts could
+        # never land in the shared one. That directory contains generated `tests/`
+        # trees (trybuild fixtures, build-script `out/*.rs`), and with only `target`
+        # excluded the mint swept them into the manifest — CI then failed with
+        # "committed source test file VANISHED" for paths that exist on no other
+        # machine. Prefix match, so the next such directory is covered too.
+        dirnames[:] = [
+            d for d in dirnames if d != "target" and not d.startswith("target-")
+        ]
         rel_dir = os.path.relpath(dirpath, root)
         parts = rel_dir.split(os.sep)
         in_tests = "tests" in parts

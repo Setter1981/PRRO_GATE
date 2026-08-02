@@ -99,6 +99,13 @@ J
  "outcomes":[{"scenario":"Baseline","summary":"Success"}]}
 J
     ;;
+  died_no_outcomes)
+    # cargo-mutants aborted before writing outcomes.json (a copy failure, a broken
+    # build). Nothing to reason about — the gate must refuse, not fall through to an
+    # empty missed.txt. This is the #376 shape.
+    echo "Error: Failed to copy ... File name too long (os error 36)" >&2
+    exit 1
+    ;;
   zero_mutants)
     # A legitimate no-op: the diff touched nothing mutable.
     cat > "$out/outcomes.json" <<'J'
@@ -174,6 +181,11 @@ run_case "T5 mutants found but none tested -> refuses (vacuity guard)" 3 found_n
 run_case "T6 zero mutants legitimately -> gate PASSES (guard must not over-fire)" 0 zero_mutants ""
 run_case "T7 baseline-KNOWN survivor still surviving -> gate PASSES (ratchet)" 0 known_survivor "$KNOWN
 "
+# T10 — cargo-mutants DIED before writing outcomes.json. The vacuity guard reads that
+# file, so without an explicit arm the whole check is skipped and the verdict falls
+# through to an empty missed.txt: fail-OPEN. That is exactly how #376 produced a green
+# 24-second "OK" from a run that tested nothing (a recursive tree copy, my own bug).
+run_case "T10 cargo-mutants died, no outcomes.json -> refuses" 4 died_no_outcomes ""
 
 # T8 — the gate must ISOLATE its build directory (bd PRRO_GATE-9g5, P1).
 #
@@ -204,8 +216,10 @@ fi
 if [ "$LAST_TMPDIR_WITNESS" = "<never-invoked>" ]; then
   echo "❌ T9 gate owns its scratch dir (cargo-mutants was never invoked)"
   FAILED=$((FAILED + 1))
-elif [ "$LAST_TMPDIR_WITNESS" = "<unset>" ] || case "$LAST_TMPDIR_WITNESS" in *ramdisk-pretend) true ;; *) false ;; esac; then
-  echo "❌ T9 gate owns its scratch dir (leaked the caller's: $LAST_TMPDIR_WITNESS)"
+elif [ "$LAST_TMPDIR_WITNESS" = "<unset>" ] \
+  || case "$LAST_TMPDIR_WITNESS" in *ramdisk-pretend) true ;; *) false ;; esac \
+  || case "$LAST_TMPDIR_WITNESS" in "$LAST_FIXTURE_ROOT"/*) true ;; *) false ;; esac; then
+  echo "❌ T9 gate owns its scratch dir, OUTSIDE the copied tree (got: $LAST_TMPDIR_WITNESS)"
   FAILED=$((FAILED + 1))
 else
   echo "✅ T9 gate owns its scratch dir ($LAST_TMPDIR_WITNESS)"

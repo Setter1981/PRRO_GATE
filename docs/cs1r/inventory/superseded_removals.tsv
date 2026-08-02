@@ -23,4 +23,3 @@
 # Their supersession records live in those commits + this file's git history. The registry is
 # currently EMPTY (no removals pending vs origin/main); the gate handles that (see the
 # empty-registry guard in inventory_gate.sh + the teeth in inventory_gate_teeth.sh).
-prro::invariant_fuzzer	phase_b_derived_minus12_punishes_a_wrong_reseed_then_the_corroborated_one_converges	prro::invariant_fuzzer	phase_b_derived_minus12_punishes_a_wrong_reseed_then_the_corroborated_one_converges	bd PRRO_GATE-5hc: the phase-B pin went from `#[ignore]`d RED (committed ahead of the implementation, #372) to an ACTIVE regression pin now that the derived -12 exists. The manifest identity carries the `ignored` FLAG, so `true -> false` reads as a removal — the exact shape recorded for bd PRRO_GATE-01g (#364) above. Same module, same test name; PRUNE this row once #375 merges.
