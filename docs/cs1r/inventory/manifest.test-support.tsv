@@ -1462,6 +1462,7 @@ test-support	prro	prro::invariant_fuzzer	scan_skips_mid_crash_sending_transient	
 test-support	prro	prro::invariant_fuzzer	shrinking_reduces_a_forced_failure_to_minimal	false
 test-support	prro	prro::invariant_fuzzer	superseded_durable_class_is_transient_retry_not_wrapperbug	false
 test-support	prro	prro::invariant_fuzzer	superseded_held_witness_reds_if_prod_persists_wrapperbug_overlay	false
+test-support	prro	prro::invariant_fuzzer	teeth_6hl_adopt_rescopes_cash_legs_to_the_real_open_shift	false
 test-support	prro	prro::invariant_fuzzer	teeth_6hl_turnover_matches_prod_counted_in_turnover	false
 test-support	prro	prro::invariant_fuzzer	teeth_aud_k8_1_rmr_redrive_makes_no_new_wire_call	false
 test-support	prro	prro::invariant_fuzzer	teeth_b10_reverted_begin_chain_reddens_ledger_delta	false

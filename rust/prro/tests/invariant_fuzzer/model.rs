@@ -187,7 +187,9 @@ pub struct RefModel {
     /// enters or leaves the counted set later needs no bookkeeping hook at all.  A document
     /// with no cash leg (a DocType=9 offline BEGIN, a SHIFT_OPEN / Z_REPORT) has no entry.
     /// CLEARED at every shift-open: prod's aggregates are scoped to the open `shift_id`, so a
-    /// prior shift's legs must not follow the drawer across the boundary.
+    /// prior shift's legs must not follow the drawer across the boundary — and RE-SCOPED from the
+    /// real ledger on a fault re-sync, the one window in which reality can cross that boundary
+    /// without the model predicting it.
     pub cash_by_lnd: BTreeMap<i64, i64>,
 
     // ── Cross-shift cash carry (mirrors prod `shifts.cash_balance_kop`) ────
@@ -583,6 +585,11 @@ impl RefModel {
     /// OPENING anchor to absorb whatever reality holds that those legs do not explain — a
     /// crash-completed doc the model never predicted, most of all.  Post-condition:
     /// `self.cash_on_hand() == real_cash`, exactly as the old scalar assignment guaranteed.
+    ///
+    /// The caller is responsible for re-scoping `cash_by_lnd` to reality's OPEN shift FIRST (see
+    /// `adopt_fault_deferred`): the anchor absorbs the unexplained remainder, so a leg left in the
+    /// map from a shift reality has since closed would be absorbed with the WRONG sign and then
+    /// move the drawer again on its next state edge.
     pub fn adopt_cash(&mut self, real_cash: i64) {
         self.opening_cash_kop = real_cash - self.counted_cash_legs();
     }
@@ -2123,6 +2130,36 @@ impl RefModel {
                 .fetch_one(pool)
                 .await
                 .unwrap();
+        // bd PRRO_GATE-6hl — the legs' SHIFT SCOPE is adopted too, not just their states.
+        //
+        // The model normally scopes them itself: a shift-open clears `cash_by_lnd`, mirroring
+        // prod's per-`shift_id` aggregates.  That self-scoping is exactly what a Fault window
+        // can invalidate — reality may have closed one shift and opened another with no model
+        // prediction in between, leaving a PRIOR shift's legs in the map to be re-counted, or
+        // to move the drawer on a later state edge, in a shift they do not belong to.  Adopting
+        // the scope from the ledger completes the funnel: `docs`, `offline_origin_lnds`,
+        // `shift_lifecycle_lnds`, codes, seed and the session flags above are ALL re-derived
+        // from reality here, and the legs' membership was the one thing that was not.
+        //
+        // The shift predicate is `cash_on_hand_for_fn`'s verbatim (`cash_ledger.rs`): the shift
+        // `node_state.current_shift_id` points at, excluding the four states that mean "not an
+        // open drawer".  No open shift ⇒ EMPTY scope ⇒ every leg drops and the anchor absorbs
+        // reality's 0 — which is what that read returns.  On every trajectory the current
+        // alphabet can produce this is a NO-OP (Crash / Reboot open no shift, and there is no
+        // auto-Z symbol), so it hardens a case rather than changing a reachable one.
+        let in_scope: Vec<(i64,)> = sqlx::query_as(
+            "SELECT fd.lnd FROM fiscal_documents fd \
+             JOIN shifts s ON s.shift_id = fd.shift_id \
+             JOIN node_state ns ON ns.current_shift_id = s.shift_id \
+             WHERE ns.fiscal_number = ? \
+               AND s.state NOT IN ('CLOSED','REQUIRES_MANUAL_RECONCILIATION','ERROR','CREATED')",
+        )
+        .bind(&fiscal_number)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let in_scope: BTreeSet<i64> = in_scope.into_iter().map(|(lnd,)| lnd).collect();
+        self.cash_by_lnd.retain(|lnd, _| in_scope.contains(lnd));
         let real_cash = prro::services::cash_ledger::cash_on_hand_for_fn(pool, &fiscal_number)
             .await
             .unwrap();

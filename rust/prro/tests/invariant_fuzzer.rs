@@ -4869,6 +4869,57 @@ fn regression_6hl_operator_release_brings_the_cash_leg_into_the_drawer() {
     );
 }
 
+/// bd `PRRO_GATE-6hl` (ADOPT-SCOPE tooth) — a fault re-sync must adopt the cash legs' SHIFT SCOPE
+/// from the ledger, not only their states.
+///
+/// The model scopes legs itself by clearing `cash_by_lnd` at every shift-open, mirroring prod's
+/// per-`shift_id` aggregates.  A Fault window is the one place that self-scoping can be wrong:
+/// reality may close one shift and open another with NO model prediction in between, and a leg left
+/// behind then belongs to a shift the drawer no longer reads.  The alphabet cannot produce that
+/// today (`Crash`/`Reboot` open no shift, there is no auto-Z symbol), so the generative capstones
+/// CANNOT reach it — which is exactly why it is pinned here instead of being assumed.
+///
+/// Reality drives `SELL → Z → SHIFT_OPEN`: doc 1's 15_000 leg is bound to the now-CLOSED shift A,
+/// and fresh shift B opens on the persisted carry.  The model is then hand-built as one that missed
+/// the whole window — still holding doc 1's leg — and adopts.
+///
+/// Two assertions, and the SECOND is the tooth: after adoption the drawer matches prod (true either
+/// way, since the anchor absorbs the remainder), and a later state edge on the PRIOR shift's
+/// document must not move it.  Drop the `cash_by_lnd.retain(...)` re-scope in
+/// `adopt_fault_deferred` and the anchor absorbs doc 1's leg with the wrong sign, so cancelling
+/// doc 1 walks shift B's drawer 15_000 kop away from prod → RED.
+#[tokio::test]
+async fn teeth_6hl_adopt_rescopes_cash_legs_to_the_real_open_shift() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    interp::run_op(&mut ctx, &Op::OnlineZReport(DpsScript::ack_path())).await;
+    interp::run_op(&mut ctx, &Op::OnlineShiftOpen(DpsScript::ack_path())).await;
+    let real = prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, ctx.fn_id())
+        .await
+        .unwrap();
+
+    // A model that missed the close+reopen: doc 1's leg is still in the map, from shift A.
+    let mut model = RefModel::new_online_open_shift();
+    model.docs.insert(1, DocState::Ack);
+    model.cash_by_lnd.insert(1, model::CASH_AMOUNT_KOP);
+    model.adopt_fault_deferred(&ctx.pool).await;
+    assert_eq!(
+        model.cash_on_hand(),
+        real,
+        "post-adoption drawer must equal prod's"
+    );
+
+    // THE TOOTH: doc 1 belongs to the CLOSED shift A, so no state edge on it may move shift B's
+    // drawer.  Without the re-scope its leg is still live and this walks 15_000 kop off prod.
+    model.docs.insert(1, DocState::Cancelled);
+    assert_eq!(
+        model.cash_on_hand(),
+        real,
+        "a PRIOR shift's document changed state and moved the OPEN shift's drawer — \
+         the fault re-sync did not re-scope `cash_by_lnd` to reality's open shift"
+    );
+}
+
 /// AUD-K8-1 TEETH CANARY (deterministic; see `tests/invariant_fuzzer/TEETH_TEST.md`).
 ///
 /// Constructs the exact AUD-K8-1 scenario the fuzzer hunts: an offline backlog
