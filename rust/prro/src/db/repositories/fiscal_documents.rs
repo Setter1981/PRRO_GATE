@@ -1283,8 +1283,20 @@ pub fn is_issued(
 /// of one rule is exactly how the defect this fixes was born:
 ///
 /// ```text
-/// counted_in_turnover := is_issued(…)  &&  state ∉ { REJECTED, REQUIRES_MANUAL_RECONCILIATION }
+/// counted_in_turnover :=  state ∈ { ACK, OFFLINE_LOCAL_ACK }                     // the old literal
+///                      || ( is_issued(…) && state ∉ { REJECTED, REQUIRES_MANUAL_RECONCILIATION } )
 /// ```
+///
+/// **The first disjunct is the old literal, kept verbatim and deliberately.** It makes this predicate
+/// a STRICT SUPERSET of what turnover counted before — the change is purely ADDITIVE, so no row that
+/// used to be in turnover can fall out of it. That is a stronger guarantee than the quiescence
+/// argument below and it is the one that matters for a hot-zone edit.
+///
+/// It is not redundant. [`is_issued`] keys the ONLINE lane on `server_fiscal_no`, so a hypothetical
+/// `ACK` row carrying NEITHER discriminator would be dropped by the second disjunct alone. Under A.3
+/// production cannot mint such a row (an online `ACK` always carries the sfn stamped at the
+/// `Sending → Sent` CAS), so in production this clause is inert — but "inert in production" is not
+/// "safe to omit" when the alternative is silently narrowing a fiscal aggregate.
 ///
 /// **Why it is NOT just `is_issued`.** [`is_issued`] is the SEED-ADVANCE authority: it admits
 /// `REJECTED` / `REQUIRES_MANUAL_RECONCILIATION` for offline origin because those DID move the MAC
@@ -1325,8 +1337,9 @@ pub fn counted_in_turnover(
     offline_fiscal_no: Option<i64>,
     server_fiscal_no: Option<&str>,
 ) -> bool {
-    is_issued(state, offline_fiscal_no, server_fiscal_no)
-        && !matches!(state, "REJECTED" | "REQUIRES_MANUAL_RECONCILIATION")
+    matches!(state, "ACK" | "OFFLINE_LOCAL_ACK")
+        || (is_issued(state, offline_fiscal_no, server_fiscal_no)
+            && !matches!(state, "REJECTED" | "REQUIRES_MANUAL_RECONCILIATION"))
 }
 
 /// bd `PRRO_GATE-knk` — how many offline-origin documents rest in a state that put OUR chain tip

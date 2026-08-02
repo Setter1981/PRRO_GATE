@@ -490,7 +490,10 @@ impl RefModel {
     /// seed-moving kinds (Accepted stamps the doc's chain tip; MacReseed re-bases).  Mutating `self`
     /// is what lets a SUBSEQUENT op issue again — the "next document passes" half of the property.
     /// bd PRRO_GATE-x5o — apply a cash leg AND remember it per-lnd so a later transition out of the
-    /// prod-counted set (`ACK` / `OFFLINE_LOCAL_ACK`) can reverse exactly this doc's contribution.
+    /// prod-counted set can reverse exactly this doc's contribution.  bd PRRO_GATE-a6n: that set is
+    /// now `fiscal_documents::counted_in_turnover` (issuance-boundary, minus the VOID terminals),
+    /// NOT the old `ACK` / `OFFLINE_LOCAL_ACK` literal — the reversal targets are unchanged
+    /// (`CANCELLED` / `RMR`), but entry happens earlier in both lanes.
     fn record_cash(&mut self, lnd: i64, delta: i64) {
         self.cash_on_hand += delta;
         self.cash_by_lnd.insert(lnd, delta);
@@ -833,8 +836,11 @@ impl RefModel {
         if doc_state == DocState::Rejected {
             return ExpectedOutcome::NoIssuanceRow;
         }
-        // Cash update only at ACK (matches aggregate_shift_cash filter).
-        if doc_state == DocState::Ack {
+        // bd PRRO_GATE-a6n — cash from the ISSUANCE boundary, not from ACK: prod's
+        // `aggregate_shift_service_io` now selects `counted_in_turnover`, which for the
+        // online lane counts from the `Sending → Sent` CAS (sfn stamped).  Mirrors via
+        // the model's own online SSOT so it cannot drift from the seed predicate.
+        if Self::online_origin_advances_seed(doc_state) {
             if is_out {
                 self.record_cash(lnd, -CASH_AMOUNT_KOP);
             } else {
@@ -983,8 +989,9 @@ impl RefModel {
         if doc_state == DocState::Rejected {
             return ExpectedOutcome::NoIssuanceRow;
         }
-        // Cash-OUT only at ACK (matches aggregate_shift_epz filter).
-        if doc_state == DocState::Ack {
+        // bd PRRO_GATE-a6n — cash-OUT from the ISSUANCE boundary, not from ACK
+        // (prod's `aggregate_shift_epz` now selects `counted_in_turnover`).
+        if Self::online_origin_advances_seed(doc_state) {
             self.record_cash(lnd, -CASH_AMOUNT_KOP);
         }
         ExpectedOutcome::Mutated(Mutation {
@@ -1441,20 +1448,26 @@ impl RefModel {
                 if doc_state == DocState::Rejected {
                     return ExpectedOutcome::NoIssuanceRow;
                 }
-                // L0 cash-on-hand update: only when the doc reaches ACK state.
+                // L0 cash-on-hand update: from the ISSUANCE boundary, not from ACK.
                 //
-                // Prod `aggregate_shift_cash` / `aggregate_shift_cash_tx` filter
-                // `state IN ('ACK','OFFLINE_LOCAL_ACK')`.  Docs at SENT/KVT1/KVT2
-                // have crossed the issuance boundary (seed advanced) but are NOT yet
-                // counted in cash-on-hand — they sit probe-pending until they reach
-                // ACK.  The in-lease guard also reads from that same aggregate, so
-                // cash availability reflects ONLY ack'd receipts, not in-flight ones.
-                // This matches Z aggregation (Z counts ACK docs) — consistent.
+                // bd PRRO_GATE-a6n resolved the question the old NOTE here parked as
+                // "a policy question, follow-up, not blocking" — and resolved it
+                // AGAINST the old behaviour.  Prod's turnover predicate is now
+                // `fiscal_documents::counted_in_turnover`, which for the online lane
+                // counts from the `Sending → Sent` CAS (where A.3 stamps the sfn and
+                // advances the seed), not from ACK.  The authority is the reference
+                // PRRO our cash formula was ported from: WebCheck writes the receipt
+                // into its journal — and thereby into turnover — the instant the DPS
+                // submit returns a fiscal number (`StringXML.cs:1382`), with no
+                // quittance wait and no delivery predicate anywhere in the aggregate
+                // (`Reports.cs:50-84`).
                 //
-                // NOTE (follow-up, not blocking): cash-on-hand counts at ACK, not at
-                // SENT.  The deep question of "should SENT docs pre-book cash capacity"
-                // is a policy question separate from INV-21 correctness.
-                if doc_state == DocState::Ack {
+                // The mirror reuses the model's OWN online-lane SSOT
+                // (`online_origin_advances_seed` = sfn stamped ⟺ Sent|Kvt1|Kvt2|Ack)
+                // rather than re-spelling the state set, so it cannot drift from the
+                // seed predicate the same op already uses above.  RMR is excluded by
+                // construction (it is not in that set), matching prod's delta.
+                if Self::online_origin_advances_seed(doc_state) {
                     if is_return {
                         self.record_cash(lnd, -CASH_AMOUNT_KOP);
                     } else {

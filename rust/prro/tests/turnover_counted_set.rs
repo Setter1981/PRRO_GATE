@@ -478,15 +478,25 @@ async fn inv21_still_refuses_over_a_genuinely_empty_drawer() {
 
     // A VOID receipt must not create spendable cash either — the widened set
     // must not have swallowed the x5o exclusions.
+    //
+    // Both void classes are exercised on purpose, because they bite DIFFERENT
+    // over-widenings: `CANCELLED` is already outside `is_issued`, so only a
+    // predicate that abandoned that SSOT would admit it; `REQUIRES_MANUAL_
+    // RECONCILIATION` IS inside `is_issued` and is held out ONLY by this
+    // predicate's delta — so dropping the delta (the most likely over-widening)
+    // reds this pin.
     let doc = seed_cash_doc(&main, shift, 1, DocType::Sell, true, CASH_KOP).await;
-    force_state(&main, doc, DocState::Cancelled).await;
-    let err = convert_to_signer_payload(&return_cmd_cash(100), FN, &main, &secure)
-        .await
-        .expect_err("a cancelled receipt is not cash");
-    assert!(
-        matches!(err, ConvertError::CashInsufficient { .. }),
-        "a CANCELLED receipt must not fund a refund, got {err:?}"
-    );
+    for void in [DocState::Cancelled, DocState::RequiresManualReconciliation] {
+        force_state(&main, doc, void).await;
+        let err = convert_to_signer_payload(&return_cmd_cash(100), FN, &main, &secure)
+            .await
+            .expect_err("a void receipt is not cash");
+        assert!(
+            matches!(err, ConvertError::CashInsufficient { .. }),
+            "a {} receipt must not fund a refund, got {err:?}",
+            void.as_str()
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
