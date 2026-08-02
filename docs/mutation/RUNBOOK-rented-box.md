@@ -202,10 +202,25 @@ discarded). An adjudication needs a note, not a test.
 
 ## 8. Known gaps in the tooling (bd `PRRO_GATE-a0d`)
 
-- **`TIMEOUT` outcomes are invisible to the ratchet.** They land in `timeout.txt`,
-  not `missed.txt`. A mutant that *hangs the suite* is therefore neither caught nor
-  reported — and at `JOBS=24` timeouts were 16 % of tested mutants, each burning
-  ~680 s of a slot.
+- **`TIMEOUT` outcomes are invisible to the ratchet — and a `full` run will silently
+  drop them from the baseline.** They land in `timeout.txt`, never in `missed.txt`,
+  and `MODE=full` refreshes the baseline with `cp missed.txt survivors.txt`. So a
+  known survivor that *hangs* the suite in the new run instead of passing it
+  **disappears from the ratchet's record**, though nothing killed it — and will
+  later reappear as a "NEW survivor" once it stops hanging.
+
+  Measured mid-run on 2026-08-02 (`main@74dc4df`, 15 % through): 157 baseline
+  survivors, 64 timeouts, **4 of them the same mutant** — `outgress.rs` `wrap` /
+  `submit`, `supervisor.rs:315` `replace && with ||`. That count grows with the run.
+
+  > **Before committing a refreshed baseline:** diff the new `timeout.txt` against
+  > the *old* `survivors.txt` and rule on every intersection by hand. A mutant that
+  > hangs the suite is not caught; it is at least as dangerous as one that passes,
+  > and it belongs in the record (or gets teeth).
+
+  Timeouts cluster where a stub breaks a loop's exit condition — `runtime/outgress`,
+  `runtime/coding`, `runtime/supervisor`. They are not cheap: each burns the full
+  timeout (~582-680 s) of a job slot.
 - **`🟢 CLOSED since baseline` lies in `diff` mode.** `run.sh` computes it as
   `comm -13 <this run's survivors> <baseline>`, so in a diff run it lists every
   baseline entry **outside the diff** — mutants that were never tested — as
