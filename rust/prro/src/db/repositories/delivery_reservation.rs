@@ -1540,9 +1540,58 @@ pub async fn complete_operator_pending(
             doc_to_rmr(tx, doc_id).await?;
         }
         OperatorResolution::MacReseed { seed } => {
+            // bd PRRO_GATE-c88 — read node_state BEFORE the advance: we need both the
+            // allocator ordinal for the witness AND the tip the seed is replacing.
+            let ns_before = crate::db::repositories::node_state::get_tx(tx, &fiscal_number)
+                .await
+                .map_err(CompletionError::Db)?
+                .ok_or(CompletionError::NodeStateMissing)?;
             node_advance_seed(tx, &fiscal_number, seed)
                 .await
                 .map_err(completion_from_apply)?;
+            // bd PRRO_GATE-c88 — durable witness, in THIS tx.
+            //
+            // A MacReseed is the FOURTH mover of the chain seed and was the only one
+            // without a witness. The other two non-document movers have them —
+            // migration 040 for a T=112 (bd hpc) and `chain_superseded_at` for the
+            // `NotAcceptedOffline` rewind (bd 2nk) — and every consumer reads the tip
+            // through the ONE projection `active_chain_tip_unsigned_xml_sha256`, which
+            // folds those witnesses in. Without a row here that projection cannot see
+            // the operator's seed at all.
+            //
+            // It stayed invisible because guard-B has two disjuncts. Under (i) the seed
+            // EQUALS the last-issued tip, so the ledger walk agrees and nothing looks
+            // wrong — and that is the only case any test covered. Under (ii), the
+            // CORROBORATED path (the seed is the value DPS named in its `-12 store`
+            // field, i.e. the real `-12` recovery), the seed is a NON-DOCUMENT value:
+            // the next issued document chains onto it and `invariant_scan` reports a
+            // permanent `ChainBreak` after a SANCTIONED operator recovery. Found by the
+            // peer-tip axis phase B, on the first trajectory that could reach it.
+            //
+            // WRITTEN ONLY WHEN THE SEED ACTUALLY MOVES. The first cut wrote
+            // unconditionally, arguing uniformity is cheaper to keep true — and that
+            // argument lost to evidence: `hpc_t112_nc03::guard_b_accepts_reseed_to_hs_
+            // rejects_hp` reseeds to the value a T=112 witness ALREADY records, in the
+            // same second, and hit `UNIQUE(fiscal_number, created_at, new_seed)`. The
+            // constraint was right and the reasoning was wrong: a reseed that installs
+            // the tip the node already holds is not a transition, and recording it as
+            // one is both a lie and a collision. `INSERT OR IGNORE` would have buried
+            // that signal instead of heeding it.
+            //
+            // Atomicity is load-bearing exactly as for the T=112 witness: same
+            // `with_immediate` as the seed write, so there is no window where the seed
+            // moved and the witness did not.
+            if ns_before.last_known_unsigned_xml_sha256.as_ref() != Some(seed) {
+                crate::db::repositories::chain_seed_transitions::insert_seed_transition_tx(
+                    tx,
+                    &fiscal_number,
+                    ns_before.next_lnd,
+                    seed,
+                    crate::db::repositories::chain_seed_transitions::SOURCE_MAC_RESEED,
+                )
+                .await
+                .map_err(CompletionError::Db)?;
+            }
             seed_advanced = true;
             doc_to_rmr(tx, doc_id).await?;
         }

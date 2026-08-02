@@ -1872,26 +1872,28 @@ async fn phase_b_derived_minus12_punishes_a_wrong_reseed_then_the_corroborated_o
          ledger={states:?} (last lnd {last_lnd})"
     );
 
-    // `oracle::assert_clean` is DELIBERATELY NOT CALLED HERE, and this is not a shortcut.
+    // `oracle::assert_clean` IS asserted here, and the story of why it briefly was not is the
+    // point of this pin.
     //
-    // Running it on this trajectory reports, reproducibly:
+    // When phase B first made this trajectory reachable, running the scan on it reported:
     //
     //   ChainBreak { lnd: 4,
     //     expected_hex: 07c018255703d7cdb389ce7133d6f06dd7f2da7823613e80ac75c82205f415af,
     //     found_hex:    d9512c0d123456789abcdef0112233445566778899aabbccddeeff000d152c0d }
     //
-    // where `found_hex` is the operator's corroborated seed. That is a REAL PRODUCTION DEFECT this
-    // trajectory uncovered — bd PRRO_GATE-c88 — not a property of the pin: a MacReseed installs the
-    // chain seed with NO durable witness, unlike the other two non-document seed movers (T=112 has
-    // migration 040, the NotAcceptedOffline rewind has `chain_superseded_at`). Under guard-B
-    // disjunct (i) the seed equals the last-issued tip so the MAC-walk agrees and nobody noticed;
-    // under disjunct (ii) — the corroborated path, which is the REAL `-12` recovery — it does not,
-    // and the ledger stays dirty forever after a sanctioned operator recovery.
+    // `found_hex` is the operator's corroborated seed — a REAL PRODUCTION DEFECT the trajectory
+    // uncovered on its first run (bd PRRO_GATE-c88), not a property of the pin. A MacReseed is the
+    // FOURTH mover of the chain seed and was the only one with no durable witness; the other two
+    // non-document movers have migration 040 (T=112) and `chain_superseded_at` (the
+    // NotAcceptedOffline rewind). Under guard-B disjunct (i) the seed equals the last-issued tip so
+    // the walk agrees and nobody noticed; under disjunct (ii) — the corroborated path, the REAL
+    // `-12` recovery — the ledger stayed dirty forever after a SANCTIONED operator action.
     //
-    // Asserting it here would leave this pin permanently red for a defect it did not introduce and
-    // does not own. RE-ADD THIS LINE in the commit that fixes c88 — it is the natural regression
-    // test for that fix, and c88 records the dependency in both directions.
-    let _ = &ctx; // keep the ctx binding meaningful when assert_clean is restored
+    // The line was omitted for exactly as long as that defect stood, with the ticket cited here so
+    // the omission could not be mistaken for laziness. c88 is fixed, so it is back — and this
+    // assertion IS the regression test for that fix: revert the witness write in
+    // `delivery_reservation.rs` and this REDs with the ChainBreak above.
+    oracle::assert_clean(&ctx.pool).await;
 }
 
 fn hex_of(bytes: &[u8; 32]) -> String {
