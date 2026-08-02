@@ -111,6 +111,18 @@ struct PeerInner {
     /// Sends the stub could not attribute to a row (diagnostic only — a growing
     /// count means the resolver needs work, not that production is wrong).
     unresolved_sends: usize,
+    /// PHASE B — may the peer REFUSE a mismatched send with a derived `-12`?
+    ///
+    /// OFF by default, and that default is the phase boundary, not timidity. The
+    /// fuzzer's model predicts wire outcomes independently and knows nothing about
+    /// the peer; phase A's `mark_diverged` fires on every `OperatorComplete`, on
+    /// held replies and on crashes — all routinely generative — so an always-on
+    /// override would answer `-12` where the model expects an `Ack` and redden the
+    /// differential across the suite. Teaching the model the peer IS phase C
+    /// (spec §8, "this is a representation change"). Until then the directed pins
+    /// opt in and generative runs are untouched, which is what keeps each phase
+    /// independently green.
+    derive_rejects: bool,
 }
 
 /// Harness-side model of the DPS peer's chain tip (phase A: read-only observer).
@@ -141,6 +153,51 @@ impl PeerLedger {
 
     pub fn diverged(&self) -> Option<String> {
         self.inner.lock().unwrap().diverged.clone()
+    }
+
+    /// PHASE B — let the peer answer a mismatched send with a DERIVED `-12`.
+    ///
+    /// Opt-in; see `derive_rejects`. A directed pin calls this to model the DPS
+    /// that actually exists: one that remembers its own chain tip and refuses a
+    /// document that does not chain onto it, whatever the script had planned.
+    /// Without it the harness models a peer that forgets its chain the moment it
+    /// stops being told about it — which is why the corroborated-MacReseed
+    /// success path had no generative coverage (bd PRRO_GATE-5hc).
+    pub fn enable_derived_rejects(&self) {
+        self.inner.lock().unwrap().derive_rejects = true;
+    }
+
+    /// The reply the peer would give on its own, or `None` to let the script
+    /// stand. Called by the stub AFTER the scripted leaf is popped, so the queue
+    /// stays in lockstep with the wire calls: one call consumes one leaf whether
+    /// or not the peer overrides it. That is faithful — a real DPS would have
+    /// refused regardless of what the generator intended for that send.
+    ///
+    /// Fires ONLY once the run has diverged. Before that, a mismatch is by
+    /// construction a movers-table bug (spec §4), and phase A's assertion is what
+    /// must surface it; converting it into a `-12` here would change the
+    /// trajectory and bury the very error the axis exists to catch.
+    fn derived_reject(&self, resolved: &Option<OutgoingDoc>) -> Option<DpsError> {
+        let g = self.inner.lock().unwrap();
+        if !g.derive_rejects || g.diverged.is_none() {
+            return None;
+        }
+        let (_, _, previous_hash, _) = resolved.as_ref()?;
+        if previous_hash.as_deref() == g.tip.as_deref() {
+            return None;
+        }
+        // The live shape, byte-for-byte: two spaces after the code, `store` = the
+        // tip this peer holds, `chk` = the link the client actually presented.
+        // Unlike the forced leaf — which zero-fills `chk` because the stub cannot
+        // know it — here the peer HAS the document in hand, so `chk` is real.
+        Some(DpsError::Server {
+            code: -12,
+            message: format!(
+                "ERROR_BAD_HASH_PREV  store {} chk {}",
+                hex_lower(g.tip.as_deref().unwrap_or(&[0u8; 32])),
+                hex_lower(previous_hash.as_deref().unwrap_or(&[0u8; 32])),
+            ),
+        })
     }
 
     /// A CONVERGENCE event: both sides land on the same fresh tip.
@@ -429,6 +486,16 @@ impl DpsChannel for ScriptedDps {
                     .to_string(),
             ))
         });
+        // Peer-tip axis phase B: the peer may refuse a document that does not
+        // chain onto its tip, whatever the script said. The leaf is popped ABOVE
+        // either way, so one wire call still consumes one leaf — a real DPS would
+        // have refused regardless of what the generator intended for this send.
+        // `apply_reply` then sees the reply that was actually returned, so the
+        // tip bookkeeping never diverges from what the client observed.
+        let reply = match &self.peer {
+            Some(peer) => peer.derived_reject(&resolved).map(Err).unwrap_or(reply),
+            None => reply,
+        };
         if let Some(peer) = &self.peer {
             peer.apply_reply(resolved, &reply);
         }

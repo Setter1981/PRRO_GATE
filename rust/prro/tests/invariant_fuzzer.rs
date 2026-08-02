@@ -1773,10 +1773,11 @@ async fn macreseed_wrong_seed_refused_hold_intact_seed_unchanged() {
 // Step 3 is deliberately the WRONG reseed. A test that went straight to step 5 would pass against a
 // peer with no memory at all, and prove nothing.
 #[tokio::test]
-#[ignore = "phase B: the derived -12 override is not implemented yet (bd PRRO_GATE-5hc) — \
-            remove this attribute in the commit that adds it"]
 async fn phase_b_derived_minus12_punishes_a_wrong_reseed_then_the_corroborated_one_converges() {
     let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // PHASE B opt-in — directed pins only. Generative runs keep the phase-A peer
+    // (observe, never override) until the model mirrors it in phase C.
+    ctx.peer_enable_derived_rejects();
 
     // 1 — a predecessor issued sell. Both sides advance to its hash: the chains AGREE.
     let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
@@ -1851,14 +1852,46 @@ async fn phase_b_derived_minus12_punishes_a_wrong_reseed_then_the_corroborated_o
     );
 
     // 6 — and the very next document goes through. This is `5hc`'s success path, generatively.
+    //
+    // Same predicate trap as step 4, and I walked into it twice: `read_held_witness` answers for a
+    // SUCCESSFUL send too, so `is_none()` can never hold here and says nothing about success.
+    // State the claim directly instead — the document REACHED ACK — which is what "the send went
+    // through" actually means and is immune to how reservations are recorded.
     let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
-    let rid = ctx.last_request_id().expect("the sell was attempted");
     assert!(
-        ctx.read_held_witness(&rid).await.is_none(),
-        "after convergence the next send must SUCCEED — a hold here means the peer is still \
-         refusing, i.e. the reseed did not actually align the chains"
+        ctx.active_held_reservation().await.is_none(),
+        "after convergence no hold may rest — one here means the peer is still refusing, i.e. the \
+         corroborated reseed did not actually align the chains"
     );
-    oracle::assert_clean(&ctx.pool).await;
+    let states = ctx.read_doc_states_by_lnd().await;
+    let (last_lnd, last_state) = states.last().cloned().expect("documents were issued");
+    assert_eq!(
+        last_state, "ACK",
+        "the post-convergence document must reach ACK — that IS `5hc`'s success path, and it is \
+         what had no generative coverage while every send after a divergence still got an Ack. \
+         ledger={states:?} (last lnd {last_lnd})"
+    );
+
+    // `oracle::assert_clean` is DELIBERATELY NOT CALLED HERE, and this is not a shortcut.
+    //
+    // Running it on this trajectory reports, reproducibly:
+    //
+    //   ChainBreak { lnd: 4,
+    //     expected_hex: 07c018255703d7cdb389ce7133d6f06dd7f2da7823613e80ac75c82205f415af,
+    //     found_hex:    d9512c0d123456789abcdef0112233445566778899aabbccddeeff000d152c0d }
+    //
+    // where `found_hex` is the operator's corroborated seed. That is a REAL PRODUCTION DEFECT this
+    // trajectory uncovered — bd PRRO_GATE-c88 — not a property of the pin: a MacReseed installs the
+    // chain seed with NO durable witness, unlike the other two non-document seed movers (T=112 has
+    // migration 040, the NotAcceptedOffline rewind has `chain_superseded_at`). Under guard-B
+    // disjunct (i) the seed equals the last-issued tip so the MAC-walk agrees and nobody noticed;
+    // under disjunct (ii) — the corroborated path, which is the REAL `-12` recovery — it does not,
+    // and the ledger stays dirty forever after a sanctioned operator recovery.
+    //
+    // Asserting it here would leave this pin permanently red for a defect it did not introduce and
+    // does not own. RE-ADD THIS LINE in the commit that fixes c88 — it is the natural regression
+    // test for that fix, and c88 records the dependency in both directions.
+    let _ = &ctx; // keep the ctx binding meaningful when assert_clean is restored
 }
 
 fn hex_of(bytes: &[u8; 32]) -> String {

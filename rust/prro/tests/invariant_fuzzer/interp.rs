@@ -584,6 +584,18 @@ impl FuzzCtx {
     /// seeing anything (operator completions), or whose delivery is unknowable
     /// (a crash parked inside the wire call).  After this the peer stops
     /// asserting — phases C/D replace it with a modelled peer truth.
+    /// PHASE B opt-in — let the peer answer a mismatched send with a derived
+    /// `-12` instead of whatever the script queued.
+    ///
+    /// DIRECTED PINS ONLY. Generative runs must not enable it until the model
+    /// mirrors the peer (phase C): the model predicts wire outcomes on its own,
+    /// and phase A marks a run diverged on every `OperatorComplete`, on held
+    /// replies and on crashes, so an always-on override would answer `-12` where
+    /// the model expects an `Ack` and redden the differential everywhere.
+    pub fn peer_enable_derived_rejects(&self) {
+        self.peer.enable_derived_rejects();
+    }
+
     pub fn peer_mark_diverged(&self, reason: &str) {
         self.peer.mark_diverged(reason);
     }
