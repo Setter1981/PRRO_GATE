@@ -51,6 +51,17 @@ use crate::db::tx::WriteTxConn;
 use crate::db::types::DbShiftId;
 use sqlx::SqlitePool;
 
+/// bd `PRRO_GATE-a6n` — row shape of a turnover query that needs the doc type:
+/// `(doc_type, payload_json, state, offline_fiscal_no, server_fiscal_no)`.
+/// The last three are the columns [`counted_in_turnover`] discriminates on;
+/// they are fetched so the ONE predicate is applied in Rust (reusing the
+/// `is_issued` SSOT verbatim) instead of being re-spelled as a SQL literal.
+type TurnoverTypedRow = (String, String, String, Option<i64>, Option<String>);
+
+/// The same without the doc type, for single-`doc_type` queries:
+/// `(payload_json, state, offline_fiscal_no, server_fiscal_no)`.
+type TurnoverPayloadRow = (String, String, Option<i64>, Option<String>);
+
 /// Derive cash-on-hand from the opening anchor and per-shift cash totals.
 ///
 /// Pure — no I/O, no `async`.  All values in kopecks.
@@ -179,7 +190,7 @@ pub async fn aggregate_shift_epz(
     fiscal_number: &str,
     shift_id: ShiftId,
 ) -> sqlx::Result<i64> {
-    let rows: Vec<(String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<TurnoverPayloadRow> = sqlx::query_as(
         "SELECT payload_json, state, offline_fiscal_no, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
@@ -219,7 +230,7 @@ pub async fn aggregate_shift_service_io(
     fiscal_number: &str,
     shift_id: ShiftId,
 ) -> sqlx::Result<(i64, i64)> {
-    let rows: Vec<(String, String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<TurnoverTypedRow> = sqlx::query_as(
         "SELECT doc_type, payload_json, state, offline_fiscal_no, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
@@ -273,7 +284,7 @@ pub async fn aggregate_shift_cash_tx(
     use crate::db::models::enums::DocType;
 
     // SELL / RETURN cash legs.
-    let rows: Vec<(String, String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<TurnoverTypedRow> = sqlx::query_as(
         "SELECT doc_type, payload_json, state, offline_fiscal_no, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
@@ -312,7 +323,7 @@ pub async fn aggregate_shift_cash_tx(
     }
 
     // SERVICE_IN / SERVICE_OUT — in the same tx snapshot.
-    let svc_rows: Vec<(String, String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+    let svc_rows: Vec<TurnoverTypedRow> = sqlx::query_as(
         "SELECT doc_type, payload_json, state, offline_fiscal_no, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
@@ -344,7 +355,7 @@ pub async fn aggregate_shift_cash_tx(
     }
 
     // EPZ (CASH_ADVANCE_EPZ) — in the same tx snapshot.  Drives cash OUT.
-    let epz_rows: Vec<(String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+    let epz_rows: Vec<TurnoverPayloadRow> = sqlx::query_as(
         "SELECT payload_json, state, offline_fiscal_no, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
