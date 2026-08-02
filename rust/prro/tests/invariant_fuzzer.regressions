@@ -50,3 +50,4 @@ cc 5a42c3bcc8c5ad17d9cfb374769b7e31e97acf03dcdf9dcfaf69d3c889c29aff # shrinks to
 cc 0ae598de59a7a27ac8dc9af608d0a641d3576670141b73f98aefd1e99d34808a # shrinks to ops = [OnlineSell(DpsScript([Ack, NotFound])), OnlineServiceOut(DpsScript([Ack, Ack]))]
 cc ede0620c971120aa0e1a5ecbabb5fd5cc1d164089a211a28f21efc84ce60d291 # shrinks to ops = [OnlineServiceIn(DpsScript([Ack, NotFound])), OnlineReturn(DpsScript([Ack, Ack]))]
 cc 3b77c969f663cd9d646b62c3be74419f5299cba09ba4efe3241ac91dc85a0742 # shrinks to ops = [Crash(Kvt1), SellWithClosedShift, OnlineShiftOpen(DpsScript([Superseded])), OnlineSell(DpsScript([Ack, Ack]))]
+cc 6fe414fa662917aeea4cf3c7074f75c3f7a43f01707ed9c993baae1fe5284c23 # shrinks to ops = [OfflineSell, OperatorComplete(Accepted), OnlineEpz(DpsScript([Ack, Ack]))]

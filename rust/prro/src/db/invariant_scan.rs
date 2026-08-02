@@ -655,18 +655,59 @@ pub async fn scan(pool: &SqlitePool) -> sqlx::Result<Vec<Violation>> {
             .await?;
 
     for (fiscal_number,) in fns_for_check16 {
-        // Skip: last closed shift has cash_balance_kop=0 AND has issued receipts
-        // (the force-close test-seam signature — only present in tests).
-        let skip: Option<i64> = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM fiscal_documents fd              JOIN shifts s ON s.shift_id = fd.shift_id              WHERE s.fiscal_number = ? AND s.state = 'CLOSED'                AND s.cash_balance_kop = 0                AND fd.state IN ('ACK','OFFLINE_LOCAL_ACK')                AND s.serial = (SELECT MAX(serial) FROM shifts WHERE fiscal_number = ? AND state='CLOSED')",
+        // Skip: last closed shift has cash_balance_kop=0 AND still holds documents the
+        // re-derivation counts (the force-close test-seam signature — only present in tests).
+        //
+        // bd `PRRO_GATE-vuw` — this guard was doubly broken and BOTH halves are repaired here:
+        //
+        //  1. It keyed the "latest closed shift" on `s.serial = (SELECT MAX(serial) …)`. `serial`
+        //     is the DEAD column of bd `PRRO_GATE-seb`: nothing writes it, so every row holds NULL,
+        //     `MAX(serial)` is NULL, and `NULL = NULL` is NULL — never TRUE. The skip therefore
+        //     COULD NOT FIRE. This was the last consumer of `serial` that bd `seb` missed; it now
+        //     uses the same total order `cash_ledger::opening_carry_for_fn` settled on
+        //     (`closed_at DESC, rowid DESC` — `closed_at` is written atomically with `state='CLOSED'`,
+        //     `rowid` breaks the second-granular tie).
+        //
+        //  2. Its receipt probe asked `state IN ('ACK','OFFLINE_LOCAL_ACK')` while the thing it
+        //     guards — `reconcile_opening_anchor` → `aggregate_shift_cash` — now selects
+        //     [`counted_in_turnover`] (bd `PRRO_GATE-a6n`). A guard must ask the SAME question as
+        //     the check it protects, or it stops recognising the very seam it exists for: a
+        //     force-closed shift whose doc rests mid-drain was invisible to the probe yet counted by
+        //     the re-derivation, producing a false `CashAnchorDrift`.
+        //
+        // In production the force-close seam does NOT exist (a shift reaches CLOSED only through the
+        // Z path, which runs quiescence AND persists `derive_closing_cash`), so this skip stays inert
+        // there and Check 16 runs unconditionally — as the comment above already promised.
+        let latest_closed: Option<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT shift_id, cash_balance_kop FROM shifts \
+             WHERE fiscal_number = ? AND state = 'CLOSED' \
+             ORDER BY closed_at DESC, rowid DESC LIMIT 1",
         )
-        .bind(&fiscal_number)
         .bind(&fiscal_number)
         .fetch_optional(pool)
         .await?;
-        if skip.unwrap_or(0) > 0 {
-            // Force-close seam detected — skip to avoid false-positive.
-            continue;
+        if let Some((shift_id_blob, cash_balance_kop)) = latest_closed {
+            if cash_balance_kop == 0 {
+                let rows: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+                    "SELECT state, offline_fiscal_no, server_fiscal_no FROM fiscal_documents \
+                     WHERE fiscal_number = ? AND shift_id = ?",
+                )
+                .bind(&fiscal_number)
+                .bind(&shift_id_blob)
+                .fetch_all(pool)
+                .await?;
+                let counted_any = rows.iter().any(|(state, ofn, sfn)| {
+                    crate::db::repositories::fiscal_documents::counted_in_turnover(
+                        state,
+                        *ofn,
+                        sfn.as_deref(),
+                    )
+                });
+                if counted_any {
+                    // Force-close seam detected — skip to avoid false-positive.
+                    continue;
+                }
+            }
         }
 
         if let Some((re_derived, stored)) =
