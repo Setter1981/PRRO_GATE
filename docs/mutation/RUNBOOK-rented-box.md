@@ -251,11 +251,25 @@ discarded). An adjudication needs a note, not a test.
   arm in `inline.rs`, `dispatch_prepared_via_chain`, `escalate_fn_to_manual_recon`,
   `run_with_registry`, `attempts_used` — recovery and write-path, not corners.
 
+  One of them is already adjudicated, and it shows why survivors need reading rather than a reflex
+  test. `transport_trace.rs:460 attempts_used -> Ok(1)` makes the boot-retry budget never reach
+  `MAX_BOOT_ATTEMPTS`, so `evaluate_er_redrive` returns `EscalateManual` where it would have
+  returned `BudgetExhausted`. **Both arms CAS the document `ErrorRetryable →
+  RequiresManualReconciliation`** (`cas_error_retryable_budget_exhausted`, boot_phase.rs:3024 vs the
+  EscalateManual arm at :3180) — identical ledger outcome, and neither re-wires (CS-3 S7-1 R6). What
+  the mutation destroys is only *which reason was recorded*: the `BOOT_ER_BUDGET_EXHAUSTED` audit
+  and its histogram counter. **Verdict: LOW** — forensic granularity, not a correctness hole.
+
   **So: never read `survivors: 0` as coverage while `timeout.txt` is non-empty.** Re-run the
   timeouts with a far larger budget before believing any verdict, and treat what still times out as
-  *not caught*. Of the 110 that survived `×12`, most cluster around `attempts_used` — the boot-retry
-  budget counter (`MAX_BOOT_ATTEMPTS = 5`); stubbing it to a constant makes the ceiling unreachable,
-  so those are genuine non-termination, not slowness, and no budget will resolve them.
+  *not caught*. The 110 that survived `×12` are spread across `boot_phase` (34),
+  `reservation_boot_pass` (22), `transport_trace` writes (13), `supervisor` (9),
+  `canonical_builder` (9), `backlog_drain` (6). Raising the budget further will not resolve them —
+  the same mutants timed out at 582 s and at ~1450 s.
+
+  > The shared shape *appears* to be "a stubbed return means something a test awaits never happens"
+  > — a server that never binds, a boot pass that never converges, a request that never completes.
+  > **Inferred from the distribution, not verified**: confirming it means reading each call site.
 
 - **`TIMEOUT` outcomes are invisible to the ratchet — and a `full` run will silently
   drop them from the baseline.** They land in `timeout.txt`, never in `missed.txt`,
