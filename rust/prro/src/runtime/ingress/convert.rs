@@ -1251,17 +1251,28 @@ pub async fn aggregate_z_payload_for_shift(
             .await
             .map_err(ConvertError::LedgerRead)?;
     if epz_sum_kop > 0 {
-        let epz_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM fiscal_documents \
+        // bd PRRO_GATE-a6n: the EPC count MUST select the same turnover set as
+        // `aggregate_shift_epz` above, or the Z `<EPZ>` count and sum disagree.
+        // Both now go through the single `counted_in_turnover` predicate — the
+        // count filters in Rust for the same reason the sum does (the predicate
+        // reads three columns and reuses the `is_issued` SSOT; re-spelling it as
+        // a SQL literal is the drift this change removes).
+        let epz_rows: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT state, offline_fiscal_no, server_fiscal_no FROM fiscal_documents \
              WHERE fiscal_number = ? AND shift_id = ? \
-               AND doc_type = 'CASH_ADVANCE_EPZ' \
-               AND state IN ('ACK','OFFLINE_LOCAL_ACK')",
+               AND doc_type = 'CASH_ADVANCE_EPZ'",
         )
         .bind(fiscal_number)
         .bind(DbShiftId(shift_id))
-        .fetch_one(main_pool)
+        .fetch_all(main_pool)
         .await
         .map_err(ConvertError::LedgerRead)?;
+        let epz_count: i64 = epz_rows
+            .iter()
+            .filter(|(state, ofn, sfn)| {
+                fiscal_documents::counted_in_turnover(state, *ofn, sfn.as_deref())
+            })
+            .count() as i64;
         out.epz = Some(ZReportEpzOut {
             epc: epz_count,
             epcs: 0,

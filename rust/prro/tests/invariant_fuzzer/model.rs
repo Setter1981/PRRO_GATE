@@ -138,37 +138,58 @@ pub struct RefModel {
     /// OFFLINE_SESSION_END (at drain finalize).  Once-only, like the BEGIN.
     pub session_has_end: bool,
 
-    // ── L0 cash-on-hand accumulator (INV-21) ──────────────────────────────
+    // ── L0 cash-on-hand (INV-21) — DERIVED, never accumulated ─────────────
     //
-    // **RAGE W1 coordination note (task #18 — shift-op model additions):**
-    // W1 adds shift-lifecycle ops (ShiftOpen/Close/ZReport) to the model.
-    // When W1 merges onto this branch it MUST:
-    //   - reset `cash_on_hand = 0` in new shift-open prediction (carry across
-    //     shifts is L3/L4 scope; the current alphabet uses a SINGLE open shift
-    //     per fixture so 0 is correct).
-    //   - NOT change sign convention: SELL(cash) → +kop, RETURN(cash) → −kop.
-    //   - The INV-21 oracle in oracle.rs reads `model.cash_on_hand` directly.
+    // bd PRRO_GATE-6hl.  **Production maintains nothing.** `aggregate_shift_cash`
+    // RE-DERIVES the drawer from the ledger on every read, so a document's cash
+    // contribution appears and disappears purely as a function of its CURRENT
+    // state (`fiscal_documents::counted_in_turnover`).  The model used to keep an
+    // incremental SCALAR instead, mutated at the ~9 issuance sites and reversed at
+    // the bd x5o cancel sites.  The two agreed only while the counted set was the
+    // TERMINAL {ACK, OFFLINE_LOCAL_ACK}: nothing could enter it except at
+    // issuance, so "add once at issuance" was EQUIVALENT to deriving.  bd
+    // PRRO_GATE-a6n moved entry EARLIER (the issuance boundary), which makes
+    // transitions INTO the counted set reachable AFTER the fact — and an
+    // incremental accumulator has no hook on those.  The operator-completion
+    // release is exactly such a hook: it moves the held doc `Sending → Sent`
+    // (Accepted) or `→ RMR` and touched cash in NEITHER direction, leaking a whole
+    // cash leg (`[OfflineSell, OperatorComplete(Accepted), OnlineEpz]` — the model
+    // refused guard-3c over an empty drawer while prod, counting the doc at SENT,
+    // admitted and minted).
+    //
+    // So the model DERIVES too:
+    //   cash_on_hand() = opening_cash_kop
+    //                  + Σ { cash_by_lnd[l] | counted_in_turnover(docs[l], origin(l)) }
+    // Reversal stops being a thing that can be FORGOTTEN, because it falls out of
+    // the document's state.  Every future state edge into or out of the counted set
+    // is covered by construction — not by a fourth patch of the same shape.
     //
     // **Model formula (§1.2 restricted, L0 scope):**
-    //   cash_on_hand += CASH_AMOUNT_KOP  (per issued SELL — cash leg)
-    //   cash_on_hand -= CASH_AMOUNT_KOP  (per issued RETURN — cash leg)
+    //   SELL / service-in           →  +CASH_AMOUNT_KOP
+    //   RETURN / service-out / EPZ  →  −CASH_AMOUNT_KOP
     //   INV-21 refusal: a RETURN is refused fail-closed (NoMutation) when
-    //                   cash_on_hand < CASH_AMOUNT_KOP.
+    //                   `cash_on_hand() < CASH_AMOUNT_KOP`.
     //
     // **Cash identification:** type_code "0" (D1 frozen invariant).
     // Fuzzer fixture (interp.rs:64-65) always uses type_code:"0", sum_kop:15000
     // → 100% cash. Model hard-codes CASH_AMOUNT_KOP (see below) instead of
     // per-op amounts (the op alphabet does not expose payment details).
-    //
-    // **L3:** service-in/out terms wired (apply_service_io). EPZ stays 0 (fail-closed).
-    pub cash_on_hand: i64,
-    /// bd PRRO_GATE-x5o — the cash delta each doc contributed to `cash_on_hand` while it counted,
-    /// keyed by lnd.  PROD derives cash from `state IN ('ACK','OFFLINE_LOCAL_ACK')`
-    /// (`cash_ledger::aggregate_shift_cash_tx`), so a doc that LEAVES that set stops counting.  The
-    /// model advances `cash_on_hand` incrementally at issuance, so it needs this per-doc ledger to
-    /// REVERSE the contribution when a transition takes the doc out of the counted set (today: the
-    /// `NotAcceptedOffline` cohort-cancel + the held doc's escalation to RMR).  Docs with no cash leg
-    /// (a DocType=9 offline BEGIN) simply have no entry.
+    /// The CURRENT shift's opening anchor — the model's mirror of the open shift's
+    /// `shifts.cash_balance_kop`, which prod's `cash_on_hand_for_fn` adds to the shift
+    /// aggregate.  Re-anchored at every shift-open from `carry_cash_kop`, and on a fault
+    /// re-sync (`adopt_cash`) to whatever part of reality's drawer the model's own
+    /// per-document legs do not explain.
+    pub opening_cash_kop: i64,
+    /// bd PRRO_GATE-x5o / PRRO_GATE-6hl — the cash leg each CURRENT-shift document carries,
+    /// keyed by lnd, recorded AT MINT **regardless of the state the document landed in**.
+    /// That mirrors prod exactly: the payment is stored in `payload_json` when the row is
+    /// written, and `counted_in_turnover` decides PER READ whether it counts — so a doc that
+    /// enters or leaves the counted set later needs no bookkeeping hook at all.  A document
+    /// with no cash leg (a DocType=9 offline BEGIN, a SHIFT_OPEN / Z_REPORT) has no entry.
+    /// CLEARED at every shift-open: prod's aggregates are scoped to the open `shift_id`, so a
+    /// prior shift's legs must not follow the drawer across the boundary — and RE-SCOPED from the
+    /// real ledger on a fault re-sync, the one window in which reality can cross that boundary
+    /// without the model predicting it.
     pub cash_by_lnd: BTreeMap<i64, i64>,
 
     // ── Cross-shift cash carry (mirrors prod `shifts.cash_balance_kop`) ────
@@ -241,7 +262,7 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0,
+            opening_cash_kop: 0,
             cash_by_lnd: BTreeMap::new(), // L0: opening = 0 (first shift; carry is L3/L4)
             carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
@@ -264,7 +285,7 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0,
+            opening_cash_kop: 0,
             cash_by_lnd: BTreeMap::new(), // L0: no open shift → no cash-on-hand
             carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
@@ -289,7 +310,7 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0,
+            opening_cash_kop: 0,
             cash_by_lnd: BTreeMap::new(), // L0: opening = 0 (first shift)
             carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
@@ -312,7 +333,7 @@ impl RefModel {
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
             session_has_end: false,
-            cash_on_hand: 0,
+            opening_cash_kop: 0,
             cash_by_lnd: BTreeMap::new(), // L0: no open shift
             carry_cash_kop: 0,            // L0: no prior CLOSED shift → carry 0
             held_reservation: None,
@@ -343,6 +364,65 @@ impl RefModel {
             state,
             DocState::Sent | DocState::Kvt1 | DocState::Kvt2 | DocState::Ack
         )
+    }
+
+    /// bd `PRRO_GATE-6hl` — the model's mirror of prod `fiscal_documents::counted_in_turnover`:
+    /// **is this document part of the shift's turnover right now?**
+    ///
+    /// Structurally the SAME three-part rule as prod, expressed through the model's OWN lane
+    /// SSOTs so it cannot drift from the seed predicates the mint sites already use:
+    ///
+    /// ```text
+    /// counted := state ∈ {ACK, OFFLINE_LOCAL_ACK}                       // the old literal
+    ///         || ( model_is_issued(state, origin) && state ∉ {REJECTED, RMR} )
+    /// ```
+    ///
+    /// The `origin` argument replaces prod's physical discriminators: an offline-origin doc is
+    /// the one that got an `offline_fiscal_no` (the model tracks it in `offline_origin_lnds`),
+    /// and the online arm keys on `server_fiscal_no`, which A.3 stamps at the `Sending → Sent`
+    /// CAS — exactly the set `online_origin_advances_seed` names.  The parity is a TOOTH, not a
+    /// convention: `teeth_6hl_turnover_matches_prod_counted_in_turnover` asserts this fn equals prod's
+    /// for every `DocState` × lane under that physical coupling, so a drift on EITHER side is RED.
+    pub fn counted_in_turnover(state: DocState, offline_origin: bool) -> bool {
+        let issued = if offline_origin {
+            Self::is_offline_origin_issued(state)
+        } else {
+            Self::online_origin_advances_seed(state)
+        };
+        matches!(state, DocState::Ack | DocState::OfflineLocalAck)
+            || (issued
+                && !matches!(
+                    state,
+                    DocState::Rejected | DocState::RequiresManualReconciliation
+                ))
+    }
+
+    /// bd `PRRO_GATE-6hl` — is the document at `lnd` counted in turnover in its CURRENT state?
+    /// `None` in `docs` (a doc the model never minted) counts as not-counted.
+    fn doc_counted_in_turnover(&self, lnd: i64) -> bool {
+        self.docs.get(&lnd).is_some_and(|state| {
+            Self::counted_in_turnover(*state, self.offline_origin_lnds.contains(&lnd))
+        })
+    }
+
+    /// bd `PRRO_GATE-6hl` — the DERIVED drawer (INV-21 / the X-report `cash_on_hand_kop`).
+    ///
+    /// The model's twin of prod `cash_on_hand_for_fn`: the open shift's opening anchor plus the
+    /// cash legs of exactly those documents whose CURRENT state is turnover-counted.  There is no
+    /// accumulator to keep in step — a state edge in either direction is reflected on the next
+    /// read, which is precisely how production behaves.
+    pub fn cash_on_hand(&self) -> i64 {
+        self.opening_cash_kop + self.counted_cash_legs()
+    }
+
+    /// bd `PRRO_GATE-6hl` — the shift-aggregate half of `cash_on_hand()`: the legs of the
+    /// currently-counted documents, WITHOUT the opening anchor (which `adopt_cash` solves for).
+    fn counted_cash_legs(&self) -> i64 {
+        self.cash_by_lnd
+            .iter()
+            .filter(|(lnd, _)| self.doc_counted_in_turnover(**lnd))
+            .map(|(_, delta)| *delta)
+            .sum()
     }
 
     fn shift_is_open(&self) -> bool {
@@ -415,7 +495,7 @@ impl RefModel {
             // (nothing changes: no lnd, no seed, no code, no doc, no shift state)
             // — the model DELIBERATELY does not branch on shift/mode: even with
             // no open shift the prod read is a row-less 422, still a NoMutation.
-            // The turnover-snapshot equality (cash-on-hand == self.cash_on_hand)
+            // The turnover-snapshot equality (cash-on-hand == self.cash_on_hand())
             // is asserted by the harness via `check_x_report_turnover`.
             Op::XReport => self.apply_x_report(),
             // L5 — input-guard probe.  ONLINE-ONLY: the L5 guards are ingress-layer
@@ -489,20 +569,37 @@ impl RefModel {
     /// predicted mode (NEVER STOP_MODE — the anti-BRICK guarantee), and the seed advances for the
     /// seed-moving kinds (Accepted stamps the doc's chain tip; MacReseed re-bases).  Mutating `self`
     /// is what lets a SUBSEQUENT op issue again — the "next document passes" half of the property.
-    /// bd PRRO_GATE-x5o — apply a cash leg AND remember it per-lnd so a later transition out of the
-    /// prod-counted set (`ACK` / `OFFLINE_LOCAL_ACK`) can reverse exactly this doc's contribution.
+    /// bd `PRRO_GATE-6hl` — record `lnd`'s cash leg.  Called AT MINT, unconditionally on the
+    /// document's landing state: whether the leg counts is `counted_in_turnover`'s job, re-asked on
+    /// every read of `cash_on_hand()`.  There is deliberately NO inverse operation — the x5o
+    /// `uncount_cash` it replaced existed only because the old accumulator had to be told, by hand,
+    /// about each transition out of the counted set (and bd `PRRO_GATE-6hl` is what that costs when
+    /// a new transition INTO the set appears and nobody adds the mirroring hook).
     fn record_cash(&mut self, lnd: i64, delta: i64) {
-        self.cash_on_hand += delta;
         self.cash_by_lnd.insert(lnd, delta);
     }
 
-    /// bd PRRO_GATE-x5o — reverse `lnd`'s cash contribution because the doc left the prod-counted
-    /// set.  Idempotent: a doc whose cash was already reversed (or that never had a cash leg) is a
-    /// no-op.
-    fn uncount_cash(&mut self, lnd: i64) {
-        if let Some(delta) = self.cash_by_lnd.remove(&lnd) {
-            self.cash_on_hand -= delta;
-        }
+    /// bd `PRRO_GATE-6hl` — re-anchor the DERIVED drawer onto a real one (the fault re-sync).
+    ///
+    /// The model keeps its per-document legs (they stay live for future state edges) and moves the
+    /// OPENING anchor to absorb whatever reality holds that those legs do not explain — a
+    /// crash-completed doc the model never predicted, most of all.  Post-condition:
+    /// `self.cash_on_hand() == real_cash`, exactly as the old scalar assignment guaranteed.
+    ///
+    /// The caller is responsible for re-scoping `cash_by_lnd` to reality's OPEN shift FIRST (see
+    /// `adopt_fault_deferred`): the anchor absorbs the unexplained remainder, so a leg left in the
+    /// map from a shift reality has since closed would be absorbed with the WRONG sign and then
+    /// move the drawer again on its next state edge.
+    pub fn adopt_cash(&mut self, real_cash: i64) {
+        self.opening_cash_kop = real_cash - self.counted_cash_legs();
+    }
+
+    /// bd `PRRO_GATE-6hl` — a NEW shift's drawer: prod's aggregates are scoped to the open
+    /// `shift_id`, so the prior shift's legs stop counting the moment a new shift opens, and the
+    /// opening anchor becomes the carry (`shifts.cash_balance_kop` of the last REAL close).
+    fn open_shift_cash_anchor(&mut self) {
+        self.cash_by_lnd.clear();
+        self.opening_cash_kop = self.carry_cash_kop;
     }
 
     fn apply_operator_complete(&mut self, kind: OperatorResolutionKind) -> ExpectedOutcome {
@@ -573,18 +670,17 @@ impl RefModel {
                 .map(|(l, _)| *l)
                 .collect();
             for l in cancel {
+                // bd PRRO_GATE-x5o: a CANCELLED doc leaves the turnover set, so its cash leg stops
+                // counting — under bd PRRO_GATE-6hl that needs no reversal call: `cash_on_hand()`
+                // re-asks `counted_in_turnover` about the doc's CURRENT state on the next read.
                 self.docs.insert(l, DocState::Cancelled);
-                // bd PRRO_GATE-x5o: a CANCELLED doc leaves prod's cash set
-                // (`state IN ('ACK','OFFLINE_LOCAL_ACK')`), so its cash leg must be reversed —
-                // otherwise the X-report turnover oracle diverges (real 0 vs model 15000).
-                self.uncount_cash(l);
             }
             self.seed = None; // structural rewind marker; exact value asserted relationally by run_harness
+
+            // The held doc escalates to RMR, which is ALSO outside the turnover set — again
+            // nothing to reverse by hand (the leg x5o had to remember, 6hl made structural).
             self.docs
                 .insert(held_lnd, DocState::RequiresManualReconciliation);
-            // The held doc escalates to RMR, which is ALSO outside prod's cash set — reverse its leg
-            // too (a cash-bearing held SELL, not just the DocType=9 BEGIN of this repro).
-            self.uncount_cash(held_lnd);
             self.mode = node_mode_from_str(witness.node_mode); // GOING_ONLINE (active session drains)
                                                                // k3y: an OFFLINE shift-family `NotAcceptedOffline` also rolls the OLPD/CLPD edge back.
             if let Some(to) = shift_after {
@@ -698,7 +794,7 @@ impl RefModel {
     /// L6 — X-report (поточний звіт): a pure read.  ALWAYS `NoMutation` — the
     /// snapshot never allocates an lnd, advances the seed, consumes a code, mints
     /// a doc/inbox row, or transitions the shift.  The turnover-snapshot equality
-    /// (`self.cash_on_hand`) is checked by the harness against the real
+    /// (`self.cash_on_hand()`) is checked by the harness against the real
     /// `XReportPayload.cash_on_hand_kop`; the model itself does not mutate.
     fn apply_x_report(&self) -> ExpectedOutcome {
         ExpectedOutcome::NoMutation
@@ -774,7 +870,7 @@ impl RefModel {
 
     /// A RETURN — chain-wise IDENTICAL to a SELL at the model level for lnd/seed/
     /// codes.  The fuzzer enters at `inline::run`, downstream of `convert.rs`, so
-    /// INV-21 does NOT refuse here.  The cash accumulator (`cash_on_hand`) tracks
+    /// INV-21 does NOT refuse here.  The derived drawer (`cash_on_hand()`) tracks
     /// what prod actually does (may go negative on empty-drawer returns); the
     /// `check_cash_on_hand` oracle detects divergence independently.
     /// Routes through `apply_sell` with `is_return=true` for the SSOT cash delta.
@@ -806,7 +902,7 @@ impl RefModel {
             return ExpectedOutcome::NoMutation;
         }
         // Guard-3b (in-lease): ServiceOut refused pre-mint when drawer insufficient.
-        if is_out && self.cash_on_hand < CASH_AMOUNT_KOP {
+        if is_out && self.cash_on_hand() < CASH_AMOUNT_KOP {
             return ExpectedOutcome::NoMutation;
         }
         // D5 gate: refused pre-mint while a non-issued sibling rests.
@@ -827,19 +923,23 @@ impl RefModel {
         }
         self.docs.insert(lnd, doc_state);
         self.next_lnd += 1;
+        // bd PRRO_GATE-a6n — cash from the ISSUANCE boundary, not from ACK: prod's
+        // `aggregate_shift_service_io` selects `counted_in_turnover`, which for the online
+        // lane counts from the `Sending → Sent` CAS (sfn stamped).  bd PRRO_GATE-6hl — the
+        // leg is recorded AT MINT whatever the landing state, exactly as prod stores the
+        // `amount_kop` payload at mint; `cash_on_hand()` asks the predicate.  That is what
+        // lets a later `Sending → Sent` operator completion bring this leg INTO the drawer
+        // without a hook here.
+        if is_out {
+            self.record_cash(lnd, -CASH_AMOUNT_KOP);
+        } else {
+            self.record_cash(lnd, CASH_AMOUNT_KOP);
+        }
         if Self::online_origin_advances_seed(doc_state) {
             self.seed = Some(unsigned_hash);
         }
         if doc_state == DocState::Rejected {
             return ExpectedOutcome::NoIssuanceRow;
-        }
-        // Cash update only at ACK (matches aggregate_shift_cash filter).
-        if doc_state == DocState::Ack {
-            if is_out {
-                self.record_cash(lnd, -CASH_AMOUNT_KOP);
-            } else {
-                self.record_cash(lnd, CASH_AMOUNT_KOP);
-            }
         }
         ExpectedOutcome::Mutated(Mutation {
             lnd,
@@ -956,7 +1056,7 @@ impl RefModel {
             return ExpectedOutcome::NoMutation;
         }
         // Guard-3c (in-lease): EPZ refused pre-mint when the drawer is insufficient.
-        if self.cash_on_hand < CASH_AMOUNT_KOP {
+        if self.cash_on_hand() < CASH_AMOUNT_KOP {
             return ExpectedOutcome::NoMutation;
         }
         // D5 gate: refused pre-mint while a non-issued sibling rests.
@@ -977,15 +1077,15 @@ impl RefModel {
         }
         self.docs.insert(lnd, doc_state);
         self.next_lnd += 1;
+        // bd PRRO_GATE-a6n — cash-OUT from the ISSUANCE boundary, not from ACK (prod's
+        // `aggregate_shift_epz` selects `counted_in_turnover`).  bd PRRO_GATE-6hl — recorded
+        // AT MINT regardless of landing state; the predicate decides on read.
+        self.record_cash(lnd, -CASH_AMOUNT_KOP);
         if Self::online_origin_advances_seed(doc_state) {
             self.seed = Some(unsigned_hash);
         }
         if doc_state == DocState::Rejected {
             return ExpectedOutcome::NoIssuanceRow;
-        }
-        // Cash-OUT only at ACK (matches aggregate_shift_epz filter).
-        if doc_state == DocState::Ack {
-            self.record_cash(lnd, -CASH_AMOUNT_KOP);
         }
         ExpectedOutcome::Mutated(Mutation {
             lnd,
@@ -1059,7 +1159,7 @@ impl RefModel {
             // reset-to-0, which was only sound under the single-open-shift-per-fixture
             // assumption that the multi-shift alphabet (RAGE W1) broke — the
             // `Sell → Z → ShiftOpen → EPZ` counterexample where prod carries 15000.
-            self.cash_on_hand = self.carry_cash_kop;
+            self.open_shift_cash_anchor();
         } else if doc_state == DocState::Rejected {
             self.shift_state = ShiftState::RequiresManualReconciliation;
             return ExpectedOutcome::NoIssuanceRow;
@@ -1079,7 +1179,7 @@ impl RefModel {
             // OnlineShiftOpen([Superseded]), XReport]` → real 0 vs stale model
             // 15000. The Rejected arm above escalates to RMR (excluded from the
             // cash read), so it deliberately does NOT re-anchor.
-            self.cash_on_hand = self.carry_cash_kop;
+            self.open_shift_cash_anchor();
         }
 
         ExpectedOutcome::Mutated(Mutation {
@@ -1173,7 +1273,7 @@ impl RefModel {
         // persists `cash_balance_kop` before a reopen entered the alphabet — the carry
         // is set at the offline drain finalize (the real close) / online Z, and is 0
         // for the FN's first shift or after a non-persisting force-close.
-        self.cash_on_hand = self.carry_cash_kop;
+        self.open_shift_cash_anchor();
 
         ExpectedOutcome::Mutated(Mutation {
             lnd,
@@ -1233,7 +1333,7 @@ impl RefModel {
             // `shifts.cash_balance_kop` (prod `cash_ledger.rs:16`), which becomes the
             // NEXT shift's opening carry. Mirror it so a reopen after this Z sees the
             // carried balance (the `Sell → Z → ShiftOpen → EPZ` counterexample).
-            self.carry_cash_kop = self.cash_on_hand;
+            self.carry_cash_kop = self.cash_on_hand();
         } else if doc_state == DocState::Rejected {
             // Current production escalates shift-class send rejects to RMR while
             // the document itself rests as non-issued Rejected.
@@ -1386,7 +1486,7 @@ impl RefModel {
         if is_return
             && self.shift_is_open()
             && self.mode == NodeMode::Online
-            && self.cash_on_hand < CASH_AMOUNT_KOP
+            && self.cash_on_hand() < CASH_AMOUNT_KOP
         {
             // In-lease guard fires (online mode): RETURN refused, no row, no cash delta.
             return ExpectedOutcome::NoMutation;
@@ -1425,6 +1525,17 @@ impl RefModel {
                 }
                 self.docs.insert(lnd, doc_state); // the row IS minted (lnd allocated)
                 self.next_lnd += 1;
+                // L0 cash leg — recorded AT MINT, whatever state the doc landed in (bd
+                // PRRO_GATE-6hl).  Prod stores the payment in `payload_json` when the row is
+                // written and lets `counted_in_turnover` decide on every read; the model does
+                // the same, so a doc that enters the counted set LATER (an operator completion
+                // CAS'ing `Sending → Sent`) brings its leg with it, with no hook here.  The
+                // leg of a doc that never counts (`Rejected`) is inert by the predicate.
+                if is_return {
+                    self.record_cash(lnd, -CASH_AMOUNT_KOP);
+                } else {
+                    self.record_cash(lnd, CASH_AMOUNT_KOP);
+                }
                 // A.3 / C6 — online-origin advances the seed at the SEND crossing
                 // (`Sent`+, matching prod advance-at-SEND), NOT only at `ACK`.
                 // A pre-SENT outcome (`Rejected` / `ErrorRetryable`, no sfn) does
@@ -1441,26 +1552,24 @@ impl RefModel {
                 if doc_state == DocState::Rejected {
                     return ExpectedOutcome::NoIssuanceRow;
                 }
-                // L0 cash-on-hand update: only when the doc reaches ACK state.
+                // L0 cash counts from the ISSUANCE boundary, not from ACK.
                 //
-                // Prod `aggregate_shift_cash` / `aggregate_shift_cash_tx` filter
-                // `state IN ('ACK','OFFLINE_LOCAL_ACK')`.  Docs at SENT/KVT1/KVT2
-                // have crossed the issuance boundary (seed advanced) but are NOT yet
-                // counted in cash-on-hand — they sit probe-pending until they reach
-                // ACK.  The in-lease guard also reads from that same aggregate, so
-                // cash availability reflects ONLY ack'd receipts, not in-flight ones.
-                // This matches Z aggregation (Z counts ACK docs) — consistent.
+                // bd PRRO_GATE-a6n resolved the question the old NOTE here parked as
+                // "a policy question, follow-up, not blocking" — and resolved it
+                // AGAINST the old behaviour.  Prod's turnover predicate is
+                // `fiscal_documents::counted_in_turnover`, which for the online lane
+                // counts from the `Sending → Sent` CAS (where A.3 stamps the sfn and
+                // advances the seed), not from ACK.  The authority is the reference
+                // PRRO our cash formula was ported from: WebCheck writes the receipt
+                // into its journal — and thereby into turnover — the instant the DPS
+                // submit returns a fiscal number (`StringXML.cs:1382`), with no
+                // quittance wait and no delivery predicate anywhere in the aggregate
+                // (`Reports.cs:50-84`).
                 //
-                // NOTE (follow-up, not blocking): cash-on-hand counts at ACK, not at
-                // SENT.  The deep question of "should SENT docs pre-book cash capacity"
-                // is a policy question separate from INV-21 correctness.
-                if doc_state == DocState::Ack {
-                    if is_return {
-                        self.record_cash(lnd, -CASH_AMOUNT_KOP);
-                    } else {
-                        self.record_cash(lnd, CASH_AMOUNT_KOP);
-                    }
-                }
+                // That boundary is applied by `Self::counted_in_turnover` on every read of
+                // `cash_on_hand()` (it reuses the model's OWN lane SSOTs, so it cannot drift
+                // from the seed predicate the same op used above) — the mint above only
+                // RECORDS the leg (bd PRRO_GATE-6hl).
                 ExpectedOutcome::Mutated(Mutation {
                     lnd,
                     doc_state,
@@ -1708,7 +1817,7 @@ impl RefModel {
                         // Cross-shift carry (offline twin of the online Z-close): the drain
                         // finalize is the REAL close that persists `cash_balance_kop`, so the
                         // next shift-open carries this drawer (symmetry with online).
-                        self.carry_cash_kop = self.cash_on_hand;
+                        self.carry_cash_kop = self.cash_on_hand();
                     }
                     _ => {}
                 }
@@ -2000,24 +2109,61 @@ impl RefModel {
             .iter()
             .any(|(dt,)| dt == "OFFLINE_SESSION_END");
 
-        // L6 — cash_on_hand ← the real ledger.  A crash-completed offline sell /
+        // L6 — the drawer ← the real ledger.  A crash-completed offline sell /
         // return / service-io issues a real cash-moving doc the model does NOT
         // predict across the crash window (it is a Fault op, adopted not
-        // predicted); without this the model's cash accumulator drifts from
-        // reality, and a subsequent Op::XReport snapshot check would spuriously
-        // RED (real cash reflects the crash-completed doc; model still at its
-        // pre-fault value).  Adopt reality's cash — same discipline as docs /
-        // codes / seed above — via the prod SSOT `cash_on_hand_for_fn`.  For a
-        // NON-fault X-report the model still tracks cash INDEPENDENTLY through
-        // `apply_*`, so the snapshot check retains its teeth there.
+        // predicted); without this the model's drawer drifts from reality, and a
+        // subsequent Op::XReport snapshot check would spuriously RED (real cash
+        // reflects the crash-completed doc; model still at its pre-fault value).
+        // Adopt reality's cash — same discipline as docs / codes / seed above —
+        // via the prod SSOT `cash_on_hand_for_fn`.  For a NON-fault X-report the
+        // model still DERIVES cash INDEPENDENTLY from its own per-doc legs, so the
+        // snapshot check retains its teeth there.
+        //
+        // bd PRRO_GATE-6hl: adoption moves the OPENING ANCHOR, it does not overwrite an
+        // accumulator — the per-doc legs the model already holds stay live, so a
+        // post-adoption state edge (a doc leaving or entering the counted set) still moves
+        // the drawer.  `docs` is adopted ABOVE, so the legs are re-classified against
+        // reality's states before the anchor is solved for.
         let fiscal_number: String =
             sqlx::query_scalar("SELECT fiscal_number FROM node_state LIMIT 1")
                 .fetch_one(pool)
                 .await
                 .unwrap();
-        self.cash_on_hand = prro::services::cash_ledger::cash_on_hand_for_fn(pool, &fiscal_number)
+        // bd PRRO_GATE-6hl — the legs' SHIFT SCOPE is adopted too, not just their states.
+        //
+        // The model normally scopes them itself: a shift-open clears `cash_by_lnd`, mirroring
+        // prod's per-`shift_id` aggregates.  That self-scoping is exactly what a Fault window
+        // can invalidate — reality may have closed one shift and opened another with no model
+        // prediction in between, leaving a PRIOR shift's legs in the map to be re-counted, or
+        // to move the drawer on a later state edge, in a shift they do not belong to.  Adopting
+        // the scope from the ledger completes the funnel: `docs`, `offline_origin_lnds`,
+        // `shift_lifecycle_lnds`, codes, seed and the session flags above are ALL re-derived
+        // from reality here, and the legs' membership was the one thing that was not.
+        //
+        // The shift predicate is `cash_on_hand_for_fn`'s verbatim (`cash_ledger.rs`): the shift
+        // `node_state.current_shift_id` points at, excluding the four states that mean "not an
+        // open drawer".  No open shift ⇒ EMPTY scope ⇒ every leg drops and the anchor absorbs
+        // reality's 0 — which is what that read returns.  On every trajectory the current
+        // alphabet can produce this is a NO-OP (Crash / Reboot open no shift, and there is no
+        // auto-Z symbol), so it hardens a case rather than changing a reachable one.
+        let in_scope: Vec<(i64,)> = sqlx::query_as(
+            "SELECT fd.lnd FROM fiscal_documents fd \
+             JOIN shifts s ON s.shift_id = fd.shift_id \
+             JOIN node_state ns ON ns.current_shift_id = s.shift_id \
+             WHERE ns.fiscal_number = ? \
+               AND s.state NOT IN ('CLOSED','REQUIRES_MANUAL_RECONCILIATION','ERROR','CREATED')",
+        )
+        .bind(&fiscal_number)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let in_scope: BTreeSet<i64> = in_scope.into_iter().map(|(lnd,)| lnd).collect();
+        self.cash_by_lnd.retain(|lnd, _| in_scope.contains(lnd));
+        let real_cash = prro::services::cash_ledger::cash_on_hand_for_fn(pool, &fiscal_number)
             .await
             .unwrap();
+        self.adopt_cash(real_cash);
         // held_reservation is synced by the harness after every op (`sync_held_reservation`), so it
         // is NOT re-derived here — adopt covers docs/mode/session/seed/cash only.
     }

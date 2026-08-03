@@ -32,7 +32,9 @@ mod strategy;
 mod oracle;
 
 use prro::db::models::enums::{DocState, NodeMode, ShiftState};
-use prro::db::repositories::fiscal_documents::{is_issued, OFFLINE_ISSUED_STATES};
+use prro::db::repositories::fiscal_documents::{
+    counted_in_turnover, is_issued, OFFLINE_ISSUED_STATES,
+};
 
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -187,6 +189,43 @@ fn teeth_d7_online_advance_matches_prod_is_issued() {
             is_issued(state.as_str(), None, sfn),
             "online-arm drift at {state:?}: model seed-advance != prod is_issued \
              (offline_fiscal_no=None, under the sfn-stamped-at-SEND coupling)"
+        );
+    }
+}
+
+/// bd `PRRO_GATE-6hl` (TURNOVER tooth) — the model's `RefModel::counted_in_turnover` MUST equal
+/// prod `fiscal_documents::counted_in_turnover` for EVERY `DocState`, in BOTH origin lanes, under
+/// the PHYSICAL discriminator coupling the two sides key on:
+///   - offline-origin ⟺ `offline_fiscal_no` stamped at the local ack that issued the doc (the
+///     model tracks the same fact in `offline_origin_lnds`); it never un-stamps;
+///   - online-origin ⟺ `server_fiscal_no` stamped, which A.3 does at the `Sending → Sent` CAS —
+///     so sfn is present exactly for the states that crossed SEND.
+///
+/// That coupling is INDEPENDENT ground truth about the write path, consulted from NEITHER side, so
+/// the three sites must agree.  This is the tooth that makes the model's DERIVED drawer (bd 6hl)
+/// safe: a derivation is only as trustworthy as the predicate it derives THROUGH, and the model's
+/// mirror is a separate expression from prod's.  Perturb either turnover rule — drop the ACK/OLA
+/// literal, forget one of the two VOID terminals, move the online boundary — and this turns RED,
+/// instead of the differential silently blessing a prod/model divergence.
+#[test]
+fn teeth_6hl_turnover_matches_prod_counted_in_turnover() {
+    for state in ALL_DOC_STATES {
+        assert_eq!(
+            RefModel::counted_in_turnover(state, true),
+            counted_in_turnover(state.as_str(), Some(1), None),
+            "offline-lane turnover drift at {state:?}: model != prod counted_in_turnover \
+             (offline_fiscal_no stamped)"
+        );
+        let crossed_send = matches!(
+            state,
+            DocState::Sent | DocState::Kvt1 | DocState::Kvt2 | DocState::Ack
+        );
+        let sfn = if crossed_send { Some("70000001") } else { None };
+        assert_eq!(
+            RefModel::counted_in_turnover(state, false),
+            counted_in_turnover(state.as_str(), None, sfn),
+            "online-lane turnover drift at {state:?}: model != prod counted_in_turnover \
+             (under the sfn-stamped-at-SEND coupling)"
         );
     }
 }
@@ -997,10 +1036,11 @@ fn drive_sequence(ops: &[Op]) {
                     let _ = interp::run_op(&mut ctx, op).await;
                     model.apply(op);
                     // Re-sync cash: reboot settles stuck docs.
-                    model.cash_on_hand =
+                    model.adopt_cash(
                         prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, ctx.fn_id())
                             .await
-                            .unwrap_or(0);
+                            .unwrap_or(0),
+                    );
                     skip_next_cash_oracle = true;
                 }
                 continue; // all other ops skipped while "dead"
@@ -1011,10 +1051,11 @@ fn drive_sequence(ops: &[Op]) {
             // Fenced on Fault/OfflineSell/OfflineReturn (pre-existing model gaps).
             if matches!(expected, ExpectedOutcome::Fault) {
                 // Fault: reboot/crash changes prod state non-deterministically.
-                model.cash_on_hand =
+                model.adopt_cash(
                     prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, ctx.fn_id())
                         .await
-                        .unwrap_or(0);
+                        .unwrap_or(0),
+                );
                 skip_next_cash_oracle = true;
             } else if matches!(
                 op,
@@ -1023,17 +1064,19 @@ fn drive_sequence(ops: &[Op]) {
                 // Cross-mode fence: Offline* on Online ctx leaves an
                 // ErrorRetryable sibling; the D5 gate may refuse the next sell.
                 // Same applies to OfflineServiceIn/Out (same offline lane).
-                model.cash_on_hand =
+                model.adopt_cash(
                     prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, ctx.fn_id())
                         .await
-                        .unwrap_or(0);
+                        .unwrap_or(0),
+                );
                 skip_next_cash_oracle = true;
             } else if skip_next_cash_oracle {
                 // One grace op after a fence: re-sync and clear the flag.
-                model.cash_on_hand =
+                model.adopt_cash(
                     prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, ctx.fn_id())
                         .await
-                        .unwrap_or(0);
+                        .unwrap_or(0),
+                );
                 skip_next_cash_oracle = false;
             } else {
                 // `drive_sequence` is the RANDOM run-without-panic proptest
@@ -1048,10 +1091,11 @@ fn drive_sequence(ops: &[Op]) {
                 // static pins in `l0_l1_cash_ledger.rs` — proven RED on a
                 // guard-revert. Here we only keep the model advancing (re-sync
                 // so any later panic-check reads a consistent state).
-                model.cash_on_hand =
+                model.adopt_cash(
                     prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, ctx.fn_id())
                         .await
-                        .unwrap_or(0);
+                        .unwrap_or(0),
+                );
             }
             // Set dead_until_reboot when a stage-composition crash fires.
             if matches!(
@@ -4014,7 +4058,7 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 } = &real
                 {
                     if let Err(d) =
-                        oracle::check_x_report_turnover(*cash_on_hand_kop, model.cash_on_hand)
+                        oracle::check_x_report_turnover(*cash_on_hand_kop, model.cash_on_hand())
                     {
                         panic!("x-report turnover on {op:?}: {d:?}");
                     }
@@ -4792,6 +4836,87 @@ fn regression_offline_shiftopen_resets_cash_on_hand() {
             Op::XReport,
         ],
         true,
+    );
+}
+
+/// bd `PRRO_GATE-6hl` MODEL-BUG regression (fuzzer find 2026-08-02, `harness_online_seeded`
+/// shrunk at the DEFAULT `FUZZ_CASES`) — an operator completion that CAS's the held doc
+/// `Sending → Sent` moves it INTO the turnover set, so its cash leg must appear in the drawer.
+/// The online-seeded fixture drives three ops in order:
+/// (1) `OfflineSell` on an ONLINE node — a mis-targeted online SELL whose empty wire script
+///     rests the doc `SENDING` under a CS-3 hold (node → STOP_MODE);
+/// (2) `OperatorComplete(Accepted)` releases the hold: the doc CAS's to `SENT`, where A.3 stamps
+///     the `server_fiscal_no` — the moment prod's `counted_in_turnover` starts counting it;
+/// (3) `OnlineEpz([Ack,Ack])` is admitted by guard-3c only over a drawer holding ≥ 15_000.
+///
+/// The REAL impl is CORRECT: it never maintains a drawer, it re-derives one per read, so the
+/// released doc counts the instant its state changes.  The MODEL was WRONG: it kept cash as an
+/// INCREMENTAL SCALAR touched at the issuance sites, and the release arm — the first transition
+/// INTO the counted set that bd `PRRO_GATE-a6n` made reachable after the fact — touched cash in
+/// NEITHER direction.  So the model refused the EPZ on guard-3c over a phantom-empty drawer while
+/// prod admitted and minted → `ExpectedNoMutation OnlineEpz ... minted a fiscal_documents row`.
+/// GREEN only while the model DERIVES its drawer (`cash_on_hand()` over
+/// `RefModel::counted_in_turnover`); it goes RED again the moment the accumulator returns.
+#[test]
+fn regression_6hl_operator_release_brings_the_cash_leg_into_the_drawer() {
+    drive(
+        &[
+            Op::OfflineSell,
+            Op::OperatorComplete(OperatorResolutionKind::Accepted),
+            Op::OnlineEpz(DpsScript::ack_path()),
+        ],
+        false,
+    );
+}
+
+/// bd `PRRO_GATE-6hl` (ADOPT-SCOPE tooth) — a fault re-sync must adopt the cash legs' SHIFT SCOPE
+/// from the ledger, not only their states.
+///
+/// The model scopes legs itself by clearing `cash_by_lnd` at every shift-open, mirroring prod's
+/// per-`shift_id` aggregates.  A Fault window is the one place that self-scoping can be wrong:
+/// reality may close one shift and open another with NO model prediction in between, and a leg left
+/// behind then belongs to a shift the drawer no longer reads.  The alphabet cannot produce that
+/// today (`Crash`/`Reboot` open no shift, there is no auto-Z symbol), so the generative capstones
+/// CANNOT reach it — which is exactly why it is pinned here instead of being assumed.
+///
+/// Reality drives `SELL → Z → SHIFT_OPEN`: doc 1's 15_000 leg is bound to the now-CLOSED shift A,
+/// and fresh shift B opens on the persisted carry.  The model is then hand-built as one that missed
+/// the whole window — still holding doc 1's leg — and adopts.
+///
+/// Two assertions, and the SECOND is the tooth: after adoption the drawer matches prod (true either
+/// way, since the anchor absorbs the remainder), and a later state edge on the PRIOR shift's
+/// document must not move it.  Drop the `cash_by_lnd.retain(...)` re-scope in
+/// `adopt_fault_deferred` and the anchor absorbs doc 1's leg with the wrong sign, so cancelling
+/// doc 1 walks shift B's drawer 15_000 kop away from prod → RED.
+#[tokio::test]
+async fn teeth_6hl_adopt_rescopes_cash_legs_to_the_real_open_shift() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    interp::run_op(&mut ctx, &Op::OnlineZReport(DpsScript::ack_path())).await;
+    interp::run_op(&mut ctx, &Op::OnlineShiftOpen(DpsScript::ack_path())).await;
+    let real = prro::services::cash_ledger::cash_on_hand_for_fn(&ctx.pool, ctx.fn_id())
+        .await
+        .unwrap();
+
+    // A model that missed the close+reopen: doc 1's leg is still in the map, from shift A.
+    let mut model = RefModel::new_online_open_shift();
+    model.docs.insert(1, DocState::Ack);
+    model.cash_by_lnd.insert(1, model::CASH_AMOUNT_KOP);
+    model.adopt_fault_deferred(&ctx.pool).await;
+    assert_eq!(
+        model.cash_on_hand(),
+        real,
+        "post-adoption drawer must equal prod's"
+    );
+
+    // THE TOOTH: doc 1 belongs to the CLOSED shift A, so no state edge on it may move shift B's
+    // drawer.  Without the re-scope its leg is still live and this walks 15_000 kop off prod.
+    model.docs.insert(1, DocState::Cancelled);
+    assert_eq!(
+        model.cash_on_hand(),
+        real,
+        "a PRIOR shift's document changed state and moved the OPEN shift's drawer — \
+         the fault re-sync did not re-scope `cash_by_lnd` to reality's open shift"
     );
 }
 

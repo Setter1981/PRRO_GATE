@@ -788,6 +788,12 @@ struct ShiftReceiptRow {
     doc_type: DocType,
     payload_json: String,
     signing_config_snapshot_id: Option<i64>,
+    // bd PRRO_GATE-a6n — the three columns `counted_in_turnover` discriminates on.  Fetched so the
+    // predicate is applied ONCE in Rust (reusing the `is_issued` SSOT verbatim) instead of being
+    // re-spelled as a SQL literal that can drift from it.
+    state: String,
+    offline_fiscal_no: Option<i64>,
+    server_fiscal_no: Option<String>,
 }
 
 // Manual `FromRow` (CS-1b): `doc_type` is the pure `prro_domain::DocType`,
@@ -800,17 +806,27 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for ShiftReceiptRow {
             doc_type: row.try_get::<DbDocType, _>("doc_type")?.0,
             payload_json: row.try_get("payload_json")?,
             signing_config_snapshot_id: row.try_get("signing_config_snapshot_id")?,
+            state: row.try_get("state")?,
+            offline_fiscal_no: row.try_get("offline_fiscal_no")?,
+            server_fiscal_no: row.try_get("server_fiscal_no")?,
         })
     }
 }
 
-/// RS-2 piece-2b — the issued `SELL` / `RETURN` receipts of a shift, for
-/// Z-report aggregation.  Returns `(doc_type, payload_json,
-/// signing_config_snapshot_id)` for docs in the given `shift_id` whose state
-/// is a terminal **issued receipt** (`ACK` or `OFFLINE_LOCAL_ACK` — the
-/// `fiscal_documents`=issued-ledger set; in-flight `SENDING`/`KVT*`/
-/// `ERROR_RETRYABLE` and `REJECTED` are intentionally excluded, matching the
-/// W4-Z1 `<NC>` spec + the Python `shift_aggregation` parity).  `payload_json`
+/// RS-2 piece-2b — the TURNOVER-counted `SELL` / `RETURN` receipts of a shift,
+/// for Z-report aggregation.  Returns `(doc_type, payload_json,
+/// signing_config_snapshot_id)` for docs in the given `shift_id` that satisfy
+/// [`counted_in_turnover`].
+///
+/// **bd `PRRO_GATE-a6n`**: this used to be the literal
+/// `state IN ('ACK','OFFLINE_LOCAL_ACK')`, which read DELIVERY state as FISCAL
+/// validity — a drained offline receipt left turnover for the whole
+/// `SENDING → SENT → KVT1 → KVT2 → ERROR_RETRYABLE` walk and came back at
+/// `ACK`, with no fiscal event in between.  The predicate now derives from the
+/// [`is_issued`] SSOT; `REJECTED` stays excluded (it is subtracted inside
+/// [`counted_in_turnover`], preserving the W4-Z1 `<NC>` intent), and the set is
+/// unchanged at any Z boundary because Z-quiescence blocks on every added state.
+/// `payload_json`
 /// is the **converted** signer-ready `CheckJson` (RS-2 §0.4 H5), so callers
 /// aggregate its `payments[]` + `items[]` directly; the nullable snapshot FK
 /// (NULL only for pre-W4-Z2a docs) lets the W4-Z2 TXS aggregation resolve each
@@ -824,11 +840,11 @@ pub async fn list_shift_issued_receipts(
     shift_id: ShiftId,
 ) -> sqlx::Result<Vec<(DocType, String, Option<i64>)>> {
     let rows = sqlx::query_as::<_, ShiftReceiptRow>(
-        "SELECT doc_type, payload_json, signing_config_snapshot_id \
+        "SELECT doc_type, payload_json, signing_config_snapshot_id, \
+                state, offline_fiscal_no, server_fiscal_no \
          FROM fiscal_documents \
          WHERE fiscal_number = ? AND shift_id = ? \
            AND doc_type IN ('SELL','RETURN') \
-           AND state IN ('ACK','OFFLINE_LOCAL_ACK') \
          ORDER BY lnd",
     )
     .bind(fn_id)
@@ -837,6 +853,9 @@ pub async fn list_shift_issued_receipts(
     .await?;
     Ok(rows
         .into_iter()
+        .filter(|r| {
+            counted_in_turnover(&r.state, r.offline_fiscal_no, r.server_fiscal_no.as_deref())
+        })
         .map(|r| (r.doc_type, r.payload_json, r.signing_config_snapshot_id))
         .collect())
 }
@@ -1256,6 +1275,71 @@ pub fn is_issued(
         // AND extends it forward to SENT+ (the A.3 advance-at-SEND change).
         matches!(server_fiscal_no, Some(sfn) if !sfn.is_empty())
     }
+}
+
+/// bd `PRRO_GATE-a6n` — the SINGLE predicate for **is this document part of the shift's TURNOVER**.
+///
+/// Deliberately a DELTA on [`is_issued`], never an independent state list — seven hand-written copies
+/// of one rule is exactly how the defect this fixes was born:
+///
+/// ```text
+/// counted_in_turnover :=  state ∈ { ACK, OFFLINE_LOCAL_ACK }                     // the old literal
+///                      || ( is_issued(…) && state ∉ { REJECTED, REQUIRES_MANUAL_RECONCILIATION } )
+/// ```
+///
+/// **The first disjunct is the old literal, kept verbatim and deliberately.** It makes this predicate
+/// a STRICT SUPERSET of what turnover counted before — the change is purely ADDITIVE, so no row that
+/// used to be in turnover can fall out of it. That is a stronger guarantee than the quiescence
+/// argument below and it is the one that matters for a hot-zone edit.
+///
+/// It is not redundant. [`is_issued`] keys the ONLINE lane on `server_fiscal_no`, so a hypothetical
+/// `ACK` row carrying NEITHER discriminator would be dropped by the second disjunct alone. Under A.3
+/// production cannot mint such a row (an online `ACK` always carries the sfn stamped at the
+/// `Sending → Sent` CAS), so in production this clause is inert — but "inert in production" is not
+/// "safe to omit" when the alternative is silently narrowing a fiscal aggregate.
+///
+/// **Why it is NOT just `is_issued`.** [`is_issued`] is the SEED-ADVANCE authority: it admits
+/// `REJECTED` / `REQUIRES_MANUAL_RECONCILIATION` for offline origin because those DID move the MAC
+/// seed. A receipt DPS never accepted is not turnover — bd `PRRO_GATE-x5o` adjudicated exactly that
+/// (prod was right, the fuzzer model was wrong), so those two are subtracted here and ONLY here.
+///
+/// **Why it is NOT the old `state IN ('ACK','OFFLINE_LOCAL_ACK')` literal.** That literal read
+/// DELIVERY state as FISCAL validity. `backlog_drain` walks a drained offline document
+/// `OFFLINE_LOCAL_ACK → SENDING → SENT → KVT1 → KVT2 → ACK`, and a `TransientRetry` parks it durably
+/// in `ERROR_RETRYABLE` **while the shift stays `OpenedLocalPendingDrain`** (backlog_drain module doc,
+/// HIGH-C4-8) — i.e. open, so the X-report answers and the INV-21 guards read. The same cash leg was
+/// counted at OLA, uncounted for the whole drain, and counted again at ACK, with NO fiscal event in
+/// between.
+///
+/// **Two cases need no clause here, and that is the point of deriving from [`is_issued`]:**
+///   - `CANCELLED` — absent from [`OFFLINE_ISSUED_STATES`], so `is_issued` is already false. The x5o
+///     cohort-cancel semantics survive for free.
+///   - online `SENDING` — under A.3 the `server_fiscal_no` is stamped AT the `Sending → Sent` CAS, so
+///     an online doc in `SENDING` has no sfn and `is_issued` is already false. The lane asymmetry
+///     (offline `SENDING` counts, online `SENDING` does not) falls out of the existing discriminator
+///     instead of being hand-written.
+///
+/// **Reference authority** (spec §4.0): our cash formula was ported from WebCheck's `Nal()`
+/// (`cash_ledger.rs` module doc). That source aggregates turnover over `SHIFTID + DOCTYPE` and NOTHING
+/// else (`Reports.cs:50-84`); `CHECKHEAD` has no state column at all. A receipt enters its journal —
+/// and thereby turnover — the instant a fiscal number exists for it: in the online lane the moment the
+/// DPS submit returns one (`StringXML.cs:1382`), which IS our `Sending → Sent` CAS. So the online
+/// counting moment is `SENT`, not `ACK`; our `KVT1 → KVT2 → ACK` ladder is a confirmation refinement
+/// the reference does not have, and it must not gate turnover.
+///
+/// **Behaviour-neutral for Z by construction** (spec §5): every state this admits beyond the old
+/// literal is a member of the Z-quiescence blocking set
+/// ([`list_shift_pending_receipts_for_z_quiescence`]), so at the instant Z aggregation runs they are
+/// provably empty and this selects exactly the rows the literal did. The change lands on the two
+/// UNGATED consumers only — the X-report and the INV-21 guards.
+pub fn counted_in_turnover(
+    state: &str,
+    offline_fiscal_no: Option<i64>,
+    server_fiscal_no: Option<&str>,
+) -> bool {
+    matches!(state, "ACK" | "OFFLINE_LOCAL_ACK")
+        || (is_issued(state, offline_fiscal_no, server_fiscal_no)
+            && !matches!(state, "REJECTED" | "REQUIRES_MANUAL_RECONCILIATION"))
 }
 
 /// bd `PRRO_GATE-knk` — how many offline-origin documents rest in a state that put OUR chain tip
