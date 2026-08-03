@@ -92,6 +92,10 @@ it bills by the hour.
 `cargo-mutants` warns that `--jobs` above 8 "may overload your machine". For
 **this** workload on a 48-vCPU box that advice is actively harmful.
 
+> ⚠️ **Speed only. Read trap 0 first.** Every number in this table was produced with a shared
+> `CARGO_TARGET_DIR`, the configuration that made 40 % of one run's verdicts wrong. Raise `--jobs`
+> only once the build directory is per-job; otherwise you are buying throughput with correctness.
+
 | config | tested mutants/min | CPU |
 |---|---|---|
 | `-j8` + `CARGO_BUILD_JOBS=6` + `NEXTEST_TEST_THREADS=6` | 1.62 | `id=96` — **idle** |
@@ -149,6 +153,40 @@ find /root/.cache/prro-mutants-scratch -mindepth 1 -depth -delete
 
 Also: `pkill -x cargo-mutants` does **not** reliably kill it. Use `-9` and then
 *verify* the process is gone instead of trusting the exit code.
+
+### Trap 0 — parallel jobs + one `CARGO_TARGET_DIR` = **40 % of the verdicts are wrong**
+
+Read this before `--jobs`. It is the trap that invalidates results rather than merely slowing them.
+
+`cargo-mutants` **honours** an inherited `CARGO_TARGET_DIR` — it does not override it, and the tree
+copies it makes contain no target directory of their own (verified: with the variable set, the
+copies are bare and everything lands in the one shared path). So with `run.sh` exporting an absolute
+path and `-j24…64`, **every job builds and links into the same `debug/`**. A job's test run can
+execute a binary another job just linked — or one that was never rebuilt, i.e. **unmutated code**.
+
+`run.sh`'s own header warns about exactly this (bd `PRRO_GATE-9g5`) — for the *dev* target dir. The
+export meant to protect it recreates the hazard one level down.
+
+Measured. The 15 survivors from a `-j48` run were re-tested locally with `-j1`, same commit, same
+mutants, same multiplier:
+
+| | |
+|---|---|
+| declared survivors (`-j48`, shared target) | 15 |
+| confirmed by the serial run | **9** |
+| **false survivors** (serial says *caught*) | **6 — 40 %** |
+| real survivors the parallel run **missed** | 2 |
+
+**Wrong in both directions**, so it cannot be dismissed as "merely conservative". And the six false
+ones were not harmless noise — they were the alarming ones: `sent_not_found_to_manual` stubbed out,
+the fail-closed `"Z_REPORT" | "SHIFT_CLOSE"` arm deleted, inverted conditions in
+`dispatch_prepared_via_chain` and `escalate_fn_to_manual_recon`. Every one of them is killed by
+existing teeth. A parallel run invents holes exactly where they would frighten you most.
+
+**Do not set `CARGO_TARGET_DIR` at all** — let `cargo-mutants` own the build directory per job. If
+you must keep it (to protect a shared dev target), then the run has to be serial, or its verdicts
+are not evidence. Cheap way to check the fix before renting anything: mutate one module twice at
+`-j4`, with and without the variable, and compare both against a `-j1` baseline.
 
 ### Trap 4 — a `full` run silently tests **only `prro`**
 
@@ -246,19 +284,30 @@ discarded). An adjudication needs a note, not a test.
   | `full`, auto-timeout 582 s | 589 | **`missed = 0`** → baseline rewritten to an **empty file** |
   | catch-up, `--timeout-multiplier 12` | 110 | 444 caught, **15 real survivors** |
 
-  All fifteen sat in the first run's timeout bucket. They are in `sent_not_found_to_manual`
-  (the whole `Sent → RMR` escalation stubbed to `Ok(())`), the fail-closed `"Z_REPORT" | "SHIFT_CLOSE"`
-  arm in `inline.rs`, `dispatch_prepared_via_chain`, `escalate_fn_to_manual_recon`,
-  `run_with_registry`, `attempts_used` — recovery and write-path, not corners.
+  ⚠️ **Those "15" were re-tested serially and only 9 held** — the catch-up itself ran with a shared
+  build directory (trap 0), so 6 of them were false. The corrected finding is below; the *mechanism*
+  above stands, because the 59 s / 1010 s split is measured within that run and does not depend on
+  which mutants were mis-verdicted.
 
-  One of them is already adjudicated, and it shows why survivors need reading rather than a reflex
-  test. `transport_trace.rs:460 attempts_used -> Ok(1)` makes the boot-retry budget never reach
-  `MAX_BOOT_ATTEMPTS`, so `evaluate_er_redrive` returns `EscalateManual` where it would have
-  returned `BudgetExhausted`. **Both arms CAS the document `ErrorRetryable →
-  RequiresManualReconciliation`** (`cas_error_retryable_budget_exhausted`, boot_phase.rs:3024 vs the
-  EscalateManual arm at :3180) — identical ledger outcome, and neither re-wires (CS-3 S7-1 R6). What
-  the mutation destroys is only *which reason was recorded*: the `BOOT_ER_BUDGET_EXHAUSTED` audit
-  and its histogram counter. **Verdict: LOW** — forensic granularity, not a correctness hole.
+  **What actually survives, after serial re-verification** (`-j1`, same commit, same multiplier):
+  9 of the 15, plus 2 the parallel run had missed. Their character is nothing like the first
+  reading. Nine are **counters and summary-struct fields** — `ReservationBootSummary::is_active`
+  (three variants), the `dispatch_pending_doc` and `run_tick_for_fn` histograms, the `scanned` and
+  `fiscal_number` fields, `+= → *=` in `reservation_boot_pass::run`. Diagnostics nobody asserts, the
+  same class the July baseline already accepts (`DispatchHistogram::total_visited`). One is
+  `&& → ||` in the supervisor's loop condition. Two are `hex_lower` in the operator-handoff audit
+  record — and that pair is the only one arguing for a real tooth: `sn01` asserts the
+  `SENT_NOT_FOUND_ESCALATED_MANUAL` row **exists** (`COUNT(*)`) but never that it names the right
+  document.
+
+  Everything frightening in the first reading — `sent_not_found_to_manual` stubbed to `Ok(())`, the
+  deleted `"Z_REPORT" | "SHIFT_CLOSE"` arm, the inverted conditions in `dispatch_prepared_via_chain`
+  and `escalate_fn_to_manual_recon`, `normalize_one`, `attempts_used` — **is killed by existing
+  teeth**. Verified by hand and again serially.
+
+  > The lesson is sharper than either finding. A tight timeout hides survivors; a shared build
+  > directory *invents* them, and it invents them in the scariest places. Neither failure announces
+  > itself — both produce a report that reads like a result.
 
   **So: never read `survivors: 0` as coverage while `timeout.txt` is non-empty.** Re-run the
   timeouts with a far larger budget before believing any verdict, and treat what still times out as
