@@ -34,6 +34,11 @@ Two tiers, driven by `scripts/mutation/run.sh`:
 `run.sh` diffs the run against the baseline and reports:
 - 🔴 **NEW survivors** — uncaught mutants in changed code → add teeth (gate: exit 1).
 - 🟢 **CLOSED** — a former survivor now killed (teeth added) or code removed.
+  ⚠️ **Only meaningful in `full` mode.** In `diff` mode this is
+  `comm -13 <this run's survivors> <baseline>`, so it lists every baseline entry
+  *outside the diff* — mutants that were never tested — as "closed". The verdict
+  itself is unaffected and the baseline is only rewritten by `full`, but do not
+  prune `survivors.txt` from that list (bd `PRRO_GATE-a0d`).
 
 ## How to run
 
@@ -50,20 +55,33 @@ scripts/mutation/run.sh full 40
 
 ### Full run on a rented server
 
-A fresh cloud VM has no forced shared `target-dir`, so `-j` parallelism works out
-of the box (the WSL dev box's target-dir force — which serialised runs — is
-absent). Recommended: **Hetzner Cloud CCX63** (48 vCPU / 192 GB / 960 GB, hourly,
-**not spot → no interruptions**, ~€0.7/h → whole crate ~8-12 h ≈ €7-9).
+📖 **Read [`RUNBOOK-rented-box.md`](RUNBOOK-rented-box.md) before the first run.**
+It carries the measured settings and three traps that each cost real box-hours.
+
+Recommended: **Hetzner Cloud CCX63** (48 vCPU / 192 GB / 960 GB, hourly, **not
+spot → no interruptions**, ~€0.7/h).
 
 ```bash
 # on the fresh Ubuntu VM (as root):
-REF=main JOBS=40 SCOPE=full bash scripts/mutation/bootstrap-vm.sh
+REF=main JOBS=64 SCOPE=full bash scripts/mutation/bootstrap-vm.sh
 # → installs rust + cargo-mutants + nextest + mold + sccache, clones, runs,
 #   refreshes docs/mutation/baseline/. scp the baseline back + commit. Delete VM.
 ```
 
 `bootstrap-vm.sh` needs **zero secrets** — the suite uses the DetCrypto stub and
 in-memory SQLite; no JKS password / live DPS / keys ever reach the box.
+
+Two corrections to what this section used to claim, both measured 2026-08-02:
+
+- **A fresh VM does *not* free you from the shared `target-dir`.** `run.sh` itself
+  exports `CARGO_TARGET_DIR="$ROOT/rust/target-mutants"` unconditionally, on every
+  machine — and because that path is *inside* the tree and is not named `target`,
+  `cargo-mutants` copies the whole build directory into every job (~40 GB each; at
+  `JOBS=24` that fills a 902 GB disk). Move it outside the tree first — runbook §5.
+- **`JOBS=40` is not the sweet spot and `8-12 h ≈ €7-9` is optimistic.** Measured
+  throughput at `-j64` was 6× that of `-j24`; the whole crate is **10 548** mutants
+  (not ~9200), and per-mutant cost is dominated by running the entire 2375-test
+  suite. Re-measure per run — runbook §4 and §6.
 
 ## History / seed
 
