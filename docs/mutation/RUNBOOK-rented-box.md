@@ -36,14 +36,21 @@ blocks merge until it is resolved.
 The README's older estimate (`~8-12 h ≈ €7-9` for the whole crate) is optimistic.
 Measured reality:
 
-| scope | mutants | notes |
-|---|---|---|
-| a large PR diff | 282 | **2 h 11 min** at `JOBS=24` *with the target-dir trap below* |
-| whole crate | **10 548** | README says "~9200" — stale |
+Measured on the 2026-08-02/03 runs:
+
+| run | mutants | wall | outcome |
+|---|---|---|---|
+| a large PR diff (`--in-diff`) | 282 | 2 h 11 min at `-j24` *with trap 1 active* | 271 caught, 0 missed, 0 timeout |
+| whole **workspace** (`full`) | 10 548 | 4 h 46 min at `-j64` | see trap 4 — only `prro`'s 3615 were actually tested |
+| catch-up of that run's timeouts | 592 | 1 h 57 min at `-j64`, `--timeout-multiplier 12` | 444 caught, **15 missed**, 110 timeout |
+
+The README's "~9200 mutants" and "~8-12 h ≈ €7-9" are stale on both counts.
 
 Per-mutant work is dominated by running the **entire** 2375-test suite, plus a
 crate rebuild. Budget accordingly and re-measure rather than trusting a number
-from a previous run — throughput swings widely with the mutant mix.
+from a previous run — throughput swings widely with the mutant mix, and counting
+raw completions instead of *tested* ones will mislead you by an order of
+magnitude (§6).
 
 ---
 
@@ -143,6 +150,30 @@ find /root/.cache/prro-mutants-scratch -mindepth 1 -depth -delete
 Also: `pkill -x cargo-mutants` does **not** reliably kill it. Use `-9` and then
 *verify* the process is gone instead of trusting the exit code.
 
+### Trap 4 — a `full` run silently tests **only `prro`**
+
+`rust/.cargo/mutants.toml` passes `additional_cargo_args = ["--features","test-support"]`, and the
+`test-support` feature exists **only on `prro`**. For every sibling crate cargo fails on argument
+parsing, so *each of their mutants is recorded as `unviable`* — indistinguishable, in the summary,
+from "the mutation didn't compile".
+
+Measured on the 2026-08-03 full run:
+
+| crate | mutants | caught | unviable | timeout |
+|---|---|---|---|---|
+| `prro` | 3615 | 2996 | 30 | 589 |
+| `prro_crypto` | 3253 | 0 | **3253** | 0 |
+| `prro_crypto_v2` | 1974 | 0 | **1974** | 0 |
+| `maria304_driver` | 720 | 0 | **720** | 0 |
+| `prro_sidecar` | 637 | 0 | **637** | 0 |
+| the rest | — | 0 | **100 %** | 0 |
+
+**Two hours of a 4 h 46 m run went into crates that could never build.** Pass `--package prro`
+explicitly: the gate's scope is already `prro` (CI's `detect mutation-relevant changes` triggers on
+`rust/prro/src/`), so this *narrows nothing* — it aligns the run with the gate and cuts the time
+roughly threefold. If sibling crates should genuinely be covered, the feature argument has to become
+per-package first; today they are silently skipped.
+
 ### Trap 3 — `pkill -f` matches its own command line
 
 `pkill -f calib.sh` issued from a command whose own command line contains
@@ -201,6 +232,30 @@ discarded). An adjudication needs a note, not a test.
 ---
 
 ## 8. Known gaps in the tooling (bd `PRRO_GATE-a0d`)
+
+- 🔴 **A tight timeout hides survivors *systematically*, and the gate reports `0` while doing it.**
+  This is the single most important thing on this page. A mutant nobody kills runs the suite **to
+  completion** — no test fails, so there is no early exit — which makes survivors the **slowest**
+  mutants and the first to hit the cap. The cap does not lose a random sample; it eats precisely
+  what the gate exists to find.
+
+  Measured, same code, same box, same 589 mutants:
+
+  | run | timeout | result |
+  |---|---|---|
+  | `full`, auto-timeout 582 s | 589 | **`missed = 0`** → baseline rewritten to an **empty file** |
+  | catch-up, `--timeout-multiplier 12` | 110 | 444 caught, **15 real survivors** |
+
+  All fifteen sat in the first run's timeout bucket. They are in `sent_not_found_to_manual`
+  (the whole `Sent → RMR` escalation stubbed to `Ok(())`), the fail-closed `"Z_REPORT" | "SHIFT_CLOSE"`
+  arm in `inline.rs`, `dispatch_prepared_via_chain`, `escalate_fn_to_manual_recon`,
+  `run_with_registry`, `attempts_used` — recovery and write-path, not corners.
+
+  **So: never read `survivors: 0` as coverage while `timeout.txt` is non-empty.** Re-run the
+  timeouts with a far larger budget before believing any verdict, and treat what still times out as
+  *not caught*. Of the 110 that survived `×12`, most cluster around `attempts_used` — the boot-retry
+  budget counter (`MAX_BOOT_ATTEMPTS = 5`); stubbing it to a constant makes the ceiling unreachable,
+  so those are genuine non-termination, not slowness, and no budget will resolve them.
 
 - **`TIMEOUT` outcomes are invisible to the ratchet — and a `full` run will silently
   drop them from the baseline.** They land in `timeout.txt`, never in `missed.txt`,
