@@ -851,7 +851,21 @@ impl FuzzCtx {
     /// which document owns a tip, or a fault re-sync would land the model on an
     /// ordinal this projection then calls wrong.
     pub async fn real_tip_class(&self) -> RealTipClass {
-        let Some(seed) = self.read_seed().await else {
+        self.classify_tip(self.read_seed().await).await
+    }
+
+    /// Peer-tip axis PHASE C — the same projection applied to the PEER's tip.
+    ///
+    /// This is what lets the model's peer mirror be ASSERTED rather than merely asserted-about: the
+    /// harness peer (phase A) holds real bytes fed by the stub's replies, the model's mirror holds
+    /// ordinals derived from the §4 movers table, and the two meet in this shared structural
+    /// vocabulary.  Neither is computed from the other.
+    pub async fn peer_tip_class(&self) -> RealTipClass {
+        self.classify_tip(self.peer.tip()).await
+    }
+
+    async fn classify_tip(&self, tip: Option<Vec<u8>>) -> RealTipClass {
+        let Some(seed) = tip else {
             return RealTipClass::Genesis;
         };
         let lnd: Option<i64> = sqlx::query_scalar(

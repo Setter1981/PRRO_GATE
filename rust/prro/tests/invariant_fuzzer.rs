@@ -1978,6 +1978,181 @@ async fn phase_b_derived_minus12_punishes_a_wrong_reseed_then_the_corroborated_o
     oracle::assert_clean(&ctx.pool).await;
 }
 
+// ═══════════ peer-tip axis PHASE C — the OPERATOR as a divergence source (spec §5, §9) ═══════════
+
+/// The operator's WRONG-but-legal claim is a divergence source in its own right — and it has to be
+/// recoverable.
+///
+/// Phase B manufactured its divergence with the forced `[BadHashPrev]` leaf: DPS declared a tip we
+/// did not hold. That is the easy half — the peer TELLS us. This pin manufactures the divergence
+/// the way production actually produces it, at §5's adjudication point: an online send goes HELD
+/// (`Superseded` — the client never gets a trusted envelope back, so whether DPS took the document
+/// is precisely what nobody knows), the peer did NOT take it, and the operator resolves the hold
+/// `Accepted`. Nothing in production constrains that claim, and here it is wrong: our seed advances
+/// onto a document the peer never accepted.
+///
+/// What the axis must then do, and why BOTH halves are asserted:
+///   - punish the next document — it chains onto a tip the peer has never seen (the derived `-12`);
+///   - admit the corroborated repair — `MacReseed(store)`, guard-B disjunct (ii) — so the FN is not
+///     bricked by an honest operator mistake.
+/// A pin that stopped at the punishment would pass against a peer that can never be convinced, and
+/// one that skipped straight to the repair would pass against a peer with no memory at all. Phase B
+/// learnt both lessons the expensive way; this trajectory keeps them.
+///
+/// *Tooth:* make the operator's claim RIGHT (resolve `NotAccepted`, so our seed never advances past
+/// the peer) and step 4's derived `-12` never fires — the hold assertion REDs.
+#[tokio::test]
+async fn phase_c_a_wrong_operator_claim_earns_the_derived_minus12_and_recovers() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    // Directed opt-in, exactly as phase B: generative runs keep the observe-only peer until the
+    // model mirrors it.
+    ctx.peer_enable_derived_rejects();
+
+    // 1 — a predecessor issued sell. Both sides land on its hash; the chains AGREE.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let agreed_tip = ctx
+        .peer_tip_hex()
+        .expect("an accepted send moves the peer onto that document");
+
+    // 2 — the ambiguous send. The peer does NOT take it (no trusted envelope came back), and the
+    //     harness stops asserting agreement from here: this is the "held / indeterminate" branch.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::superseded_tip())).await;
+    assert!(
+        ctx.peer_diverged().is_some(),
+        "a held / indeterminate reply must mark the run diverged — whether the peer took the \
+         document is exactly what the client cannot know"
+    );
+    assert_eq!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(agreed_tip.as_str()),
+        "the peer did not take the ambiguous document, so its tip must not have moved"
+    );
+
+    // 3 — the operator's wrong claim. `Accepted` is legal, plausible, and false here: it advances
+    //     OUR seed onto the held document while the peer is still a document behind.
+    let out = interp::run_op(
+        &mut ctx,
+        &Op::OperatorComplete(OperatorResolutionKind::Accepted),
+    )
+    .await;
+    assert!(
+        matches!(out, interp::RealOutcome::Released(_)),
+        "nothing constrains the operator's claim — an `Accepted` on an online hold must release, \
+         got {out:?}"
+    );
+    assert_ne!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)).as_deref(),
+        Some(agreed_tip.as_str()),
+        "step 3 must actually move our seed past the peer, or there is no divergence to recover \
+         from and the rest of this pin proves nothing"
+    );
+
+    // 4 — the punishment. The next document chains onto a tip the peer has never accepted.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_some(),
+        "a send chaining onto a tip the peer never accepted must earn a DERIVED -12 and leave a \
+         completable hold. peer_tip={:?} our_seed={:?}",
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+
+    // 5 — the corroborated repair: the seed the peer itself named in `store`. Guard-B disjunct (ii).
+    let store: [u8; 32] = hex_to_32(&agreed_tip);
+    let out = interp::operator_complete_macreseed(&ctx, store).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Released(_)),
+        "MacReseed(store) is corroborated by the recorded -12 and must release, got {out:?}"
+    );
+
+    // 6 — and the FN is working again.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_none(),
+        "after the corroborated repair no hold may rest — one here means the chains are still \
+         apart, i.e. an honest operator mistake bricked the FN"
+    );
+}
+
+/// Peer-tip axis PHASE C (spec §4 row 12b, §9) — `Crash(Kvt1)` is an advance/advance, and the two
+/// sides RE-SYNC across it.
+///
+/// The movers table orders row 1 as "the peer moves at the reply, we move at the later
+/// `Sending → Sent` CAS". That ordering is unobservable in every ordinary trajectory — the only
+/// windows that fall BETWEEN the two are the wire crashes, which is why rows 12/12b are the
+/// ordering witnesses and not decoration.
+///
+/// `Crash(Send)` parks BEFORE the reply is popped: the peer holds the envelope and nothing says
+/// whether it took it, so the harness marks the run diverged and stops asserting (its out-of-script
+/// `Took`/`NotTook` choice is phase C-2). `Crash(Kvt1)` is the OTHER side of that boundary — the
+/// send-`Ack` was consumed, so the peer advanced, and the `Sent` commit landed, so we advanced too.
+/// Both moved, onto the same document. Nothing diverged.
+///
+/// The pin asserts that in the strongest available form: the derived `-12` override is ON, so if
+/// the peer had NOT taken the document across this crash, the very next send would be refused. It
+/// is not — the FN carries on. This is what "advance/advance re-syncs" MEANS operationally.
+///
+/// *Tooth, both run and both reported as OBSERVED, not as predicted.* Marking `Crash(Kvt1)`
+/// diverged like `Crash(Send)` REDs the divergence assertion (step 3, as expected). Making the peer
+/// forget to take what it accepted REDs the TIP-EQUALITY assertion — also step 3, one line further
+/// down, not the next-send assertion I first wrote here: a peer that never advances is behind by
+/// the time the crash lands, so the equality catches it before the derived `-12` ever gets the
+/// chance. Step 4 is therefore the weaker of the two by construction; it is kept because it states
+/// the operational consequence ("the FN carries on") that the equality only implies.
+#[tokio::test]
+async fn phase_c_crash_at_kvt1_is_an_advance_advance_and_stays_in_step() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.peer_enable_derived_rejects();
+
+    // 1 — a predecessor issued sell; both sides agree.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+
+    // 2 — killed at the `last_chk` hang. The send-Ack was already consumed.
+    let out = interp::run_op(&mut ctx, &Op::Crash(Stage::Kvt1)).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Crashed { .. }),
+        "Crash(Kvt1) must actually reach and park in the wire await, got {out:?}"
+    );
+
+    // 3 — nothing diverged: unlike Crash(Send), the acceptance here is KNOWN.
+    assert!(
+        ctx.peer_diverged().is_none(),
+        "Crash(Kvt1) consumed the send-Ack, so the peer's acceptance is not in question — marking \
+         it diverged would throw away the one crash whose delivery IS knowable. reason={:?}",
+        ctx.peer_diverged()
+    );
+    assert_eq!(
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)),
+        "advance/advance: the peer moved at the reply and we moved at the Sent commit, onto the \
+         SAME document — the ordering the crash exposes must not leave the two apart"
+    );
+
+    // 4 — and the FN carries on. With the override armed, a peer that had NOT taken the crashed
+    //     document would refuse this send; it does not.
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_none(),
+        "the document after a Crash(Kvt1) chains onto a tip the peer DID accept, so it must go \
+         through. peer_tip={:?} our_seed={:?}",
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+}
+
+/// Peer-tip axis PHASE C — the ONE place reality's tip vocabulary is translated into the model's.
+///
+/// Written out as an explicit match rather than derived or `#[repr]`-aliased, because this mapping
+/// IS the claim the two tip assertions rest on: collapse a case here and both sides agree on a lie.
+fn as_model_tip(real: interp::RealTipClass) -> model::ModelTipClass {
+    match real {
+        interp::RealTipClass::Genesis => model::ModelTipClass::Genesis,
+        interp::RealTipClass::Doc(lnd) => model::ModelTipClass::Doc(lnd),
+        interp::RealTipClass::NonDoc => model::ModelTipClass::NonDoc,
+    }
+}
+
 fn hex_of(bytes: &[u8; 32]) -> String {
     hex_of_slice(bytes)
 }
@@ -3928,6 +4103,17 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     );
                 }
                 model.adopt_fault_deferred(&ctx.pool).await;
+                // Peer-tip axis PHASE C (spec §8.3) — and hand the peer over.
+                //
+                // Everything `adopt_fault_deferred` re-syncs it re-DERIVES from the ledger. The
+                // peer has no ledger row: it is environment state, so a fault window is the one
+                // place the model cannot recover it on its own. Handing it over is the
+                // `sync_fence_active` pattern and carries the same stated boundary — across a
+                // fault the harness verifies *given this peer state, the model behaves correctly*,
+                // not that the model would have derived it. Between faults the mirror is fully
+                // independent, and that is where the assertion above has teeth.
+                let peer_now = as_model_tip(ctx.peer_tip_class().await);
+                model.sync_peer_tip(peer_now);
             }
             // Predictable mutation — differential-match the model.
             oracle::OpClass::PredictableMutating => {
@@ -4537,24 +4723,42 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // So: project both sides onto the same three structural cases and demand they agree.  This
         // is the model-side twin of phase A's peer assertion — an empirical load test of the seed
         // algebra rather than a comment claiming it holds.
-        let real_tip = ctx.real_tip_class().await;
+        let real_tip = as_model_tip(ctx.real_tip_class().await);
         let model_tip = model::model_tip_class(model.seed);
-        let agrees = matches!(
-            (model_tip, real_tip),
-            (model::ModelTipClass::Genesis, interp::RealTipClass::Genesis)
-                | (model::ModelTipClass::NonDoc, interp::RealTipClass::NonDoc)
-        ) || matches!(
-            (model_tip, real_tip),
-            (model::ModelTipClass::Doc(a), interp::RealTipClass::Doc(b)) if a == b
-        );
         assert!(
-            agrees,
+            model_tip == real_tip,
             "peer-tip axis (phase C) on {op:?}: the model's MAC tip names {model_tip:?} but the \
              real tip is {real_tip:?} — the model's symbolic seed algebra has drifted from the \
              ledger, so any tip COMPARISON built on it (the peer mirror, the derived -12) would be \
              built on sand. real_seed={:?}",
             ctx.read_seed().await.map(|s| hex_of_slice(&s))
         );
+
+        // ── Peer-tip axis PHASE C (spec §4, §8) — and the model's PEER mirror must agree too ──
+        //
+        // Phase A made the harness peer falsifiable by asserting it against the outgoing documents'
+        // own chain links, and found a missing mover on its first run. This is the same test one
+        // level up: the model derives the peer INDEPENDENTLY, from the movers table alone, and the
+        // two derivations must name the same document. Wire a model mover wrong — say "an offline
+        // issuance advances the peer", or forget that the drain-finalize END is an ONLINE issuance
+        // the peer also takes — and this fires on the very next op.
+        //
+        // Gated on the model still CLAIMING to know. A held or ambiguous wire outcome, and a crash
+        // parked inside the wire call, leave the peer's acceptance genuinely undetermined; the
+        // model says so (`peer_unknown`) instead of guessing, and a comparison against a guess
+        // would be worse than no comparison at all. Phase C-2's `Took`/`NotTook` leaf is what
+        // narrows this gate — and the gate is exactly the measure of how much it will buy.
+        if !model.peer_unknown {
+            let real_peer = as_model_tip(ctx.peer_tip_class().await);
+            let model_peer = model::model_tip_class(model.peer_tip);
+            assert!(
+                model_peer == real_peer,
+                "peer-tip axis (phase C) on {op:?}: the model's peer mirror names {model_peer:?} \
+                 but the harness peer is on {real_peer:?} — a §4 mover is wrong on the model side. \
+                 peer_tip={:?}",
+                ctx.peer_tip_hex()
+            );
+        }
     }
 
     // A2/A4: terminal liveness + scan.  The per-op scan is suppressed mid-crash

@@ -254,6 +254,36 @@ to converge → derived `-12` → corroborated `MacReseed(store)` → **next sen
 *Tooth:* peer ignores the mismatch → the trajectory pin REDs.
 *Deliverable:* `PRRO_GATE-5hc` closes here.
 
+> **PHASE C — PART ONE HAS SHIPPED (2026-08-04, branch `fuzzer/peer-tip-phase-c`).** The model
+> representation change (§8.1, §8.3) and both §9 trajectory pins landed; §8.2 and the C-2 leaf work
+> did NOT, and the boundary is exact rather than approximate.
+>
+> **Landed.** (1) §8.1 — the rewind marker is gone. The model records each document's chain link at
+> mint (`mint_doc`, `or_insert`, mirroring an immutable prod column), the `NotAcceptedOffline`
+> rewind restores that link, and `adopt_fault_deferred` re-derives every link from the ledger. A new
+> `run_harness` assertion projects the model's tip AND reality's onto {Genesis, Doc(lnd), NonDoc}
+> after every op and demands they agree — the seed differential previously only asked whether the
+> tip MOVED. (2) The model's own peer mirror, moved by the §4 movers table, asserted the same way
+> against the phase-A harness peer. (3) Both §9 pins: the operator's wrong claim earning a derived
+> `-12` and recovering through the corroborated reseed, and `Crash(Kvt1)` as an advance/advance that
+> re-syncs.
+>
+> **Two rows of §4 were wrong in rev1 and are corrected here, each with a canary that fires:** the
+> drain-finalize END advances the PEER as well as our seed (it is an online issuance minted at drain
+> time), and the held/ambiguous leaf is generator-chosen in the DRAIN lane too, not only online.
+>
+> **The honest gate.** The model's peer comparison is suppressed once `peer_unknown` is set — a held
+> or ambiguous wire outcome, or a crash inside the wire call, leaves the peer's acceptance genuinely
+> undetermined and the model states that rather than guessing. That gate is exactly what phase C-2's
+> `Took`/`NotTook` leaf exists to narrow, so the size of it IS the measure of what C-2 buys.
+>
+> **§8.2 is deliberately NOT landed.** The `MacReseed` arm still reads `synth(held_lnd)` where it
+> should read `model.peer_tip`. `MacReseed` is generator-EXCLUDED and every directed pin drives it
+> through `operator_complete_macreseed`, which bypasses the model — so the arm is unreachable and
+> its canary cannot be made to fire. It lands with the machinery that reaches it (an interpreter
+> that supplies the corroborated seed the peer itself declared), not before: a fix whose teeth have
+> not been watched to bite is exactly what this project's teeth rule forbids.
+
 **Phase C — the model mirror + annotated ambiguity.** §8's representation change; appended
 peer-truth leaf variants; `Crash(Send)` out-of-script choice; C.1 constrains offline-hold
 completions to peer truth (§5). Trajectory pins: operator-wrong-claim (online) earns `-12` and

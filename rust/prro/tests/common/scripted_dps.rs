@@ -226,6 +226,12 @@ impl PeerLedger {
         self.inner.lock().unwrap().tip.as_deref().map(hex_lower)
     }
 
+    /// The peer's tip as raw bytes — phase C projects it onto a document ordinal so the MODEL's
+    /// independently-derived mirror can be compared against it.
+    pub fn tip(&self) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().tip.clone()
+    }
+
     /// Resolve the document currently on the wire.
     ///
     /// By state, NOT by `local_number`: `build_send_envelope` hard-overrides
