@@ -118,6 +118,21 @@ pub struct RefModel {
     pub codes_consumed: i64,
     /// Per-lnd document state.
     pub docs: BTreeMap<i64, DocState>,
+    /// Peer-tip axis PHASE C (spec §8.1) — the chain link each document was MINTED onto, keyed by
+    /// lnd, in the model's symbolic algebra.
+    ///
+    /// Prod writes `fiscal_documents.previous_hash` once, at mint, and never rewrites it; the
+    /// `NotAcceptedOffline` rewind reads exactly that column back (`delivery_reservation.rs`
+    /// `offline_cohort_cleanup`).  The model used to mark that rewind with `seed = None` — a "this
+    /// value is not mine to know" flag, checked relationally by `run_harness` against the ledger.
+    /// That sufficed while the only question asked of the tip was *did it move*.  It stops
+    /// sufficing the moment the tip is COMPARED — against the peer's, to derive a `-12` — because
+    /// the marker compares equal to genesis, and a model that thinks it is at genesis when the
+    /// ledger is three documents along will manufacture divergences that production never had.
+    ///
+    /// So the model mirrors prod's DERIVATION rather than its result: record the link at mint,
+    /// restore that same link at the rewind.
+    pub doc_prev: BTreeMap<i64, Option<[u8; 32]>>,
     /// LNDs of shift-lifecycle docs (`SHIFT_OPEN` / `SHIFT_CLOSE` /
     /// `Z_REPORT`).  Z quiescence blocks on in-flight receipts, not on earlier
     /// lifecycle artifacts that can legally rest at `SENT` while the shift has
@@ -258,6 +273,7 @@ impl RefModel {
             codes_issued: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            doc_prev: BTreeMap::new(),
             shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
@@ -281,6 +297,7 @@ impl RefModel {
             codes_issued: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            doc_prev: BTreeMap::new(),
             shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
@@ -306,6 +323,7 @@ impl RefModel {
             codes_issued: codes,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            doc_prev: BTreeMap::new(),
             shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
@@ -329,6 +347,7 @@ impl RefModel {
             codes_issued: codes,
             codes_consumed: 0,
             docs: BTreeMap::new(),
+            doc_prev: BTreeMap::new(),
             shift_lifecycle_lnds: BTreeSet::new(),
             offline_origin_lnds: BTreeSet::new(),
             session_has_begin: false,
@@ -579,6 +598,18 @@ impl RefModel {
         self.cash_by_lnd.insert(lnd, delta);
     }
 
+    /// Peer-tip axis PHASE C (spec §8.1) — MINT a document into the model ledger, recording the
+    /// chain link it was minted onto.
+    ///
+    /// `or_insert`, not `insert`: prod's `previous_hash` is written once and is immutable
+    /// thereafter, so no later edge may rewrite it.  Plain state TRANSITIONS therefore keep calling
+    /// `self.docs.insert` directly — that split is what makes "the link is recorded at mint, and
+    /// only at mint" a greppable rule rather than a convention every future arm has to remember.
+    fn mint_doc(&mut self, lnd: i64, state: DocState, previous_hash: Option<[u8; 32]>) {
+        self.docs.insert(lnd, state);
+        self.doc_prev.entry(lnd).or_insert(previous_hash);
+    }
+
     /// bd `PRRO_GATE-6hl` — re-anchor the DERIVED drawer onto a real one (the fault re-sync).
     ///
     /// The model keeps its per-document legs (they stay live for future state edges) and moves the
@@ -675,7 +706,17 @@ impl RefModel {
                 // re-asks `counted_in_turnover` about the doc's CURRENT state on the next read.
                 self.docs.insert(l, DocState::Cancelled);
             }
-            self.seed = None; // structural rewind marker; exact value asserted relationally by run_harness
+            // spec §8.1 — rewind to the held doc's OWN immutable chain link, the same column prod
+            // reads back.  This used to be `self.seed = None`, a structural marker whose exact
+            // value `run_harness` then checked relationally against the ledger; see `doc_prev` for
+            // why a marker stops being good enough once the tip has to be COMPARED.
+            //
+            // Absent from the map ⇒ the model never saw this document minted (it was adopted across
+            // a fault window, and `adopt_fault_deferred` re-derives every link precisely so this
+            // cannot happen).  Falling back to genesis rather than panicking is deliberate: the
+            // harness's phase-C tip assertion names the drift far more precisely than a panic here
+            // would, and it names it at the op that caused it.
+            self.seed = self.doc_prev.get(&held_lnd).copied().flatten();
 
             // The held doc escalates to RMR, which is ALSO outside the turnover set — again
             // nothing to reverse by hand (the leg x5o had to remember, 6hl made structural).
@@ -808,7 +849,7 @@ impl RefModel {
     /// (no issuance) — a row exists but no receipt was issued.
     fn mint_aborted_refusal(&mut self) -> ExpectedOutcome {
         let lnd = self.next_lnd;
-        self.docs.insert(lnd, DocState::Aborted);
+        self.mint_doc(lnd, DocState::Aborted, self.seed);
         self.next_lnd += 1;
         ExpectedOutcome::NoIssuanceRow
     }
@@ -921,7 +962,7 @@ impl RefModel {
             // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
             self.mode = NodeMode::StopMode;
         }
-        self.docs.insert(lnd, doc_state);
+        self.mint_doc(lnd, doc_state, previous_hash);
         self.next_lnd += 1;
         // bd PRRO_GATE-a6n — cash from the ISSUANCE boundary, not from ACK: prod's
         // `aggregate_shift_service_io` selects `counted_in_turnover`, which for the online
@@ -992,7 +1033,7 @@ impl RefModel {
             self.session_has_begin = true;
             let begin_lnd = self.next_lnd;
             let begin_unsigned = synth_unsigned_hash(begin_lnd);
-            self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+            self.mint_doc(begin_lnd, DocState::OfflineLocalAck, self.seed);
             self.offline_origin_lnds.insert(begin_lnd);
             self.next_lnd += 1;
             self.codes_consumed += 1;
@@ -1008,7 +1049,7 @@ impl RefModel {
         let lnd = self.next_lnd;
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
-        self.docs.insert(lnd, DocState::OfflineLocalAck);
+        self.mint_doc(lnd, DocState::OfflineLocalAck, previous_hash);
         self.offline_origin_lnds.insert(lnd);
         self.next_lnd += 1;
         self.codes_consumed += 1;
@@ -1075,7 +1116,7 @@ impl RefModel {
             // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
             self.mode = NodeMode::StopMode;
         }
-        self.docs.insert(lnd, doc_state);
+        self.mint_doc(lnd, doc_state, previous_hash);
         self.next_lnd += 1;
         // bd PRRO_GATE-a6n — cash-OUT from the ISSUANCE boundary, not from ACK (prod's
         // `aggregate_shift_epz` selects `counted_in_turnover`).  bd PRRO_GATE-6hl — recorded
@@ -1144,7 +1185,7 @@ impl RefModel {
             // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
             self.mode = NodeMode::StopMode;
         }
-        self.docs.insert(lnd, doc_state);
+        self.mint_doc(lnd, doc_state, previous_hash);
         self.shift_lifecycle_lnds.insert(lnd);
         self.next_lnd += 1;
 
@@ -1238,7 +1279,7 @@ impl RefModel {
             just_minted_begin = true;
             let begin_lnd = self.next_lnd;
             let begin_unsigned = synth_unsigned_hash(begin_lnd);
-            self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+            self.mint_doc(begin_lnd, DocState::OfflineLocalAck, self.seed);
             self.offline_origin_lnds.insert(begin_lnd);
             self.next_lnd += 1;
             self.codes_consumed += 1;
@@ -1260,7 +1301,7 @@ impl RefModel {
         let lnd = self.next_lnd;
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
-        self.docs.insert(lnd, DocState::OfflineLocalAck);
+        self.mint_doc(lnd, DocState::OfflineLocalAck, previous_hash);
         self.shift_lifecycle_lnds.insert(lnd);
         self.offline_origin_lnds.insert(lnd);
         self.next_lnd += 1;
@@ -1322,7 +1363,7 @@ impl RefModel {
             // CALL_STARTED) flips the node to STOP_MODE — record_outcome's early node-safety halt.
             self.mode = NodeMode::StopMode;
         }
-        self.docs.insert(lnd, doc_state);
+        self.mint_doc(lnd, doc_state, previous_hash);
         self.shift_lifecycle_lnds.insert(lnd);
         self.next_lnd += 1;
 
@@ -1396,7 +1437,7 @@ impl RefModel {
             just_minted_begin = true;
             let begin_lnd = self.next_lnd;
             let begin_unsigned = synth_unsigned_hash(begin_lnd);
-            self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+            self.mint_doc(begin_lnd, DocState::OfflineLocalAck, self.seed);
             self.offline_origin_lnds.insert(begin_lnd);
             self.next_lnd += 1;
             self.codes_consumed += 1;
@@ -1414,7 +1455,7 @@ impl RefModel {
         let lnd = self.next_lnd;
         let previous_hash = self.seed;
         let unsigned_hash = synth_unsigned_hash(lnd);
-        self.docs.insert(lnd, DocState::OfflineLocalAck);
+        self.mint_doc(lnd, DocState::OfflineLocalAck, previous_hash);
         self.shift_lifecycle_lnds.insert(lnd);
         self.offline_origin_lnds.insert(lnd);
         self.next_lnd += 1;
@@ -1523,7 +1564,7 @@ impl RefModel {
                     // CS-3 S7-1: a HELD online outcome flips the node to STOP_MODE.
                     self.mode = NodeMode::StopMode;
                 }
-                self.docs.insert(lnd, doc_state); // the row IS minted (lnd allocated)
+                self.mint_doc(lnd, doc_state, previous_hash); // the row IS minted (lnd allocated)
                 self.next_lnd += 1;
                 // L0 cash leg — recorded AT MINT, whatever state the doc landed in (bd
                 // PRRO_GATE-6hl).  Prod stores the payment in `payload_json` when the row is
@@ -1646,7 +1687,7 @@ impl RefModel {
                     self.session_has_begin = true; // the BEGIN row now rests (OLA)
                     let begin_lnd = self.next_lnd;
                     let begin_unsigned = synth_unsigned_hash(begin_lnd);
-                    self.docs.insert(begin_lnd, DocState::OfflineLocalAck);
+                    self.mint_doc(begin_lnd, DocState::OfflineLocalAck, self.seed);
                     self.offline_origin_lnds.insert(begin_lnd);
                     self.next_lnd += 1;
                     self.codes_consumed += 1;
@@ -1664,7 +1705,7 @@ impl RefModel {
                 let unsigned_hash = synth_unsigned_hash(lnd);
                 // Offline issuance → OFFLINE_LOCAL_ACK, advances the seed THERE
                 // (spec §6 offline lane); stays issued through later drain states.
-                self.docs.insert(lnd, DocState::OfflineLocalAck);
+                self.mint_doc(lnd, DocState::OfflineLocalAck, previous_hash);
                 // A.3 PR-C — mark offline-origin: a later drain-Superseded may
                 // park this lnd at ErrorRetryable, which stays ISSUED (offline)
                 // and MUST NOT be read as a D5-gate blocker.
@@ -1855,7 +1896,7 @@ impl RefModel {
                     // Advance the ONLINE seed to the END's unsigned hash (mirrors
                     // the impl's advance-at-SEND).  NO code consumed, NOT added to
                     // `offline_origin_lnds` (it is online-origin).
-                    self.docs.insert(end_lnd, DocState::Ack);
+                    self.mint_doc(end_lnd, DocState::Ack, end_prev);
                     self.seed = Some(end_unsigned);
                     self.mode = NodeMode::Online;
                     return ExpectedOutcome::Mutated(Mutation {
@@ -2060,6 +2101,41 @@ impl RefModel {
             // No real seed at all → genesis.
             (None, _) => self.seed = None,
         }
+
+        // spec §8.1 — re-derive every document's chain link, in the model's symbolic algebra.
+        //
+        // Reality stores real hashes; the model stores ordinals, so each link is projected through
+        // the SAME document lookup the seed adoption above uses.  A link that names a row becomes
+        // that row's ordinal; a link that names no row is a non-document tip (a T=112 replenish
+        // seed, a rebase) and gets the reserved non-document ordinal — the CLASS is what any
+        // consumer can act on, and inventing a document ordinal for it would be the exact aliasing
+        // trap bd `PRRO_GATE-01g` cost us on the seed itself.  NULL is genesis.
+        //
+        // Without this, a document minted inside a fault window carries no recorded link, and a
+        // later `NotAcceptedOffline` rewind would silently fall back to genesis.
+        let doc_links: Vec<(i64, Option<Vec<u8>>)> =
+            sqlx::query_as("SELECT lnd, previous_hash FROM fiscal_documents")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        let issued_hashes: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT unsigned_xml_sha256, MAX(lnd) FROM fiscal_documents \
+             WHERE unsigned_xml_sha256 IS NOT NULL GROUP BY unsigned_xml_sha256",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let by_hash: BTreeMap<Vec<u8>, i64> = issued_hashes.into_iter().collect();
+        self.doc_prev = doc_links
+            .into_iter()
+            .map(|(lnd, prev)| {
+                let sym = prev.map(|p| match by_hash.get(&p) {
+                    Some(owner) => synth_unsigned_hash(*owner),
+                    None => synth_unsigned_hash(ADOPTED_NON_DOC_ORDINAL),
+                });
+                (lnd, sym)
+            })
+            .collect();
 
         // offline session + codes ← real.
         self.session = sqlx::query_scalar::<_, prro::db::types::DbOfflineSessionState>(
@@ -2281,6 +2357,57 @@ fn synth_unsigned_hash(lnd: i64) -> [u8; 32] {
     let mut h = [0u8; 32];
     h[..8].copy_from_slice(&lnd.to_be_bytes());
     h
+}
+
+/// Peer-tip axis PHASE C (spec §8.1) — the reserved ordinal a chain link adopted from the ledger
+/// gets when it names NO document (a T=112 replenish seed, a rebase).
+///
+/// Negative, so [`model_tip_class`] reads it as `NonDoc`; `i64::MIN` specifically, so it can never
+/// collide with the `-codes_issued - 1` ordinals `apply_replenish` mints for tips the model DID
+/// predict.  The model cannot recover WHICH non-document value reality holds — it builds no XML —
+/// and must not pretend otherwise; the class is the honest ceiling.
+const ADOPTED_NON_DOC_ORDINAL: i64 = i64::MIN;
+
+/// Peer-tip axis PHASE C (spec §8) — the STRUCTURAL class of a model-symbolic MAC tip.
+///
+/// The model never holds a real hash (it builds no XML); it holds `synth_unsigned_hash(ordinal)`
+/// placeholders and, from phase C on, opaque constants copied verbatim from the wire vocabulary.
+/// Decoding is therefore TOTAL and injective by construction: a placeholder carries its ordinal
+/// big-endian in the leading 8 bytes with the remaining 24 zero, so a NON-NEGATIVE ordinal names a
+/// document, a NEGATIVE one names the non-document T=112 seed (`apply_replenish`), and a value that
+/// is not a placeholder at all is some other non-document tip.
+///
+/// This is what makes the model's tip ASSERTABLE rather than merely conventional.  Before phase C
+/// the differential only ever asked "did the seed CHANGE"; `run_harness` now also asks "does the
+/// model's tip name the same thing reality's names", against
+/// [`crate::interp::FuzzCtx::real_tip_class`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTipClass {
+    /// The model holds no tip — genesis.
+    Genesis,
+    /// The model's tip is the document minted at this ordinal.
+    Doc(i64),
+    /// The model's tip is a NON-document value (the T=112 replenish seed, or an opaque
+    /// peer-declared constant).
+    NonDoc,
+}
+
+/// Decode a model-symbolic tip into its [`ModelTipClass`].  See that type for why this is total.
+pub fn model_tip_class(seed: Option<[u8; 32]>) -> ModelTipClass {
+    let Some(sym) = seed else {
+        return ModelTipClass::Genesis;
+    };
+    // Not a `synth_unsigned_hash` placeholder at all (the trailing 24 bytes are zero for every
+    // ordinal) → an opaque wire value, which by construction names no document.
+    if sym[8..].iter().any(|b| *b != 0) {
+        return ModelTipClass::NonDoc;
+    }
+    let ordinal = i64::from_be_bytes(sym[..8].try_into().expect("8 bytes of a 32-byte symbol"));
+    if ordinal >= 0 {
+        ModelTipClass::Doc(ordinal)
+    } else {
+        ModelTipClass::NonDoc
+    }
 }
 
 /// CS-3 operator-completion (1b) — map the `ReleasedWitness` DB-text `node_mode` back to the model's

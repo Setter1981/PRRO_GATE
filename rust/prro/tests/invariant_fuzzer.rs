@@ -1616,6 +1616,44 @@ async fn operator_complete_releases_then_next_sell_issues() {
     .await;
 }
 
+/// Peer-tip axis PHASE C (spec §8.1) — the `NotAcceptedOffline` rewind must land the MODEL on the
+/// same tip it lands the LEDGER on, and that only becomes observable when the rewind target is NOT
+/// genesis.
+///
+/// WHY THIS EXACT SEQUENCE. The generative alphabet almost never exposes the defect: the held doc of
+/// a drain-reject hold is the backlog HEAD, the head is the session's first document (the B10
+/// `OFFLINE_SESSION_BEGIN`), and in both offline fixtures the session opens at genesis — so the
+/// rewind target is NULL and the model's `seed = None` marker is accidentally RIGHT. A granted T=112
+/// FIRST moves the tip to a NON-document `sha256(request_xml)` before any offline document exists,
+/// so the BEGIN chains onto that value and the rewind has somewhere real to go. (Ordering matters
+/// twice over: prod refuses a replenish while an undrained backlog rests — bd `PRRO_GATE-knk` — so
+/// the replenish cannot come second.)
+///
+/// The assertion this drives lives in `run_harness` (the phase-C tip check), not here: after the
+/// completion the model claims `Genesis` while the ledger sits on the replenish seed. Restoring
+/// `self.seed = None` as the rewind marker in `apply_operator_complete` turns this RED again —
+/// canary run in both directions.
+#[tokio::test]
+async fn phase_c_not_accepted_offline_rewind_lands_the_model_on_the_real_tip() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(4).await;
+    let model = RefModel::new_offline_open_shift(4);
+    let _ = run_harness(
+        &[
+            // Tip → a NON-document value, with an empty backlog so the replenish is admitted.
+            Op::Replenish(ReplenishLeaf::Granted),
+            // BEGIN + SELL, both chaining off that non-document tip.
+            Op::OfflineSell,
+            // Drain-reject → the backlog HEAD rests SENDING under an offline-origin PENDING_APPLY.
+            Op::GoOnline(DpsScript::send_then_reject()),
+            // The rewind: ledger → the head's own `previous_hash` (the replenish seed).
+            Op::OperatorComplete(OperatorResolutionKind::NotAcceptedOffline),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+}
+
 /// CS-3 operator-completion (1b) [end-to-end] — `OperatorComplete` with NO held reservation is an
 /// inert no-op (Refused-predicted, `Release(None)`): drives `[OnlineSell(ack_path) →
 /// OperatorComplete(Accepted)]`; the first sell ISSUES (no hold rests), so the completion refuses and
@@ -4486,6 +4524,37 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 ctx.peer_tip_hex()
             );
         }
+
+        // ── Peer-tip axis PHASE C (spec §8) — the model's tip must NAME what reality's names ──
+        //
+        // Until now the seed differential was purely "did it move": `check_differential` compares
+        // `seed_after` against the prior tip STRUCTURALLY, and `adopt_fault_deferred` re-seats the
+        // model on a synthetic placeholder after every fault.  Nothing ever asserted that the
+        // placeholder points at the RIGHT document.  Phase C needs that, because a peer comparison
+        // is only as good as the two symbols being compared: `previous_hash == peer_tip` is
+        // meaningless if `previous_hash` is a marker the model chose for its own bookkeeping.
+        //
+        // So: project both sides onto the same three structural cases and demand they agree.  This
+        // is the model-side twin of phase A's peer assertion — an empirical load test of the seed
+        // algebra rather than a comment claiming it holds.
+        let real_tip = ctx.real_tip_class().await;
+        let model_tip = model::model_tip_class(model.seed);
+        let agrees = matches!(
+            (model_tip, real_tip),
+            (model::ModelTipClass::Genesis, interp::RealTipClass::Genesis)
+                | (model::ModelTipClass::NonDoc, interp::RealTipClass::NonDoc)
+        ) || matches!(
+            (model_tip, real_tip),
+            (model::ModelTipClass::Doc(a), interp::RealTipClass::Doc(b)) if a == b
+        );
+        assert!(
+            agrees,
+            "peer-tip axis (phase C) on {op:?}: the model's MAC tip names {model_tip:?} but the \
+             real tip is {real_tip:?} — the model's symbolic seed algebra has drifted from the \
+             ledger, so any tip COMPARISON built on it (the peer mirror, the derived -12) would be \
+             built on sand. real_seed={:?}",
+            ctx.read_seed().await.map(|s| hex_of_slice(&s))
+        );
     }
 
     // A2/A4: terminal liveness + scan.  The per-op scan is suppressed mid-crash

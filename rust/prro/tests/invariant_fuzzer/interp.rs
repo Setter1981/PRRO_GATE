@@ -91,6 +91,21 @@ const EPZ_PAYLOAD: &str = r#"{"schema_version":"1.0","sum_kop":15000,"code":"0",
 
 // ─── Observed result (read back from the ledger after each op) ──────────────
 
+/// Peer-tip axis PHASE C — what the REAL MAC tip is, structurally.  See
+/// [`FuzzCtx::real_tip_class`]; the model's own symbolic tip projects onto the
+/// same three cases, and the harness asserts the two agree after every op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealTipClass {
+    /// No tip at all — the FN has never issued (`last_known_unsigned_xml_sha256`
+    /// is NULL).
+    Genesis,
+    /// The tip is the `unsigned_xml_sha256` of the document at this `lnd`.
+    Doc(i64),
+    /// The tip is a value no `fiscal_documents` row carries: a T=112
+    /// `sha256(request_xml)`, a MacReseed rebase, a peer-declared `store`.
+    NonDoc,
+}
+
 /// The observed ledger effect of one op — exactly the fields the Task 4
 /// differential will compare with `RefModel::Mutation` (lnd / doc_state /
 /// previous_hash / seed) plus the offline code count.
@@ -817,6 +832,42 @@ impl FuzzCtx {
         .await
         .unwrap();
         v
+    }
+
+    /// Peer-tip axis PHASE C (spec §8) — the real MAC tip PROJECTED onto the
+    /// model's symbolic algebra: which document, if any, the tip currently rests
+    /// on.
+    ///
+    /// The model cannot hold real hashes (it builds no XML), so it carries
+    /// `synth_unsigned_hash(lnd)` placeholders and the differential compares
+    /// STRUCTURALLY.  Phase C needs that comparison to become a real assertion
+    /// rather than a convention: `Doc(lnd)` when the tip is some document's
+    /// `unsigned_xml_sha256`, `NonDoc` when it is a value no row carries (a
+    /// T=112 `sha256(request_xml)`, a MacReseed rebase, a peer-declared `store`),
+    /// `Genesis` when there is no tip at all.
+    ///
+    /// `ORDER BY lnd DESC` is deliberate and shared with
+    /// `RefModel::adopt_fault_deferred`'s own lookup — the two must agree on
+    /// which document owns a tip, or a fault re-sync would land the model on an
+    /// ordinal this projection then calls wrong.
+    pub async fn real_tip_class(&self) -> RealTipClass {
+        let Some(seed) = self.read_seed().await else {
+            return RealTipClass::Genesis;
+        };
+        let lnd: Option<i64> = sqlx::query_scalar(
+            "SELECT lnd FROM fiscal_documents \
+             WHERE fiscal_number = ? AND unsigned_xml_sha256 = ? \
+             ORDER BY lnd DESC LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .bind(&seed[..])
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        match lnd {
+            Some(lnd) => RealTipClass::Doc(lnd),
+            None => RealTipClass::NonDoc,
+        }
     }
 
     /// The bounded MAC-recovery counter for the doc at `lnd`.
