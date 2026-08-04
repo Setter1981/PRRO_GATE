@@ -53,6 +53,24 @@ write_stub_cargo() {
 #!/usr/bin/env bash
 # Only `cargo mutants ...` is emulated; anything else is a no-op success.
 [ "${1:-}" = "mutants" ] || exit 0
+# `--list` is the LIVENESS PROBE's channel (bd PRRO_GATE-1rw): it enumerates without
+# testing, so it writes no mutants.out and just prints. Two knobs, because the probe
+# asks two different questions and they fail independently: can the tool enumerate
+# prro/src at all, and does `--in-diff` still MATCH a diff synthesised from what it
+# enumerated.
+for a in "$@"; do [ "$a" = "--list" ] && LISTING=1; done
+for a in "$@"; do [ "$a" = "--in-diff" ] && IN_DIFF=1; done
+if [ "${LISTING:-0}" = 1 ]; then
+  case "${TEETH_PROBE:-live}" in
+    live)        printf '%s\n' 'prro/src/a.rs:1:1: replace x with y' ;;
+    # The mechanism is dead: enumeration works, `--in-diff` matches nothing. This is the
+    # exact shape of the three-week vacuity — and the shape `total == 0` used to hide.
+    dead_indiff) [ "${IN_DIFF:-0}" = 1 ] || printf '%s\n' 'prro/src/a.rs:1:1: replace x with y' ;;
+    # The tool cannot see the crate at all (features / manifest / layout broken).
+    blind)       : ;;
+  esac
+  exit 0
+fi
 # T8 witness: record whether the gate isolated the build directory before
 # invoking us (bd PRRO_GATE-9g5 — a shared target dir gets MUTATED artifacts).
 printf '%s\n' "${CARGO_TARGET_DIR:-<unset>}" > "${TEETH_TARGET_WITNESS:-/dev/null}"
@@ -122,9 +140,9 @@ STUB
   chmod +x "$bin/cargo-mutants"
 }
 
-# run_case NAME EXPECTED_EXIT SCENARIO [BASELINE_SURVIVORS] [MUTATE_GATE_SED]
+# run_case NAME EXPECTED_EXIT SCENARIO [BASELINE_SURVIVORS] [MUTATE_GATE_SED] [PROBE]
 run_case() {
-  local name="$1" expect="$2" scenario="$3" baseline="${4:-}" mutate="${5:-}"
+  local name="$1" expect="$2" scenario="$3" baseline="${4:-}" mutate="${5:-}" probe="${6:-live}"
   local R; R="$(mktemp -d)"
   mkdir -p "$R/rust/prro/src" "$R/docs/mutation/baseline" "$R/scripts/mutation" "$R/bin"
   cp "$GATE_SRC" "$R/scripts/mutation/run.sh"
@@ -148,7 +166,7 @@ run_case() {
   local rc=0
   # Inherit a DELIBERATELY shared target dir, so T8 proves the gate overrides it
   # rather than merely happening to run in a clean environment.
-  ( cd "$R" && PATH="$R/bin:$PATH" TEETH_SCENARIO="$scenario" \
+  ( cd "$R" && PATH="$R/bin:$PATH" TEETH_SCENARIO="$scenario" TEETH_PROBE="$probe" \
       CARGO_TARGET_DIR="$R/shared-target" TEETH_TARGET_WITNESS="$R/target_witness" \
       TMPDIR="$R/ramdisk-pretend" TEETH_TMPDIR_WITNESS="$R/tmpdir_witness" \
       bash scripts/mutation/run.sh diff 1 ) > "$R/out.log" 2>&1 || rc=$?
@@ -186,6 +204,15 @@ run_case "T7 baseline-KNOWN survivor still surviving -> gate PASSES (ratchet)" 0
 # through to an empty missed.txt: fail-OPEN. That is exactly how #376 produced a green
 # 24-second "OK" from a run that tested nothing (a recursive tree copy, my own bug).
 run_case "T10 cargo-mutants died, no outcomes.json -> refuses" 4 died_no_outcomes ""
+# T11/T12 — bd PRRO_GATE-1rw item 2: "zero mutants" must never again read as "pass".
+#
+# T6 above pins the legitimate zero (a comment-only diff mutates nothing) and must STAY
+# green — which is precisely why the zero could not simply be made fatal. These two pin
+# the OTHER zero: the one the mechanism produced. T11 is the three-week defect's own
+# shape (enumeration fine, `--in-diff` matches nothing); T12 is the blunter case where
+# the tool cannot see the crate at all. The pair is what makes T6 safe to keep.
+run_case "T11 zero mutants because --in-diff matched nothing -> refuses" 5 zero_mutants "" "" dead_indiff
+run_case "T12 zero mutants and prro/src not enumerable at all -> refuses" 5 zero_mutants "" "" blind
 
 # T8 — the gate must ISOLATE its build directory (bd PRRO_GATE-9g5, P1).
 #

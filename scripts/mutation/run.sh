@@ -162,7 +162,10 @@ if [ "$MUT_RC" -ne 0 ] && [ ! -f "$OUT/outcomes.json" ]; then
   echo "FATAL: cargo-mutants exited $MUT_RC and wrote no outcomes.json — it did not run." >&2
   exit 4
 fi
+TOTAL_MUTANTS=0
 if [ -f "$OUT/outcomes.json" ]; then
+  TOTAL_MUTANTS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("total_mutants",0))' \
+    "$OUT/outcomes.json" 2>/dev/null || echo 0)"
   python3 - "$OUT/outcomes.json" <<'PY' || exit 3
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -179,6 +182,71 @@ if total > 0 and tested == 0:
     sys.exit(f"FATAL: {total} mutants were found but NONE were tested. "
              "The gate cannot bite.")
 PY
+fi
+
+# ── LIVENESS PROBE: a ZERO-mutant diff run must PROVE it (bd PRRO_GATE-1rw, item 2) ──
+#
+# The guards above cover every way the gate can report OK on a run that tested nothing —
+# EXCEPT the original one. `total == 0` still falls straight through, and "zero mutants"
+# is exactly the signature the vacuous gate produced for three weeks: cargo-mutants
+# printed `Diff changes no Rust source files`, tested nothing, and the gate said OK.
+#
+# A zero CAN be legitimate: a diff of comments, imports or `mod` lines mutates nothing.
+# So the assertion is NOT "the diff must produce mutants" — that would RED honest
+# comment-only PRs and be tuned away within a month. It is the weaker, exactly-true one:
+# whatever this diff contains, the `--in-diff` MECHANISM must still be able to match.
+#
+# Proven by construction: take a mutant cargo-mutants can enumerate in `prro/src` right
+# now, synthesise a one-line diff at its own line, and feed it back through the SAME
+# `--in-diff` path. That diff is known-good by definition, so a zero there is never
+# about the change under test — it is the mechanism, and the gate refuses.
+#
+# Chosen over the tempting alternative ("the touched FILES have mutants, so the diff
+# should too"): a mutant's line is its function signature, and an edit deep inside a body
+# legitimately matches nothing. That check would fire on honest PRs; this one cannot.
+# Costs ~1.3s, and only on the zero path.
+if [ "$MODE" = "diff" ] && [ "$TOTAL_MUTANTS" -eq 0 ]; then
+  PROBE_LIST="$(mktemp)"; PROBE_DIFF="$(mktemp)"
+  trap 'rm -f "$PROBE_LIST" "$PROBE_DIFF"' EXIT
+  cargo mutants --list 2>/dev/null | grep '^prro/src/' > "$PROBE_LIST" || true
+  if [ ! -s "$PROBE_LIST" ]; then
+    echo "FATAL: cargo-mutants enumerates NO mutant in prro/src at all." >&2
+    echo "       The zero above says nothing about this diff — the tool cannot see the" >&2
+    echo "       crate (features? manifest? workspace layout?). Refusing to report OK." >&2
+    exit 5
+  fi
+  PROBE_ENTRY="$(head -1 "$PROBE_LIST")"
+  PROBE_FILE="${PROBE_ENTRY%%:*}"
+  PROBE_REST="${PROBE_ENTRY#*:}"
+  PROBE_LINE="${PROBE_REST%%:*}"
+  # Read defensively. Without this the canary run showed `sed: can't read …` and the
+  # gate died at exit 2 under `set -e` — the SAME code as the repo-relative refusal,
+  # from a completely different cause. A guard that reports the wrong reason is how the
+  # three-week defect stayed invisible; this one names itself.
+  PROBE_TEXT=""
+  [ -f "$PROBE_FILE" ] && PROBE_TEXT="$(sed -n "${PROBE_LINE}p" "$PROBE_FILE" 2>/dev/null || true)"
+  if [ -z "$PROBE_TEXT" ]; then
+    echo "FATAL: cargo-mutants listed a mutant at $PROBE_ENTRY, but that file/line could" >&2
+    echo "       not be read back — the probe cannot be built, so the zero above is" >&2
+    echo "       unverifiable. Refusing to report OK." >&2
+    exit 5
+  fi
+  {
+    printf -- '--- a/%s\n+++ b/%s\n' "$PROBE_FILE" "$PROBE_FILE"
+    printf -- '@@ -%d,1 +%d,1 @@\n' "$PROBE_LINE" "$PROBE_LINE"
+    printf -- '-%s\n' "$PROBE_TEXT"
+    printf -- '+%s\n' "$PROBE_TEXT"
+  } > "$PROBE_DIFF"
+  PROBE_HITS="$(cargo mutants --list --in-diff "$PROBE_DIFF" 2>/dev/null | grep -c . || true)"
+  if [ "${PROBE_HITS:-0}" -eq 0 ]; then
+    echo "FATAL: --in-diff matched NOTHING for a diff synthesised from a KNOWN mutant" >&2
+    echo "       ($PROBE_ENTRY)." >&2
+    echo "       So the zero mutants above are the MECHANISM, not the change under test —" >&2
+    echo "       the same failure that made this gate vacuous for three weeks." >&2
+    exit 5
+  fi
+  echo "zero mutants in this diff — and the --in-diff mechanism is PROVEN live" \
+       "(probe matched $PROBE_HITS on $PROBE_FILE:$PROBE_LINE)."
 fi
 
 # ── analysis vs the committed baseline ──────────────────────────────────────
