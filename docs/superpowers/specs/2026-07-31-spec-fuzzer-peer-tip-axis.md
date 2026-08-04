@@ -275,7 +275,11 @@ to converge → derived `-12` → corroborated `MacReseed(store)` → **next sen
 > **The honest gate.** The model's peer comparison is suppressed once `peer_unknown` is set — a held
 > or ambiguous wire outcome, or a crash inside the wire call, leaves the peer's acceptance genuinely
 > undetermined and the model states that rather than guessing. That gate is exactly what phase C-2's
-> `Took`/`NotTook` leaf exists to narrow, so the size of it IS the measure of what C-2 buys.
+> `Took`/`NotTook` leaf exists to narrow, so the size of it IS the measure of what C-2 buys — and it
+> was MEASURED rather than waved at, by counting both branches through a capstone run at the PR
+> default: **online capstone 990 open / 10 closed (99%), offline capstone 783 / 217 (78%)**. So the
+> mirror is asserted on the large majority of ops today, and C-2's leaf is worth roughly the
+> remaining 1-22% — concentrated in the offline lane, which is where the held drain outcomes live.
 >
 > **§8.2 is deliberately NOT landed.** The `MacReseed` arm still reads `synth(held_lnd)` where it
 > should read `model.peer_tip`. `MacReseed` is generator-EXCLUDED and every directed pin drives it
