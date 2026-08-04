@@ -52,7 +52,7 @@ use prro::transports::dps::channel::DpsChannel;
 use prro::transports::dps::dto::{CheckAck, CheckSignBlob, StatusSnapshot};
 use prro::transports::dps::error::{AuthorizationKind, DpsError};
 
-use crate::common::scripted_dps::{PeerLedger, PeerMismatch, ScriptedDps};
+use crate::common::scripted_dps::{PeerAcceptance, PeerLedger, PeerMismatch, ScriptedDps};
 use crate::common::{det_signing_ctx, drain_test_guard};
 use crate::op::{
     DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, Stage, WireResponse,
@@ -615,6 +615,12 @@ impl FuzzCtx {
         self.peer.mark_diverged(reason);
     }
 
+    /// Peer-tip axis PHASE C-2 — settle the fate of the document that was on the wire when a
+    /// `Crash(Send)` dropped the future.  See `Op::CrashSend`.
+    pub fn peer_resolve_in_flight(&self, truth: PeerAcceptance) {
+        self.peer.resolve_in_flight(truth);
+    }
+
     /// Peer-tip axis: a granted T=112 CONVERGES both sides onto the same fresh
     /// non-document seed.  Reported by the interpreter because the replenish
     /// rides `ask_offline_codes`, which the send-side observer never sees.
@@ -1136,6 +1142,44 @@ impl FuzzCtx {
         })
     }
 
+    /// Peer-tip axis PHASE C.1 (spec §5, MAJOR #6) — does the FN's active hold rest on an
+    /// OFFLINE-origin document that the PEER has taken?
+    ///
+    /// That combination is the state production has no exit from, and the generator must not walk
+    /// into it blind (see the `run_harness` C.1 constraint). The two halves:
+    ///   - offline origin (`fs_mode = 'OFFLINE'`) — `MacReseed` is fail-closed for it
+    ///     (`MacReseedNotOfflineDefined`, `delivery_reservation.rs`), so the one repair that can
+    ///     re-base a chain is unavailable;
+    ///   - the peer's tip IS this document's `unsigned_xml_sha256` — DPS holds it, so a
+    ///     `NotAcceptedOffline` rewind would move OUR chain back beneath a document the peer has
+    ///     already accepted, and every later send earns a `-12` with no way out.
+    ///
+    /// Read from the ledger + the harness peer rather than tracked, so it cannot drift: the peer's
+    /// acceptance is a fact about the environment and the origin is a column.
+    pub async fn held_offline_doc_taken_by_peer(&self) -> bool {
+        let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+            "SELECT fd.unsigned_xml_sha256 \
+             FROM delivery_reservation dr \
+             JOIN fiscal_documents fd \
+               ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
+             JOIN node_state ns ON ns.fiscal_number = dr.fiscal_number \
+             WHERE dr.fiscal_number = ? \
+               AND dr.state = 'OUTCOME_OBSERVED' \
+               AND dr.apply_state = 'PENDING_APPLY' \
+               AND dr.reservation_id = ns.active_delivery_reservation_id \
+               AND dr.authorized_generation = ns.delivery_generation \
+               AND fd.fs_mode = 'OFFLINE' LIMIT 1",
+        )
+        .bind(self.fn_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        match row {
+            Some((Some(unsigned),)) => self.peer.tip().as_deref() == Some(unsigned.as_slice()),
+            _ => false,
+        }
+    }
+
     /// CS-3 operator-completion — the `reservation_id` of the latest reservation attempt for a doc
     /// (keyed by `request_id`), the handle `resolve_operator_pending` completes.  `None` if the doc
     /// has no reservation row.
@@ -1439,6 +1483,10 @@ pub async fn run_op(ctx: &mut FuzzCtx, op: &Op) -> RealOutcome {
         Op::Reboot => reboot(ctx).await,
         // ── crash (wire stages only — drop-injection) ──
         Op::Crash(Stage::Send) => crash_via_drop(ctx, Stage::Send).await,
+        // Peer-tip axis PHASE C-2 — the same crash, with the peer's out-of-script truth named.
+        Op::CrashSend(truth) => {
+            crash_via_drop_with_peer(ctx, Stage::Send, Some(peer_acceptance(*truth))).await
+        }
         Op::Crash(Stage::Kvt1) => crash_via_drop(ctx, Stage::Kvt1).await,
         // U3: the stage-composition crashes (no DPS hang — the pipeline is run
         // up to a committed-envelope boundary, then STOPPED).  They model
@@ -1638,6 +1686,22 @@ async fn run_inline_row(
 /// call), the future COMPLETES instead of hanging — that is a refusal / no-op,
 /// not a crash, and is reported as such (no panic).
 async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
+    crash_via_drop_with_peer(ctx, stage, None).await
+}
+
+/// Peer-tip axis PHASE C-2 (spec §4 row 12) — `crash_via_drop` with the PEER's truth supplied
+/// out-of-band.
+///
+/// `peer_truth` is `None` for the plain `Crash(stage)` op (unchanged behaviour: the harness marks
+/// the run diverged and stops asserting) and `Some(..)` for `Op::CrashSend`, where the generator
+/// names what DPS did with the envelope it definitely received.  The truth is applied AFTER the
+/// future is dropped, against the document the stub recorded on the way in — the only place it can
+/// be applied, since the reply is never popped.
+async fn crash_via_drop_with_peer(
+    ctx: &mut FuzzCtx,
+    stage: Stage,
+    peer_truth: Option<PeerAcceptance>,
+) -> RealOutcome {
     // B10: on an OFFLINE node the offline-ack path makes no wire call, so this
     // "crash" COMPLETES as a real offline sell — which lazily interposes a BEGIN
     // when it is the session's first offline doc.  Detect that (BEGIN 0→1 across
@@ -1691,10 +1755,18 @@ async fn crash_via_drop(ctx: &mut FuzzCtx, stage: Stage) -> RealOutcome {
             // no divergence, and the stub's own reply handling already booked
             // it.)
             if stage == Stage::Send {
-                ctx.peer_mark_diverged(
-                    "Crash(Send): envelope delivered, reply never consumed — \
-                     peer acceptance unknowable",
-                );
+                match peer_truth {
+                    // PHASE C-2: the choice the script cannot carry. `Took` advances the peer onto
+                    // the delivered document and declares the divergence; `NotTook` moves nothing
+                    // and — the point of the whole dimension — leaves the run UNdiverged, so phase
+                    // A's mismatch assertion survives the crash instead of being switched off for
+                    // the rest of the sequence.
+                    Some(truth) => ctx.peer_resolve_in_flight(truth),
+                    None => ctx.peer_mark_diverged(
+                        "Crash(Send): envelope delivered, reply never consumed — \
+                         peer acceptance unknowable",
+                    ),
+                }
             }
             RealOutcome::Crashed {
                 stage,
@@ -2940,6 +3012,14 @@ fn load_script(dps: &ScriptedDps, script: &DpsScript) {
                 dps.push_send(legacy);
                 dps.push_send_obs_override(obs);
             }
+            // Peer-tip axis PHASE C-2: the reply is `Superseded`'s, byte for byte; the peer truth
+            // rides in the SAME queue entry so it cannot be mis-attributed to another send.
+            (0, WireResponse::HeldWithPeer(truth)) => {
+                dps.push_send_with_peer(
+                    wire_to_result(WireResponse::Superseded),
+                    peer_acceptance(truth),
+                );
+            }
             (0, _) => dps.push_send(wire_to_result(wr)),
             (_, _) => dps.push_last(wire_to_result(wr)),
         }
@@ -3063,6 +3143,21 @@ fn wire_to_result(wr: WireResponse) -> Result<CheckAck, DpsError> {
         // `load_script`'s obs-override (real decode); this defensive arm keeps `wire_to_result` total
         // for any last_chk position (unused by the shipped scripts — UnknownStatus is send-only).
         WireResponse::UnknownStatus(code) => unknown_status_pair(code).0,
+        // Peer-tip axis PHASE C-2: the CLIENT-side reply of an annotated held leaf IS
+        // `Superseded`'s — the annotation is a fact about the peer, never about the wire. Routing it
+        // through the same arm (rather than a copy) is what makes "our side is byte-identical" a
+        // property of the code instead of a claim in a comment.
+        WireResponse::HeldWithPeer(_) => wire_to_result(WireResponse::Superseded),
+    }
+}
+
+/// Peer-tip axis PHASE C-2 — the fuzzer alphabet's peer truth as the stub's.  Two enums rather than
+/// one: `op.rs` is the generator's own vocabulary and `common::scripted_dps` is shared with ten test
+/// binaries that must not gain a dependency on it.
+fn peer_acceptance(truth: crate::op::PeerTruth) -> PeerAcceptance {
+    match truth {
+        crate::op::PeerTruth::Took => PeerAcceptance::Took,
+        crate::op::PeerTruth::NotTook => PeerAcceptance::NotTook,
     }
 }
 

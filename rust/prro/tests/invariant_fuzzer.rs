@@ -41,7 +41,9 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{FileFailurePersistence, TestRunner};
 
 use model::{ExpectedOutcome, RefModel};
-use op::{DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, Stage, WireResponse};
+use op::{
+    DpsScript, L5Kind, Op, OperatorResolutionKind, PeerTruth, ReplenishLeaf, Stage, WireResponse,
+};
 
 /// Every `DocState` variant — the test enumerates the domain to prove the
 /// model's issued predicate mirrors the SSOT const for ALL states (the
@@ -764,6 +766,50 @@ fn generator_emits_both_replenish_leaves() {
         granted >= 100 && rejected >= 100,
         "Replenish under-emitted (granted={granted}, reject={rejected} over 2000 seqs) — the \
          appended arm is dropped or severely skewed (anti-silent-zero)"
+    );
+}
+
+/// Peer-tip axis PHASE C-2 (anti-silent-zero) — the generator ACTUALLY emits both peer truths, on
+/// BOTH surfaces that carry them.
+///
+/// The leaf and the `CrashSend` op are what keep the model's peer mirror asserting through a held
+/// outcome; a dropped or skewed weight would put the mirror back behind the `peer_unknown` gate in
+/// the very lane the measurement said it matters (the drain), and every test would stay green while
+/// the coverage evaporated. Four counters rather than two, because the two surfaces fail
+/// independently: the leaf rides `dps_script()` (so it reaches sells, drains and go-onlines) and
+/// `CrashSend` is its own `op()` arm.
+#[test]
+fn generator_emits_both_peer_truths_on_leaf_and_crash() {
+    let mut runner = TestRunner::deterministic();
+    let strat = strategy::op_sequence();
+    let (mut leaf_took, mut leaf_not) = (0usize, 0usize);
+    let (mut crash_took, mut crash_not) = (0usize, 0usize);
+    for _ in 0..2000 {
+        let seq = strat.new_tree(&mut runner).unwrap().current();
+        for op in &seq {
+            match op {
+                Op::CrashSend(PeerTruth::Took) => crash_took += 1,
+                Op::CrashSend(PeerTruth::NotTook) => crash_not += 1,
+                other => match other.wire_script().map(|s| s.0.as_slice()) {
+                    Some([WireResponse::HeldWithPeer(PeerTruth::Took), ..]) => leaf_took += 1,
+                    Some([WireResponse::HeldWithPeer(PeerTruth::NotTook), ..]) => leaf_not += 1,
+                    _ => {}
+                },
+            }
+        }
+    }
+    // Same density-floor reasoning as the other anti-silent-zero pins: a dropped arm gives 0 and a
+    // halved weight roughly halves the count, so a floor well under the expected value still trips.
+    assert!(
+        leaf_took >= 100 && leaf_not >= 100,
+        "the annotated held leaf is under-emitted (took={leaf_took}, not_took={leaf_not} over 2000 \
+         seqs) — the model's peer mirror silently falls back behind the `peer_unknown` gate"
+    );
+    assert!(
+        crash_took >= 100 && crash_not >= 100,
+        "CrashSend is under-emitted (took={crash_took}, not_took={crash_not} over 2000 seqs) — the \
+         out-of-script crash dimension is dropped, and every Crash(Send) goes back to blinding the \
+         axis for the rest of its sequence"
     );
 }
 
@@ -2138,6 +2184,523 @@ async fn phase_c_crash_at_kvt1_is_an_advance_advance_and_stays_in_step() {
          through. peer_tip={:?} our_seed={:?}",
         ctx.peer_tip_hex(),
         ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+}
+
+// ═══════════ peer-tip axis PHASE C-2 — the ANNOTATED held leaf (spec §5, §4 rows 3 + 9) ═══════════
+
+/// A held outcome whose peer branch is `NotTook` leaves the two chains IN AGREEMENT — and the
+/// operator who says so is right.
+///
+/// The client-visible facts are `Superseded`'s exactly: no trusted envelope came back, so the
+/// document rests `SENDING` under a `PENDING_APPLY` hold with the node in `STOP_MODE`, and nothing
+/// in the reply says whether DPS took it. The delta is entirely on the other side of the wire —
+/// the generator NAMED the peer's branch, so the harness need not fall silent.
+///
+/// Why the whole trajectory and not just "the tip did not move": a peer that never advances passes
+/// the tip assertion trivially. The pin therefore arms the derived `-12` (phase B) and runs the FN
+/// on afterwards — with the override armed, ANY disagreement between our seed and the peer's tip
+/// refuses the next send. It goes through, which is the operational content of "nothing diverged".
+///
+/// *Tooth, RUN and reported as OBSERVED.* Collapsing the harness's `NotTook` branch into `Took`
+/// REDs this pin at step 2's tip equality — one line before the divergence assertion and three
+/// before the trajectory's end. Step 4 is therefore the weaker of the three by construction; it is
+/// kept because it states the operational consequence ("the FN carries on") that the tip equality
+/// only implies. The mirrored canary (`Took` collapsed into `NotTook`) leaves this pin GREEN and
+/// REDs its twin below — the pair is what proves the two branches are actually distinguished.
+#[tokio::test]
+async fn phase_c2_a_not_took_hold_keeps_both_chains_in_step() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.peer_enable_derived_rejects();
+
+    // 1 — a predecessor issued sell; both sides land on it.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let agreed_tip = ctx
+        .peer_tip_hex()
+        .expect("an accepted send moves the peer onto that document");
+
+    // 2 — the annotated hold. The client learns nothing; the peer did NOT take it.
+    let _ = interp::run_op(
+        &mut ctx,
+        &Op::OnlineSell(DpsScript::held_with_peer(PeerTruth::NotTook)),
+    )
+    .await;
+    assert!(
+        ctx.active_held_reservation().await.is_some(),
+        "an annotated held leaf must still be a HELD outcome client-side — its whole design is that \
+         production cannot tell it from `Superseded`"
+    );
+    assert_eq!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(agreed_tip.as_str()),
+        "`NotTook` means the peer did not take the document, so its tip must not have moved"
+    );
+    assert!(
+        ctx.peer_diverged().is_none(),
+        "`NotTook` is the branch where the two sides still AGREE — marking the run diverged here \
+         throws away exactly the assertion coverage this leaf exists to buy back. reason={:?}",
+        ctx.peer_diverged()
+    );
+
+    // 3 — the operator resolves it correctly: DPS did not take it, so our seed must not advance.
+    let out = interp::run_op(
+        &mut ctx,
+        &Op::OperatorComplete(OperatorResolutionKind::NotAccepted),
+    )
+    .await;
+    assert!(
+        matches!(out, interp::RealOutcome::Released(_)),
+        "an online-origin `NotAccepted` must release the hold, got {out:?}"
+    );
+    assert_eq!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)).as_deref(),
+        Some(agreed_tip.as_str()),
+        "`NotAccepted` records the document as never-issued: our tip stays where the peer's is"
+    );
+
+    // 4 — and the FN carries on. The override is armed, so a peer holding a different tip would
+    //     refuse this send outright.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_none(),
+        "after an agreed-upon hold the next document chains onto a tip the peer holds, so it must \
+         go through. peer_tip={:?} our_seed={:?}",
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+}
+
+/// The `Took` branch is the divergence — and the operator who guesses RIGHT heals it without a
+/// reseed.
+///
+/// This is the deliberate counterpart to `phase_c_a_wrong_operator_claim_earns_the_derived_minus12`:
+/// same held shape, same `Accepted` completion, opposite peer truth. There the claim was false and
+/// had to be punished then repaired; here it is TRUE, and the axis must let it through silently.
+/// Both pins are needed — an axis that punished every completion would pass the first pin and be
+/// worthless, and one that punished none would pass this one and be worse.
+///
+/// The `Accepted` completion advances our seed onto the held document's own hash — the very
+/// document the peer took — so the two sides CONVERGE at the completion, with no `-12` and no
+/// MacReseed anywhere in the trajectory.
+///
+/// *Tooth, RUN and reported as OBSERVED.* Collapsing the harness's `Took` branch into `NotTook`
+/// REDs step 2 (`assert_ne` on the peer's tip) — again the earliest assertion, not the derived
+/// `-12` I first expected: a peer that never took the document is already visibly behind before
+/// the completion runs. The same canary leaves the `NotTook` twin above GREEN, which is the half
+/// that matters — it shows the two annotations are genuinely distinguished rather than jointly
+/// asserted by one over-broad claim.
+#[tokio::test]
+async fn phase_c2_b_took_hold_diverges_and_a_correct_operator_claim_converges() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.peer_enable_derived_rejects();
+
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let agreed_tip = ctx
+        .peer_tip_hex()
+        .expect("an accepted send moves the peer onto that document");
+
+    // 2 — the annotated hold, `Took`. The peer DID take it; we cannot know that, so we hold.
+    let _ = interp::run_op(
+        &mut ctx,
+        &Op::OnlineSell(DpsScript::held_with_peer(PeerTruth::Took)),
+    )
+    .await;
+    assert!(
+        ctx.active_held_reservation().await.is_some(),
+        "client-side this is a hold like any other — the peer's truth must not leak into production"
+    );
+    assert_ne!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(agreed_tip.as_str()),
+        "`Took` means the peer accepted the document, so its tip MUST have moved onto it — without \
+         that there is no divergence and the rest of this pin proves nothing"
+    );
+    assert!(
+        ctx.peer_diverged().is_some(),
+        "the peer holds a document we do not know it holds — that IS a divergence, and declaring it \
+         is what separates C-2 from phase A's silence"
+    );
+
+    // 3 — the operator's claim, and this time it is TRUE. Our seed advances onto the held document.
+    let out = interp::run_op(
+        &mut ctx,
+        &Op::OperatorComplete(OperatorResolutionKind::Accepted),
+    )
+    .await;
+    assert!(
+        matches!(out, interp::RealOutcome::Released(_)),
+        "an online-origin `Accepted` must release the hold, got {out:?}"
+    );
+    assert_eq!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)),
+        ctx.peer_tip_hex(),
+        "a CORRECT operator claim converges the two sides on the held document itself — no reseed, \
+         no `-12`, which is the whole point of modelling the peer's truth instead of guessing it"
+    );
+
+    // 4 — the FN carries on, with the derived `-12` armed and nothing left to repair.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_none(),
+        "after a correct claim the chains agree, so the next document must go through with no \
+         MacReseed anywhere in this trajectory. peer_tip={:?} our_seed={:?}",
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+}
+
+/// The MODEL side of C-2, in the lane the measurement said it was worth: the drain.
+///
+/// The phase-C-part-1 measurement counted the mirror's gate — `peer_unknown` — at 1% of ops online
+/// and 22% offline, i.e. the ignorance was CONCENTRATED in the drain lane, where the held outcomes
+/// of a backlog submit live. This pin is the direct check that the annotated leaf closes it there:
+/// after a held drain the model must still NAME the peer's tip, and name the right document.
+///
+/// Asserted on the model alone rather than through `run_harness`, deliberately. The harness's mirror
+/// assertion is GATED on `!peer_unknown` — so a regression that re-opened the gate would make the
+/// comparison silently skip and every generative run would stay green. The vacuity is the thing to
+/// pin, and only a direct assertion on the flag can pin it.
+///
+/// *Tooth, RUN and reported as OBSERVED.* Routing the annotated arm back to `peer_unknown = true`
+/// (the pre-C-2 behaviour) REDs this pin — and leaves the end-to-end pin below GREEN, because the
+/// harness's mirror assertion is gated on that very flag and simply stops comparing. That pair of
+/// results is the evidence for the paragraph above: the vacuity is real, and this is the only
+/// assertion that sees it.
+#[test]
+fn phase_c2_c_model_still_names_the_peer_after_a_held_drain() {
+    for (truth, moves) in [(PeerTruth::Took, true), (PeerTruth::NotTook, false)] {
+        let mut model = RefModel::new_offline_open_shift(3);
+        let _ = model.apply(&Op::OfflineSell);
+        let peer_before = model.peer_tip;
+
+        let out = model.apply(&Op::GoOnline(DpsScript::held_with_peer(truth)));
+        let ExpectedOutcome::Mutated(m) = out else {
+            panic!("a held drain of a non-empty backlog is a predicted mutation, got {out:?}");
+        };
+        assert_eq!(
+            m.doc_state,
+            DocState::Sending,
+            "client-side the annotated leaf must be the same recorded HOLD as `Superseded` — the \
+             head backlog doc rests SENDING under PENDING_APPLY"
+        );
+        assert!(
+            !model.peer_unknown,
+            "{truth:?}: the generator NAMED what the peer did, so the model must not fall back to \
+             ignorance — this flag gates the harness's mirror assertion, and setting it here would \
+             make every generative comparison in the drain lane silently skip"
+        );
+        if moves {
+            assert_eq!(
+                model::model_tip_class(model.peer_tip),
+                model::ModelTipClass::Doc(m.lnd),
+                "`Took`: the peer accepted the HEAD backlog document, so the mirror must name that \
+                 document — not merely 'something moved'"
+            );
+        } else {
+            assert_eq!(
+                model.peer_tip, peer_before,
+                "`NotTook`: the peer refused the head document, so the mirror must hold where it \
+                 was"
+            );
+        }
+    }
+}
+
+/// The two derivations of the peer must agree ACROSS a held drain — model against harness, end to
+/// end.
+///
+/// The pin above proves the model claims to know; this one proves the claim is TRUE. `run_harness`
+/// projects both the model's mirror and the harness peer (which is fed by the stub's own replies,
+/// off the real ledger) onto the same {Genesis, Doc(lnd), NonDoc} vocabulary after every op and
+/// demands they name the same thing. Running the annotated drain through it is what turns the model
+/// arm from a plausible edit into a checked one.
+///
+/// *Tooth, RUN and reported as OBSERVED.* Making the model's `NotTook` arm advance the peer REDs
+/// this pin inside `run_harness` with *"the model's peer mirror names Doc(1) but the harness peer
+/// is on Genesis"* — the mirror assertion, not the differential, which is the assertion this pin
+/// exists to exercise.
+#[tokio::test]
+async fn phase_c2_d_model_and_harness_peers_agree_across_a_held_drain() {
+    for truth in [PeerTruth::Took, PeerTruth::NotTook] {
+        let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+        let model = RefModel::new_offline_open_shift(3);
+        let _ = run_harness(
+            &[
+                Op::OfflineSell,
+                Op::GoOnline(DpsScript::held_with_peer(truth)),
+            ],
+            ctx,
+            model,
+        )
+        .await;
+    }
+}
+
+/// `Crash(Send)` with the peer's truth named — the crash stops being a blindfold for the REST of
+/// the run.
+///
+/// A bare `Crash(Send)` marks the run diverged permanently: the envelope was delivered, the reply
+/// was never popped, and nothing can say what DPS did. That is honest, and it costs the whole
+/// remainder of the sequence — phase A's mismatch assertion is switched off from there on, and a
+/// crash is a routinely-generated symbol. `Op::CrashSend` names the branch instead, and this pin
+/// asserts both halves of what that buys:
+///   - `NotTook` — the run is NOT diverged, so every later send is still checked against the peer,
+///     and the FN carries on with the derived `-12` armed;
+///   - `Took` — the peer holds a document we abandoned, which is a REAL divergence and must be
+///     declared, then punished on the next send exactly as an operator's wrong claim would be.
+///
+/// The `Took` half is also the axis's honest account of the double-fiscalisation hazard: DPS has
+/// the document, we resumed it to `ErrorRetryable` with ZERO re-sends (ADR-M3-A9), and the chains
+/// are apart until an operator reconciles.
+///
+/// *Tooth, RUN and reported as OBSERVED.* Dropping the `Some(truth)` branch back to
+/// `mark_diverged` (the pre-C-2 behaviour) REDs the `NotTook` half at the divergence assertion.
+/// Swapping the two truths REDs the `Took` half at its tip assertion — the same pairwise evidence
+/// as the annotated-leaf pins: each branch is asserted, not just their disjunction.
+#[tokio::test]
+async fn phase_c2_e_crash_send_names_the_peer_instead_of_going_blind() {
+    // ── NotTook: nothing diverged, and the axis keeps asserting through the crash ──
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.peer_enable_derived_rejects();
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let agreed_tip = ctx
+        .peer_tip_hex()
+        .expect("an accepted send moves the peer onto that document");
+
+    let out = interp::run_op(&mut ctx, &Op::CrashSend(PeerTruth::NotTook)).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Crashed { .. }),
+        "CrashSend must actually reach and park in the send await — otherwise the peer never even \
+         received the envelope and the whole dimension is moot, got {out:?}"
+    );
+    assert!(
+        ctx.peer_diverged().is_none(),
+        "a NAMED refusal is not a divergence: the peer holds nothing new and our doc never left \
+         SENDING. Marking it diverged is precisely the blindfold C-2 removes. reason={:?}",
+        ctx.peer_diverged()
+    );
+    assert_eq!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(agreed_tip.as_str()),
+        "`NotTook`: the peer refused the in-flight document, so its tip must hold"
+    );
+
+    let sends_before_reboot = ctx.send_calls();
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+    assert_eq!(
+        ctx.send_calls(),
+        sends_before_reboot,
+        "ADR-M3-A9: boot resumes the SENDING doc with ZERO re-sends — the peer's named refusal must \
+         not tempt recovery into a blind resend either"
+    );
+    assert_eq!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)).as_deref(),
+        Some(agreed_tip.as_str()),
+        "our seed never advanced past the abandoned document, and the peer refused it — so after \
+         the crash the two sides are on the SAME tip, which is what `NotTook` asserts"
+    );
+    assert!(
+        ctx.peer_mismatches().is_empty(),
+        "and phase A's per-send agreement check recorded nothing — it stayed LIVE across the crash \
+         rather than being switched off by a blanket divergence: {:#?}",
+        ctx.peer_mismatches()
+    );
+
+    // ── Took: the peer kept a document we abandoned — a real divergence, declared and punished ──
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.peer_enable_derived_rejects();
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let agreed_tip = ctx
+        .peer_tip_hex()
+        .expect("an accepted send moves the peer onto that document");
+
+    let _ = interp::run_op(&mut ctx, &Op::CrashSend(PeerTruth::Took)).await;
+    assert_ne!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(agreed_tip.as_str()),
+        "`Took`: DPS accepted the document whose reply we never saw, so its tip MUST have moved — \
+         this is the double-fiscalisation hazard the no-resend rule exists for"
+    );
+    assert!(
+        ctx.peer_diverged().is_some(),
+        "the peer holds a document we resumed as ErrorRetryable — the chains ARE apart and the \
+         axis must say so"
+    );
+
+    let _ = interp::run_op(&mut ctx, &Op::Reboot).await;
+    assert_ne!(
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)),
+        "after recovery the peer holds the abandoned document and we do not — the chains are apart \
+         and stay apart until an operator reconciles, which is the divergence this branch names"
+    );
+
+    // And what production does about it, in BOTH branches: nothing automatic. The abandoned doc
+    // rests ERROR_RETRYABLE, which is a NON-ISSUED sibling, so the D5 write gate refuses the next
+    // issuance outright (`WRITE_GATE_SIBLING_PENDING`). Asserted here because it is the honest
+    // answer to "and then what": a `Crash(Send)` does not resolve into either a resend or a fresh
+    // document — the FN stops until the doc is dealt with. The peer's truth changes WHAT the
+    // operator must decide, never whether the gate holds.
+    let next = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(&next, interp::RealOutcome::Refused(r) if r.contains("WRITE_GATE_SIBLING_PENDING")),
+        "the abandoned ERROR_RETRYABLE doc is a non-issued sibling — the next issuance must be \
+         refused pre-mint, not chained onto a contested tip. got {next:?} docs={:?}",
+        ctx.read_doc_states_by_lnd().await
+    );
+}
+
+// ═══════════ peer-tip axis PHASE C.1 — the offline-origin hole, pinned rather than papered ═══════
+
+/// An OFFLINE-origin hold on a document the PEER TOOK is a chain fork with NO EXIT — and this pin
+/// keeps that fact from being quietly forgotten.
+///
+/// The review that produced this spec called it MAJOR #6, and C-2's annotated leaves are what make
+/// the state constructible at all: before them, "the peer took the held document" was never a fact
+/// the harness could know. The trajectory:
+///   1. an offline document is issued locally (`OFFLINE_LOCAL_ACK`, chain advanced at issuance);
+///   2. the drain submits it, the reply is unusable — a recorded HOLD, offline origin — but the
+///      peer DID take it;
+///   3. the operator, who cannot see step 2's truth, resolves `NotAcceptedOffline`: production
+///      rewinds our chain to the held doc's own `previous_hash` and cancels the OLA cohort;
+///   4. our tip is now BEHIND a document DPS holds. Every later send earns `-12`, and the one
+///      repair that re-bases a chain — `MacReseed` — is fail-closed for offline origin.
+///
+/// Both the rewind and the refusal are asserted, because the hole is the CONJUNCTION: a rewind
+/// alone would be fine if a reseed could undo it, and a refusal alone would be fine if nothing had
+/// moved. This is also why `run_harness` refuses to generate step 3 while the peer's acceptance is
+/// known (the C.1 constraint) — the generator would otherwise spend its budget re-deriving a hole
+/// that is already documented, and report every downstream consequence as a fresh failure.
+///
+/// Phase D lifts the constraint deliberately, and its stated expectation is that it files a
+/// PRODUCTION finding. When production grows a recovery story for this state, THIS pin is what
+/// should RED first.
+#[tokio::test]
+async fn phase_c1_offline_hold_the_peer_took_is_a_fork_with_no_exit() {
+    let mut ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let _ = interp::run_op(&mut ctx, &Op::OfflineSell).await;
+
+    // The drain meets a held reply; the peer took the document anyway.
+    let _ = interp::run_op(
+        &mut ctx,
+        &Op::GoOnline(DpsScript::held_with_peer(PeerTruth::Took)),
+    )
+    .await;
+    assert!(
+        ctx.active_held_reservation().await.is_some(),
+        "the held drain must leave a completable hold — without one there is nothing for the \
+         operator to get wrong and this pin describes nothing"
+    );
+    assert!(
+        ctx.held_offline_doc_taken_by_peer().await,
+        "the predicate the C.1 constraint reads must SEE this state: offline origin, and the peer's \
+         tip is the held document itself. peer_tip={:?}",
+        ctx.peer_tip_hex()
+    );
+
+    // The operator's honest, wrong resolution. Production rewinds beneath a document DPS holds.
+    let out = interp::run_op(
+        &mut ctx,
+        &Op::OperatorComplete(OperatorResolutionKind::NotAcceptedOffline),
+    )
+    .await;
+    assert!(
+        matches!(out, interp::RealOutcome::Released(_)),
+        "`NotAcceptedOffline` on an offline-origin hold releases — nothing in production constrains \
+         the claim to the peer's truth, which is the whole hazard. got {out:?}"
+    );
+    assert_ne!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)),
+        ctx.peer_tip_hex(),
+        "after the rewind our tip must sit BEHIND the peer's — if these agreed there would be no \
+         fork and the constraint would be pointless"
+    );
+
+    // And there is no way back from here inside the alphabet. Three doors, all shut:
+    //
+    //   1. the corroborated MacReseed that heals an ONLINE fork — the completion RELEASED the
+    //      hold, so there is no reservation left to reseed. (Note what this is NOT: the refusal is
+    //      "no held reservation rests", NOT `MacReseedNotOfflineDefined`. The spec's §5 predicted
+    //      the origin guard would be the wall; the wall is one step earlier. Recorded here rather
+    //      than smoothed over — see the §5 note added with this phase.)
+    let peer_tip: [u8; 32] = hex_to_32(
+        &ctx.peer_tip_hex()
+            .expect("the peer took a document, so it has a tip"),
+    );
+    let repair = interp::operator_complete_macreseed(&ctx, peer_tip).await;
+    assert!(
+        matches!(&repair, interp::RealOutcome::Refused(_)),
+        "no reseed is available after the completion released the hold. If this ever RELEASES, \
+         production has grown a recovery story and this pin is the first thing that should be \
+         revisited. got {repair:?}"
+    );
+    //   2. issuance — the node is stuck mid-transition, so nothing new can be minted;
+    assert_eq!(
+        ctx.read_node_mode().await,
+        NodeMode::GoingOnline,
+        "the drain never finished, so the node rests GoingOnline — the FN issues nothing until an \
+         operator intervenes outside this alphabet"
+    );
+    let blocked = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(&blocked, interp::RealOutcome::Refused(r) if r.contains("NODE_GOING_ONLINE")),
+        "a mid-transition node refuses issuance, got {blocked:?}"
+    );
+    //   3. and the drain that would finish the transition is itself a no-op on an RMR shift
+    //      (AUD-K8-1 re-entry guard), so the transition can never complete on its own.
+    assert_eq!(
+        ctx.read_shift_state().await,
+        ShiftState::RequiresManualReconciliation,
+        "the held drain escalated the shift to RMR — which is what makes the GoingOnline mode \
+         permanent: a drain re-tick on an RMR shift is a guarded no-op"
+    );
+    let stuck = interp::run_op(&mut ctx, &Op::GoOnline(DpsScript::ack_path())).await;
+    let _ = stuck;
+    assert_eq!(
+        ctx.read_node_mode().await,
+        NodeMode::GoingOnline,
+        "and a further drain does not move it — the FN is parked for an operator, with our chain \
+         rewound beneath a document DPS holds"
+    );
+}
+
+/// And the generator DOES walk that trajectory — every oracle in the harness survives it.
+///
+/// The spec wanted this sequence suppressed (the C.1 constraint); the pin above is why it is not.
+/// What remains to prove is that emitting it is SAFE for the harness: the model predicts the
+/// completion, the differential matches, the settled scan and the mirrors accept the parked FN, and
+/// the peer mirror does not fall out of step across a rewind that moves our tip and not the peer's.
+/// All of that is asserted inside `run_harness` — the value of this pin is that it drives the whole
+/// trajectory through it deterministically, instead of waiting for a generative run to stumble on
+/// the same three ops in the same order.
+///
+/// *Tooth, RUN:* re-instating the C.1 `continue` REDs this pin — the completion is skipped, the
+/// hold survives and the post-condition below (the doc reached its RMR terminal) fails. That is the
+/// canary in the direction that matters now: the suppression, not the emission.
+#[tokio::test]
+async fn phase_c1_the_no_exit_completion_is_generated_and_the_oracles_hold() {
+    let ctx = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let model = RefModel::new_offline_open_shift(3);
+    let ctx = run_harness(
+        &[
+            Op::OfflineSell,
+            Op::GoOnline(DpsScript::held_with_peer(PeerTruth::Took)),
+            Op::OperatorComplete(OperatorResolutionKind::NotAcceptedOffline),
+        ],
+        ctx,
+        model,
+    )
+    .await;
+    assert!(
+        !ctx.held_offline_doc_taken_by_peer().await,
+        "the completion must have RUN: no offline hold may still rest at the end of the sequence"
+    );
+    let docs = ctx.read_doc_states_by_lnd().await;
+    assert!(
+        docs.iter()
+            .any(|(_, state)| state == "REQUIRES_MANUAL_RECONCILIATION"),
+        "the held document must have reached its RMR terminal through the real completion, got \
+         {docs:?}"
     );
 }
 
@@ -3866,6 +4429,33 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         if dead_until_reboot && !matches!(op, Op::Reboot | Op::RepeatReboot) {
             continue; // process is dead — no op reaches the gateway before reboot
         }
+        // Peer-tip axis PHASE C.1 (spec §5, MAJOR #6) — the constraint the spec asked for is
+        // DELIBERATELY NOT HERE, and this comment is the reason.
+        //
+        // §5 said: `NotAcceptedOffline` on a hold the peer TOOK rewinds our chain beneath a
+        // document DPS holds, after which "every later drain send earns `-12`, the hold is
+        // offline-origin, and MacReseed is fail-closed refused" — a divergence with no exit, so the
+        // generator should stay out of it. Built, then measured against the real seam
+        // (`phase_c1_offline_hold_the_peer_took_is_a_fork_with_no_exit`), and the chain of reasoning
+        // does not hold up:
+        //   - there are no "later drain sends" — the completion's OLA-cohort cancel EMPTIES the
+        //     backlog (successors → CANCELLED, the held doc → RMR);
+        //   - MacReseed is refused one step EARLIER and for a different reason ("no held
+        //     reservation rests" — the completion already released it), never reaching the
+        //     offline-origin guard the spec named;
+        //   - the FN does park unrecoverably, but as `GoingOnline` + an RMR shift (issuance refused
+        //     `NODE_GOING_ONLINE`, the drain a guarded no-op) — a state that has nothing to do with
+        //     the peer.
+        // And the decisive one: production cannot SEE the peer's truth, so its behaviour is
+        // identical whether the peer took the document or not. The same park is reachable today via
+        // an ordinary `Superseded` drain — a constraint keyed on the peer's truth would remove
+        // freshly-won coverage while preventing nothing.
+        //
+        // So the generator emits it freely, and the two `phase_c1_*` pins hold the ground instead:
+        // one documents the park (and REDs first if production ever grows a way out), one drives the
+        // whole trajectory through this harness. If phase D ever turns the derived `-12` on
+        // GENERATIVELY, revisit — that is the world in which the spec's reasoning would start to
+        // bite.
         let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
         let seed_at_op_start = model.seed; // model MAC tip BEFORE the op (B10 B3 structural seed check)
         let codes_before = ctx.consumed_codes_count().await;
@@ -3915,7 +4505,13 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             // crash differential is NOT vacuous (see the `b10_lazy_begin_interposed`
             // ledger-delta branch below for the Recovered case).
             (Op::Crash(_), interp::RealOutcome::Doc(_))
-            | (Op::Crash(_), interp::RealOutcome::Recovered { .. }) => {
+            | (Op::Crash(_), interp::RealOutcome::Recovered { .. })
+            // PHASE C-2: `CrashSend` is the same crash — on an Offline node it likewise never
+            // reaches the wire and completes as a real offline sell, so it takes the same
+            // deterministic prediction. Omitting it here would silently route an offline
+            // `CrashSend` through the Fault arm and re-adopt the DB — the exact vacuity O2 closed.
+            | (Op::CrashSend(_), interp::RealOutcome::Doc(_))
+            | (Op::CrashSend(_), interp::RealOutcome::Recovered { .. }) => {
                 model.predict_crash_completed_sell()
             }
             _ => model.apply(op),
@@ -4467,7 +5063,10 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
         // (only an operator completes it) nor lose the doc. A change here is an illegal HELD release /
         // doc loss across recovery. (Drain / GoOnline legitimately mutate holds, so they are excluded
         // — the operator-completion + count oracles cover those; this is the recovery-specific pin.)
-        if matches!(op, Op::Crash(_) | Op::Reboot | Op::RepeatReboot) {
+        if matches!(
+            op,
+            Op::Crash(_) | Op::CrashSend(_) | Op::Reboot | Op::RepeatReboot
+        ) {
             let held_res_after = ctx.active_held_reservation().await;
             assert_eq!(
                 held_res_after, held_res_before,

@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlx::SqlitePool;
 
 use crate::op::{
-    DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, WireResponse, DPS_RECOVERY_TIP,
+    DpsScript, L5Kind, Op, OperatorResolutionKind, PeerTruth, ReplenishLeaf, WireResponse,
+    DPS_RECOVERY_TIP,
 };
 use prro::db::models::enums::{DocState, DocType, NodeMode, OfflineSessionState, ShiftState};
 
@@ -578,7 +579,12 @@ impl RefModel {
             Op::Drain(script) => self.apply_drain(script),
             // Faults / recovery: ground-truth re-synced by the Task 5 oracle.
             // RepeatReboot drives the boot seam too → also Fault (re-sync).
-            Op::Crash(_) | Op::Reboot | Op::RepeatReboot => ExpectedOutcome::Fault,
+            // PHASE C-2's `CrashSend` is a `Crash(Send)` that also names the peer's truth — the
+            // peer is ENVIRONMENT state with no ledger row, so it changes nothing about what the
+            // model can predict of OUR side: still a Fault, re-adopted from the DB.
+            Op::Crash(_) | Op::CrashSend(_) | Op::Reboot | Op::RepeatReboot => {
+                ExpectedOutcome::Fault
+            }
             // Re-entry ops that drive a REAL transition seam — mirror the seam:
             Op::RepeatDrain => self.apply_drain(&DpsScript(Vec::new())),
             Op::GoOnlineWithoutBacklog => self.apply_go_online(&DpsScript(Vec::new())),
@@ -2035,13 +2041,23 @@ impl RefModel {
             // deferred to APPLY, never runs), NOT ERROR_RETRYABLE; the shift → RMR (EscalateManual,
             // M3b §16.7); mode stays GoingOnline; successors held at OFFLINE_LOCAL_ACK; the seed does
             // NOT re-advance (offline-origin advanced it at issuance).
-            [WireResponse::Superseded, ..] => {
+            [held @ (WireResponse::Superseded | WireResponse::HeldWithPeer(_)), ..] => {
                 let first = backlog[0];
                 self.docs.insert(first, DocState::Sending);
                 // spec §4 row 9 — the held/ambiguous outcome is generator-chosen, and rev1 scoped
-                // that to the online lane WRONGLY: the drain lane meets it identically.  Until
-                // phase C-2's leaf decides it, the model states its ignorance.
-                self.peer_unknown = true;
+                // that to the online lane WRONGLY: the drain lane meets it identically.  The bare
+                // `Superseded` leaf still says nothing about the peer, so the model states its
+                // ignorance; PHASE C-2's annotated twin names it, and the mirror keeps its teeth
+                // for the whole rest of the run.  This lane is where the ignorance was
+                // CONCENTRATED (the measured offline gate, spec §9), so this arm is most of what
+                // C-2 buys.
+                match held {
+                    WireResponse::HeldWithPeer(PeerTruth::Took) => {
+                        self.peer_tip = Some(synth_unsigned_hash(first));
+                    }
+                    WireResponse::HeldWithPeer(PeerTruth::NotTook) => {}
+                    _ => self.peer_unknown = true,
+                }
                 self.shift_state = ShiftState::RequiresManualReconciliation;
                 // CS-3 S7-1: the WrapperBug HOLD flips the node to STOP_MODE (record_outcome halt).
                 self.mode = NodeMode::StopMode;
@@ -2550,6 +2566,12 @@ fn online_peer_effect(script: &DpsScript) -> PeerEffect {
         [WireResponse::Ack, ..] => PeerEffect::Advance,
         [WireResponse::Reject, ..] => PeerEffect::Hold,
         [WireResponse::BadHashPrev, ..] => PeerEffect::Declared,
+        // PHASE C-2 — the held leaf that NAMES what the peer did. Same client-side outcome as
+        // `Superseded` (a recorded hold), but the model no longer has to state ignorance: the
+        // generator chose the peer's branch, so the mirror keeps asserting straight through the
+        // hold. This is the arm that narrows the `peer_unknown` gate.
+        [WireResponse::HeldWithPeer(PeerTruth::Took), ..] => PeerEffect::Advance,
+        [WireResponse::HeldWithPeer(PeerTruth::NotTook), ..] => PeerEffect::Hold,
         // Superseded / UnknownStatus / Timeout — and the EMPTY script, which is how
         // `predict_crash_completed_sell` reaches this code. An empty script never makes a wire call
         // at all, so it is not really "unknown" so much as "no event"; it is routed here anyway
