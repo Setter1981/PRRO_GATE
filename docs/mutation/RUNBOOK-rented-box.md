@@ -92,15 +92,24 @@ it bills by the hour.
 `cargo-mutants` warns that `--jobs` above 8 "may overload your machine". For
 **this** workload on a 48-vCPU box that advice is actively harmful.
 
-> ⚠️ **Speed only. Read trap 0 first.** Every number in this table was produced with a shared
-> `CARGO_TARGET_DIR`, the configuration that made 40 % of one run's verdicts wrong. Raise `--jobs`
-> only once the build directory is per-job; otherwise you are buying throughput with correctness.
+> 🛑 **This table is RETRACTED.** Every number in it was produced with a shared `CARGO_TARGET_DIR` —
+> the configuration where jobs die on `ENOSPC` and "finish" instantly, inflating the counter. The
+> `31.4/min` figure in particular is fiction, and every time estimate built on it was wrong.
 
-| config | tested mutants/min | CPU |
-|---|---|---|
-| `-j8` + `CARGO_BUILD_JOBS=6` + `NEXTEST_TEST_THREADS=6` | 1.62 | `id=96` — **idle** |
-| `-j24` | 5.1 | `id=90` — **idle** |
-| **`-j64`** | **31.4** | `us=73 sy=27 id=0` |
+**Measured on a working configuration** (isolation on, ballast removed, `-j16`, steady state):
+
+| | |
+|---|---|
+| throughput | **1.3 tested mutants/min** (45 in 34 min) |
+| whole `prro` crate (3623 mutants) | **≈ 45 h ≈ €35** |
+| load at `-j16` on 48 cores | **460** — each job runs nextest across every core, ~10× oversubscription |
+| disk ceiling | 35 GB per job copy ⇒ ~24 copies max on a 902 GB volume |
+
+So the real trade is not "which `--jobs`" — it is that **a full baseline costs two days of rental**
+while `prro` is one monolith whose every mutant re-runs all 2375 tests. Until the crate split lands
+(a mutant then rebuilds a leaf, not the monolith), a full run is deferred by decision, not by
+accident. Pick `--jobs` from `free_disk / 35 GB` and keep a disk watchdog; that is all this knob can
+do for you.
 
 Why the intuition fails: the bottleneck is **slots, not cores**. A mutant that
 hangs the suite sleeps until the test timeout (auto-set to ~680 s from the
