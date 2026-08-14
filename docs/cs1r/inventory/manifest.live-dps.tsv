@@ -1368,6 +1368,7 @@ live-dps	prro	prro::invariant_fuzzer	generator_emits_both_peer_truths_on_leaf_an
 live-dps	prro	prro::invariant_fuzzer	generator_emits_both_replenish_leaves	false
 live-dps	prro	prro::invariant_fuzzer	generator_emits_online_and_offline_returns	false
 live-dps	prro	prro::invariant_fuzzer	generator_emits_unknown_status_on_sell_and_shift_lanes	false
+live-dps	prro	prro::invariant_fuzzer	h7b_a_granted_replenish_is_refused_on_a_tip_dps_never_accepted	false
 live-dps	prro	prro::invariant_fuzzer	harness_crash_reboot_enforces_no_resend_postcond	false
 live-dps	prro	prro::invariant_fuzzer	harness_exotic_drain_is_bounded_postcond_verified	false
 live-dps	prro	prro::invariant_fuzzer	harness_generative_not_accepted_offline_cohort_cancel_and_rewind	false

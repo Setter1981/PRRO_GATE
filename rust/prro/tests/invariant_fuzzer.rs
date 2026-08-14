@@ -3015,6 +3015,84 @@ async fn phase_d_model_and_harness_agree_across_an_ambiguous_replenish() {
     .await;
 }
 
+/// bd `PRRO_GATE-h7b` — a GRANTED replenish is impossible on a tip DPS has never accepted, and the
+/// difference from a merely STALE one is the whole point.
+///
+/// `ReplenishLeaf::Granted` used to be a free generator choice, so the harness could hand out a code
+/// window while our embedded `<MAC>` was a value DPS never took. That is coverage of a state
+/// production cannot reach — and worse than merely vacuous, because the peer then CONVERGED onto
+/// us, healing a divergence reality would have punished.
+///
+/// The state is reachable exactly through the operator: a held send the peer did NOT take, then an
+/// `Accepted` completion, which advances our seed onto a document DPS has never seen. (The offline
+/// route is closed by the knk pre-wire guard, and the fenced route by bd PRRO_GATE-2fr; this is what
+/// remains, and it is generatively reachable in four ops.)
+///
+/// Both live observations are asserted here as a PAIR, because either alone invites the wrong fix:
+///   * never-seen `<MAC>` → `-12`, DPS's tip does not move (probe, 2026-08-01);
+///   * stale-but-seen `<MAC>` → accepted and re-based ([N=1] H2) — pinned separately by
+///     `phase_d_a_granted_replenish_heals_the_ambiguous_fork`, which a "refuse whenever diverged"
+///     rule would break.
+///
+/// *Tooth:* drop the `tip_is_foreign` guard in the interpreter and the replenish succeeds — this
+/// REDs on the outcome assertion; drop it in the MODEL only and the differential REDs instead.
+#[tokio::test]
+async fn h7b_a_granted_replenish_is_refused_on_a_tip_dps_never_accepted() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+
+    // 1 — an accepted sell: both sides on a tip DPS demonstrably knows.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let known = ctx.peer_tip_hex().expect("an accepted send moves the peer");
+
+    // 2 — a held send the peer did NOT take, and an operator who says it did. Our seed advances
+    //     onto a document DPS has never seen; the peer stays where it was.
+    let _ = interp::run_op(
+        &mut ctx,
+        &Op::OnlineSell(DpsScript::held_with_peer(PeerTruth::NotTook)),
+    )
+    .await;
+    let released = interp::run_op(
+        &mut ctx,
+        &Op::OperatorComplete(OperatorResolutionKind::Accepted),
+    )
+    .await;
+    assert!(
+        matches!(released, interp::RealOutcome::Released(_)),
+        "nothing constrains the operator's claim — the completion must release, got {released:?}"
+    );
+    let our_seed = ctx.read_seed().await.map(|s| hex_of_slice(&s));
+    assert_ne!(
+        our_seed.as_deref(),
+        Some(known.as_str()),
+        "the wrong claim must actually move our seed, or there is no foreign tip to test"
+    );
+    assert_eq!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(known.as_str()),
+        "and the peer must NOT have moved — that is what makes our tip foreign to it"
+    );
+
+    // 3 — the replenish. DPS chain-checks the request and refuses it.
+    let out = interp::run_op(&mut ctx, &Op::Replenish(ReplenishLeaf::Granted)).await;
+    assert!(
+        matches!(&out, interp::RealOutcome::Refused(r) if r.contains("-12")
+            || r.contains("BAD_HASH_PREV")),
+        "a T=112 embedding a <MAC> DPS has never accepted must earn -12, not a code window. \
+         Granting it invents a state production cannot reach. got {out:?}"
+    );
+    assert_eq!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(known.as_str()),
+        "and DPS's tip must NOT move on a refusal — the live probe recorded exactly that. A peer \
+         that re-based here would HEAL a fork reality leaves open"
+    );
+    assert_eq!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)),
+        our_seed,
+        "our side persists nothing on the refusal either"
+    );
+}
+
 /// Peer-tip axis PHASE C — the ONE place reality's tip vocabulary is translated into the model's.
 ///
 /// Written out as an explicit match rather than derived or `#[repr]`-aliased, because this mapping
@@ -5020,7 +5098,12 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                 // not that the model would have derived it. Between faults the mirror is fully
                 // independent, and that is where the assertion above has teeth.
                 let peer_now = as_model_tip(ctx.peer_tip_class().await);
-                model.sync_peer_tip(peer_now);
+                // bd `PRRO_GATE-h7b` — hand over the seen-question with the tip, for the same
+                // reason: across a fault the model cannot re-derive which of its symbols DPS would
+                // still recognise, and getting this wrong flips a replenish between "accepted and
+                // re-based" and "-12, tip unmoved".
+                let peer_saw_our_tip = ctx.peer_has_seen(ctx.read_seed().await.as_deref());
+                model.sync_peer_tip(peer_now, peer_saw_our_tip);
             }
             // Predictable mutation — differential-match the model.
             oracle::OpClass::PredictableMutating => {
