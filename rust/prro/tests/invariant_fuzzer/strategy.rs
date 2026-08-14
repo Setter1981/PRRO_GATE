@@ -193,6 +193,11 @@ fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
             Just(ReplenishLeaf::Granted),
             Just(ReplenishLeaf::ServerReject),
+            // Peer-tip axis PHASE D — APPENDED LAST (corpus-index preservation). The reply is lost
+            // after DPS processed the request: our side records nothing, the peer re-bases. Held
+            // back until now not because the contract was unknown (the live capture landed in #351)
+            // but because the harness had no peer to move — see `ReplenishLeaf::Ambiguous`.
+            Just(ReplenishLeaf::Ambiguous),
         ]
         .prop_map(Op::Replenish),
         // Peer-tip axis PHASE C-2 — APPENDED LAST (corpus-index preservation). `Crash(Send)` with

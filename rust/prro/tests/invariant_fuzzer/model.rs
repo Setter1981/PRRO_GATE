@@ -119,6 +119,14 @@ pub struct RefModel {
     /// Offline codes issued to / consumed by this session.
     pub codes_issued: i64,
     pub codes_consumed: i64,
+    /// Peer-tip axis PHASE D — how many AMBIGUOUS T=112 replenishes have moved the peer alone.
+    ///
+    /// A counter of its own, not `codes_issued`, and the reason is a trap worth stating: the harness
+    /// re-syncs `codes_issued` from reality after every replenish (prod dedups by value, so reality
+    /// owns the count). An ambiguous replenish grants no code, so that re-sync would REWIND any
+    /// increment made here — and the next ambiguous one would then mint the SAME symbol, which reads
+    /// as "the peer did not move". Silent, and exactly wrong.
+    pub ambiguous_t112_count: i64,
     /// Per-lnd document state.
     pub docs: BTreeMap<i64, DocState>,
     /// Peer-tip axis PHASE C (spec §8.1) — the chain link each document was MINTED onto, keyed by
@@ -297,6 +305,7 @@ impl RefModel {
             mode: NodeMode::Online,
             session: None,
             codes_issued: 0,
+            ambiguous_t112_count: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
             doc_prev: BTreeMap::new(),
@@ -323,6 +332,7 @@ impl RefModel {
             mode: NodeMode::Online,
             session: None,
             codes_issued: 0,
+            ambiguous_t112_count: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
             doc_prev: BTreeMap::new(),
@@ -351,6 +361,7 @@ impl RefModel {
             mode: NodeMode::Offline,
             session: Some(OfflineSessionState::Open),
             codes_issued: codes,
+            ambiguous_t112_count: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
             doc_prev: BTreeMap::new(),
@@ -377,6 +388,7 @@ impl RefModel {
             mode: NodeMode::Offline,
             session: Some(OfflineSessionState::Open),
             codes_issued: codes,
+            ambiguous_t112_count: 0,
             codes_consumed: 0,
             docs: BTreeMap::new(),
             doc_prev: BTreeMap::new(),
@@ -841,6 +853,23 @@ impl RefModel {
     /// `active_chain_tip_unsigned_xml_sha256` depends on.
     ///
     /// `ServerReject`: prod persists NOTHING — no codes, no seed advance, no witness.
+    /// bd `PRRO_GATE-knk` — prod's PRE-WIRE refusal predicate, mirrored as its own method so the
+    /// ordering against the post-wire fence stays greppable (see `apply_replenish`).
+    ///
+    /// Mirrors prod's FULL disjunction rather than the obvious state: it counts
+    /// `offline_fiscal_no IS NOT NULL AND state IN ('OFFLINE_LOCAL_ACK','ERROR_RETRYABLE')` —
+    /// `ErrorRetryable` is in because such a doc already crossed `OFFLINE_LOCAL_ACK` and still has
+    /// no DPS acceptance. Gating both arms on `offline_origin_lnds` mirrors the
+    /// `offline_fiscal_no IS NOT NULL` clause, so an ONLINE-origin `ErrorRetryable` (which never
+    /// advanced the seed — A.3 advances at the `Sending → Sent` CAS) does NOT block, exactly as in
+    /// production.
+    fn undrained_offline_backlog(&self) -> bool {
+        self.docs.iter().any(|(lnd, st)| {
+            self.offline_origin_lnds.contains(lnd)
+                && matches!(st, DocState::OfflineLocalAck | DocState::ErrorRetryable)
+        })
+    }
+
     fn apply_replenish(&mut self, leaf: ReplenishLeaf) -> ExpectedOutcome {
         // S7-2 fence (FOUND GENERATIVELY, 2026-07-31): prod refuses a replenish outright while the FN
         // has an ACTIVE delivery reservation — `offline_code_replenish.rs` calls
@@ -858,7 +887,34 @@ impl RefModel {
         // unknown); the model was widened to prod's own predicate. That seed is pinned in
         // `invariant_fuzzer.regressions` and in the directed tooth
         // `replenish_refused_after_crash_at_send`.
+        // ORDER MIRRORS PROD, and phase D proved that the order is observable.
+        //
+        // The backlog check sits BEFORE the wire (`offline_code_replenish.rs:245`) and the fence
+        // check sits INSIDE the persist envelope, i.e. AFTER it (`:402-411`). Both refuse, but only
+        // one of them refuses before DPS has seen anything — so with both conditions true, prod
+        // never reaches the wire and the peer cannot have moved. The model used to check the fence
+        // first and, worse, treated both as if nothing had left the building; the capstone caught it
+        // the first time the ambiguous leaf was generated (`Replenish(Ambiguous)`: model said
+        // `Doc(1)`, the harness peer was on a non-doc tip).
+        if self.undrained_offline_backlog() {
+            return ExpectedOutcome::Replenish { granted: false };
+        }
         if self.fence_active {
+            // POST-WIRE refusal: DPS answered — for `Granted` it issued a code window, for
+            // `Ambiguous` the answer was lost — and in both cases it re-based its chain onto the
+            // request it just processed. We persist NOTHING. So the fence protects our ledger and
+            // does nothing at all for the chain: the two sides part company here, exactly as they do
+            // in the `2ds` trajectory, and the next document earns `-12`.
+            //
+            // bd `PRRO_GATE-2fr` — filed from this arm. The fuzzer cannot prove what DPS does with
+            // its tip; the [N=1] H2 capture says a processed T=112 re-bases it, and that is the
+            // basis for modelling the move here.
+            if matches!(leaf, ReplenishLeaf::Granted | ReplenishLeaf::Ambiguous) {
+                self.ambiguous_t112_count += 1;
+                self.peer_tip = Some(synth_unsigned_hash(
+                    AMBIGUOUS_T112_BASE - self.ambiguous_t112_count,
+                ));
+            }
             return ExpectedOutcome::Replenish { granted: false };
         }
         // bd PRRO_GATE-knk — prod refuses a replenish while an UNDRAINED offline backlog rests.
@@ -883,13 +939,6 @@ impl RefModel {
         // in a state where production would have earned `-12`. Prod refusing here is what removes
         // that particular piece of vacuous coverage; the general `Granted`-leaf constraint against
         // the PEER tip is still phase B's job.
-        let undrained_offline_backlog = self.docs.iter().any(|(lnd, st)| {
-            self.offline_origin_lnds.contains(lnd)
-                && matches!(st, DocState::OfflineLocalAck | DocState::ErrorRetryable)
-        });
-        if undrained_offline_backlog {
-            return ExpectedOutcome::Replenish { granted: false };
-        }
         match leaf {
             ReplenishLeaf::Granted => {
                 self.codes_issued += 1;
@@ -904,6 +953,24 @@ impl RefModel {
                 ExpectedOutcome::Replenish { granted: true }
             }
             ReplenishLeaf::ServerReject => ExpectedOutcome::Replenish { granted: false },
+            // PHASE D (spec §4 row 13b, bd PRRO_GATE-2ds) — the reply was lost AFTER DPS processed
+            // the request. OUR side is a refusal in every observable way: the persist happens in the
+            // same envelope as the reply, so nothing lands — no code, no seed advance, no witness.
+            // The peer, though, re-based onto the request it did process.
+            //
+            // The model states that with a fresh NON-DOCUMENT symbol, mirroring how it handles the
+            // granted convergence: it can no more compute `sha256(request_xml)` than a document
+            // hash, and inventing agreement would be worse than naming the divergence. The symbol
+            // comes from a namespace of its own (`AMBIGUOUS_T112_BASE`), so it can never collide
+            // with a granted replenish's — see `ambiguous_t112_count` for why reusing that counter
+            // is a trap.
+            ReplenishLeaf::Ambiguous => {
+                self.ambiguous_t112_count += 1;
+                self.peer_tip = Some(synth_unsigned_hash(
+                    AMBIGUOUS_T112_BASE - self.ambiguous_t112_count,
+                ));
+                ExpectedOutcome::Replenish { granted: false }
+            }
         }
     }
 
@@ -2481,6 +2548,16 @@ fn synth_unsigned_hash(lnd: i64) -> [u8; 32] {
 /// predict.  The model cannot recover WHICH non-document value reality holds — it builds no XML —
 /// and must not pretend otherwise; the class is the honest ceiling.
 const ADOPTED_NON_DOC_ORDINAL: i64 = i64::MIN;
+
+/// Peer-tip axis PHASE D — the base of the ordinal namespace for tips only the PEER holds, minted by
+/// an AMBIGUOUS T=112 (bd `PRRO_GATE-2ds`).
+///
+/// Negative (so [`model_tip_class`] reads `NonDoc`) and far from both neighbours: the granted-
+/// replenish ordinals march down from `-1`, and [`ADOPTED_NON_DOC_ORDINAL`] sits at `i64::MIN`.
+/// Separate namespaces are what make aliasing impossible rather than merely unlikely — a peer tip
+/// that accidentally equalled one of ours would read as agreement, which is the one wrong answer
+/// this axis must never give.
+const AMBIGUOUS_T112_BASE: i64 = -1_000_000;
 
 /// Peer-tip axis PHASE C (spec §8) — the STRUCTURAL class of a model-symbolic MAC tip.
 ///
