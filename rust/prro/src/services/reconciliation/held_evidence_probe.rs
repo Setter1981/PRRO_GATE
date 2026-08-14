@@ -44,12 +44,20 @@
 //! no node-mode gate at all, and the boot stale-tip guard probes before deciding to block. `STOP`
 //! forbids ISSUING, not asking.
 
+use std::time::Duration;
+
 use sqlx::SqlitePool;
 
 use super::last_chk_probe::{self, ProbeOutcome};
 use super::runtime::RuntimeView;
 use crate::db::models::enums::Severity;
 use crate::db::repositories::audit_log;
+
+/// How often the supervisor runs this tick.  Hardcoded — NO config knob, the same D6 precedent as
+/// `inbox_reaper::REAPER_TICK_INTERVAL` and the same value: with nothing held a tick is a single
+/// SELECT, and with a hold resting the probe is one `last_chk` per five minutes — enough for the
+/// verdict to track a DPS outage ending, nowhere near enough to bother anyone.
+pub const HELD_PROBE_TICK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// The audit `event_type` this module writes. One code with the verdict in the payload, rather than
 /// a code per verdict: an operator surface greps for the event, then reads what was learnt.
@@ -142,6 +150,39 @@ pub async fn run_tick_for_fn(
     };
 
     let reservation_id_hex: String = reservation_id.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Record CHANGES of knowledge, not heartbeats. A hold can rest for hours waiting on an
+    // operator, and this tick runs every five minutes; without this guard the audit log would grow
+    // a row per tick saying the same thing, burying the rows that matter. The comparison is
+    // against the LAST row only — verdict transitions (NoChecks → Indeterminate → NoChecks) are
+    // all recorded — and on (reservation, verdict), not on `detail`: two Indeterminate probes with
+    // different transport texts are the same knowledge.
+    // ordering-justified: `audit_id` is `audit_log`'s INTEGER PRIMARY KEY (the rowid alias,
+    // allocated by SQLite's monotonic rowid allocator) — unique across the whole table, so no two
+    // rows inside this WHERE scope can tie and "the last row" has exactly one winner.
+    let last: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT event_payload_json FROM audit_log \
+         WHERE event_type = ? AND entity_id = ? ORDER BY audit_id DESC LIMIT 1",
+    )
+    .bind(HELD_PROBE_EVENT)
+    .bind(fiscal_number)
+    .fetch_optional(pool)
+    .await?;
+    let already_recorded = last
+        .flatten()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+        .is_some_and(|v| {
+            v.get("reservation_id").and_then(|x| x.as_str()) == Some(reservation_id_hex.as_str())
+                && v.get("verdict").and_then(|x| x.as_str()) == Some(verdict.as_str())
+        });
+    if already_recorded {
+        return Ok(Some(HeldEvidence {
+            reservation_id_hex,
+            lnd,
+            verdict,
+        }));
+    }
+
     let payload = serde_json::json!({
         "reservation_id": reservation_id_hex,
         "lnd": lnd,

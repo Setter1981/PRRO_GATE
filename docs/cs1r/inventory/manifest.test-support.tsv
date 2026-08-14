@@ -1295,6 +1295,7 @@ test-support	prro	prro::held_evidence_probe	a_non_transient_hold_is_not_probed	f
 test-support	prro	prro::held_evidence_probe	no_held_reservation_makes_no_wire_call	false
 test-support	prro	prro::held_evidence_probe	peer_holding_another_check_is_recorded_as_inconclusive	false
 test-support	prro	prro::held_evidence_probe	peer_with_no_checks_is_recorded_and_the_hold_is_untouched	false
+test-support	prro	prro::held_evidence_probe	repeat_verdicts_are_not_re_recorded_but_transitions_are	false
 test-support	prro	prro::hpc_t112_nc03	after_sell_recovers_hsell_not_stale_hs	false
 test-support	prro	prro::hpc_t112_nc03	ambiguous_t112_hold_is_resolvable_only_by_a_peer_corroborated_seed	false
 test-support	prro	prro::hpc_t112_nc03	crash_atomicity_all_three_coexist_on_success	false

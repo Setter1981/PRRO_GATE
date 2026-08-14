@@ -350,8 +350,15 @@ where
     let auto_z_handle = spawn_auto_z_loop(
         app.clone(),
         Arc::clone(&registry),
-        fn_ids,
+        fn_ids.clone(),
         Duration::from_secs(auto_z_secs),
+        shutdown_rx.clone(),
+    );
+    // bd 6bj step 1 — held-evidence probe loop (per-FN, fixed interval, no config knob).
+    let held_probe_handle = spawn_held_probe_loop(
+        app.clone(),
+        Arc::clone(&registry),
+        fn_ids,
         shutdown_rx.clone(),
     );
     // RS-3 inbox-reaper loop — not per-FN (inbox-global), unconditional, fixed
@@ -388,6 +395,7 @@ where
         SupervisedTask::runs_until_shutdown("online-convergence", convergence_handle),
         SupervisedTask::runs_until_shutdown("auto-z", auto_z_handle),
         SupervisedTask::runs_until_shutdown("inbox-reaper", reaper_handle),
+        SupervisedTask::runs_until_shutdown("held-evidence-probe", held_probe_handle),
     ];
     if let Some(handle) = backup_handle {
         tasks.push(SupervisedTask::runs_until_shutdown("backup", handle));
@@ -1036,6 +1044,105 @@ async fn drain_tick(
 /// `ACK` via the reused recovery arms (OCF-5 runtime owner).  Exact structural
 /// copy of [`spawn_drain_loop`]: `MissedTickBehavior::Skip` + `biased` select
 /// makes shutdown win, and the loop returns `Ok(())` only (F1).
+/// bd `PRRO_GATE-6bj` step 1 — the held-evidence probe loop.
+///
+/// For an FN whose transient send outcome is HELD (`SENDING` + `PENDING_APPLY` +
+/// `routing_class = TransientRetry`, node `STOP_MODE`), ask DPS what it actually holds via the
+/// existing `last_chk` probe and record the verdict in the audit log — so the operator who must
+/// resolve the hold decides on a fact instead of a guess.
+///
+/// READ-ONLY by construction (asserted by the module's tests, not merely promised): no document
+/// transition, no `send_chk`, no mode change, and ZERO wire calls for an FN with nothing held —
+/// which is every FN, almost always. Interval is the module's own no-knob constant, the same D6
+/// precedent as the reaper.
+fn spawn_held_probe_loop(
+    app: App,
+    registry: Arc<BindingsRegistry>,
+    fn_ids: Vec<String>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        let tick_shutdown = shutdown_rx.clone();
+        let mut iv = tokio::time::interval(
+            crate::services::reconciliation::held_evidence_probe::HELD_PROBE_TICK_INTERVAL,
+        );
+        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // F1 INVARIANT: `Ok(())` only (on watch-exit); per-FN errors are logged-and-skipped
+        // inside the tick, never propagated — same contract as every sibling loop.
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        tracing::info!(target: "prro::runtime::supervisor", "held-evidence probe loop: shutdown; exiting");
+                        return Ok(());
+                    }
+                }
+                _ = iv.tick() => {
+                    held_probe_tick(&app, &registry, &fn_ids, &tick_shutdown).await;
+                }
+            }
+        }
+    })
+}
+
+/// One held-evidence pass over all FNs.  Rebuilds `fn_sign` FRESH per FN (signingTime must be
+/// current at the wire call — NEVER cached) — the mirror of [`convergence_tick`], for the same
+/// reasons, with the same per-FN error isolation.
+async fn held_probe_tick(
+    app: &App,
+    registry: &BindingsRegistry,
+    fn_ids: &[String],
+    shutdown: &watch::Receiver<bool>,
+) {
+    use crate::services::reconciliation::held_evidence_probe;
+    for fn_id in fn_ids {
+        // F2: bail BETWEEN FNs so shutdown is honored promptly.
+        if *shutdown.borrow() {
+            return;
+        }
+        let Some(b) = registry.get(fn_id) else {
+            continue;
+        };
+        let fn_sign = match build_fn_sign(&b.sign_ctx.session, fn_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "prro::runtime::supervisor",
+                    fiscal_number = fn_id,
+                    error = ?e,
+                    "held-evidence probe tick: fn_sign build failed; FN skipped this tick"
+                );
+                continue;
+            }
+        };
+        let view = RuntimeView {
+            dps: b.dps.as_ref(),
+            signing_ctx: &b.sign_ctx,
+            fn_sign: &fn_sign,
+        };
+        match held_evidence_probe::run_tick_for_fn(app.db(), &view, fn_id).await {
+            Ok(Some(evidence)) => {
+                tracing::info!(
+                    target: "prro::runtime::supervisor",
+                    fiscal_number = fn_id,
+                    ?evidence,
+                    "held-evidence probe: verdict for the resting hold"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(
+                    target: "prro::runtime::supervisor",
+                    fiscal_number = fn_id,
+                    error = ?e,
+                    "held-evidence probe tick failed; FN skipped this tick"
+                );
+            }
+        }
+    }
+}
+
 fn spawn_convergence_loop(
     app: App,
     registry: Arc<BindingsRegistry>,

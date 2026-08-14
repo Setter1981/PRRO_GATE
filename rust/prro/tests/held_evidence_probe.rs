@@ -261,7 +261,7 @@ async fn peer_with_no_checks_is_recorded_and_the_hold_is_untouched() {
     );
 
     let rows = audit_rows(app.db()).await;
-    assert_eq!(rows.len(), 1, "exactly one evidence row per probe");
+    assert_eq!(rows.len(), 1, "one evidence row for the first verdict");
     let (_, actor, payload) = &rows[0];
     assert_eq!(
         actor.as_deref(),
@@ -343,6 +343,56 @@ async fn a_failed_probe_is_indeterminate_not_evidence_of_absence() {
     );
     assert_eq!(doc_state(app.db()).await, "SENDING");
     assert_eq!(node_mode(app.db()).await, "STOP_MODE");
+}
+
+/// Record CHANGES of knowledge, not heartbeats. A hold rests for hours and the tick runs every five
+/// minutes; a row per tick saying the same thing would bury the rows that matter. The contract:
+/// same (reservation, verdict) as the LAST row ⇒ probe still runs, nothing is written; a verdict
+/// TRANSITION is always written — including back to a verdict seen earlier.
+#[tokio::test]
+async fn repeat_verdicts_are_not_re_recorded_but_transitions_are() {
+    let (_dir, app) = boot_app().await;
+    seed_fn(&app).await;
+    seed_held(app.db(), -3).await;
+
+    // Twice the same answer: one row.
+    let stub = new_stub();
+    stub.push_last(Err(DpsError::NotFound));
+    let _ = run(&app, &stub).await.expect("probed");
+    let stub2 = new_stub();
+    stub2.push_last(Err(DpsError::NotFound));
+    let e2 = run(&app, &stub2).await.expect("probed again");
+    assert_eq!(
+        e2.verdict,
+        HeldVerdict::PeerHasNoChecks,
+        "the probe itself still runs on every tick — only the RECORDING is deduplicated"
+    );
+    assert_eq!(
+        audit_rows(app.db()).await.len(),
+        1,
+        "an unchanged verdict must not be re-recorded"
+    );
+
+    // The answer changes: a second row.
+    let stub3 = new_stub();
+    stub3.push_last(Err(DpsError::Transport("outage".into())));
+    let _ = run(&app, &stub3).await.expect("probed");
+    assert_eq!(
+        audit_rows(app.db()).await.len(),
+        2,
+        "a verdict TRANSITION is knowledge and must be recorded"
+    );
+
+    // And back again: a third row — dedup compares against the LAST row only, so the history of
+    // transitions survives.
+    let stub4 = new_stub();
+    stub4.push_last(Err(DpsError::NotFound));
+    let _ = run(&app, &stub4).await.expect("probed");
+    assert_eq!(
+        audit_rows(app.db()).await.len(),
+        3,
+        "returning to an earlier verdict is a transition too"
+    );
 }
 
 /// Scope: only the TRANSIENT class. A `-12` (`MacReseedPending`) hold has its own resolution story —
