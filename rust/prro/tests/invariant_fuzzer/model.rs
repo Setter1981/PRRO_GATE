@@ -900,45 +900,12 @@ impl RefModel {
             return ExpectedOutcome::Replenish { granted: false };
         }
         if self.fence_active {
-            // POST-WIRE refusal: DPS answered — for `Granted` it issued a code window, for
-            // `Ambiguous` the answer was lost — and in both cases it re-based its chain onto the
-            // request it just processed. We persist NOTHING. So the fence protects our ledger and
-            // does nothing at all for the chain: the two sides part company here, exactly as they do
-            // in the `2ds` trajectory, and the next document earns `-12`.
-            //
-            // bd `PRRO_GATE-2fr` — filed from this arm. The fuzzer cannot prove what DPS does with
-            // its tip; the [N=1] H2 capture says a processed T=112 re-bases it, and that is the
-            // basis for modelling the move here.
-            if matches!(leaf, ReplenishLeaf::Granted | ReplenishLeaf::Ambiguous) {
-                self.ambiguous_t112_count += 1;
-                self.peer_tip = Some(synth_unsigned_hash(
-                    AMBIGUOUS_T112_BASE - self.ambiguous_t112_count,
-                ));
-            }
+            // POST-WIRE no longer: bd `PRRO_GATE-2fr` moved this check ahead of the wire, so the
+            // request never leaves the building and DPS cannot re-base on it. Before that fix this
+            // arm had to move the peer — the fuzzer is what found the ordering, and the model
+            // mirroring prod's ordering is what turned an internal disagreement into the finding.
             return ExpectedOutcome::Replenish { granted: false };
         }
-        // bd PRRO_GATE-knk — prod refuses a replenish while an UNDRAINED offline backlog rests.
-        //
-        // An offline document advances OUR seed at `OFFLINE_LOCAL_ACK`, i.e. at local issuance,
-        // before DPS ever sees it. So while such a doc rests, the `<MAC>` the T=112 would carry is a
-        // value DPS has never accepted — and the live TEST-cabinet probe of 2026-08-01 settled that
-        // DPS chain-checks the request and answers `-12 ERROR_BAD_HASH_PREV` without moving its tip.
-        // Prod now refuses locally, BEFORE the wire, because reaching DPS costs a `MacReseedPending`
-        // → `STOP_MODE` the operator has no documented way out of.
-        //
-        // The predicate mirrors prod's FULL disjunction rather than just the obvious state: prod
-        // counts `offline_fiscal_no IS NOT NULL AND state IN ('OFFLINE_LOCAL_ACK','ERROR_RETRYABLE')`
-        // — `ErrorRetryable` is in because such a doc already crossed `OFFLINE_LOCAL_ACK` and still
-        // has no DPS acceptance. Gating BOTH arms on `offline_origin_lnds` mirrors the
-        // `offline_fiscal_no IS NOT NULL` clause, so an ONLINE-origin `ErrorRetryable` (which never
-        // advanced the seed — A.3 advances at the `Sending → Sent` CAS) does NOT block, exactly as
-        // in production.
-        //
-        // Note the shape this makes VISIBLE rather than hides: the generator's
-        // `ReplenishLeaf::Granted` was free-choice, so the harness used to model a granted replenish
-        // in a state where production would have earned `-12`. Prod refusing here is what removes
-        // that particular piece of vacuous coverage; the general `Granted`-leaf constraint against
-        // the PEER tip is still phase B's job.
         match leaf {
             ReplenishLeaf::Granted => {
                 self.codes_issued += 1;

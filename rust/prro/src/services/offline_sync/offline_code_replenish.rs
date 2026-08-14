@@ -102,6 +102,14 @@ pub enum ReplenishError {
         fiscal_number: String,
         undrained: i64,
     },
+    /// bd `PRRO_GATE-2fr` — the S7-2 delivery fence is up, refused BEFORE the wire.
+    ///
+    /// The fence check inside the persist envelope stays (it is the fail-closed authority and the
+    /// TOCTOU backstop); this one exists because refusing after the wire is not the same thing.
+    /// DPS processes whatever it is asked and re-bases its chain onto that request, so a
+    /// post-wire refusal leaves THEIR tip advanced and OURS untouched — a fork the operator only
+    /// meets when the next document earns `-12`.
+    FenceActive { fiscal_number: String },
     /// `node_state` row missing for the FN — structural breach (App boot
     /// must upsert the row before replenish is called).
     NodeStateMissing,
@@ -134,6 +142,13 @@ impl std::fmt::Display for ReplenishError {
                  would earn -12 ERROR_BAD_HASH_PREV and put the node into STOP_MODE. DRAIN THE \
                  BACKLOG FIRST (bring the node online and let the drain complete), then request \
                  codes again."
+            ),
+            ReplenishError::FenceActive { fiscal_number } => write!(
+                f,
+                "replenish refused: FN {fiscal_number} has an active delivery reservation (S7-2 \
+                 fence) — a document is in flight on this chain and its outcome is not yet \
+                 applied. Nothing was sent to DPS. RESOLVE THE IN-FLIGHT DELIVERY FIRST (let it \
+                 settle, or complete the held reservation), then request codes again."
             ),
             ReplenishError::NodeStateMissing => write!(f, "node_state row missing for FN"),
             ReplenishError::SeedUpdateMissing => {
@@ -252,6 +267,31 @@ impl OfflineCodeReplenishService {
             return Err(ReplenishError::UndrainedOfflineBacklog {
                 fiscal_number: fiscal_number.to_string(),
                 undrained,
+            });
+        }
+
+        // ── Step 2b: S7-2 delivery fence, BEFORE the wire (bd PRRO_GATE-2fr) ──
+        //
+        // The fence inside the persist envelope below is the fail-closed authority, and it stays.
+        // What it cannot be is the FIRST check: it runs after `ask_offline_codes`, so on the fence
+        // path DPS has already processed the request and re-based its chain onto it — while we
+        // persist nothing at all. Our tip then trails theirs and the next document earns `-12`,
+        // which is a fork produced BY the guard that exists to prevent forks.
+        //
+        // Found generatively (invariant fuzzer, peer-tip axis phase D). The comment on the
+        // in-envelope check calls it a guard "against a fork at cutover" — true of a LOCAL fork,
+        // structurally impossible for the peer's, since by the time it runs the peer has moved.
+        //
+        // Same shape and the same soundness argument as the undrained-backlog guard above: a
+        // read-only query outside any transaction (invariant #1), under the `acquire_fn_gate`
+        // lease taken in Step 1 (invariant #2), so no reservation can appear between this read and
+        // the send. The tx-bound check re-asks under `BEGIN IMMEDIATE` regardless.
+        if delivery_reservation::fn_fence_active_pool(pool, fiscal_number)
+            .await
+            .map_err(ReplenishError::Db)?
+        {
+            return Err(ReplenishError::FenceActive {
+                fiscal_number: fiscal_number.to_string(),
             });
         }
 

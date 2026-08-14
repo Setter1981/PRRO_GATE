@@ -215,6 +215,40 @@ pub async fn fn_fence_active_tx(
     Ok(active == 1)
 }
 
+/// bd `PRRO_GATE-2fr` — the same fence predicate, read OUTSIDE a transaction.
+///
+/// For callers that must decide **before doing something irreversible off-box**, where the
+/// tx-bound [`fn_fence_active_tx`] is structurally too late: it can only run inside the persist
+/// envelope, and by then the wire call has already happened and DPS has already acted on it.
+/// The T=112 replenish is the first such caller.
+///
+/// This does NOT replace the tx-bound check — it precedes it. The in-envelope call remains the
+/// fail-closed authority and the TOCTOU backstop; this one exists to keep the request from
+/// leaving the building at all. The same relationship the undrained-backlog guard already has
+/// with its own persist-time invariants.
+///
+/// Soundness of the pool read: every caller holds the per-FN `acquire_fn_gate` lease (frozen
+/// invariant #2), which serialises it against the write-path that creates reservations, so the
+/// answer cannot change under it before the wire call. The tx-bound check then re-asks the
+/// question under `BEGIN IMMEDIATE` anyway.
+///
+/// Reuses [`ACTIVE_FENCE_STATE_PREDICATE`] verbatim rather than restating it — the conformance
+/// test `fence_predicate_byte_identity` pins that constant against the migration SQL, and a second
+/// hand-written copy is exactly how two fences start disagreeing about what "active" means.
+pub async fn fn_fence_active_pool(
+    pool: &sqlx::SqlitePool,
+    fiscal_number: &str,
+) -> sqlx::Result<bool> {
+    let active: i64 = sqlx::query_scalar(&format!(
+        "SELECT EXISTS(SELECT 1 FROM delivery_reservation \
+         WHERE fiscal_number = ? AND ({ACTIVE_FENCE_STATE_PREDICATE}))"
+    ))
+    .bind(fiscal_number)
+    .fetch_one(pool)
+    .await?;
+    Ok(active == 1)
+}
+
 /// **INACTIVE:** invoked only from persistence tests in CS-2.
 pub async fn get_active_for_fn(
     pool: &sqlx::SqlitePool,

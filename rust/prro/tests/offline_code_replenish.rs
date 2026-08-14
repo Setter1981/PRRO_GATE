@@ -218,6 +218,56 @@ async fn replenish_refused_while_reservation_active_seed_unchanged() {
     assert_eq!(n, 0, "no codes persisted when the fence refuses");
 }
 
+// bd `PRRO_GATE-2fr` — the fence must refuse BEFORE the wire, not merely before the persist.
+//
+// The pin above proves the refusal is complete on OUR side: no seed advance, no codes. It says
+// nothing about whether DPS was asked — and it was. The fence lived inside the persist envelope,
+// which runs after `ask_offline_codes`, so on this path DPS issued a code window and (per the
+// [N=1] H2 capture) re-based its chain onto that request while we recorded nothing at all. Our
+// chain then trails theirs, and the next document we issue earns `-12`.
+//
+// The distinction is the whole ticket: "refused" and "refused without asking" are the same thing
+// locally and completely different across the wire. The in-code comment claimed the fence "guards
+// the tip against a fork at cutover" — against a LOCAL fork it does; against the peer's it cannot,
+// because by the time it runs the peer has already moved.
+//
+// Found generatively by the invariant fuzzer's peer-tip axis (phase D) on its first capstone run
+// with the ambiguous T=112 leaf.
+//
+// *Tooth:* revert the pre-wire check in `offline_code_replenish.rs` and this REDs on
+// `stub.calls()` — while the seed/codes assertions above stay green, which is exactly why they
+// were not enough.
+#[tokio::test]
+async fn fence_refuses_before_the_wire_so_dps_never_re_bases() {
+    let (_dir, app) = boot_app().await;
+    let prior_seed = [0x11u8; 32];
+    seed_fn(&app, Some(prior_seed)).await;
+    seed_active_reservation(app.db()).await;
+
+    let stub = new_scripted();
+    stub.push_ask_codes(Ok(codes_resp(&["code-X"])));
+    let svc =
+        OfflineCodeReplenishService::new(app.clone(), stub.clone(), Arc::new(det_signing_ctx()));
+
+    let err = svc
+        .replenish(FN, TN, 1, 1)
+        .await
+        .expect_err("the S7-2 fence must refuse while a reservation is active");
+
+    assert!(
+        stub.calls().is_empty(),
+        "bd 2fr: DPS must never be asked while the fence is up. Every call here is a request DPS \
+         processes and re-bases its chain onto, while we persist nothing — a fork the operator \
+         only discovers when the NEXT document earns -12. Observed calls: {:?}",
+        stub.calls()
+    );
+    let rendered = err.to_string().to_lowercase();
+    assert!(
+        rendered.contains("reservation") || rendered.contains("fence"),
+        "the refusal must still name the fence so an operator can act on it. Got: {err}"
+    );
+}
+
 // ─── (a) persists codes + assigns ordinals ────────────────────────────────────
 
 #[tokio::test]
