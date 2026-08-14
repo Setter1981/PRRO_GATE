@@ -1466,7 +1466,11 @@ live-dps	prro	prro::invariant_fuzzer	phase_d_a_granted_replenish_heals_the_ambig
 live-dps	prro	prro::invariant_fuzzer	phase_d_ambiguous_t112_strands_us_behind_and_the_named_seed_recovers	false
 live-dps	prro	prro::invariant_fuzzer	phase_d_model_and_harness_agree_across_an_ambiguous_replenish	false
 live-dps	prro	prro::invariant_fuzzer	phase_d_model_names_a_fresh_peer_tip_per_ambiguous_replenish	false
+<<<<<<< HEAD
 live-dps	prro	prro::invariant_fuzzer	phase_d_the_fenced_replenish_never_reaches_dps_so_the_chains_stay_together	false
+=======
+live-dps	prro	prro::invariant_fuzzer	phase_d_the_s7_2_fence_refuses_after_the_wire_and_leaves_dps_ahead	false
+>>>>>>> origin/main
 live-dps	prro	prro::invariant_fuzzer	regression_6hl_operator_release_brings_the_cash_leg_into_the_drawer	false
 live-dps	prro	prro::invariant_fuzzer	regression_offline_shiftopen_resets_cash_on_hand	false
 live-dps	prro	prro::invariant_fuzzer	release_witness_accepted_clears_fence_and_stop	false
