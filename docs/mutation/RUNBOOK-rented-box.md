@@ -92,11 +92,24 @@ it bills by the hour.
 `cargo-mutants` warns that `--jobs` above 8 "may overload your machine". For
 **this** workload on a 48-vCPU box that advice is actively harmful.
 
-| config | tested mutants/min | CPU |
-|---|---|---|
-| `-j8` + `CARGO_BUILD_JOBS=6` + `NEXTEST_TEST_THREADS=6` | 1.62 | `id=96` — **idle** |
-| `-j24` | 5.1 | `id=90` — **idle** |
-| **`-j64`** | **31.4** | `us=73 sy=27 id=0` |
+> 🛑 **This table is RETRACTED.** Every number in it was produced with a shared `CARGO_TARGET_DIR` —
+> the configuration where jobs die on `ENOSPC` and "finish" instantly, inflating the counter. The
+> `31.4/min` figure in particular is fiction, and every time estimate built on it was wrong.
+
+**Measured on a working configuration** (isolation on, ballast removed, `-j16`, steady state):
+
+| | |
+|---|---|
+| throughput | **1.3 tested mutants/min** (45 in 34 min) |
+| whole `prro` crate (3623 mutants) | **≈ 45 h ≈ €35** |
+| load at `-j16` on 48 cores | **460** — each job runs nextest across every core, ~10× oversubscription |
+| disk ceiling | 35 GB per job copy ⇒ ~24 copies max on a 902 GB volume |
+
+So the real trade is not "which `--jobs`" — it is that **a full baseline costs two days of rental**
+while `prro` is one monolith whose every mutant re-runs all 2375 tests. Until the crate split lands
+(a mutant then rebuilds a leaf, not the monolith), a full run is deferred by decision, not by
+accident. Pick `--jobs` from `free_disk / 35 GB` and keep a disk watchdog; that is all this knob can
+do for you.
 
 Why the intuition fails: the bottleneck is **slots, not cores**. A mutant that
 hangs the suite sleeps until the test timeout (auto-set to ~680 s from the
@@ -149,6 +162,40 @@ find /root/.cache/prro-mutants-scratch -mindepth 1 -depth -delete
 
 Also: `pkill -x cargo-mutants` does **not** reliably kill it. Use `-9` and then
 *verify* the process is gone instead of trusting the exit code.
+
+### Trap 0 — parallel jobs + one `CARGO_TARGET_DIR` = **40 % of the verdicts are wrong**
+
+Read this before `--jobs`. It is the trap that invalidates results rather than merely slowing them.
+
+`cargo-mutants` **honours** an inherited `CARGO_TARGET_DIR` — it does not override it, and the tree
+copies it makes contain no target directory of their own (verified: with the variable set, the
+copies are bare and everything lands in the one shared path). So with `run.sh` exporting an absolute
+path and `-j24…64`, **every job builds and links into the same `debug/`**. A job's test run can
+execute a binary another job just linked — or one that was never rebuilt, i.e. **unmutated code**.
+
+`run.sh`'s own header warns about exactly this (bd `PRRO_GATE-9g5`) — for the *dev* target dir. The
+export meant to protect it recreates the hazard one level down.
+
+Measured. The 15 survivors from a `-j48` run were re-tested locally with `-j1`, same commit, same
+mutants, same multiplier:
+
+| | |
+|---|---|
+| declared survivors (`-j48`, shared target) | 15 |
+| confirmed by the serial run | **9** |
+| **false survivors** (serial says *caught*) | **6 — 40 %** |
+| real survivors the parallel run **missed** | 2 |
+
+**Wrong in both directions**, so it cannot be dismissed as "merely conservative". And the six false
+ones were not harmless noise — they were the alarming ones: `sent_not_found_to_manual` stubbed out,
+the fail-closed `"Z_REPORT" | "SHIFT_CLOSE"` arm deleted, inverted conditions in
+`dispatch_prepared_via_chain` and `escalate_fn_to_manual_recon`. Every one of them is killed by
+existing teeth. A parallel run invents holes exactly where they would frighten you most.
+
+**Do not set `CARGO_TARGET_DIR` at all** — let `cargo-mutants` own the build directory per job. If
+you must keep it (to protect a shared dev target), then the run has to be serial, or its verdicts
+are not evidence. Cheap way to check the fix before renting anything: mutate one module twice at
+`-j4`, with and without the variable, and compare both against a `-j1` baseline.
 
 ### Trap 4 — a `full` run silently tests **only `prro`**
 
@@ -246,16 +293,41 @@ discarded). An adjudication needs a note, not a test.
   | `full`, auto-timeout 582 s | 589 | **`missed = 0`** → baseline rewritten to an **empty file** |
   | catch-up, `--timeout-multiplier 12` | 110 | 444 caught, **15 real survivors** |
 
-  All fifteen sat in the first run's timeout bucket. They are in `sent_not_found_to_manual`
-  (the whole `Sent → RMR` escalation stubbed to `Ok(())`), the fail-closed `"Z_REPORT" | "SHIFT_CLOSE"`
-  arm in `inline.rs`, `dispatch_prepared_via_chain`, `escalate_fn_to_manual_recon`,
-  `run_with_registry`, `attempts_used` — recovery and write-path, not corners.
+  ⚠️ **Those "15" were re-tested serially and only 9 held** — the catch-up itself ran with a shared
+  build directory (trap 0), so 6 of them were false. The corrected finding is below; the *mechanism*
+  above stands, because the 59 s / 1010 s split is measured within that run and does not depend on
+  which mutants were mis-verdicted.
+
+  **What actually survives, after serial re-verification** (`-j1`, same commit, same multiplier):
+  9 of the 15, plus 2 the parallel run had missed. Their character is nothing like the first
+  reading. Nine are **counters and summary-struct fields** — `ReservationBootSummary::is_active`
+  (three variants), the `dispatch_pending_doc` and `run_tick_for_fn` histograms, the `scanned` and
+  `fiscal_number` fields, `+= → *=` in `reservation_boot_pass::run`. Diagnostics nobody asserts, the
+  same class the July baseline already accepts (`DispatchHistogram::total_visited`). One is
+  `&& → ||` in the supervisor's loop condition. Two are `hex_lower` in the operator-handoff audit
+  record — and that pair is the only one arguing for a real tooth: `sn01` asserts the
+  `SENT_NOT_FOUND_ESCALATED_MANUAL` row **exists** (`COUNT(*)`) but never that it names the right
+  document.
+
+  Everything frightening in the first reading — `sent_not_found_to_manual` stubbed to `Ok(())`, the
+  deleted `"Z_REPORT" | "SHIFT_CLOSE"` arm, the inverted conditions in `dispatch_prepared_via_chain`
+  and `escalate_fn_to_manual_recon`, `normalize_one`, `attempts_used` — **is killed by existing
+  teeth**. Verified by hand and again serially.
+
+  > The lesson is sharper than either finding. A tight timeout hides survivors; a shared build
+  > directory *invents* them, and it invents them in the scariest places. Neither failure announces
+  > itself — both produce a report that reads like a result.
 
   **So: never read `survivors: 0` as coverage while `timeout.txt` is non-empty.** Re-run the
   timeouts with a far larger budget before believing any verdict, and treat what still times out as
-  *not caught*. Of the 110 that survived `×12`, most cluster around `attempts_used` — the boot-retry
-  budget counter (`MAX_BOOT_ATTEMPTS = 5`); stubbing it to a constant makes the ceiling unreachable,
-  so those are genuine non-termination, not slowness, and no budget will resolve them.
+  *not caught*. The 110 that survived `×12` are spread across `boot_phase` (34),
+  `reservation_boot_pass` (22), `transport_trace` writes (13), `supervisor` (9),
+  `canonical_builder` (9), `backlog_drain` (6). Raising the budget further will not resolve them —
+  the same mutants timed out at 582 s and at ~1450 s.
+
+  > The shared shape *appears* to be "a stubbed return means something a test awaits never happens"
+  > — a server that never binds, a boot pass that never converges, a request that never completes.
+  > **Inferred from the distribution, not verified**: confirming it means reading each call site.
 
 - **`TIMEOUT` outcomes are invisible to the ratchet — and a `full` run will silently
   drop them from the baseline.** They land in `timeout.txt`, never in `missed.txt`,
