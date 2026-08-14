@@ -2860,35 +2860,28 @@ async fn phase_d_a_granted_replenish_heals_the_ambiguous_fork() {
     );
 }
 
-/// bd `PRRO_GATE-2fr` — the S7-2 fence refuses a replenish **after** the wire, so it protects the
-/// ledger and not the chain.
+/// bd `PRRO_GATE-2fr`, FIXED — the S7-2 fence now refuses BEFORE the wire, so DPS never re-bases.
 ///
-/// Found by the capstone the first time the ambiguous leaf was generated, then confirmed against
-/// production's own ordering:
-///   * `count_undrained_diverging_offline_docs` refuses BEFORE the wire
-///     (`offline_code_replenish.rs:245`) — DPS never sees a request, nothing forks;
-///   * `ask_offline_codes` is the wire (`:296`);
-///   * `fn_fence_active_tx` refuses INSIDE the persist envelope (`:402-411`) — i.e. AFTER DPS has
-///     already answered.
+/// The fuzzer found the defect here (peer-tip phase D, first capstone with the ambiguous leaf) and
+/// this pin is what it became after the fix. Production's replenish had two refusals on opposite
+/// sides of the wire: the undrained-backlog check before it (`offline_code_replenish.rs:245`) and
+/// the S7-2 fence inside the persist envelope, i.e. after it. On the fence path DPS had already
+/// answered and re-based its chain while we persisted nothing — a fork produced by the guard that
+/// exists to prevent forks.
 ///
-/// So on the fence path DPS issued a code window and re-based its chain onto that request, while we
-/// persisted nothing: no codes, no seed advance, no witness. The comment on the fence calls it
-/// "guards the tip against a fork at cutover", and against a LOCAL fork it does. Against the peer's
-/// it cannot — by the time it runs, the peer has already moved.
+/// The fix adds a pre-wire fence check (the in-envelope one stays as the fail-closed authority and
+/// the TOCTOU backstop). This pin holds the property END TO END, where the unit pin in
+/// `offline_code_replenish.rs` cannot: it runs the whole trajectory through the real seams and
+/// asserts that the two chains are STILL TOGETHER afterwards — the thing an operator actually
+/// cares about, and the thing that was false before.
 ///
-/// This pin drives the whole consequence rather than just the tip comparison: the FN is left issuing
-/// documents onto a stale chain, and the very next one is refused `-12`. The divergence is
-/// manufactured with a C-2 `NotTook` leaf precisely so there is exactly ONE source of it — the
-/// fence — and no ambiguity to blame it on.
+/// The hold is raised with a C-2 `NotTook` leaf on purpose: it moves neither tip, so if the chains
+/// part company anywhere in this sequence, the replenish is the only candidate.
 ///
-/// **Not a claim about DPS's internals.** That a processed T=112 re-bases its tip rests on the
-/// `[N=1]` H2 capture, and the whole model of the peer rests on it too. If that ever turns out to be
-/// wrong, this pin is where it should be re-argued.
-///
-/// *Tooth:* make the harness treat the fence refusal as pre-wire (leave the peer put) and step 4's
-/// `-12` never fires.
+/// *Tooth:* revert the pre-wire check in production and this REDs on the tip comparison — the peer
+/// walks forward while our seed holds.
 #[tokio::test]
-async fn phase_d_the_s7_2_fence_refuses_after_the_wire_and_leaves_dps_ahead() {
+async fn phase_d_the_fenced_replenish_never_reaches_dps_so_the_chains_stay_together() {
     let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
     ctx.peer_enable_derived_rejects();
 
@@ -2896,8 +2889,7 @@ async fn phase_d_the_s7_2_fence_refuses_after_the_wire_and_leaves_dps_ahead() {
     let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
     let agreed_tip = ctx.peer_tip_hex().expect("an accepted send moves the peer");
 
-    // 2 — a HELD send the peer did NOT take. This raises the fence (a PENDING_APPLY reservation)
-    //     without moving either tip: the one and only divergence source in this pin is step 3.
+    // 2 — a HELD send the peer did NOT take: raises the fence, moves neither tip.
     let _ = interp::run_op(
         &mut ctx,
         &Op::OnlineSell(DpsScript::held_with_peer(PeerTruth::NotTook)),
@@ -2907,33 +2899,30 @@ async fn phase_d_the_s7_2_fence_refuses_after_the_wire_and_leaves_dps_ahead() {
         ctx.active_held_reservation().await.is_some(),
         "the hold is what raises the S7-2 fence — without it this pin tests nothing"
     );
+
+    // 3 — the replenish. Refused, and refused WITHOUT asking DPS.
+    let out = interp::run_op(&mut ctx, &Op::Replenish(ReplenishLeaf::Granted)).await;
+    assert!(
+        // The interpreter renders the typed error with `{:?}`, so this matches the VARIANT —
+        // which is the stronger assertion anyway: it pins WHICH refusal fired, not just that one
+        // did. `FenceActive` is the new pre-wire arm; the in-envelope one surfaces as `Internal`.
+        matches!(&out, interp::RealOutcome::Refused(r) if r.contains("FenceActive")),
+        "the PRE-WIRE fence arm must be the one that refuses, got {out:?}"
+    );
     assert_eq!(
         ctx.peer_tip_hex().as_deref(),
         Some(agreed_tip.as_str()),
-        "the held document was NOT taken, so both sides are still on the predecessor"
-    );
-
-    // 3 — the replenish. Production refuses it — but only after DPS has answered.
-    let out = interp::run_op(&mut ctx, &Op::Replenish(ReplenishLeaf::Granted)).await;
-    assert!(
-        matches!(&out, interp::RealOutcome::Refused(r) if r.contains("fence")),
-        "the S7-2 fence must refuse the persist, got {out:?}"
+        "THE FIX: DPS was never asked, so its chain cannot have moved. Before bd PRRO_GATE-2fr the \
+         request went out, DPS re-based on it, and this assertion failed"
     );
     assert_eq!(
         ctx.read_seed().await.map(|s| hex_of_slice(&s)).as_deref(),
         Some(agreed_tip.as_str()),
-        "and it must refuse COMPLETELY on our side — no seed advance, no codes, no witness"
-    );
-    assert_ne!(
-        ctx.peer_tip_hex().as_deref(),
-        Some(agreed_tip.as_str()),
-        "THE FINDING: DPS answered before the fence ran, so its chain moved while ours did not. \
-         A fence that runs after the wire cannot prevent this fork — it can only decline to record \
-         our half of it"
+        "and our side is unchanged too — the refusal is total, on both sides of the wire"
     );
 
-    // 4 — the consequence. Release the hold honestly (DPS did not take that document), and the very
-    //     next issuance is refused by DPS for a chain it moved past while we were being careful.
+    // 4 — the operational consequence, which is the point: the FN carries on. Resolve the hold and
+    //     issue again; with the derived `-12` armed, any surviving fork would refuse this send.
     let released = interp::run_op(
         &mut ctx,
         &Op::OperatorComplete(OperatorResolutionKind::NotAccepted),
@@ -2941,13 +2930,13 @@ async fn phase_d_the_s7_2_fence_refuses_after_the_wire_and_leaves_dps_ahead() {
     .await;
     assert!(
         matches!(released, interp::RealOutcome::Released(_)),
-        "the operator resolves the hold correctly, got {released:?}"
+        "the operator resolves the hold, got {released:?}"
     );
     let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
     assert!(
-        ctx.active_held_reservation().await.is_some(),
-        "the FN is now issuing onto a stale chain and DPS refuses it -12 — the operator is left \
-         reseeding after an operation the gateway itself declined to record. peer_tip={:?} \
+        ctx.active_held_reservation().await.is_none(),
+        "no fork was created, so the next document goes through — no -12, no reseed, no operator \
+         chasing a chain the gateway broke while declining to record anything. peer_tip={:?} \
          our_seed={:?}",
         ctx.peer_tip_hex(),
         ctx.read_seed().await.map(|s| hex_of_slice(&s))
