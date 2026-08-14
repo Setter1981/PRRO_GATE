@@ -20,7 +20,11 @@
 #   * 1 bd PRRO_GATE-01g row (#364) — the pin went from `#[ignore]`d RED to an active regression
 #     pin, and the manifest identity carries the ignored FLAG, so `true -> false` read as a
 #     removal. Pruned here once #364 merged (origin/main 1c0bac70).
+#   * 1 bd PRRO_GATE-2fr row (#382) — a peer-tip phase-D pin was renamed because the child PR FIXED
+#     the defect the pin used to describe, so the same trajectory now asserts the opposite property
+#     (`..._refuses_after_the_wire_and_leaves_dps_ahead` -> `..._never_reaches_dps_so_the_chains_
+#     stay_together`). The rename read as a removal only while #381 sat between the pin and main;
+#     once #382 merged, both sides are in main and the row went STALE. Pruned here.
 # Their supersession records live in those commits + this file's git history. The registry is
 # currently EMPTY (no removals pending vs origin/main); the gate handles that (see the
 # empty-registry guard in inventory_gate.sh + the teeth in inventory_gate_teeth.sh).
-prro::invariant_fuzzer	phase_d_the_s7_2_fence_refuses_after_the_wire_and_leaves_dps_ahead	prro::invariant_fuzzer	phase_d_the_fenced_replenish_never_reaches_dps_so_the_chains_stay_together	bd PRRO_GATE-2fr: the pin DESCRIBED the defect (fence refuses post-wire, DPS ends up ahead) and this PR FIXES it, so the same trajectory now asserts the opposite property. Keeping the old name would leave a test whose name states behaviour production no longer has. Same file, same trajectory, strictly stronger assertions (both tips must hold AND the next document must go through). PRUNE this row once #382 merges.
