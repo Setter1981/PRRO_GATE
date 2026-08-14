@@ -346,6 +346,37 @@ completions to peer truth (§5). Trajectory pins: operator-wrong-claim (online) 
 recovers; `Crash(Kvt1)` advance/advance re-syncs.
 *Tooth:* model MacReseed arm left at `synth(held_lnd)` → spurious divergence, RED.
 
+> **PHASE D HAS SHIPPED (2026-08-04, branch `fuzzer/peer-tip-phase-d`).** And it did what §9 said it
+> would: **it filed a production finding on its first capstone run** — bd `PRRO_GATE-2fr`.
+>
+> **The leaf.** `ReplenishLeaf::Ambiguous`, appended last. Our side is byte-identical to a refusal
+> (the persist rides in the envelope the reply commits), the peer re-bases onto the request it did
+> process. Both §9 trajectories are pinned: the stranded-then-reseeded one, and the healing variant
+> where a second, GRANTED replenish converges both sides with no operator at all. The stale exclusion
+> comment is fixed in `op.rs` and `interp.rs` — and the correction is not just "the capture landed":
+> the true blocker was that the harness had no peer to move, which is why the leaf belongs to this
+> axis rather than to RULING 2.
+>
+> **The finding — bd `PRRO_GATE-2fr` (P1).** Production's replenish refuses in two places, and they
+> sit on opposite sides of the wire: the undrained-backlog check at `offline_code_replenish.rs:245`
+> is PRE-wire, the S7-2 fence at `:402-411` is inside the persist envelope, i.e. POST-wire. So a
+> fence refusal happens after DPS has already answered and re-based — it protects our ledger and
+> cannot protect the chain. Same end state as `2ds`, reached with no ambiguity at all: the reply
+> arrives intact and we discard it. Reproduced deterministically
+> (`phase_d_the_s7_2_fence_refuses_after_the_wire_and_leaves_dps_ahead`), using a C-2 `NotTook` leaf
+> to raise the fence so the trajectory has exactly ONE divergence source.
+>
+> **What the capstone actually caught** was the model, not production: it had the two refusals in the
+> wrong order and treated both as if nothing had left the building. The model now mirrors prod's
+> ordering, and the fix is what turned an internal disagreement into an external finding. §4's row
+> 13c ("T=112 while a fence is active — refused in-envelope, seed holds") was right about our side
+> and silent about the peer's; that silence was the bug.
+>
+> **One trap worth carrying forward:** the peer's symbol for an ambiguous replenish must NOT be
+> minted from `codes_issued` — the harness re-syncs that counter from reality after every replenish,
+> and an ambiguous one grants no code, so the increment is rewound and the next fork mints the SAME
+> symbol, reading as "the peer never moved". It gets its own counter and its own ordinal namespace.
+
 **Phase D — ambiguous T=112 (`2ds`).** `ReplenishLeaf::Ambiguous` appended (its exclusion
 comment cites RULING 2 §4's "known-red until a live capture lands" — **stale**, the capture
 landed in #351; the true blocker was this axis — fix the comment here). Trajectory pin:

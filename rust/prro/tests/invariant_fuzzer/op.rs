@@ -160,14 +160,15 @@ impl DpsScript {
     }
 }
 
-/// bd `PRRO_GATE-2ds` / `PRRO_GATE-hpc` — the DECIDED outcomes of a T=112
-/// `ask_offline_codes` replenish.
+/// bd `PRRO_GATE-2ds` / `PRRO_GATE-hpc` — the outcomes of a T=112 `ask_offline_codes` replenish.
 ///
-/// **Deliberately only two leaves.** `RULING 2` §4
-/// (`docs/RULINGS_2026-07-10_SHIFT_T112_AUTOZ.md`) pins the ambiguous /
-/// transport-timeout branch as **known-red until a live capture lands**
-/// (bd `PRRO_GATE-2ds`, blocked on the operator), so the generator MUST NOT emit
-/// it: doing so would pin a contract that has no evidence behind it yet.
+/// **Three leaves since phase D.** The comment that used to sit here said the ambiguous /
+/// transport-timeout branch was "known-red until a live capture lands" per `RULING 2` §4
+/// (`docs/RULINGS_2026-07-10_SHIFT_T112_AUTOZ.md`) — that was STALE. The capture landed in #351, and
+/// the real blocker was something else entirely: the harness had no model of the PEER's tip, so an
+/// ambiguous replenish (where DPS processed the request and we never saw the reply) had no way to
+/// express "their chain moved and ours did not". The peer-tip axis is what unblocked it, which is
+/// why this leaf lands in its phase D and not before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplenishLeaf {
     /// DPS grants a code window.  Prod persists the codes (`INSERT OR IGNORE`),
@@ -177,6 +178,19 @@ pub enum ReplenishLeaf {
     Granted,
     /// DPS refuses server-side: NO codes persisted, NO seed advance, NO witness.
     ServerReject,
+    /// Peer-tip axis PHASE D (bd `PRRO_GATE-2ds`) — the reply is LOST in transport **after** DPS
+    /// processed the request.  **Appended LAST** (corpus-index preservation).
+    ///
+    /// Our side is byte-identical to a refusal: nothing is persisted, no code, no seed advance, no
+    /// witness — the envelope commits only on a successful reply.  The PEER, however, re-based onto
+    /// `sha256(request_xml)` exactly as it does for a granted one; it has no idea we never heard it.
+    ///
+    /// That asymmetry is the entire leaf, and it is why it could not be written before the axis
+    /// existed: "granted" and "ambiguous" are indistinguishable on our side of the wire, and differ
+    /// ONLY in where the peer's tip ends up. The consequence is a real-world trap — every later
+    /// document chains onto a tip DPS has moved past, earning `-12` until an operator reseeds to the
+    /// value DPS itself named.
+    Ambiguous,
 }
 
 /// Operation alphabet (spec §5).  Wire-hitting ops carry a [`DpsScript`]; there

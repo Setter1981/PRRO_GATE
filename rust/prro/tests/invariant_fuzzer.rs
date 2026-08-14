@@ -750,20 +750,36 @@ fn generator_emits_both_replenish_leaves() {
     let strat = strategy::op_sequence();
     let mut granted = 0usize;
     let mut rejected = 0usize;
+    // Peer-tip axis PHASE D — the third leaf joins the same anti-silent-zero count. It is the one
+    // whose absence would be hardest to notice: an ambiguous replenish looks like a refusal on our
+    // side, so a dropped arm costs nothing visible and quietly removes the only generative source
+    // of a peer-ahead chain fork.
+    let mut ambiguous = 0usize;
     for _ in 0..2000 {
         let seq = strat.new_tree(&mut runner).unwrap().current();
         for op in &seq {
             match op {
                 Op::Replenish(ReplenishLeaf::Granted) => granted += 1,
                 Op::Replenish(ReplenishLeaf::ServerReject) => rejected += 1,
+                Op::Replenish(ReplenishLeaf::Ambiguous) => ambiguous += 1,
                 _ => {}
             }
         }
     }
+    assert!(
+        ambiguous >= 60,
+        "the ambiguous T=112 leaf is under-emitted ({ambiguous} over 2000 seqs) — bd \
+         PRRO_GATE-2ds loses its generative coverage silently"
+    );
     // Density floor, same reasoning as the UnknownStatus lanes: a dropped arm gives 0 and a halved
     // weight roughly halves the count, so a floor well below the expected value still trips hard.
+    //
+    // Lowered 100 -> 60 when PHASE D appended the third leaf: `prop_oneof!` splits the weight
+    // evenly, so the per-leaf count fell from ~150 to ~97 (measured, not guessed) and the old floor
+    // would have RED-ed on a healthy generator. 60 keeps both teeth — a dropped arm still gives 0,
+    // and a halved weight lands near 48, under the floor.
     assert!(
-        granted >= 100 && rejected >= 100,
+        granted >= 60 && rejected >= 60,
         "Replenish under-emitted (granted={granted}, reject={rejected} over 2000 seqs) — the \
          appended arm is dropped or severely skewed (anti-silent-zero)"
     );
@@ -2702,6 +2718,312 @@ async fn phase_c1_the_no_exit_completion_is_generated_and_the_oracles_hold() {
         "the held document must have reached its RMR terminal through the real completion, got \
          {docs:?}"
     );
+}
+
+// ═══════════ peer-tip axis PHASE D — the ambiguous T=112 (bd PRRO_GATE-2ds) ═══════════
+
+/// A T=112 whose reply is lost leaves DPS a chain ahead of us — and the way out is the seed DPS
+/// itself names.
+///
+/// This is the trajectory the spec reserved for phase D, and it could not be written earlier: our
+/// side of an ambiguous replenish is byte-identical to a refusal (the persist rides in the same
+/// envelope as the reply, so nothing lands), and the ONLY difference is where the peer's tip ends
+/// up. Without a modelled peer there was nothing to assert.
+///
+///   1. an ambiguous replenish — we record nothing; DPS re-based onto the request it processed;
+///   2. the next document chains onto our stale tip → DPS refuses it `-12`, naming its own tip;
+///   3. the operator reseeds to that named value (guard-B disjunct (ii), corroborated);
+///   4. the FN issues again.
+///
+/// Steps 3-4 are what make it a recovery story rather than a bug report; step 2 is what makes it a
+/// trap. Both halves are asserted for the reason phase B learnt the hard way: a pin that stopped at
+/// the punishment would pass against a peer that can never be convinced, and one that skipped to the
+/// repair would pass against a peer with no memory.
+///
+/// *Tooth:* make the ambiguous leaf leave the peer where it was (i.e. model it as a plain refusal)
+/// and step 2's hold never appears — the trap is gone and the pin REDs.
+#[tokio::test]
+async fn phase_d_ambiguous_t112_strands_us_behind_and_the_named_seed_recovers() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.peer_enable_derived_rejects();
+
+    // 1 — a predecessor sell, so both sides start on a document they agree about.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let agreed_tip = ctx
+        .peer_tip_hex()
+        .expect("an accepted send moves the peer onto that document");
+
+    // 2 — the ambiguous replenish. Client-side: a refusal, nothing persisted.
+    let out = interp::run_op(&mut ctx, &Op::Replenish(ReplenishLeaf::Ambiguous)).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Refused(_)),
+        "a lost reply must persist NOTHING — the codes, the seed advance and the witness all ride \
+         in the envelope the reply commits, got {out:?}"
+    );
+    assert_eq!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)).as_deref(),
+        Some(agreed_tip.as_str()),
+        "our chain must not have moved — that is what makes this ambiguous rather than granted"
+    );
+    let peer_after = ctx
+        .peer_tip_hex()
+        .expect("DPS processed the request, so its tip re-based");
+    assert_ne!(
+        peer_after, agreed_tip,
+        "DPS re-based onto the request it processed; if its tip also held there is no divergence \
+         and the rest of this pin proves nothing"
+    );
+
+    // 3 — the trap. The next document chains onto a tip DPS has moved past.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_some(),
+        "a send onto a stale tip must earn the derived -12 and a completable hold — otherwise an \
+         operator would never learn their chain forked. peer_tip={:?} our_seed={:?}",
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+
+    // 4 — the way out: reseed to the value DPS named in `store`.
+    let named: [u8; 32] = hex_to_32(&peer_after);
+    let repair = interp::operator_complete_macreseed(&ctx, named).await;
+    assert!(
+        matches!(repair, interp::RealOutcome::Released(_)),
+        "MacReseed to the tip DPS itself named is corroborated (guard-B disjunct ii) and must \
+         release, got {repair:?}"
+    );
+
+    // 5 — and the FN works again.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_none(),
+        "after the corroborated reseed the chains agree, so the next document must go through. \
+         peer_tip={:?} our_seed={:?}",
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+}
+
+/// The other exit, and the cheaper one: a GRANTED replenish HEALS the fork without an operator.
+///
+/// Live-anchored **[N=1]** (the H2 capture): handed a T=112 whose embedded tip is STALE — a value
+/// DPS has seen before — DPS accepts and re-bases rather than answering `-12`, so both sides land on
+/// the same fresh `sha256(request_xml)`. That is a different input class from the never-seen value
+/// of `bd PRRO_GATE-knk`, which DPS refuses; the axis models both and neither may be restated as the
+/// general rule.
+///
+/// Operationally this is the good news buried in `2ds`: an operator who simply asks for codes again
+/// gets their chain back, with no reseed and no `-12` in between. The pin asserts exactly that
+/// sequence with the derived `-12` armed — so if the second replenish did NOT converge the two
+/// sides, the following send would be refused.
+///
+/// *Tooth:* make the granted replenish move only OUR side (drop the peer's convergence) and the
+/// final send earns a `-12` — the last assertion REDs.
+#[tokio::test]
+async fn phase_d_a_granted_replenish_heals_the_ambiguous_fork() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.peer_enable_derived_rejects();
+
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let agreed_tip = ctx.peer_tip_hex().expect("an accepted send moves the peer");
+
+    // 1 — the fork.
+    let _ = interp::run_op(&mut ctx, &Op::Replenish(ReplenishLeaf::Ambiguous)).await;
+    assert_ne!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(agreed_tip.as_str()),
+        "the ambiguous replenish must move the peer, or there is no fork to heal"
+    );
+
+    // 2 — ask again, and this time the reply arrives. Both sides re-base onto the same request.
+    let out = interp::run_op(&mut ctx, &Op::Replenish(ReplenishLeaf::Granted)).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Replenished { .. }),
+        "a fresh T=112 on a STALE embedded tip is ACCEPTED [N=1 live] — DPS re-bases rather than \
+         refusing, got {out:?}"
+    );
+    assert_eq!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)),
+        ctx.peer_tip_hex(),
+        "the grant is a CONVERGENCE: both sides land on sha256(request_xml). Without this the \
+         'healing' claim is just a hopeful comment"
+    );
+
+    // 3 — and the FN carries on, with no operator involved anywhere in this trajectory.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_none(),
+        "after the healing grant the next document must go through — an operator should never have \
+         had to touch this FN. peer_tip={:?} our_seed={:?}",
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+}
+
+/// bd `PRRO_GATE-2fr` — the S7-2 fence refuses a replenish **after** the wire, so it protects the
+/// ledger and not the chain.
+///
+/// Found by the capstone the first time the ambiguous leaf was generated, then confirmed against
+/// production's own ordering:
+///   * `count_undrained_diverging_offline_docs` refuses BEFORE the wire
+///     (`offline_code_replenish.rs:245`) — DPS never sees a request, nothing forks;
+///   * `ask_offline_codes` is the wire (`:296`);
+///   * `fn_fence_active_tx` refuses INSIDE the persist envelope (`:402-411`) — i.e. AFTER DPS has
+///     already answered.
+///
+/// So on the fence path DPS issued a code window and re-based its chain onto that request, while we
+/// persisted nothing: no codes, no seed advance, no witness. The comment on the fence calls it
+/// "guards the tip against a fork at cutover", and against a LOCAL fork it does. Against the peer's
+/// it cannot — by the time it runs, the peer has already moved.
+///
+/// This pin drives the whole consequence rather than just the tip comparison: the FN is left issuing
+/// documents onto a stale chain, and the very next one is refused `-12`. The divergence is
+/// manufactured with a C-2 `NotTook` leaf precisely so there is exactly ONE source of it — the
+/// fence — and no ambiguity to blame it on.
+///
+/// **Not a claim about DPS's internals.** That a processed T=112 re-bases its tip rests on the
+/// `[N=1]` H2 capture, and the whole model of the peer rests on it too. If that ever turns out to be
+/// wrong, this pin is where it should be re-argued.
+///
+/// *Tooth:* make the harness treat the fence refusal as pre-wire (leave the peer put) and step 4's
+/// `-12` never fires.
+#[tokio::test]
+async fn phase_d_the_s7_2_fence_refuses_after_the_wire_and_leaves_dps_ahead() {
+    let mut ctx = interp::FuzzCtx::new_online_open_shift().await;
+    ctx.peer_enable_derived_rejects();
+
+    // 1 — a predecessor sell; both sides agree.
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let agreed_tip = ctx.peer_tip_hex().expect("an accepted send moves the peer");
+
+    // 2 — a HELD send the peer did NOT take. This raises the fence (a PENDING_APPLY reservation)
+    //     without moving either tip: the one and only divergence source in this pin is step 3.
+    let _ = interp::run_op(
+        &mut ctx,
+        &Op::OnlineSell(DpsScript::held_with_peer(PeerTruth::NotTook)),
+    )
+    .await;
+    assert!(
+        ctx.active_held_reservation().await.is_some(),
+        "the hold is what raises the S7-2 fence — without it this pin tests nothing"
+    );
+    assert_eq!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(agreed_tip.as_str()),
+        "the held document was NOT taken, so both sides are still on the predecessor"
+    );
+
+    // 3 — the replenish. Production refuses it — but only after DPS has answered.
+    let out = interp::run_op(&mut ctx, &Op::Replenish(ReplenishLeaf::Granted)).await;
+    assert!(
+        matches!(&out, interp::RealOutcome::Refused(r) if r.contains("fence")),
+        "the S7-2 fence must refuse the persist, got {out:?}"
+    );
+    assert_eq!(
+        ctx.read_seed().await.map(|s| hex_of_slice(&s)).as_deref(),
+        Some(agreed_tip.as_str()),
+        "and it must refuse COMPLETELY on our side — no seed advance, no codes, no witness"
+    );
+    assert_ne!(
+        ctx.peer_tip_hex().as_deref(),
+        Some(agreed_tip.as_str()),
+        "THE FINDING: DPS answered before the fence ran, so its chain moved while ours did not. \
+         A fence that runs after the wire cannot prevent this fork — it can only decline to record \
+         our half of it"
+    );
+
+    // 4 — the consequence. Release the hold honestly (DPS did not take that document), and the very
+    //     next issuance is refused by DPS for a chain it moved past while we were being careful.
+    let released = interp::run_op(
+        &mut ctx,
+        &Op::OperatorComplete(OperatorResolutionKind::NotAccepted),
+    )
+    .await;
+    assert!(
+        matches!(released, interp::RealOutcome::Released(_)),
+        "the operator resolves the hold correctly, got {released:?}"
+    );
+    let _ = interp::run_op(&mut ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        ctx.active_held_reservation().await.is_some(),
+        "the FN is now issuing onto a stale chain and DPS refuses it -12 — the operator is left \
+         reseeding after an operation the gateway itself declined to record. peer_tip={:?} \
+         our_seed={:?}",
+        ctx.peer_tip_hex(),
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+}
+
+/// The MODEL must name the fork too — and name a DIFFERENT tip each time.
+///
+/// Two assertions, and the second is the one with a bug behind it. The model re-syncs `codes_issued`
+/// from reality after every replenish (prod dedups by value, so reality owns that count), and an
+/// ambiguous replenish grants no code — so minting the peer's symbol from that counter would be
+/// rewound by the re-sync, and the NEXT ambiguous replenish would mint the same symbol. Two
+/// consecutive forks would then read as "the peer never moved", which is silent and exactly wrong.
+/// Hence `ambiguous_t112_count` and its own ordinal namespace.
+///
+/// *Tooth, RUN:* point the arm back at `codes_issued` and the distinctness assertion REDs; drop the
+/// peer move entirely and the first assertion REDs.
+#[test]
+fn phase_d_model_names_a_fresh_peer_tip_per_ambiguous_replenish() {
+    let mut model = RefModel::new_online_open_shift();
+    let before = model.peer_tip;
+
+    let out = model.apply(&Op::Replenish(ReplenishLeaf::Ambiguous));
+    assert_eq!(
+        out,
+        ExpectedOutcome::Replenish { granted: false },
+        "our side of a lost reply is a refusal — nothing is persisted, because the persist rides in \
+         the envelope the reply commits"
+    );
+    let first = model.peer_tip;
+    assert_ne!(
+        first, before,
+        "the peer processed the request and re-based; a model that leaves its mirror put cannot \
+         predict the `-12` the next document will earn"
+    );
+    assert_eq!(
+        model::model_tip_class(first),
+        model::ModelTipClass::NonDoc,
+        "the peer's new tip is `sha256(request_xml)` — a NON-document value, and the model must say \
+         so rather than aliasing it onto a document ordinal"
+    );
+
+    // The trap: a second fork must not reuse the first one's symbol.
+    model.codes_issued = 0; // what the harness's post-replenish re-sync does
+    let _ = model.apply(&Op::Replenish(ReplenishLeaf::Ambiguous));
+    assert_ne!(
+        model.peer_tip, first,
+        "a second ambiguous replenish must mint a DISTINCT tip — reusing the first reads as 'the \
+         peer stayed put', which is the one wrong answer this axis must never give"
+    );
+}
+
+/// End to end: the model's mirror and the harness peer must still agree across an ambiguous
+/// replenish.
+///
+/// `run_harness` projects both onto `{Genesis, Doc(lnd), NonDoc}` after every op. The ambiguous leaf
+/// is the first event that moves the peer while our side records nothing at all, so it is the one
+/// place where "the model predicts the peer independently" has to survive a step with no ledger
+/// evidence whatsoever.
+///
+/// *Tooth, RUN:* give the model's arm a Doc-class symbol (a positive ordinal) instead of a non-doc
+/// one and this REDs inside `run_harness` with the mirror assertion.
+#[tokio::test]
+async fn phase_d_model_and_harness_agree_across_an_ambiguous_replenish() {
+    let ctx = interp::FuzzCtx::new_online_open_shift().await;
+    let model = RefModel::new_online_open_shift();
+    let _ = run_harness(
+        &[
+            Op::OnlineSell(DpsScript::ack_path()),
+            Op::Replenish(ReplenishLeaf::Ambiguous),
+            Op::Replenish(ReplenishLeaf::Granted),
+        ],
+        ctx,
+        model,
+    )
+    .await;
 }
 
 /// Peer-tip axis PHASE C — the ONE place reality's tip vocabulary is translated into the model's.

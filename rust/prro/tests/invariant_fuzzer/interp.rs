@@ -628,6 +628,11 @@ impl FuzzCtx {
         self.peer.converge_to(tip);
     }
 
+    /// Peer-tip axis PHASE D — the peer processed a request whose reply never reached us.
+    pub fn peer_advance_without_us(&self, tip: Vec<u8>, reason: &str) {
+        self.peer.advance_without_us(tip, reason);
+    }
+
     /// Offline documents that are locally issued but NOT yet delivered — the
     /// backlog a drain still owes DPS.  `bd PRRO_GATE-knk` turns on whether this
     /// is zero when a T=112 moves the chain.
@@ -2425,9 +2430,11 @@ async fn l5_probe(ctx: &mut FuzzCtx, kind: L5Kind) -> RealOutcome {
 /// Re-implementing those effects here instead of driving the service would make the oracle agree with
 /// itself by construction — so the fixture owns a real `App` and this arm calls production.
 ///
-/// Scope (RULING 2 §4): only the DECIDED leaves.  `Granted` and `ServerReject` are contractually
-/// settled; the ambiguous / transport-timeout branch stays out until the live capture lands
-/// (bd `PRRO_GATE-2ds`).
+/// Scope: all three leaves since PHASE D.  `Granted` and `ServerReject` are the contractually
+/// settled pair; `Ambiguous` (bd `PRRO_GATE-2ds`) joined once the axis could express its whole
+/// content — the peer moving while we record nothing.  The note that used to sit here cited
+/// `RULING 2` §4's "known-red until a live capture lands"; the capture landed in #351, and the real
+/// blocker was the missing peer.
 ///
 /// Codes are made unique per call from the ctx sequence so a second replenish in one case exercises a
 /// genuine INSERT rather than colliding with the previous window's dedup.
@@ -2447,7 +2454,18 @@ async fn replenish(ctx: &mut FuzzCtx, leaf: ReplenishLeaf) -> RealOutcome {
                 message: "fuzzer: T=112 server reject".into(),
             }))
         }
+        // PHASE D (bd PRRO_GATE-2ds): the reply is lost in transport. Client-side indistinguishable
+        // from any other failed replenish — the difference is entirely on the peer, below.
+        ReplenishLeaf::Ambiguous => {
+            dps.push_ask_codes(Err(prro::transports::dps::error::DpsError::Transport(
+                "fuzzer: T=112 reply lost after DPS processed the request".into(),
+            )))
+        }
     }
+    // Keep a typed handle to the stub: the service takes it as `Arc<dyn DpsChannel>`, and the
+    // PHASE D peer mover below needs the concrete call log to tell a pre-wire refusal from a lost
+    // reply.
+    let spy = Arc::clone(&dps);
     let svc =
         prro::services::offline_sync::offline_code_replenish::OfflineCodeReplenishService::new(
             ctx.app.clone(),
@@ -2499,8 +2517,52 @@ async fn replenish(ctx: &mut FuzzCtx, leaf: ReplenishLeaf) -> RealOutcome {
                 new_seed,
             }
         }
-        Err(e) => RealOutcome::Refused(format!("{e:?}")),
+        Err(e) => {
+            // Peer-tip axis PHASE D — an AMBIGUOUS replenish moves the peer alone.
+            //
+            // Gated on the wire actually having happened, and that gate is load-bearing rather than
+            // defensive: production refuses a replenish BEFORE the wire in two states the generator
+            // reaches constantly — an active delivery fence (S7-2) and an undrained offline backlog
+            // (bd PRRO_GATE-knk). In both, DPS never saw a request, so its tip cannot have moved,
+            // and advancing the peer here would manufacture a divergence production could not
+            // produce. The stub's own call log is the witness; the error text is not (a refusal and
+            // a lost reply are both just `Err`).
+            let reached_dps = spy
+                .calls()
+                .iter()
+                .any(|c| matches!(c, crate::common::scripted_dps::DpsCall::AskCodes(_)));
+            // Which leaves leave DPS having PROCESSED the request: a granted one obviously, and an
+            // ambiguous one by definition (the reply existed, we just never saw it). A server
+            // reject did not — DPS refused and its tip holds.
+            let dps_processed_it =
+                matches!(leaf, ReplenishLeaf::Granted | ReplenishLeaf::Ambiguous);
+            if reached_dps && dps_processed_it {
+                ctx.peer_advance_without_us(
+                    ambiguous_replenish_tip(seq),
+                    "T=112 processed by DPS while our side persisted nothing — its chain re-based, \
+                     ours did not (bd PRRO_GATE-2ds for the lost reply; bd PRRO_GATE-2fr for the \
+                     post-wire fence refusal)",
+                );
+            }
+            RealOutcome::Refused(format!("{e:?}"))
+        }
     }
+}
+
+/// Peer-tip axis PHASE D — the tip DPS re-bases onto after an AMBIGUOUS T=112.
+///
+/// A real one is `sha256(request_xml)`, which the client cannot compute here: the reply carrying it
+/// is precisely what was lost. So the harness mints a distinct synthetic value per call — distinct
+/// because two ambiguous replenishes in one sequence must not alias into "the peer stayed put", and
+/// synthetic because the honest statement is "some value only DPS knows".
+///
+/// The leading `0x2d` byte keeps it clear of `synth_unsigned_hash` (document ordinals, big-endian in
+/// the first 8 bytes) and of [`DPS_RECOVERY_TIP`] (`0xd9…`), so a tip can always be attributed to the
+/// mechanism that produced it.
+fn ambiguous_replenish_tip(seq: u64) -> Vec<u8> {
+    let mut tip = vec![0x2du8; 32];
+    tip[24..32].copy_from_slice(&seq.to_be_bytes());
+    tip
 }
 
 /// L6 — X-report (поточний звіт) through the REAL ingress dispatch.

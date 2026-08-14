@@ -238,6 +238,21 @@ impl PeerLedger {
         g.tip = tip;
     }
 
+    /// Peer-tip axis PHASE D — the peer moves and we do NOT: it processed a request whose reply we
+    /// never received (an ambiguous T=112).
+    ///
+    /// The mirror image of `converge_to`, and deliberately a separate method rather than a flag on
+    /// it: the two differ by whether the run has DIVERGED, which is the only thing that decides
+    /// whether the next send earns a derived `-12`. Collapsing them into one call with a boolean is
+    /// exactly how a caller ends up recording a convergence for a divergence.
+    pub fn advance_without_us(&self, tip: Vec<u8>, reason: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.tip = Some(tip);
+        if g.diverged.is_none() {
+            g.diverged = Some(reason.to_string());
+        }
+    }
+
     pub fn mismatches(&self) -> Vec<PeerMismatch> {
         self.inner.lock().unwrap().mismatches.clone()
     }
