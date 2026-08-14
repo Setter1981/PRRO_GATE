@@ -86,6 +86,25 @@ pub enum DpsCall {
 /// becomes if it accepts.
 type OutgoingDoc = (i64, String, Option<Vec<u8>>, Option<Vec<u8>>);
 
+/// Peer-tip axis PHASE C-2 — what the peer did with a document whose reply told the client
+/// NOTHING.  The fuzzer's `op::PeerTruth` maps onto this; the two are separate types on purpose:
+/// `op.rs` is the fuzzer's own alphabet and this stub is shared with ten other test binaries that
+/// must not gain a dependency on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAcceptance {
+    /// The peer TOOK the document — its tip advances onto it while ours holds.  A real divergence,
+    /// declared rather than guessed.
+    Took,
+    /// The peer did NOT take it — both tips hold, so the run has NOT diverged and every downstream
+    /// assertion stays live.  This is the branch that buys back assertion coverage.
+    NotTook,
+}
+
+/// One queued `send_chk` answer: the reply the CLIENT sees, plus — for a held reply — what the peer
+/// actually did with the document (phase C-2).  The pair travels together so a truth can never be
+/// mis-attributed to a different send than the one it was enqueued with.
+type ScriptedSend = (Result<CheckAck, DpsError>, Option<PeerAcceptance>);
+
 /// One observed disagreement between the outgoing document's chain link and the
 /// peer's tip, recorded on a run that had NOT yet diverged.
 #[derive(Debug, Clone)]
@@ -111,6 +130,11 @@ struct PeerInner {
     /// Sends the stub could not attribute to a row (diagnostic only — a growing
     /// count means the resolver needs work, not that production is wrong).
     unresolved_sends: usize,
+    /// Peer-tip axis PHASE C-2 — the document handed over on the LAST `send_chk`, kept so a
+    /// `Crash(Send)` (which drops the future before any reply is popped, so `apply_reply` never
+    /// runs) can still be told what the peer did with it.  The envelope was delivered; only the
+    /// answer was lost.
+    in_flight: Option<OutgoingDoc>,
     /// PHASE B — may the peer REFUSE a mismatched send with a derived `-12`?
     ///
     /// OFF by default, and that default is the phase boundary, not timidity. The
@@ -226,6 +250,12 @@ impl PeerLedger {
         self.inner.lock().unwrap().tip.as_deref().map(hex_lower)
     }
 
+    /// The peer's tip as raw bytes — phase C projects it onto a document ordinal so the MODEL's
+    /// independently-derived mirror can be compared against it.
+    pub fn tip(&self) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().tip.clone()
+    }
+
     /// Resolve the document currently on the wire.
     ///
     /// By state, NOT by `local_number`: `build_send_envelope` hard-overrides
@@ -250,12 +280,47 @@ impl PeerLedger {
         }
     }
 
+    /// Peer-tip axis PHASE C-2 — apply the generator's named peer truth to the document that is (or
+    /// was) on the wire, and report whether the peer's tip moved.
+    ///
+    /// `Took` advances the peer onto the document and marks the run diverged: the peer holds a
+    /// document we do not know it holds, which is a REAL divergence — the point is that it is now a
+    /// KNOWN one, so the model can keep mirroring instead of falling silent.  `NotTook` moves
+    /// nothing and, crucially, does NOT mark the run diverged: both sides still agree, so phase A's
+    /// mismatch assertion and the model's mirror both keep their teeth for the rest of the run.
+    fn apply_peer_truth(&self, doc: Option<&OutgoingDoc>, truth: PeerAcceptance) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        match truth {
+            PeerAcceptance::Took => {
+                let Some((_, _, _, Some(unsigned))) = doc else {
+                    return false;
+                };
+                g.tip = Some(unsigned.clone());
+                if g.diverged.is_none() {
+                    g.diverged =
+                        Some("peer TOOK a held document (phase C-2 leaf) — our side holds".into());
+                }
+                true
+            }
+            PeerAcceptance::NotTook => false,
+        }
+    }
+
+    /// Peer-tip axis PHASE C-2 — resolve the truth of a document whose reply NEVER CAME (a
+    /// `Crash(Send)`): the envelope was delivered and the future dropped before the pop, so the
+    /// scripted leaf is provably never consumed and the choice has to arrive out-of-band.
+    pub fn resolve_in_flight(&self, truth: PeerAcceptance) {
+        let doc = self.inner.lock().unwrap().in_flight.clone();
+        self.apply_peer_truth(doc.as_ref(), truth);
+    }
+
     /// Called by the stub BEFORE the reply is produced: compare the outgoing
     /// document's chain link against the peer tip.  Returns the resolved row so
     /// the caller can advance the tip once the reply is known.
     async fn observe_send(&self) -> Option<OutgoingDoc> {
         let resolved = self.resolve_outgoing().await;
         let mut g = self.inner.lock().unwrap();
+        g.in_flight = resolved.clone();
         match &resolved {
             None => {
                 g.unresolved_sends += 1;
@@ -280,7 +345,23 @@ impl PeerLedger {
     /// `unsigned_xml_sha256`.  This is the send-`Ack` moment, NOT the whole
     /// script: an `[Ack, NotFound]` tail is the K4 empty-quittance ("accepted,
     /// quittance lagging"), so the peer HAS taken it.
-    fn apply_reply(&self, resolved: Option<OutgoingDoc>, reply: &Result<CheckAck, DpsError>) {
+    fn apply_reply(
+        &self,
+        resolved: Option<OutgoingDoc>,
+        reply: &Result<CheckAck, DpsError>,
+        truth: Option<PeerAcceptance>,
+    ) {
+        // Peer-tip axis PHASE C-2 — an ANNOTATED held leaf answers the question the reply cannot,
+        // so it takes precedence over the "unknowable" fallback below.  It applies only to the held
+        // class: an accepting or `-12` reply says what the peer did all by itself, and letting an
+        // annotation contradict a reply the client actually received would model a Byzantine peer
+        // (excluded, spec §10).
+        if let Some(truth) = truth {
+            if matches!(reply, Err(e) if !is_named_peer_verdict(e)) {
+                self.apply_peer_truth(resolved.as_ref(), truth);
+                return;
+            }
+        }
         let mut g = self.inner.lock().unwrap();
         match reply {
             Ok(_) => {
@@ -312,6 +393,16 @@ impl PeerLedger {
             }
         }
     }
+}
+
+/// Peer-tip axis PHASE C-2 — does this error carry the PEER's own verdict on the document?
+///
+/// A `Server` envelope (a business reject, a `-12` naming the peer's tip) and an `Authorization`
+/// reject are the peer speaking: it parsed the document and refused it.  Everything else — transport
+/// collapse, a decode failure, an unusable server fiscal id — is the HELD class, where the client
+/// learns nothing and a generator annotation is the only thing that can say what happened.
+fn is_named_peer_verdict(e: &DpsError) -> bool {
+    matches!(e, DpsError::Server { .. } | DpsError::Authorization { .. })
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -347,7 +438,11 @@ fn extract_store_hash(message: &str) -> Option<Vec<u8>> {
 /// restart" assertions), an ordered call log, and an optional per-method hang
 /// hook for cancellation-injection.
 pub struct ScriptedDps {
-    send_q: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
+    /// Peer-tip axis PHASE C-2 — each send response carries an OPTIONAL peer truth, in the queue
+    /// itself rather than in a parallel one.  A second queue would have to be kept in lockstep by
+    /// hand at every `push_send` call site (ten test binaries' worth), and the first site that
+    /// forgot would silently mis-attribute a truth to the wrong document.
+    send_q: Mutex<VecDeque<ScriptedSend>>,
     last_q: Mutex<VecDeque<Result<CheckAck, DpsError>>>,
     send_calls: Arc<AtomicUsize>,
     last_calls: Arc<AtomicUsize>,
@@ -408,7 +503,14 @@ impl ScriptedDps {
     }
 
     pub fn push_send(&self, r: Result<CheckAck, DpsError>) {
-        self.send_q.lock().unwrap().push_back(r);
+        self.send_q.lock().unwrap().push_back((r, None));
+    }
+
+    /// Peer-tip axis PHASE C-2 — enqueue a HELD send response together with what the peer did with
+    /// the document.  The reply the client sees is unchanged; the annotation only reaches the
+    /// harness peer, which is the whole point: production must not be able to tell the difference.
+    pub fn push_send_with_peer(&self, r: Result<CheckAck, DpsError>, truth: PeerAcceptance) {
+        self.send_q.lock().unwrap().push_back((r, Some(truth)));
     }
 
     /// CS-3 Slice E: enqueue a REAL-decode observation OVERRIDE for the next `send_chk_observed`
@@ -480,11 +582,15 @@ impl DpsChannel for ScriptedDps {
             let _ = block.await;
         }
         let popped = self.send_q.lock().unwrap().pop_front();
-        let reply = popped.unwrap_or_else(|| {
-            Err(DpsError::Internal(
-                "ScriptedDps.send_chk: response queue empty (over-call / caller forgot to enqueue)"
-                    .to_string(),
-            ))
+        let (reply, peer_truth) = popped.unwrap_or_else(|| {
+            (
+                Err(DpsError::Internal(
+                    "ScriptedDps.send_chk: response queue empty (over-call / caller forgot to \
+                     enqueue)"
+                        .to_string(),
+                )),
+                None,
+            )
         });
         // Peer-tip axis phase B: the peer may refuse a document that does not
         // chain onto its tip, whatever the script said. The leaf is popped ABOVE
@@ -497,7 +603,7 @@ impl DpsChannel for ScriptedDps {
             None => reply,
         };
         if let Some(peer) = &self.peer {
-            peer.apply_reply(resolved, &reply);
+            peer.apply_reply(resolved, &reply, peer_truth);
         }
         reply
     }

@@ -40,6 +40,28 @@ Two tiers, driven by `scripts/mutation/run.sh`:
   itself is unaffected and the baseline is only rewritten by `full`, but do not
   prune `survivors.txt` from that list (bd `PRRO_GATE-a0d`).
 
+### Refusals — why the gate exits non-zero without a survivor
+
+The gate was VACUOUS and fail-OPEN for three weeks (bd `PRRO_GATE-1rw`): it derived its
+verdict from an empty `missed.txt` and never asked WHY that file was empty. Each refusal
+below is a way "empty" happened while nothing was tested, and each has a tooth in
+`run_teeth.sh`:
+
+| exit | refusal |
+|------|---------|
+| 1 | a NEW survivor vs the baseline — the ratchet, the only *finding* in this table |
+| 2 | diff paths went repo-relative again (`--relative` dropped) — `--in-diff` would match nothing |
+| 3 | the unmutated baseline failed, or mutants were found and none tested |
+| 4 | cargo-mutants died before writing `outcomes.json` |
+| 5 | **zero mutants, and the mechanism could not be proven live** |
+
+Exit 5 is the last hole closed. A zero CAN be legitimate — a comment-only diff mutates
+nothing — so it is not fatal by itself. Instead the gate synthesises a one-line diff at a
+mutant cargo-mutants can enumerate *right now* and feeds it back through the same
+`--in-diff` path: that diff is known-good by construction, so if it matches nothing, the
+zero is the mechanism rather than the change, and the gate refuses. Costs ~1.3 s, and only
+on the zero path.
+
 ## How to run
 
 ```bash

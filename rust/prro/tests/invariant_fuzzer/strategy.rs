@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, ReplenishLeaf, Stage};
+use crate::op::{DpsScript, L5Kind, Op, OperatorResolutionKind, PeerTruth, ReplenishLeaf, Stage};
 
 /// The result-able wire-response shapes for a wire op.  `timeout_at_call` is
 /// intentionally EXCLUDED — the timeout SCENARIO is realized via `Crash`
@@ -28,6 +28,16 @@ fn dps_script() -> impl Strategy<Value = DpsScript> {
         // directed corpus (`directed_unknown_status_probe.rs` + the fuzzer's directed pins) covers
         // `-17` / outside-enum. Feeds the REAL decode via `interp::load_script` obs-override.
         Just(DpsScript::unknown_status(-4)),
+        // Peer-tip axis PHASE C-2 — APPENDED LAST (corpus seed indices preserved): the HELD leaf
+        // whose PEER-side truth the generator names. Client-side it is `Superseded` byte for byte,
+        // so it adds no new production contract to verify; what it adds is that the model's peer
+        // mirror keeps asserting THROUGH the hold instead of falling silent (`peer_unknown`).
+        // Both branches are emitted: `NotTook` keeps the two sides in agreement (so every
+        // downstream assertion stays live), `Took` manufactures a KNOWN divergence — the shape an
+        // operator's `Accepted` claim resolves correctly and a `NotAcceptedOffline` claim cannot
+        // (spec §5, the C.1 constraint).
+        Just(DpsScript::held_with_peer(PeerTruth::Took)),
+        Just(DpsScript::held_with_peer(PeerTruth::NotTook)),
     ]
 }
 
@@ -185,6 +195,11 @@ fn op() -> impl Strategy<Value = Op> {
             Just(ReplenishLeaf::ServerReject),
         ]
         .prop_map(Op::Replenish),
+        // Peer-tip axis PHASE C-2 — APPENDED LAST (corpus-index preservation). `Crash(Send)` with
+        // the peer's truth named: its scripted leaf is provably never consumed (the hang hook
+        // precedes the pop), so the choice cannot ride on the script and gets its own dimension.
+        // The plain `Crash(Send)` above stays — it is the "nobody can say" case, and both are real.
+        prop_oneof![Just(PeerTruth::Took), Just(PeerTruth::NotTook)].prop_map(Op::CrashSend),
     ]
 }
 

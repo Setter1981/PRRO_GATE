@@ -40,6 +40,24 @@ pub const DPS_RECOVERY_TIP: [u8; 32] = [
     0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x0d, 0x15, 0x2c, 0x0d,
 ];
 
+/// Peer-tip axis PHASE C-2 (spec §5) — the PEER's side of a HELD wire outcome, NAMED by the
+/// generator because the wire itself cannot say it.
+///
+/// A held outcome is precisely one where no trusted envelope came back, so "did DPS take the
+/// document" has no answer on the client side — production holds exactly because it cannot know.
+/// The peer, however, DID one of the two things. Phase C-1 (the axis's own phase A/B) modelled that
+/// as ignorance on both sides; C-2 splits it into the two worlds, so the model's mirror keeps
+/// asserting through a hold instead of falling silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerTruth {
+    /// DPS accepted the document; its tip advanced onto it.  We hold ⇒ the chains DIVERGE, which is
+    /// the real-world shape an operator's `Accepted` claim would (correctly) resolve.
+    Took,
+    /// DPS did not take it; its tip holds.  The chains still AGREE — which is what makes this branch
+    /// the valuable one: nothing diverged, so every downstream assertion stays live.
+    NotTook,
+}
+
 /// One DPS wire-call response (spec §5).  Not mapped to `Result<CheckAck, _>`
 /// here — that is the Task 2 interpreter's job.  Pure enumerable data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,6 +76,21 @@ pub enum WireResponse {
     /// `Indeterminate` degrades to `NoResponse` in `observe_faithful_from_legacy`, losing the
     /// `ProbeRequired` classification (see `interp::load_script` + `ScriptedDps` obs-override).
     UnknownStatus(i32),
+    /// Peer-tip axis PHASE C-2 (spec §5, §4 rows 3 + 9) — a HELD send whose PEER-side truth is
+    /// ANNOTATED by the generator.  **Appended LAST** (corpus-seed indices preserved).
+    ///
+    /// OUR side is byte-identical to [`WireResponse::Superseded`]: the same
+    /// `ServerFiscalIdMismatch` reaches the same production routing (`WrapperBug` → a recorded HOLD,
+    /// doc `SENDING` under `PENDING_APPLY`, node `STOP_MODE`).  That identity is deliberate — the
+    /// leaf must add a peer fact, never a new client-side contract to re-verify; the whole delta
+    /// lives on the other side of the wire.
+    ///
+    /// Why `Superseded` and not `Timeout`: `Timeout` is generator-EXCLUDED (its scenario is realized
+    /// via `Crash` drop-injection), so its client-side routing has no differential coverage to
+    /// inherit.  And the choice is honest for this leaf — a mismatched server fiscal id means the
+    /// reply came back UNUSABLE, which is exactly a state where DPS may or may not hold the
+    /// document.
+    HeldWithPeer(PeerTruth),
 }
 
 /// An ORDERED queue of per-call wire responses for a wire-hitting op.  A real
@@ -111,6 +144,12 @@ impl DpsScript {
     /// is what made it look real — see `bd PRRO_GATE-3uo`.
     pub fn bad_hash_prev() -> Self {
         Self(vec![WireResponse::BadHashPrev])
+    }
+
+    /// Peer-tip axis PHASE C-2 — the HELD send of [`WireResponse::HeldWithPeer`]: one response, the
+    /// leaf HOLDS (no `last_chk` follows a held send), and the peer's truth rides along.
+    pub fn held_with_peer(truth: PeerTruth) -> Self {
+        Self(vec![WireResponse::HeldWithPeer(truth)])
     }
 
     /// CS-3 Slice E: the DPS returns a parsed envelope with an unnamed non-zero status `code`
@@ -235,6 +274,19 @@ pub enum Op {
     /// seam against the doc held by the most-recent wire op; a no-op when no held reservation rests.
     /// **Appended LAST** (preserves the `Op` discriminant order the regression corpus depends on).
     OperatorComplete(OperatorResolutionKind),
+    /// Peer-tip axis PHASE C-2 (spec §4 row 12, §5) — `Crash(Stage::Send)` with the PEER's truth
+    /// named.  **Appended LAST** (same corpus rule).
+    ///
+    /// A separate op rather than an annotated leaf because the leaf is provably never consumed: the
+    /// crash parks INSIDE the `send_chk` await, after the envelope was handed over and the spy
+    /// recorded it, but BEFORE the response queue is popped (`scripted_dps.rs`, the hang hook
+    /// precedes the pop).  So the script has no say here — the choice has to be its own generator
+    /// dimension, which is exactly what the spec's §5 says and what row 12 records.
+    ///
+    /// `NotTook` is the branch that buys coverage back: a bare `Crash(Send)` marks the run diverged
+    /// forever, so phase A's mismatch assertion is dead for the whole REST of the sequence.  With
+    /// the peer's refusal named, the two sides still agree and the assertion keeps its teeth.
+    CrashSend(PeerTruth),
 }
 
 /// The operator's verified resolution of a HELD reservation.  A test-local mirror of the prod

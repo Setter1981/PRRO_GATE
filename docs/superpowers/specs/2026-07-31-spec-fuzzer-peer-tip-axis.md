@@ -144,6 +144,28 @@ Rev1's "peer is definite, we are ignorant" survives, with the missing half fille
   truth. The unconstrained mode is phase D — and it is likely to file a **production** finding,
   because the operator CAN make that mistake in reality.
 
+  > **MEASURED IN PHASE C-2 (2026-08-04) — the mechanism above is WRONG, and the constraint was
+  > therefore NOT shipped.** C-2's annotated leaves made the state constructible for the first
+  > time, so it could finally be driven against the real seam rather than reasoned about
+  > (`phase_c1_offline_hold_the_peer_took_is_a_fork_with_no_exit`). What actually happens:
+  > - there are **no "later drain sends"** — the completion's OLA-cohort cancel EMPTIES the backlog
+  >   (successors → `CANCELLED`, the held doc → `RMR`);
+  > - **MacReseed is refused one step earlier and for a different reason** — *"no held reservation
+  >   rests"*, because the completion already released the hold. The `MacReseedNotOfflineDefined`
+  >   origin guard this bullet named is never reached;
+  > - the FN **does** park unrecoverably, but as `GoingOnline` + an RMR shift — issuance refused
+  >   `NODE_GOING_ONLINE`, the drain a guarded no-op (AUD-K8-1 re-entry). Nothing about that park
+  >   involves the peer.
+  >
+  > And the decisive fact: **production cannot see the peer's truth**, so its behaviour is
+  > byte-identical whether the peer took the document or not — the same park is reachable today via
+  > an ordinary `Superseded` drain, and has been all along. A generator constraint keyed on the
+  > peer's truth would have removed freshly-won coverage while preventing nothing. The trajectory is
+  > therefore GENERATED, with two pins holding the ground: one documents the park and REDs first if
+  > production ever grows a way out, one drives the whole sequence through `run_harness` so every
+  > oracle is known to survive it. Revisit if phase D ever turns the derived `-12` on
+  > **generatively** — that is the world in which this bullet's reasoning would start to bite.
+
 ## 6. The forced `[BadHashPrev]` leaf — kept, and made consistent
 
 The blast-radius inventory found **every** existing `-12` test drives the forced leaf at
@@ -253,6 +275,70 @@ phase: the forced leaf's declared tip. Trajectory pin: forced `-12` → `MacRese
 to converge → derived `-12` → corroborated `MacReseed(store)` → **next send SUCCEEDS**.
 *Tooth:* peer ignores the mismatch → the trajectory pin REDs.
 *Deliverable:* `PRRO_GATE-5hc` closes here.
+
+> **PHASE C — PART ONE HAS SHIPPED (2026-08-04, branch `fuzzer/peer-tip-phase-c`).** The model
+> representation change (§8.1, §8.3) and both §9 trajectory pins landed; §8.2 and the C-2 leaf work
+> did NOT, and the boundary is exact rather than approximate.
+>
+> **Landed.** (1) §8.1 — the rewind marker is gone. The model records each document's chain link at
+> mint (`mint_doc`, `or_insert`, mirroring an immutable prod column), the `NotAcceptedOffline`
+> rewind restores that link, and `adopt_fault_deferred` re-derives every link from the ledger. A new
+> `run_harness` assertion projects the model's tip AND reality's onto {Genesis, Doc(lnd), NonDoc}
+> after every op and demands they agree — the seed differential previously only asked whether the
+> tip MOVED. (2) The model's own peer mirror, moved by the §4 movers table, asserted the same way
+> against the phase-A harness peer. (3) Both §9 pins: the operator's wrong claim earning a derived
+> `-12` and recovering through the corroborated reseed, and `Crash(Kvt1)` as an advance/advance that
+> re-syncs.
+>
+> **Two rows of §4 were wrong in rev1 and are corrected here, each with a canary that fires:** the
+> drain-finalize END advances the PEER as well as our seed (it is an online issuance minted at drain
+> time), and the held/ambiguous leaf is generator-chosen in the DRAIN lane too, not only online.
+>
+> **The honest gate.** The model's peer comparison is suppressed once `peer_unknown` is set — a held
+> or ambiguous wire outcome, or a crash inside the wire call, leaves the peer's acceptance genuinely
+> undetermined and the model states that rather than guessing. That gate is exactly what phase C-2's
+> `Took`/`NotTook` leaf exists to narrow, so the size of it IS the measure of what C-2 buys — and it
+> was MEASURED rather than waved at, by counting both branches through a capstone run at the PR
+> default: **online capstone 990 open / 10 closed (99%), offline capstone 783 / 217 (78%)**. So the
+> mirror is asserted on the large majority of ops today, and C-2's leaf is worth roughly the
+> remaining 1-22% — concentrated in the offline lane, which is where the held drain outcomes live.
+>
+> **§8.2 is deliberately NOT landed.** The `MacReseed` arm still reads `synth(held_lnd)` where it
+> should read `model.peer_tip`. `MacReseed` is generator-EXCLUDED and every directed pin drives it
+> through `operator_complete_macreseed`, which bypasses the model — so the arm is unreachable and
+> its canary cannot be made to fire. It lands with the machinery that reaches it (an interpreter
+> that supplies the corroborated seed the peer itself declared), not before: a fix whose teeth have
+> not been watched to bite is exactly what this project's teeth rule forbids.
+
+> **PHASE C — PART TWO HAS SHIPPED (2026-08-04, same branch).** The annotated leaf, the
+> `Crash(Send)` dimension, and the C.1 adjudication. §8.2 remains deliberately unlanded (its arm is
+> still unreachable — see part one's note).
+>
+> **The leaf.** `WireResponse::HeldWithPeer(Took|NotTook)`, appended last. Client-side it is
+> `Superseded` **through the same `wire_to_result` arm**, so it adds no production contract to
+> re-verify — the annotation rides in the stub's send queue entry itself (not a parallel queue that
+> a future `push_send` site could forget to keep in lockstep) and reaches only the harness peer.
+> `NotTook` leaves the run UNdiverged, which is the half that buys coverage: both the phase-A
+> mismatch assertion and the model's mirror keep their teeth for the rest of the sequence.
+>
+> **`Crash(Send)`.** `Op::CrashSend(PeerTruth)`, appended last, because the scripted leaf is
+> provably never consumed (the hang hook precedes the pop). The truth is applied to the document
+> the stub recorded on the way in. Pinned in both directions, including what production does about
+> it in EITHER branch: nothing automatic — the abandoned doc rests `ERROR_RETRYABLE`, a non-issued
+> sibling, so the D5 write gate refuses the next issuance (`WRITE_GATE_SIBLING_PENDING`). The
+> trajectory I first wrote — "and the FN carries on" — does not exist, and the pin says so.
+>
+> **The gate, re-measured with a baseline this time.** The part-one figure (990/10 online,
+> 783/217 offline) is NOT comparable — it does not reproduce under the same counter, so both
+> numbers below were taken today, one method, with and without the new symbols, at the PR default:
+> **online 1137 open / 243 closed → 1267 / 158** (closed ops down 35%), **offline 1389 / 20 →
+> 1318 / 0** (the gate never closes in the drain lane). The direction the part-one note predicted —
+> that the offline lane is where the leaf pays — holds; the magnitudes it quoted do not.
+>
+> **C.1 was adjudicated AGAINST the spec and not shipped** — see the measured note in §5. The
+> constraint was built, driven against the real seam, and removed: its stated mechanism does not
+> occur, and production cannot see the peer's truth at all, so keying a generator constraint on it
+> would cost coverage and prevent nothing.
 
 **Phase C — the model mirror + annotated ambiguity.** §8's representation change; appended
 peer-truth leaf variants; `Crash(Send)` out-of-script choice; C.1 constrains offline-hold
