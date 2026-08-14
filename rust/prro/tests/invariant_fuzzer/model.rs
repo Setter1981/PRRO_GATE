@@ -119,6 +119,19 @@ pub struct RefModel {
     /// Offline codes issued to / consumed by this session.
     pub codes_issued: i64,
     pub codes_consumed: i64,
+    /// bd `PRRO_GATE-h7b` — does the PEER recognise the tip our next request would embed?
+    ///
+    /// The model tracks the PREDICATE, not the peer's whole history, and that is a deliberate
+    /// ceiling: it can no more enumerate what DPS has ever accepted than it can compute a document
+    /// hash. What it CAN derive is whether the value our seed currently holds is one the peer took
+    /// — every mover that advances our seed already knows whether the peer moved with it.
+    ///
+    /// Genesis is always "seen" — an empty `<MAC>` is what a fresh FN legitimately sends — so it is
+    /// represented by absence rather than by a member of this set.
+    ///
+    /// Populated through ONE door (`peer_accepts`), so a future mover cannot advance the peer and
+    /// forget to record what it now recognises.
+    pub peer_seen: BTreeSet<[u8; 32]>,
     /// Peer-tip axis PHASE D — how many AMBIGUOUS T=112 replenishes have moved the peer alone.
     ///
     /// A counter of its own, not `codes_issued`, and the reason is a trap worth stating: the harness
@@ -306,6 +319,7 @@ impl RefModel {
             session: None,
             codes_issued: 0,
             ambiguous_t112_count: 0,
+            peer_seen: BTreeSet::new(),
             codes_consumed: 0,
             docs: BTreeMap::new(),
             doc_prev: BTreeMap::new(),
@@ -333,6 +347,7 @@ impl RefModel {
             session: None,
             codes_issued: 0,
             ambiguous_t112_count: 0,
+            peer_seen: BTreeSet::new(),
             codes_consumed: 0,
             docs: BTreeMap::new(),
             doc_prev: BTreeMap::new(),
@@ -362,6 +377,7 @@ impl RefModel {
             session: Some(OfflineSessionState::Open),
             codes_issued: codes,
             ambiguous_t112_count: 0,
+            peer_seen: BTreeSet::new(),
             codes_consumed: 0,
             docs: BTreeMap::new(),
             doc_prev: BTreeMap::new(),
@@ -389,6 +405,7 @@ impl RefModel {
             session: Some(OfflineSessionState::Open),
             codes_issued: codes,
             ambiguous_t112_count: 0,
+            peer_seen: BTreeSet::new(),
             codes_consumed: 0,
             docs: BTreeMap::new(),
             doc_prev: BTreeMap::new(),
@@ -666,11 +683,23 @@ impl RefModel {
     /// new online document type cannot be added without confronting what its send does to the peer.
     fn move_peer_for_online_send(&mut self, script: &DpsScript, unsigned_hash: [u8; 32]) {
         match online_peer_effect(script) {
-            PeerEffect::Advance => self.peer_tip = Some(unsigned_hash),
+            PeerEffect::Advance => self.peer_accepts(unsigned_hash),
             PeerEffect::Hold => {}
-            PeerEffect::Declared => self.peer_tip = Some(DPS_RECOVERY_TIP),
+            PeerEffect::Declared => self.peer_accepts(DPS_RECOVERY_TIP),
             PeerEffect::Unknown => self.peer_unknown = true,
         }
+    }
+
+    /// bd `PRRO_GATE-h7b` — the peer ACCEPTS a tip: it becomes the peer's current one AND joins the
+    /// set of values it would recognise later.
+    ///
+    /// One door for both effects on purpose. The defect this closes was born of exactly the split
+    /// the obvious code would keep: the tip moved and nothing recorded that DPS now knows it, so a
+    /// later replenish could not tell "stale but known" from "never seen" — and the live evidence
+    /// says DPS treats those two oppositely.
+    fn peer_accepts(&mut self, tip: [u8; 32]) {
+        self.peer_seen.insert(tip);
+        self.peer_tip = Some(tip);
     }
 
     /// Peer-tip axis PHASE C (spec §8.3) — ADOPT the peer's tip from the harness.
@@ -681,12 +710,28 @@ impl RefModel {
     /// harness verifies *given the peer state, the model behaves correctly*, not that the model
     /// would have derived that peer state itself.  Between faults the mirror is fully independent,
     /// which is where its teeth are.
-    pub fn sync_peer_tip(&mut self, class: ModelTipClass) {
-        self.peer_tip = match class {
-            ModelTipClass::Genesis => None,
-            ModelTipClass::Doc(lnd) => Some(synth_unsigned_hash(lnd)),
-            ModelTipClass::NonDoc => Some(synth_unsigned_hash(ADOPTED_NON_DOC_ORDINAL)),
-        };
+    pub fn sync_peer_tip(&mut self, class: ModelTipClass, peer_saw_our_tip: bool) {
+        match class {
+            ModelTipClass::Genesis => self.peer_tip = None,
+            ModelTipClass::Doc(lnd) => self.peer_accepts(synth_unsigned_hash(lnd)),
+            ModelTipClass::NonDoc => {
+                self.peer_accepts(synth_unsigned_hash(ADOPTED_NON_DOC_ORDINAL))
+            }
+        }
+        // bd `PRRO_GATE-h7b` — the `seen` question is handed over for the same reason the tip is:
+        // it is a fact about the environment, and across a fault window the model cannot re-derive
+        // which of its symbols the peer would still recognise. Between faults it tracks the set
+        // itself, which is where the independence lives.
+        match self.seed {
+            None => {}
+            Some(seed) => {
+                if peer_saw_our_tip {
+                    self.peer_seen.insert(seed);
+                } else {
+                    self.peer_seen.remove(&seed);
+                }
+            }
+        }
         self.peer_unknown = false;
     }
 
@@ -906,6 +951,16 @@ impl RefModel {
             // mirroring prod's ordering is what turned an internal disagreement into the finding.
             return ExpectedOutcome::Replenish { granted: false };
         }
+        // bd `PRRO_GATE-h7b` — DPS chain-checks the T=112 request, so a leaf is an INTENT, not a
+        // fact. On a `<MAC>` it has never accepted it answers `-12` and its tip does not move (live
+        // probe, 2026-08-01); on a STALE-but-seen one it accepts and re-bases (the [N=1] H2
+        // capture). Keyed on SEEN for exactly that reason — "diverged" would collapse the two.
+        let tip_is_foreign = self
+            .seed
+            .is_some_and(|seed| !self.peer_seen.contains(&seed));
+        if tip_is_foreign && matches!(leaf, ReplenishLeaf::Granted | ReplenishLeaf::Ambiguous) {
+            return ExpectedOutcome::Replenish { granted: false };
+        }
         match leaf {
             ReplenishLeaf::Granted => {
                 self.codes_issued += 1;
@@ -916,7 +971,9 @@ impl RefModel {
                 // hash, so the convergence is recorded the only honest way — one fresh symbol
                 // assigned to both sides.  (Row 13a, the undrained-backlog divergence, cannot be
                 // reached from here: prod refuses that replenish outright — bd `PRRO_GATE-knk`.)
-                self.peer_tip = self.seed;
+                if let Some(fresh) = self.seed {
+                    self.peer_accepts(fresh);
+                }
                 ExpectedOutcome::Replenish { granted: true }
             }
             ReplenishLeaf::ServerReject => ExpectedOutcome::Replenish { granted: false },
@@ -933,7 +990,7 @@ impl RefModel {
             // is a trap.
             ReplenishLeaf::Ambiguous => {
                 self.ambiguous_t112_count += 1;
-                self.peer_tip = Some(synth_unsigned_hash(
+                self.peer_accepts(synth_unsigned_hash(
                     AMBIGUOUS_T112_BASE - self.ambiguous_t112_count,
                 ));
                 ExpectedOutcome::Replenish { granted: false }
@@ -1968,7 +2025,7 @@ impl RefModel {
                 // origin advanced it at issuance): this is exactly the asymmetry phase A proved is
                 // only true per-DOCUMENT, never per-node-seed.
                 if let Some(last) = backlog.last() {
-                    self.peer_tip = Some(synth_unsigned_hash(*last));
+                    self.peer_accepts(synth_unsigned_hash(*last));
                 }
                 // Tier-1 shift resolution — a full-ACK drain resolves a
                 // pending-drain shift BEFORE the END mints (the impl confirms
@@ -2027,7 +2084,7 @@ impl RefModel {
                     // spec §4 row 7 — the END is minted AND sent here, and accepted, so the peer
                     // moves onto it too.  (rev1's drain row had this wrong: the END is an ONLINE
                     // issuance, not a replay of an already-issued offline document.)
-                    self.peer_tip = Some(end_unsigned);
+                    self.peer_accepts(end_unsigned);
                     self.mode = NodeMode::Online;
                     return ExpectedOutcome::Mutated(Mutation {
                         lnd: end_lnd,
@@ -2087,7 +2144,7 @@ impl RefModel {
                 // C-2 buys.
                 match held {
                     WireResponse::HeldWithPeer(PeerTruth::Took) => {
-                        self.peer_tip = Some(synth_unsigned_hash(first));
+                        self.peer_accepts(synth_unsigned_hash(first));
                     }
                     WireResponse::HeldWithPeer(PeerTruth::NotTook) => {}
                     _ => self.peer_unknown = true,
@@ -2118,7 +2175,7 @@ impl RefModel {
                 // spec §4 row 1 applies in the DRAIN lane too: the send-`Ack` is the acceptance
                 // moment and the `NotFound` tail is the K4 empty quittance, so the peer took the
                 // head document even though the quittance is lagging.
-                self.peer_tip = Some(synth_unsigned_hash(first));
+                self.peer_accepts(synth_unsigned_hash(first));
                 ExpectedOutcome::Mutated(Mutation {
                     lnd: first,
                     doc_state: DocState::Sent,

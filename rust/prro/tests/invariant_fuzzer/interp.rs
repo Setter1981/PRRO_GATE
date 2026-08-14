@@ -628,6 +628,11 @@ impl FuzzCtx {
         self.peer.converge_to(tip);
     }
 
+    /// bd `PRRO_GATE-h7b` — has the peer ever accepted or declared this chain tip?
+    pub fn peer_has_seen(&self, tip: Option<&[u8]>) -> bool {
+        self.peer.has_seen(tip)
+    }
+
     /// Peer-tip axis PHASE D — the peer processed a request whose reply never reached us.
     pub fn peer_advance_without_us(&self, tip: Vec<u8>, reason: &str) {
         self.peer.advance_without_us(tip, reason);
@@ -2442,7 +2447,36 @@ async fn replenish(ctx: &mut FuzzCtx, leaf: ReplenishLeaf) -> RealOutcome {
     let dps = Arc::new(ctx.new_dps());
     ctx.seq += 1;
     let seq = ctx.seq;
+    // bd `PRRO_GATE-h7b` — the leaf is a generator INTENT, not a fact about DPS.
+    //
+    // `Granted` was a free choice, so the harness could hand out a code window while our embedded
+    // `<MAC>` is a value DPS has never accepted — a state production cannot reach. Worse than
+    // merely vacuous: the peer then CONVERGED onto us, healing a divergence reality would have
+    // punished. The 2026-08-01 live probe settled that input class — on a never-seen `<MAC>` DPS
+    // answers `-12 ERROR_BAD_HASH_PREV` and its tip does NOT move
+    // (`live_probe_knk_t112_foreign_mac.rs`).
+    //
+    // Keyed on SEEN, not on "diverged", and that is the whole care in this fix: on a
+    // STALE-but-previously-seen tip DPS ACCEPTS and re-bases (the [N=1] H2 capture), which is what
+    // makes a granted replenish a divergence-HEALING move. A "refuse whenever the tips differ"
+    // rule would contradict that capture; `phase_d_a_granted_replenish_heals_the_ambiguous_fork`
+    // is the standing guard against anyone writing it.
+    //
+    // `ServerReject` is untouched: DPS refusing for its own reasons is orthogonal to whether it
+    // recognised the tip.
+    let our_tip = ctx.read_seed().await;
+    let tip_is_foreign = !ctx.peer_has_seen(our_tip.as_deref());
     match leaf {
+        ReplenishLeaf::Granted | ReplenishLeaf::Ambiguous if tip_is_foreign => {
+            let store = ctx.peer_tip_hex().unwrap_or_else(|| hex_lower(&[0u8; 32]));
+            dps.push_ask_codes(Err(prro::transports::dps::error::DpsError::Server {
+                code: -12,
+                message: format!(
+                    "ERROR_BAD_HASH_PREV  store {store} chk {}",
+                    hex_lower(our_tip.as_deref().unwrap_or(&[0u8; 32])),
+                ),
+            }));
+        }
         ReplenishLeaf::Granted => {
             dps.push_ask_codes(Ok(prro::transports::dps::dto::OfflineCodesResponse {
                 codes: vec![format!("fuzz-code-{seq}")],
@@ -2533,9 +2567,12 @@ async fn replenish(ctx: &mut FuzzCtx, leaf: ReplenishLeaf) -> RealOutcome {
                 .any(|c| matches!(c, crate::common::scripted_dps::DpsCall::AskCodes(_)));
             // Which leaves leave DPS having PROCESSED the request: a granted one obviously, and an
             // ambiguous one by definition (the reply existed, we just never saw it). A server
-            // reject did not — DPS refused and its tip holds.
+            // reject did not — DPS refused and its tip holds. Nor did a `-12` on a foreign tip:
+            // the live probe recorded that DPS refuses it WITHOUT moving (bd PRRO_GATE-h7b), and a
+            // peer that re-based there would HEAL a fork reality leaves open.
             let dps_processed_it =
-                matches!(leaf, ReplenishLeaf::Granted | ReplenishLeaf::Ambiguous);
+                matches!(leaf, ReplenishLeaf::Granted | ReplenishLeaf::Ambiguous)
+                    && !tip_is_foreign;
             if reached_dps && dps_processed_it {
                 ctx.peer_advance_without_us(
                     ambiguous_replenish_tip(seq),

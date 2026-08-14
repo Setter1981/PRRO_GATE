@@ -35,7 +35,7 @@
 //! guard is ever held across an `.await`.  The hang hook awaits a `oneshot`
 //! *after* the guard is released.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -130,6 +130,19 @@ struct PeerInner {
     /// Sends the stub could not attribute to a row (diagnostic only — a growing
     /// count means the resolver needs work, not that production is wrong).
     unresolved_sends: usize,
+    /// bd `PRRO_GATE-h7b` — every chain tip this peer has ACCEPTED or DECLARED, i.e. every value
+    /// it would recognise if a later request embedded it.
+    ///
+    /// The distinction this set exists to make, and the one a naive "refuse whenever diverged"
+    /// rule gets wrong: DPS treats a STALE-but-previously-seen tip differently from one it has
+    /// never seen. On the stale one it ACCEPTS a fresh T=112 and re-bases (the [N=1] H2 capture —
+    /// that is what makes a granted replenish a divergence-HEALING move). On a never-seen value it
+    /// REFUSES `-12` and does not move (the live TEST-cabinet probe of 2026-08-01,
+    /// `live_probe_knk_t112_foreign_mac.rs`). Both are live observations about DIFFERENT input
+    /// classes, and neither may be restated as the general rule.
+    ///
+    /// Genesis (`None`) counts as seen: an empty `<MAC>` is what a fresh FN legitimately sends.
+    seen: HashSet<Vec<u8>>,
     /// Peer-tip axis PHASE C-2 — the document handed over on the LAST `send_chk`, kept so a
     /// `Crash(Send)` (which drops the future before any reply is popped, so `apply_reply` never
     /// runs) can still be told what the peer did with it.  The envelope was delivered; only the
@@ -235,7 +248,22 @@ impl PeerLedger {
     /// send-side observer cannot see it; the interpreter reports it here.
     pub fn converge_to(&self, tip: Option<Vec<u8>>) {
         let mut g = self.inner.lock().unwrap();
+        if let Some(t) = tip.clone() {
+            g.seen.insert(t);
+        }
         g.tip = tip;
+    }
+
+    /// bd `PRRO_GATE-h7b` — would this peer RECOGNISE the chain tip a request embeds?
+    ///
+    /// `true` for genesis and for anything it has accepted or declared; `false` for a value it has
+    /// never seen, which is the input class the live probe pinned as `-12 ERROR_BAD_HASH_PREV`.
+    /// The caller decides what to do with the answer — the peer only states what it knows.
+    pub fn has_seen(&self, tip: Option<&[u8]>) -> bool {
+        match tip {
+            None => true,
+            Some(t) => self.inner.lock().unwrap().seen.contains(t),
+        }
     }
 
     /// Peer-tip axis PHASE D — the peer moves and we do NOT: it processed a request whose reply we
@@ -247,6 +275,7 @@ impl PeerLedger {
     /// exactly how a caller ends up recording a convergence for a divergence.
     pub fn advance_without_us(&self, tip: Vec<u8>, reason: &str) {
         let mut g = self.inner.lock().unwrap();
+        g.seen.insert(tip.clone());
         g.tip = Some(tip);
         if g.diverged.is_none() {
             g.diverged = Some(reason.to_string());
@@ -310,6 +339,7 @@ impl PeerLedger {
                 let Some((_, _, _, Some(unsigned))) = doc else {
                     return false;
                 };
+                g.seen.insert(unsigned.clone());
                 g.tip = Some(unsigned.clone());
                 if g.diverged.is_none() {
                     g.diverged =
@@ -381,6 +411,7 @@ impl PeerLedger {
         match reply {
             Ok(_) => {
                 if let Some((_, _, _, Some(unsigned))) = resolved {
+                    g.seen.insert(unsigned.clone());
                     g.tip = Some(unsigned);
                 }
             }
@@ -389,6 +420,7 @@ impl PeerLedger {
             // disagree until an operator resolves it.
             Err(DpsError::Server { code: -12, message }) => {
                 if let Some(store) = extract_store_hash(message) {
+                    g.seen.insert(store.clone());
                     g.tip = Some(store);
                 }
                 if g.diverged.is_none() {
