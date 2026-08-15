@@ -211,7 +211,14 @@ pub struct FuzzCtx {
     /// the pools so Rust's declaration-order drop closes the pools first, then
     /// these remove the directories — cleanup never races a live connection.
     /// Held only for their `Drop`; never read.
-    _tempdir: tempfile::TempDir,
+    ///
+    /// `None` for a W6 SIBLING ctx — a second FN living on the FIRST ctx's App and database. The
+    /// primary owns the TempDir (and the App's pid-lock singleton makes a second `App::boot` on
+    /// the same DB impossible anyway — `singleton.rs` — which is faithful: production is ONE
+    /// process hosting many FNs). Drop order therefore matters in multi-FN tests: the primary
+    /// must outlive its siblings, which [`FuzzCtx::sibling_online_open_shift`] taking `&self`
+    /// cannot enforce across the return — so the sibling constructor documents it instead.
+    _tempdir: Option<tempfile::TempDir>,
     /// bd PRRO_GATE-2ds/hpc — the fixture now owns a REAL `App` so the interpreter can drive
     /// production services that need one (the T=112 `OfflineCodeReplenishService` takes an `App`
     /// for the per-FN write gate + pool).  `pool` / `pool_secure` are clones of `app.db()` /
@@ -256,13 +263,14 @@ impl FuzzCtx {
     }
 
     pub async fn new_online_open_shift() -> Self {
-        let (app, _tempdir) = boot_fuzz_app(None).await;
+        let (app, tempdir) = boot_fuzz_app(None).await;
+        let _tempdir = Some(tempdir);
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
         let peer_pool = pool.clone();
-        seed_fn_config(&pool).await;
-        let shift_id = seed_open_shift(&pool).await;
-        seed_node_state(&pool, NodeMode::Online, shift_id).await;
+        seed_fn_config(&pool, FN).await;
+        let shift_id = seed_open_shift(&pool, FN).await;
+        seed_node_state(&pool, FN, NodeMode::Online, shift_id).await;
         Self {
             pool,
             pool_secure,
@@ -280,16 +288,56 @@ impl FuzzCtx {
         }
     }
 
+    /// W6 (Tier-3, multi-FN) — a SECOND fiscal number on the SAME App and database, seeded
+    /// online + open shift.
+    ///
+    /// Faithful to the production topology by construction: one process hosts many FNs, and the
+    /// App's pid-lock singleton would refuse a second `App::boot` on this DB anyway. The sibling
+    /// gets everything logically per-FN fresh — its own write gate (a DIFFERENT mutex from the
+    /// primary's, which is exactly invariant #2's shape: same-FN serialises, cross-FN does not),
+    /// its own signing ctx, idempotency counter, wire counters, and its own `PeerLedger` bound to
+    /// its own fiscal number. It shares the pools and the App handle, and owns NO TempDir — the
+    /// PRIMARY must outlive it, or the database vanishes from under it.
+    pub async fn sibling_online_open_shift(&self, fn_id: &str) -> Self {
+        assert_ne!(
+            fn_id, self.fn_id,
+            "a sibling is a DIFFERENT fiscal number — two ctxs on one FN would violate the very \
+             invariant (#2) the multi-FN tier exists to prove"
+        );
+        let pool = self.pool.clone();
+        let pool_secure = self.pool_secure.clone();
+        let peer_pool = pool.clone();
+        seed_fn_config(&pool, fn_id).await;
+        let shift_id = seed_open_shift(&pool, fn_id).await;
+        seed_node_state(&pool, fn_id, NodeMode::Online, shift_id).await;
+        Self {
+            pool,
+            pool_secure,
+            _tempdir: None,
+            app: self.app.clone(),
+            sign_ctx: det_signing_ctx(),
+            fn_sign: fn_sign_blob(),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            fn_id: fn_id.to_string(),
+            send_calls: Arc::new(AtomicUsize::new(0)),
+            last_calls: Arc::new(AtomicUsize::new(0)),
+            seq: 0,
+            last_row: None,
+            peer: PeerLedger::new(peer_pool, fn_id.to_string()),
+        }
+    }
+
     /// Fixture variant used by the cleanup test: keep all DB tempdirs under a
     /// caller-owned base dir without mutating the process-global `TMPDIR`.
     async fn new_online_open_shift_in(base: &Path) -> Self {
-        let (app, _tempdir) = boot_fuzz_app(Some(base)).await;
+        let (app, tempdir) = boot_fuzz_app(Some(base)).await;
+        let _tempdir = Some(tempdir);
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
         let peer_pool = pool.clone();
-        seed_fn_config(&pool).await;
-        let shift_id = seed_open_shift(&pool).await;
-        seed_node_state(&pool, NodeMode::Online, shift_id).await;
+        seed_fn_config(&pool, FN).await;
+        let shift_id = seed_open_shift(&pool, FN).await;
+        seed_node_state(&pool, FN, NodeMode::Online, shift_id).await;
         Self {
             pool,
             pool_secure,
@@ -310,12 +358,13 @@ impl FuzzCtx {
     /// Fixture: a fresh DB with an ONLINE node and no open/current shift.
     /// `SHIFT_OPEN` should create and open the shift through stage_acquire.
     pub async fn new_online_closed_shift() -> Self {
-        let (app, _tempdir) = boot_fuzz_app(None).await;
+        let (app, tempdir) = boot_fuzz_app(None).await;
+        let _tempdir = Some(tempdir);
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
         let peer_pool = pool.clone();
-        seed_fn_config(&pool).await;
-        seed_node_state_with_shift(&pool, NodeMode::Online, ShiftState::Closed, None).await;
+        seed_fn_config(&pool, FN).await;
+        seed_node_state_with_shift(&pool, FN, NodeMode::Online, ShiftState::Closed, None).await;
         Self {
             pool,
             pool_secure,
@@ -337,16 +386,17 @@ impl FuzzCtx {
     /// session carrying `codes` offline codes (the offline lane is fixture-
     /// seeded — there is no go_offline op, spec §5).
     pub async fn new_offline_open_shift(codes: i64) -> Self {
-        let (app, _tempdir) = boot_fuzz_app(None).await;
+        let (app, tempdir) = boot_fuzz_app(None).await;
+        let _tempdir = Some(tempdir);
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
         let peer_pool = pool.clone();
-        seed_fn_config(&pool).await;
-        let shift_id = seed_open_shift(&pool).await;
-        seed_node_state(&pool, NodeMode::Offline, shift_id).await;
-        seed_open_offline_session(&pool).await;
+        seed_fn_config(&pool, FN).await;
+        let shift_id = seed_open_shift(&pool, FN).await;
+        seed_node_state(&pool, FN, NodeMode::Offline, shift_id).await;
+        seed_open_offline_session(&pool, FN).await;
         for code_lnd in 1..=codes {
-            seed_offline_code(&pool, code_lnd).await;
+            seed_offline_code(&pool, FN, code_lnd).await;
         }
         Self {
             pool,
@@ -368,15 +418,16 @@ impl FuzzCtx {
     /// Fixture: a fresh DB with an OFFLINE node, no open/current shift, and an
     /// OPEN offline session carrying `codes`.  `SHIFT_OPEN` local-acks.
     pub async fn new_offline_closed_shift(codes: i64) -> Self {
-        let (app, _tempdir) = boot_fuzz_app(None).await;
+        let (app, tempdir) = boot_fuzz_app(None).await;
+        let _tempdir = Some(tempdir);
         let pool = app.db().clone();
         let pool_secure = app.db_secure().clone();
         let peer_pool = pool.clone();
-        seed_fn_config(&pool).await;
-        seed_node_state_with_shift(&pool, NodeMode::Offline, ShiftState::Closed, None).await;
-        seed_open_offline_session(&pool).await;
+        seed_fn_config(&pool, FN).await;
+        seed_node_state_with_shift(&pool, FN, NodeMode::Offline, ShiftState::Closed, None).await;
+        seed_open_offline_session(&pool, FN).await;
         for code_lnd in 1..=codes {
-            seed_offline_code(&pool, code_lnd).await;
+            seed_offline_code(&pool, FN, code_lnd).await;
         }
         Self {
             pool,
@@ -545,6 +596,36 @@ impl FuzzCtx {
         }
     }
 
+    /// W6 — drive one online sell through the REAL `inline::run` under an EXPLICIT idempotency
+    /// key, so a multi-FN pin can hand the SAME key to two FNs and assert the namespacing.
+    /// Identical to the generated `OnlineSell` arm in every other respect.
+    pub async fn run_sell_with_idem(&mut self, idem: &str, script: &DpsScript) -> RealOutcome {
+        let row = seed_inbox_keyed(&self.pool, &self.fn_id, idem, "SELL").await;
+        let dps = self.new_dps();
+        load_script(&dps, script);
+        let guard = self.gate.clone().lock_owned().await;
+        let result = inline::run(
+            &self.pool,
+            &self.pool_secure,
+            &dps,
+            &self.sign_ctx,
+            &self.fn_sign,
+            &guard,
+            &row,
+            prro::services::time_budget::system_gate(),
+        )
+        .await;
+        drop(guard);
+        match result {
+            Ok(_outcome) => {
+                let observed = self.observe_doc_by_request_id(&row.request_id).await;
+                self.last_row = Some(row);
+                RealOutcome::Doc(observed)
+            }
+            Err(e) => RealOutcome::Refused(format!("{e:?}")),
+        }
+    }
+
     fn next_idem(&mut self) -> String {
         self.seq += 1;
         format!("idem-fuzz-{}", self.seq)
@@ -654,7 +735,7 @@ impl FuzzCtx {
 
     async fn seed_inbox_sell(&mut self) -> InboxRow {
         let idem = self.next_idem();
-        seed_inbox_keyed(&self.pool, &idem, "SELL").await
+        seed_inbox_keyed(&self.pool, &self.fn_id, &idem, "SELL").await
     }
 
     /// PR-R-fuzz — seed a `RETURN` inbox row (the shared converted CheckJson
@@ -662,13 +743,14 @@ impl FuzzCtx {
     /// not the payload — same shape as a SELL row).
     async fn seed_inbox_return(&mut self) -> InboxRow {
         let idem = self.next_idem();
-        seed_inbox_keyed(&self.pool, &idem, "RETURN").await
+        seed_inbox_keyed(&self.pool, &self.fn_id, &idem, "RETURN").await
     }
 
     async fn seed_inbox_taxable(&mut self, operation_type: &str) -> InboxRow {
         let idem = self.next_idem();
         seed_inbox_keyed_payload(
             &self.pool,
+            &self.fn_id,
             &idem,
             operation_type,
             TAXABLE_PAYLOAD,
@@ -683,7 +765,7 @@ impl FuzzCtx {
         tax_groups::insert(
             &self.pool_secure,
             &NewTaxGroup {
-                fn_id: FN.to_string(),
+                fn_id: self.fn_id.clone(),
                 tx_num: 1,
                 letter: "A".to_string(),
                 dtpr: 0.0,
@@ -719,14 +801,30 @@ impl FuzzCtx {
     /// Seed a live `SHIFT_OPEN` inbox row (opening payload, no total).
     async fn seed_inbox_shift_open(&mut self) -> InboxRow {
         let idem = self.next_idem();
-        seed_inbox_keyed_payload(&self.pool, &idem, "SHIFT_OPEN", SHIFT_OPEN_PAYLOAD, None).await
+        seed_inbox_keyed_payload(
+            &self.pool,
+            &self.fn_id,
+            &idem,
+            "SHIFT_OPEN",
+            SHIFT_OPEN_PAYLOAD,
+            None,
+        )
+        .await
     }
 
     /// Seed a live `Z_REPORT` inbox row (wire intent, no total).  The write path
     /// aggregates the shift ledger into the canonical Z payload internally.
     async fn seed_inbox_z_report(&mut self) -> InboxRow {
         let idem = self.next_idem();
-        seed_inbox_keyed_payload(&self.pool, &idem, "Z_REPORT", Z_WIRE_INTENT, None).await
+        seed_inbox_keyed_payload(
+            &self.pool,
+            &self.fn_id,
+            &idem,
+            "Z_REPORT",
+            Z_WIRE_INTENT,
+            None,
+        )
+        .await
     }
 
     /// L3 — seed a `SERVICE_IN` inbox row.  The payload is the already-converted
@@ -736,6 +834,7 @@ impl FuzzCtx {
         let idem = self.next_idem();
         seed_inbox_keyed_payload(
             &self.pool,
+            &self.fn_id,
             &idem,
             "SERVICE_IN",
             SERVICE_IN_PAYLOAD,
@@ -748,14 +847,30 @@ impl FuzzCtx {
     /// `name = "SERVICE_OUT"`.
     async fn seed_inbox_service_out(&mut self) -> InboxRow {
         let idem = self.next_idem();
-        seed_inbox_keyed_payload(&self.pool, &idem, "SERVICE_OUT", SERVICE_OUT_PAYLOAD, None).await
+        seed_inbox_keyed_payload(
+            &self.pool,
+            &self.fn_id,
+            &idem,
+            "SERVICE_OUT",
+            SERVICE_OUT_PAYLOAD,
+            None,
+        )
+        .await
     }
 
     /// EPZ — seed a `CASH_ADVANCE_EPZ` inbox row (already-converted signer
     /// format; stage_sign parses `EpzJson`).  `sum_kop = CASH_AMOUNT_KOP`.
     async fn seed_inbox_epz(&mut self) -> InboxRow {
         let idem = self.next_idem();
-        seed_inbox_keyed_payload(&self.pool, &idem, "CASH_ADVANCE_EPZ", EPZ_PAYLOAD, None).await
+        seed_inbox_keyed_payload(
+            &self.pool,
+            &self.fn_id,
+            &idem,
+            "CASH_ADVANCE_EPZ",
+            EPZ_PAYLOAD,
+            None,
+        )
+        .await
     }
 
     pub async fn observed_doc_count(&self) -> i64 {
@@ -2397,6 +2512,7 @@ async fn l5_probe(ctx: &mut FuzzCtx, kind: L5Kind) -> RealOutcome {
     // Valid path: seed the CONVERTED payload into the inbox and issue via inline.
     let row = seed_inbox_keyed_payload(
         &ctx.pool,
+        &ctx.fn_id,
         &idem,
         "SELL",
         &converted.payload_json,
@@ -3383,11 +3499,11 @@ async fn fresh_secure_pool_in(base: &Path) -> (SqlitePool, tempfile::TempDir) {
     (pool, dir)
 }
 
-async fn seed_fn_config(pool: &SqlitePool) {
+async fn seed_fn_config(pool: &SqlitePool, fn_id: &str) {
     fn_repo::insert(
         pool,
         &NewFnConfig {
-            fiscal_number: FN.into(),
+            fiscal_number: fn_id.into(),
             tax_number: "12345678".into(),
             vat_payer_inn: None,
             fiscal_mode: FiscalMode::Test,
@@ -3405,7 +3521,7 @@ async fn seed_fn_config(pool: &SqlitePool) {
     .unwrap();
 }
 
-async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
+async fn seed_open_shift(pool: &SqlitePool, fn_id: &str) -> ShiftId {
     let shift_id = ShiftId::new();
     sqlx::query(
         "INSERT INTO shifts (shift_id, fiscal_number, serial, state, open_mode, \
@@ -3413,7 +3529,7 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
          VALUES (?, ?, 1, 'OPENED', 'ONLINE', 0, ?)",
     )
     .bind(DbShiftId(shift_id))
-    .bind(FN)
+    .bind(fn_id)
     .bind(CASHIER)
     .execute(pool)
     .await
@@ -3421,12 +3537,13 @@ async fn seed_open_shift(pool: &SqlitePool) -> ShiftId {
     shift_id
 }
 
-async fn seed_node_state(pool: &SqlitePool, mode: NodeMode, shift_id: ShiftId) {
-    seed_node_state_with_shift(pool, mode, ShiftState::Opened, Some(shift_id)).await;
+async fn seed_node_state(pool: &SqlitePool, fn_id: &str, mode: NodeMode, shift_id: ShiftId) {
+    seed_node_state_with_shift(pool, fn_id, mode, ShiftState::Opened, Some(shift_id)).await;
 }
 
 async fn seed_node_state_with_shift(
     pool: &SqlitePool,
+    fn_id: &str,
     mode: NodeMode,
     shift_state: ShiftState,
     current_shift_id: Option<ShiftId>,
@@ -3437,7 +3554,7 @@ async fn seed_node_state_with_shift(
           backend_profile_id, transport_profile_id) \
          VALUES (?, ?, ?, ?, 1, 'b', 't')",
     )
-    .bind(FN)
+    .bind(fn_id)
     .bind(mode.as_str())
     .bind(shift_state.as_str())
     .bind(current_shift_id.map(DbShiftId))
@@ -3446,25 +3563,25 @@ async fn seed_node_state_with_shift(
     .unwrap();
 }
 
-async fn seed_open_offline_session(pool: &SqlitePool) {
+async fn seed_open_offline_session(pool: &SqlitePool, fn_id: &str) {
     let session_id = OfflineSessionId::new();
     sqlx::query(
         "INSERT INTO offline_sessions(offline_session_id, fiscal_number, state, opened_at) \
          VALUES (?, ?, ?, '2026-06-09T00:00:00Z')",
     )
     .bind(DbOfflineSessionId(session_id))
-    .bind(FN)
+    .bind(fn_id)
     .bind(OfflineSessionState::Open.as_str())
     .execute(pool)
     .await
     .unwrap();
 }
 
-async fn seed_offline_code(pool: &SqlitePool, code_lnd: i64) {
+async fn seed_offline_code(pool: &SqlitePool, fn_id: &str, code_lnd: i64) {
     // B8-1: acquire_code_tx requires dps_code IS NOT NULL; use synthetic codes.
     let dps_code = format!("DRILL-{code_lnd}");
     sqlx::query("INSERT INTO offline_codes(fiscal_number, code_lnd, dps_code) VALUES (?, ?, ?)")
-        .bind(FN)
+        .bind(fn_id)
         .bind(code_lnd)
         .bind(&dps_code)
         .execute(pool)
@@ -3477,12 +3594,26 @@ async fn seed_offline_code(pool: &SqlitePool, code_lnd: i64) {
 /// CheckJson — SELL and RETURN carry the identical `{items,payments}` shape at
 /// the write-path layer; the direction is carried by `operation_type` (→
 /// `DocType::Sell` / `DocType::Return` in `build_canonical`), not the body.
-async fn seed_inbox_keyed(pool: &SqlitePool, idem: &str, operation_type: &str) -> InboxRow {
-    seed_inbox_keyed_payload(pool, idem, operation_type, SELL_PAYLOAD, Some(TOTAL_KOP)).await
+async fn seed_inbox_keyed(
+    pool: &SqlitePool,
+    fn_id: &str,
+    idem: &str,
+    operation_type: &str,
+) -> InboxRow {
+    seed_inbox_keyed_payload(
+        pool,
+        fn_id,
+        idem,
+        operation_type,
+        SELL_PAYLOAD,
+        Some(TOTAL_KOP),
+    )
+    .await
 }
 
 async fn seed_inbox_keyed_payload(
     pool: &SqlitePool,
+    fn_id: &str,
     idem: &str,
     operation_type: &str,
     payload_json: &str,
@@ -3495,7 +3626,7 @@ async fn seed_inbox_keyed_payload(
         pool,
         &NewInboxEntry {
             request_id,
-            fiscal_number: FN.into(),
+            fiscal_number: fn_id.into(),
             protocol: Protocol::Rest,
             operation_type: operation_type.into(),
             idempotency_key: idem.into(),
@@ -3512,7 +3643,7 @@ async fn seed_inbox_keyed_payload(
     .unwrap();
     InboxRow {
         request_id,
-        fiscal_number: FN.into(),
+        fiscal_number: fn_id.into(),
         protocol: Protocol::Rest,
         operation_type: operation_type.into(),
         idempotency_key: idem.into(),

@@ -3093,6 +3093,253 @@ async fn h7b_a_granted_replenish_is_refused_on_a_tip_dps_never_accepted() {
     );
 }
 
+// ═══════════ W6 (Tier-3) — multi-FN: per-FN single-writer isolation, INV-2 ═══════════
+//
+// Slice 1 of the fleet wave (`docs/FUZZER_TIER2_RAGE_DOSSIER.md` §7): DIRECTED, deterministic,
+// N=2, driven through `run_op` on two `FuzzCtx`s sharing ONE App and ONE database — which is the
+// production topology (one process, many FNs; the pid-lock singleton forbids anything else).
+// The oracle throughout is the dossier's: no cross-FN lnd/seed/pool/session/shift bleed.
+//
+// Deliberately NOT here (slice 2+, excluded loudly rather than silently): the generative
+// interleaving harness (run_harness is single-FN; RefModel's fault-adoption reads are unscoped),
+// the N=200 soak lane, fairness/starvation, and shutdown-with-held-leases. Cut breadth, not
+// discipline.
+
+/// Two FNs, interleaved sells, and every per-FN axis stays its own: lnd sequences, chain seeds,
+/// document ledgers. The whole-DB `invariant_scan` (already multi-FN-aware — it GROUPs by
+/// fiscal_number) must see a clean database at the end.
+#[tokio::test]
+async fn w6_interleaved_sells_keep_two_fns_fully_isolated() {
+    let mut a = interp::FuzzCtx::new_online_open_shift().await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+
+    // Interleave A,B,A,B,A — five sells, three on A, two on B. (Written out rather than looped:
+    // two `&mut` handles cannot share an array, and the explicit order IS the test.)
+    async fn sell(ctx: &mut interp::FuzzCtx, tag: &str) {
+        let out = interp::run_op(ctx, &Op::OnlineSell(DpsScript::ack_path())).await;
+        assert!(
+            matches!(out, interp::RealOutcome::Doc(_)),
+            "{tag}: an interleaved sell must issue normally, got {out:?}"
+        );
+    }
+    sell(&mut a, "a1").await;
+    sell(&mut b, "b1").await;
+    sell(&mut a, "a2").await;
+    sell(&mut b, "b2").await;
+    sell(&mut a, "a3").await;
+
+    // Per-FN lnd sequences advanced independently — no shared allocator, no gaps from the other
+    // FN's traffic. (Fixtures seed next_lnd = 1, so A minted 1,2,3 and B minted 1,2.)
+    assert_eq!(
+        a.read_ledger().await.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "FN-A's lnd sequence must be its own — a hole or a jump here means the other FN's \
+         allocation bled in"
+    );
+    assert_eq!(
+        b.read_ledger().await.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2],
+        "FN-B's lnd sequence must be its own"
+    );
+
+    // Chain seeds are per-FN: each FN's tip is ITS latest document, and the two differ (same lnd
+    // ordinal, different fiscal_number ⇒ different unsigned XML ⇒ different hash).
+    let seed_a = a.read_seed().await.expect("A issued, so A has a tip");
+    let seed_b = b.read_seed().await.expect("B issued, so B has a tip");
+    assert_ne!(
+        seed_a, seed_b,
+        "two FNs' chain tips must never coincide — a shared seed cell would be the exact \
+         cross-FN bleed INV-2 forbids"
+    );
+
+    // And the whole database is clean under the ledger oracle, which scans ALL FNs.
+    prro::db::invariant_scan::assert_clean(&a.pool).await;
+}
+
+/// The SAME idempotency key on two FNs mints on BOTH — idempotency is per-FN
+/// (the inbox unique index is (fiscal_number, idempotency_key), not global), so one tenant's key
+/// cannot swallow another tenant's document as a "replay".
+#[tokio::test]
+async fn w6_same_idempotency_key_on_two_fns_mints_on_both() {
+    let mut a = interp::FuzzCtx::new_online_open_shift().await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+
+    let out_a = a
+        .run_sell_with_idem("w6-shared-key", &DpsScript::ack_path())
+        .await;
+    let out_b = b
+        .run_sell_with_idem("w6-shared-key", &DpsScript::ack_path())
+        .await;
+    assert!(
+        matches!(out_a, interp::RealOutcome::Doc(_)),
+        "FN-A mints under the shared key, got {out_a:?}"
+    );
+    assert!(
+        matches!(out_b, interp::RealOutcome::Doc(_)),
+        "FN-B must ALSO mint — the key is namespaced per FN; a global-idempotency regression \
+         would silently count one tenant's sale as the other's replay. got {out_b:?}"
+    );
+    assert_eq!(a.observed_doc_count().await, 1);
+    assert_eq!(b.observed_doc_count().await, 1);
+    prro::db::invariant_scan::assert_clean(&a.pool).await;
+}
+
+/// A wire crash on FN-A neither stops FN-B nor lets A's recovery touch B's rows.
+///
+/// The dossier names this pin directly: "crash/recovery of FN-A while FN-B progresses". A
+/// `Crash(Send)` is TRANSPORT collapse — the process lives — so B keeps issuing while A rests
+/// crashed, and A's `Reboot` (boot reconciliation over the WHOLE DB) must resume A's document
+/// without perturbing a byte of B's.
+#[tokio::test]
+async fn w6_crash_on_fn_a_leaves_fn_b_progressing_and_recovery_scoped() {
+    let mut a = interp::FuzzCtx::new_online_open_shift().await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+
+    let _ = interp::run_op(&mut a, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let crashed = interp::run_op(&mut a, &Op::Crash(Stage::Send)).await;
+    assert!(
+        matches!(crashed, interp::RealOutcome::Crashed { .. }),
+        "the crash must park inside A's wire await, got {crashed:?}"
+    );
+
+    // B progresses while A rests mid-crash.
+    for _ in 0..2 {
+        let out = interp::run_op(&mut b, &Op::OnlineSell(DpsScript::ack_path())).await;
+        assert!(
+            matches!(out, interp::RealOutcome::Doc(_)),
+            "FN-B must keep issuing while FN-A rests crashed — a cross-FN stall here is the \
+             'accidental global mutex' the dossier warns about. got {out:?}"
+        );
+    }
+
+    // Snapshot B before A recovers; A's reboot must not move a byte of it.
+    let b_ledger_before = b.read_ledger().await;
+    let b_seed_before = b.read_seed().await;
+    let b_sends_before = b.send_calls();
+
+    let _ = interp::run_op(&mut a, &Op::Reboot).await;
+
+    assert_eq!(
+        b.read_ledger().await,
+        b_ledger_before,
+        "A's boot recovery must not transition any of B's documents"
+    );
+    assert_eq!(
+        b.read_seed().await,
+        b_seed_before,
+        "…nor move B's chain seed"
+    );
+    assert_eq!(
+        b.send_calls(),
+        b_sends_before,
+        "…nor put anything of B's on the wire — a cross-FN resend during recovery would be a \
+         double-fiscalisation vector, not merely a bleed"
+    );
+    assert_eq!(
+        a.read_ledger().await.len(),
+        2,
+        "A holds exactly its own two documents after recovery (the crashed one resumed to its \
+         documented terminal with zero re-sends)"
+    );
+    prro::db::invariant_scan::assert_clean(&a.pool).await;
+}
+
+/// Offline FN-A and online FN-B: offline codes and sessions are per-FN pools, and A's offline
+/// issuance consumes only A's codes.
+#[tokio::test]
+async fn w6_offline_a_and_online_b_share_no_codes_or_sessions() {
+    // The offline fixture must be the PRIMARY (it owns the TempDir); B is its online sibling.
+    // 3 codes, not 2: the code-reserve floor holds codes back for the shift CLOSE, so a 2-code
+    // pool refuses a sell outright (`OFFLINE_CODE_RESERVE_HELD`) — the same sizing the single-FN
+    // capstones use.
+    let mut a = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+
+    assert_eq!(a.offline_codes_total().await, 3, "A's pool seeded");
+    assert_eq!(
+        b.offline_codes_total().await,
+        0,
+        "B sees NONE of A's codes — the pool is keyed by fiscal_number"
+    );
+
+    // The FIRST offline sell lazily interposes the session BEGIN (B10) — a two-document event the
+    // interpreter reports as `Recovered`; either shape is a successful offline issuance.
+    let out = interp::run_op(&mut a, &Op::OfflineSell).await;
+    assert!(
+        matches!(
+            out,
+            interp::RealOutcome::Doc(_) | interp::RealOutcome::Recovered { .. }
+        ),
+        "A issues offline, got {out:?}"
+    );
+    let out = interp::run_op(&mut b, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(
+        matches!(out, interp::RealOutcome::Doc(_)),
+        "B issues online, got {out:?}"
+    );
+
+    let consumed_a = a.consumed_codes_count().await;
+    assert!(
+        consumed_a >= 1,
+        "A's issuance consumed at least one of A's codes (the lazy BEGIN may consume its own), \
+         got {consumed_a}"
+    );
+    assert_eq!(
+        b.consumed_codes_count().await,
+        0,
+        "and none of B's — B has no pool and needed none (it is online)"
+    );
+    prro::db::invariant_scan::assert_clean(&a.pool).await;
+}
+
+/// The PRODUCTION per-FN write gate: same-FN acquisitions serialise, different-FN acquisitions
+/// overlap. The dossier's "no accidental global mutex" pin, driven through `App::acquire_fn_gate`
+/// itself — not the harness's private per-ctx mutex (whose independence from the prod gate is a
+/// documented fidelity wrinkle).
+#[tokio::test]
+async fn w6_prod_fn_gate_serialises_same_fn_and_overlaps_different_fns() {
+    let a = interp::FuzzCtx::new_online_open_shift().await;
+    let b = a.sibling_online_open_shift("4000000002").await;
+
+    // Hold A's gate…
+    let held = a.app.acquire_fn_gate(a.fn_id()).await;
+
+    // …a DIFFERENT FN acquires immediately (no accidental global mutex):
+    let overlapped = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        b.app.acquire_fn_gate(b.fn_id()),
+    )
+    .await;
+    assert!(
+        overlapped.is_ok(),
+        "FN-B's gate must be free while FN-A's is held — a timeout here means the per-FN gate \
+         degenerated into a global mutex, the fleet-killing regression W6 exists to catch"
+    );
+
+    // …and the SAME FN does NOT acquire while held (single-writer per FN):
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        a.app.acquire_fn_gate(a.fn_id()),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "a second acquisition of FN-A's gate must WAIT while the first is held — if it goes \
+         through, invariant #2 has no lock behind it at all"
+    );
+
+    // Release A; the same FN now proceeds.
+    drop(held);
+    let after = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        a.app.acquire_fn_gate(a.fn_id()),
+    )
+    .await;
+    assert!(after.is_ok(), "released gate must be acquirable again");
+    drop(overlapped);
+    drop(after);
+}
+
 /// Peer-tip axis PHASE C — the ONE place reality's tip vocabulary is translated into the model's.
 ///
 /// Written out as an explicit match rather than derived or `#[repr]`-aliased, because this mapping

@@ -1524,6 +1524,11 @@ test-support	prro	prro::invariant_fuzzer	teeth_shift_state_oracle_catches_drift	
 test-support	prro	prro::invariant_fuzzer	teeth_x2_multiple_active_sessions_flagged	false
 test-support	prro	prro::invariant_fuzzer	teeth_x2_single_active_session_not_flagged	false
 test-support	prro	prro::invariant_fuzzer	teeth_x_report_side_effect_free_and_snapshots_model	false
+test-support	prro	prro::invariant_fuzzer	w6_crash_on_fn_a_leaves_fn_b_progressing_and_recovery_scoped	false
+test-support	prro	prro::invariant_fuzzer	w6_interleaved_sells_keep_two_fns_fully_isolated	false
+test-support	prro	prro::invariant_fuzzer	w6_offline_a_and_online_b_share_no_codes_or_sessions	false
+test-support	prro	prro::invariant_fuzzer	w6_prod_fn_gate_serialises_same_fn_and_overlaps_different_fns	false
+test-support	prro	prro::invariant_fuzzer	w6_same_idempotency_key_on_two_fns_mints_on_both	false
 test-support	prro	prro::invariant_fuzzer	z_aggregation_oracle_checks_taxable_sell_return_turnover	false
 test-support	prro	prro::invariant_scan	aborted_doc_does_not_trip_chain_walk	false
 test-support	prro	prro::invariant_scan	clean_consistent_ledger_scans_clean	false
