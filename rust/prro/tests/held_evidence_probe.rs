@@ -395,6 +395,20 @@ async fn repeat_verdicts_are_not_re_recorded_but_transitions_are() {
     );
 }
 
+/// The tick interval is an OPERATIONAL contract, not a free constant: five minutes is the reaper's
+/// D6 precedent, slow enough to never bother DPS and fast enough that a verdict tracks an outage
+/// ending. The mutation gate caught `5 * 60` surviving as `5 + 60` — a 65-second cadence nobody
+/// asked for — so the value is pinned. Changing it is fine; changing it UNKNOWINGLY is not.
+#[test]
+fn tick_interval_is_the_reaper_precedent_five_minutes() {
+    assert_eq!(
+        held_evidence_probe::HELD_PROBE_TICK_INTERVAL,
+        std::time::Duration::from_secs(300),
+        "the probe cadence is a deliberate operational choice (D6, the reaper's precedent) — \
+         if you meant to change it, change this pin in the same commit and say why"
+    );
+}
+
 /// Scope: only the TRANSIENT class. A `-12` (`MacReseedPending`) hold has its own resolution story —
 /// the operator supplies a corrected seed — and this probe has nothing to say about it.
 #[tokio::test]

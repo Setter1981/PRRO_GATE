@@ -83,6 +83,7 @@ prro/src/runtime/outgress.rs:236:9: replace <impl SignEnvelope for CmsOverDatEnv
 prro/src/runtime/supervisor.rs:315:23: replace && with || in run_with_registry
 prro/src/runtime/supervisor.rs:700:5: replace log_join_failure with ()
 prro/src/runtime/supervisor.rs:1084:5: replace convergence_tick with ()
+prro/src/runtime/supervisor.rs:1098:5: replace held_probe_tick with ()
 prro/src/runtime/supervisor.rs:1180:5: replace auto_z_tick with ()
 prro/src/runtime/supervisor.rs:1294:75: replace + with - in spawn_backup_loop
 prro/src/runtime/supervisor.rs:1414:5: replace backup_same_device_advisory with ()
