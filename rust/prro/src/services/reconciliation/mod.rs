@@ -24,6 +24,9 @@
 pub mod boot_phase;
 pub mod er_redrive_policy;
 pub mod guard;
+/// bd `PRRO_GATE-6bj` step 1 — ask DPS what it holds while a transient outcome is HELD, and record
+/// the answer. Read-only by construction: no document transition, no `send_chk`, no mode change.
+pub mod held_evidence_probe;
 pub mod inbox_reaper;
 pub mod last_chk_probe;
 pub mod online_convergence;
