@@ -5111,6 +5111,21 @@ fn is_settled(mode: NodeMode, shift: ShiftState) -> bool {
     ) || shift == ShiftState::RequiresManualReconciliation
 }
 
+/// W6 slice 2b — the PROCESS-wide settled predicate for the per-op scan gate.  The settled
+/// scan reads the WHOLE database, so it may only run when EVERY tenant is settled: another
+/// tenant resting mid-transition (GoingOnline) legitimately carries a deferred SENDING doc
+/// the scan would false-flag as stuck.  In the single-FN harness `node_state` holds one row
+/// and this degenerates to the tenant's own `is_settled`.  The terminal pass has its own
+/// two-phase settle-then-scan and does not use this.
+async fn process_settled(pool: &sqlx::SqlitePool) -> bool {
+    let rows: Vec<(prro::db::types::DbNodeMode, prro::db::types::DbShiftState)> =
+        sqlx::query_as("SELECT mode, shift_state FROM node_state")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    !rows.is_empty() && rows.into_iter().all(|(m, s)| is_settled(m.0, s.0))
+}
+
 /// The shift states a real drain can make progress on (`backlog_drain.rs`
 /// finalize transitions + SW-3 fail-loud).  A drain over a non-eligible shift
 /// (e.g. a force-closed shift) cannot finalize `GoingOnline → Online`, so a
@@ -6363,9 +6378,10 @@ async fn harness_step(
     //     legitimate durable operator terminal, AUD-K8-1) even at mode
     //     GoingOnline — a reject-halt rests there and MUST be scanned in
     //     place (a violation there is a REAL finding, not suppressed).
-    let mode_now = ctx.read_node_mode().await;
-    let shift_now = ctx.read_shift_state().await;
-    if !st.pending_crash && !st.defer_scan && is_settled(mode_now, shift_now) {
+    //   - W6 slice 2b: the predicate is PROCESS-wide (`process_settled`) — the
+    //     scan reads the whole database, so another tenant mid-transition
+    //     suppresses it exactly like this tenant's own transition would.
+    if !st.pending_crash && !st.defer_scan && process_settled(&ctx.pool).await {
         oracle::assert_clean(&ctx.pool).await;
         if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
             panic!("mirror drift on {op:?}: {d:?}");
