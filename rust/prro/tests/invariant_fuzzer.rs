@@ -3513,6 +3513,101 @@ async fn w6_hold_and_fence_preconditions_are_fn_scoped() {
     );
 }
 
+// ── W6 slice 2b — the generative multi-FN lane ──
+
+/// Directed smoke of `run_harness_multi` with a REAL cross-tenant effect: B crashes mid-wire,
+/// then A's Reboot brings the PROCESS back — the driver cascades the reboot to B's pair, whose
+/// own boot reconciliation resumes B's crashed SENDING doc under B's differential, with no op
+/// of B's own in the sequence.  Drop the cascade and this test REDs (canaried).
+#[tokio::test]
+async fn w6_multi_harness_routes_ops_and_resyncs_the_bystander_across_a_fault() {
+    let a = interp::FuzzCtx::new_online_open_shift().await;
+    let ma = RefModel::new_online_open_shift();
+    let b = a.sibling_online_open_shift("4000000002").await;
+    let mb = RefModel::new_online_open_shift().for_fn("4000000002");
+
+    let ops = vec![
+        (1usize, Op::OnlineSell(DpsScript::ack_path())),
+        // B parks a doc inside the wire (TRANSPORT collapse — the process lives on).
+        (1, Op::Crash(Stage::Send)),
+        (0, Op::OnlineSell(DpsScript::ack_path())),
+        // A's Reboot cascades: B's OWN recon (per-FN, prod topology) resumes B's SENDING
+        // doc to ERROR_RETRYABLE (zero re-sends) — B's ledger moves with no op of B's own.
+        (0, Op::Reboot),
+        // B tries to issue again.  The resumed doc rests ERROR_RETRYABLE — an online-ER is
+        // a D5 BLOCKER, so this sell is REFUSED.  The step's differential stays green only
+        // because the cascade resync'd mb onto the resumed ledger: an un-resync'd model
+        // would mispredict here and the differential would panic (that IS the cascade's
+        // proof).
+        (1, Op::OnlineSell(DpsScript::ack_path())),
+        (0, Op::OnlineSell(DpsScript::ack_path())),
+    ];
+    let ctxs = run_harness_multi(&ops, vec![(a, ma), (b, mb)]).await;
+
+    assert_eq!(
+        ctxs[0]
+            .read_ledger()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "A minted exactly its two sells"
+    );
+    let b_ledger = ctxs[1].read_ledger().await;
+    assert_eq!(
+        b_ledger.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2],
+        "B holds its sell and the crash-parked doc (the post-ER sell was refused by the D5 \
+         blocker — no third row)"
+    );
+    assert_eq!(
+        b_ledger.get(&2),
+        Some(&DocState::ErrorRetryable),
+        "B's crash-parked doc was resumed by ITS OWN cascaded reboot (zero re-sends), not \
+         left SENDING"
+    );
+    prro::db::invariant_scan::assert_clean(&ctxs[0].pool).await;
+}
+
+/// Anti-silent-zero — the multi-FN strategy ACTUALLY routes ops to BOTH tenants, and each
+/// tenant sees both ordinary issuance and the fault lane.  A dropped index (or a constant one)
+/// would quietly turn the multi-FN capstones back into single-FN runs with an idle sibling.
+#[test]
+fn multi_fn_generator_routes_both_tenants_across_the_alphabet() {
+    let mut runner = TestRunner::deterministic();
+    let strat = strategy::multi_fn_op_sequence();
+    let (mut routed, mut sells, mut faults) = ([0usize; 2], [0usize; 2], [0usize; 2]);
+    for _ in 0..2000 {
+        let seq = strat.new_tree(&mut runner).unwrap().current();
+        for (idx, op) in &seq {
+            let idx = idx % 2;
+            routed[idx] += 1;
+            match op {
+                Op::OnlineSell(_) | Op::OfflineSell => sells[idx] += 1,
+                Op::Crash(_) | Op::CrashSend(_) | Op::Reboot | Op::RepeatReboot => faults[idx] += 1,
+                _ => {}
+            }
+        }
+    }
+    // Density floors well under the expected values (≈5500 routed, ≈700 sells, ≈900 faults per
+    // tenant over 2000 seqs × ~5.5 avg len): a dropped arm gives 0, a heavy skew trips the floor.
+    assert!(
+        routed[0] >= 1000 && routed[1] >= 1000,
+        "the multi-FN strategy under-routes a tenant (routed={routed:?} over 2000 seqs)"
+    );
+    assert!(
+        sells[0] >= 100 && sells[1] >= 100,
+        "a tenant sees too few sells (sells={sells:?}) — the interleave is not exercising \
+         ordinary issuance on both"
+    );
+    assert!(
+        faults[0] >= 100 && faults[1] >= 100,
+        "a tenant sees too few fault ops (faults={faults:?}) — the crash/reboot lane is not \
+         exercised on both sides of the interleave"
+    );
+}
+
 /// Peer-tip axis PHASE C — the ONE place reality's tip vocabulary is translated into the model's.
 ///
 /// Written out as an explicit match rather than derived or `#[repr]`-aliased, because this mapping
@@ -5016,6 +5111,21 @@ fn is_settled(mode: NodeMode, shift: ShiftState) -> bool {
     ) || shift == ShiftState::RequiresManualReconciliation
 }
 
+/// W6 slice 2b — the PROCESS-wide settled predicate for the per-op scan gate.  The settled
+/// scan reads the WHOLE database, so it may only run when EVERY tenant is settled: another
+/// tenant resting mid-transition (GoingOnline) legitimately carries a deferred SENDING doc
+/// the scan would false-flag as stuck.  In the single-FN harness `node_state` holds one row
+/// and this degenerates to the tenant's own `is_settled`.  The terminal pass has its own
+/// two-phase settle-then-scan and does not use this.
+async fn process_settled(pool: &sqlx::SqlitePool) -> bool {
+    let rows: Vec<(prro::db::types::DbNodeMode, prro::db::types::DbShiftState)> =
+        sqlx::query_as("SELECT mode, shift_state FROM node_state")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    !rows.is_empty() && rows.into_iter().all(|(m, s)| is_settled(m.0, s.0))
+}
+
 /// The shift states a real drain can make progress on (`backlog_drain.rs`
 /// finalize transitions + SW-3 fail-loud).  A drain over a non-eligible shift
 /// (e.g. a force-closed shift) cannot finalize `GoingOnline → Online`, so a
@@ -5087,12 +5197,28 @@ fn terminal_verdict(
 ///   - `ArtifactNoResend` → a forced-mode GoingOnline artifact: assert the
 ///     bounded no-resend invariant (the recovery ops re-drove nothing).
 async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
-    // A legitimate settle takes 1–2 real recovery ops (a drain-tick that
-    // finalizes GoingOnline → Online, OR a reboot that resolves a crash
-    // transient, OR a reject that lands RMR).  `3` is a small bound above that;
-    // exceeding it with a real settle path open is the liveness signal.
-    const SETTLE_BUDGET: usize = 3;
+    let outcome = settle_phase(ctx, pending_crash).await;
+    scan_phase(ctx, outcome).await;
+}
 
+/// A legitimate settle takes 1–2 real recovery ops (a drain-tick that finalizes
+/// GoingOnline → Online, OR a reboot that resolves a crash transient, OR a reject that lands
+/// RMR).  `3` is a small bound above that; exceeding it with a real settle path open is the
+/// liveness signal (`scan_phase`'s Liveness verdict names it).
+const SETTLE_BUDGET: usize = 3;
+
+/// What `settle_phase` hands to `scan_phase`: the pre-settle wire counter (for the
+/// ArtifactNoResend bound) and whether a legitimate settle-drain ran (which excuses it).
+struct SettleOutcome {
+    sends_before: usize,
+    settle_drain_ran: bool,
+}
+
+/// The SETTLE half of the terminal pass: drive bounded REAL recovery until the node settles.
+/// Split from the scan (W6 slice 2b) because the scan reads the WHOLE database — with two
+/// tenants, every tenant must settle BEFORE the first scan runs, or one tenant's terminal
+/// scan trips over another's not-yet-recovered crash transient.
+async fn settle_phase(ctx: &mut interp::FuzzCtx, pending_crash: bool) -> SettleOutcome {
     let sends_before = ctx.send_calls();
     // B10: track whether a LEGIT settle-drain ran.  A settle-capable state
     // (active session + non-empty drain cohort + eligible shift) drives a real
@@ -5127,6 +5253,35 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
         let _ = interp::run_op(ctx, &Op::Reboot).await;
         crash_pending = false;
     }
+    SettleOutcome {
+        sends_before,
+        settle_drain_ran,
+    }
+}
+
+/// The SCAN half of the terminal pass: classify the settled terminal and run the whole-DB
+/// oracles.  See `settle_phase` for why the split exists.
+async fn scan_phase(ctx: &mut interp::FuzzCtx, outcome: SettleOutcome) {
+    let verdict = terminal_local_checks(ctx, outcome).await;
+    terminal_scan(
+        &ctx.pool,
+        matches!(verdict, TerminalVerdict::ArtifactNoResend),
+    )
+    .await;
+}
+
+/// The verdict plus its LOCAL (per-FN) assertions: the Liveness panic and the
+/// ArtifactNoResend no-resend bound.  The whole-DB scan lives in [`terminal_scan`] — with two
+/// tenants it must run ONCE, combined over every tenant's verdict, or one tenant's strict
+/// scan trips over another tenant's LEGITIMATE GoingOnline artifact.
+async fn terminal_local_checks(
+    ctx: &mut interp::FuzzCtx,
+    outcome: SettleOutcome,
+) -> TerminalVerdict {
+    let SettleOutcome {
+        sends_before,
+        settle_drain_ran,
+    } = outcome;
 
     let mode = ctx.read_node_mode().await;
     let shift = ctx.read_shift_state().await;
@@ -5135,34 +5290,15 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
         Some(sid) => ctx.drain_cohort_len(sid).await > 0,
         None => false,
     };
-    match terminal_verdict(
+    let verdict = terminal_verdict(
         mode,
         shift,
         session.is_some(),
         cohort_nonempty,
         shift_drain_eligible(shift),
-    ) {
-        TerminalVerdict::Scan => {
-            // O1 (CP2 re-scope): the online-convergence drive+assert is DIRECTED-ONLY
-            // (`teeth_o1_*`), NOT wired here.  Driving it in the random net converges
-            // GENERATIVELY-STACKED SENT docs — multiple sells that each rest at SENT
-            // were signed against the SAME (un-advanced) seed, so acking them all
-            // chain-breaks (the lnd-2+ docs never chained onto lnd-1's post-ACK tip).
-            // That stacked-then-all-converge state is an artifact the generator
-            // reaches but real single-writer convergence escalates on (ChainSeedMismatch)
-            // — exactly the P1 "directed-only, generatively-unreachable" precedent.
-            // See TEETH_TEST.md + the architect note.
-            oracle::assert_clean(&ctx.pool).await;
-            if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
-                panic!("terminal mirror drift (mode={mode:?} shift={shift:?}): {d:?}");
-            }
-            // O3: catch a stored-hash/payload divergence the referential oracle misses.
-            if let Err(d) = oracle::check_payload_hash_integrity(&ctx.pool).await {
-                panic!(
-                    "terminal payload-hash integrity (O3) (mode={mode:?} shift={shift:?}): {d:?}"
-                );
-            }
-        }
+    );
+    match verdict {
+        TerminalVerdict::Scan => {}
         TerminalVerdict::Liveness => {
             panic!(
                 "LIVENESS: node did not settle to {{Online, Offline, RMR}} within \
@@ -5175,10 +5311,9 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
             // A forced-mode GoingOnline a real drain cannot progress (no session —
             // an impossible real GoingOnline, which is only entered via the
             // return-online probe FROM Offline, i.e. with a session; OR empty
-            // cohort; OR ineligible/force-closed shift).  Do NOT scan (a deferred
-            // online-origin SENDING would false-flag StuckSending) and do NOT
-            // liveness-panic (no real settle path).  Assert the bounded invariant
-            // that the recovery ops re-drove nothing.
+            // cohort; OR ineligible/force-closed shift).  Do NOT liveness-panic (no
+            // real settle path).  Assert the bounded invariant that the recovery
+            // ops re-drove nothing; the scan half is [`terminal_scan`]'s O5 filter.
             //
             // B10: the no-resend send-count assertion applies ONLY when NO LEGIT
             // settle-drain ran.  A settle-capable state (session + cohort +
@@ -5197,37 +5332,218 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
                      real recovery ops made a NEW wire send — deferred docs must not be re-driven"
                 );
             }
-            // O5: previously this branch SKIPPED the scan entirely (a deferred
-            // online-origin SENDING would false-flag StuckSending).  Run the scan
-            // but EXCUSE only that StuckSending variant — every OTHER violation
-            // (chain break / leaked pre-send doc / duplicate lnd / …) stays fatal,
-            // closing the blind spot where this terminal was never scanned.
-            let violations = prro::db::invariant_scan::scan(&ctx.pool)
-                .await
-                .expect("invariant_scan query");
-            if let Err(d) = oracle::filter_artifact_violations(violations) {
-                panic!("terminal ArtifactNoResend scan (mode={mode:?} shift={shift:?}): {d:?}");
-            }
+        }
+    }
+    verdict
+}
+
+/// The whole-DB terminal scan, run ONCE per terminal pass.
+///
+/// `excuse_artifacts = false` (every tenant settled clean) — the strict stack:
+/// `assert_clean` + Mirror-2/X2 + O3 payload-hash.  (O1 note, CP2 re-scope: the
+/// online-convergence drive+assert is DIRECTED-ONLY (`teeth_o1_*`), NOT wired here — driving
+/// it in the random net converges generatively-stacked SENT docs that real single-writer
+/// convergence escalates on; see TEETH_TEST.md.)
+///
+/// `excuse_artifacts = true` (some tenant rests a forced-mode GoingOnline artifact) — the O5
+/// filtered scan: a deferred online-origin SENDING would false-flag StuckSending, so exactly
+/// that variant is excused and every OTHER violation (chain break / leaked pre-send doc /
+/// duplicate lnd / …) stays fatal.  This is the single-FN ArtifactNoResend semantics lifted
+/// to the process: one tenant's artifact must not let ANOTHER tenant's real violation hide,
+/// and must not fail another tenant's clean terminal either.
+async fn terminal_scan(pool: &sqlx::SqlitePool, excuse_artifacts: bool) {
+    if excuse_artifacts {
+        let violations = prro::db::invariant_scan::scan(pool)
+            .await
+            .expect("invariant_scan query");
+        if let Err(d) = oracle::filter_artifact_violations(violations) {
+            panic!("terminal ArtifactNoResend scan: {d:?}");
+        }
+    } else {
+        oracle::assert_clean(pool).await;
+        if let Err(d) = oracle::check_mirrors(pool).await {
+            panic!("terminal mirror drift: {d:?}");
+        }
+        // O3: catch a stored-hash/payload divergence the referential oracle misses.
+        if let Err(d) = oracle::check_payload_hash_integrity(pool).await {
+            panic!("terminal payload-hash integrity (O3): {d:?}");
         }
     }
 }
 
+/// Cross-op crash bookkeeping for the generative harness.  One instance per PROCESS, not per
+/// FN: a stage-composition crash is process death and the resolving reboot revives the whole
+/// gateway, so the multi-FN driver shares ONE of these across every (ctx, model) pair while the
+/// single-FN `run_harness` owns its own.
+#[derive(Default, Clone, Copy)]
+struct CrashState {
+    /// A crash transient opened but not yet resolved by a reboot (A1 scan-gate
+    /// suppresses the scan while set; A3 asserts the no-resend postcond on the
+    /// resolving reboot).
+    pending_crash: bool,
+    /// U3 realism: a STAGE-COMPOSITION crash (Sign/Finalize/OfflineAck) models PROCESS death —
+    /// every op until the resolving Reboot is SKIPPED (see the long rationale at the
+    /// dead-until-reboot gate in `harness_step`).  Wire crashes (Send/Kvt1) are TRANSPORT
+    /// collapse and do NOT set this.
+    dead_until_reboot: bool,
+    /// U3: a WIRE crash (Send/Kvt1 — the doc already hit the wire) is pending; gates the A3
+    /// no-resend assert (composition-crash resumes legitimately perform a FIRST send).
+    pending_wire_crash: bool,
+    /// W6 slice 2b (driver-managed): suppress THIS step's settled-scan.  The scan reads the
+    /// WHOLE database, so during a cascaded multi-FN reboot only the LAST (acting) step may
+    /// scan — a bystander's step resolves its own crash bookkeeping before the other tenants
+    /// have reconciled, and its scan would trip over their still-SENDING docs.  Always false
+    /// in the single-FN harness.
+    defer_scan: bool,
+}
+
 /// Per-op dispatch gluing T1-T6: model.apply + run_op, then assert per the op's
 /// classification, with the T5 scan-timing rule (never mid-crash) and re-sync
-/// after a fault.
+/// after a fault.  The per-op body lives in `harness_step` so the multi-FN
+/// driver (`run_harness_multi`) holds the SAME oracle stack per step.
 async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) -> interp::FuzzCtx {
+    let mut st = CrashState::default();
+    for op in ops {
+        let _ = harness_step(&mut ctx, &mut model, op, &mut st).await;
+    }
+    // A2/A4: terminal liveness + scan.  The per-op scan is suppressed mid-crash
+    // and mid-transition; without a terminal pass an unpaired crash or a
+    // GoingOnline terminal would NEVER be recovered/scanned.  This drives bounded
+    // REAL recovery until the node settles, then scans (or fails liveness on a
+    // genuine non-settling settle-path; a forced-mode artifact asserts no-resend).
+    settle_and_scan(&mut ctx, st.pending_crash).await;
+    // U3: hand the ctx back so directed pins can inspect the settled ledger
+    // (e.g. the dead-until-reboot doc-count pin) — the capstones ignore it.
+    ctx
+}
+
+/// W6 slice 2b — the multi-FN generative driver: route each `(fn_idx, op)` to its own
+/// (ctx, model) pair, holding the single-FN harness's FULL oracle stack per step.
+///
+/// Semantics pinned here rather than implied:
+/// - `CrashState` is PROCESS-wide: a composition crash on either tenant kills the gateway for
+///   both (the dead-until-reboot gate in `harness_step` reads the shared state), and the
+///   resolving Reboot revives both.
+/// - A Reboot op CASCADES to every pair through the same full-oracle step: the interpreter's
+///   Reboot runs PER-FN boot reconciliation (mirroring prod, where App::boot iterates the fn
+///   set), so "the process came back" means every tenant's recon ran — a bystander's crashed
+///   doc resumes under its OWN differential.  After a non-reboot fault the bystander models
+///   are re-grounded in reality (adoption + peer handover + precondition syncs).
+/// - A tenant's op may never MINT a row for another tenant: the bystander doc-count is
+///   asserted unchanged around every step (the cross-FN mint bleed INV-2 forbids).  Send
+///   counters are deliberately NOT asserted here — boot-resume send attribution across
+///   tenants is transport plumbing pinned by the directed W6 pins instead.
+async fn run_harness_multi(
+    ops: &[(usize, Op)],
+    mut pairs: Vec<(interp::FuzzCtx, RefModel)>,
+) -> Vec<interp::FuzzCtx> {
+    assert!(
+        !pairs.is_empty(),
+        "run_harness_multi needs at least one pair"
+    );
+    let mut st = CrashState::default();
+    for (fn_idx, op) in ops {
+        let idx = fn_idx % pairs.len(); // the strategy emits small indices; stay total
+        if matches!(op, Op::Reboot | Op::RepeatReboot) {
+            // A process reboot revives EVERY tenant: the interpreter's Reboot runs PER-FN
+            // boot reconciliation (mirroring prod, where App::boot iterates the fn set), so
+            // the reboot cascades to every pair through the SAME full-oracle step — each
+            // tenant's crashed doc resumes under its OWN differential, and each model resyncs
+            // via its own FaultOrRecovery arm rather than a driver-side shortcut.
+            //
+            // Ordering is load-bearing: every step's settled-scan reads the WHOLE database,
+            // so the crash transient may only be declared resolved once the LAST tenant's
+            // recon has run.  Bystanders reboot first, each from the SAVED pre-reboot crash
+            // state (keeping the scan suppressed while another tenant's doc still rests
+            // SENDING); the acting pair reboots LAST and its step performs the final
+            // resolve-and-scan.
+            let saved = st;
+            for (j, (ctx_j, model_j)) in pairs.iter_mut().enumerate() {
+                if j != idx {
+                    st = saved;
+                    st.defer_scan = true; // only the LAST (acting) step scans the whole DB
+                    let _ = harness_step(ctx_j, model_j, op, &mut st).await;
+                }
+            }
+            st = saved;
+            let (ctx, model) = &mut pairs[idx];
+            let _ = harness_step(ctx, model, op, &mut st).await;
+            continue;
+        }
+        let mut bystander_docs = Vec::with_capacity(pairs.len());
+        for (j, (ctx_j, _)) in pairs.iter_mut().enumerate() {
+            if j != idx {
+                bystander_docs.push((j, ctx_j.observed_doc_count().await));
+            }
+        }
+        let class = {
+            let (ctx, model) = &mut pairs[idx];
+            harness_step(ctx, model, op, &mut st).await
+        };
+        for (j, before) in bystander_docs {
+            let (ctx_j, _) = &mut pairs[j];
+            let after = ctx_j.observed_doc_count().await;
+            assert_eq!(
+                after, before,
+                "cross-FN mint bleed: op {op:?} on pair {idx} changed pair {j}'s \
+                 fiscal_documents row count {before} -> {after}"
+            );
+        }
+        if matches!(class, Some(oracle::OpClass::FaultOrRecovery)) {
+            for (j, (ctx_j, model_j)) in pairs.iter_mut().enumerate() {
+                if j == idx {
+                    continue;
+                }
+                // A non-reboot fault (a crash) collapses transport/process state, not the
+                // bystander's database — but ground the bystander models anyway: adoption is
+                // cheap, and the driver's contract stays simple (any fault ⇒ every model
+                // grounded in reality before its next op).
+                model_j.adopt_fault_deferred(&ctx_j.pool).await;
+                let peer_now = as_model_tip(ctx_j.peer_tip_class().await);
+                let peer_saw = ctx_j.peer_has_seen(ctx_j.read_seed().await.as_deref());
+                model_j.sync_peer_tip(peer_now, peer_saw);
+                model_j.sync_held_reservation(&ctx_j.pool).await;
+                model_j.sync_fence_active(&ctx_j.pool).await;
+            }
+        }
+    }
+    // Two-phase terminal (the scan reads the WHOLE database): settle EVERY tenant first,
+    // then run every tenant's terminal scan — one tenant's scan must not trip over another's
+    // not-yet-recovered crash transient.
+    let pending = st.pending_crash;
+    let mut outcomes = Vec::with_capacity(pairs.len());
+    for (ctx, _) in pairs.iter_mut() {
+        outcomes.push(settle_phase(ctx, pending).await);
+    }
+    // Per-tenant verdicts + local assertions first, then ONE combined whole-DB scan: strict
+    // when every tenant settled clean, O5-filtered when any tenant rests a legitimate
+    // GoingOnline artifact (its deferred SENDING doc must not fail the OTHER tenant's scan).
+    let mut any_artifact = false;
+    for ((ctx, _), outcome) in pairs.iter_mut().zip(outcomes) {
+        let verdict = terminal_local_checks(ctx, outcome).await;
+        any_artifact |= matches!(verdict, TerminalVerdict::ArtifactNoResend);
+    }
+    terminal_scan(&pairs[0].0.pool, any_artifact).await;
+    pairs.into_iter().map(|(ctx, _)| ctx).collect()
+}
+
+/// ONE generative step: run `op` on the (ctx, model) pair and hold EVERY per-op oracle.
+/// Returns the op's class (`None` when the dead-until-reboot gate skipped the op) so the
+/// multi-FN driver can trigger the cross-FN resync a Fault op requires.
+async fn harness_step(
+    ctx: &mut interp::FuzzCtx,
+    model: &mut RefModel,
+    op: &Op,
+    st: &mut CrashState,
+) -> Option<oracle::OpClass> {
     // W6 slice 2 — the model's adoption/sync reads are scoped to ITS fiscal number, so a
     // ctx/model pair built for different FNs would silently adopt nothing (or the wrong
     // tenant). Fail loudly at the seam instead.
     assert_eq!(
         model.fn_id(),
         ctx.fn_id(),
-        "run_harness needs a ctx/model pair for the SAME fiscal number"
+        "harness_step needs a ctx/model pair for the SAME fiscal number"
     );
-    // A crash transient opened but not yet resolved by a reboot (A1 scan-gate
-    // suppresses the scan while set; A3 asserts the no-resend postcond on the
-    // resolving reboot).
-    let mut pending_crash = false;
     // U3 realism: a STAGE-COMPOSITION crash (Sign/Finalize/OfflineAck) models
     // PROCESS death — single-writer + boot-recon-before-serve means a crashed
     // gateway serves no new request before recovery, so every op until the
@@ -5237,84 +5553,78 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
     // see `dead_until_reboot_skips_ops_after_composition_crash`).  Wire crashes
     // (Send/Kvt1) are TRANSPORT collapse — the process may live on, later ops
     // legitimately run (the nightly-find 0627 class) — so they do NOT set this.
-    let mut dead_until_reboot = false;
-    // U3: a WIRE crash (Send/Kvt1 — the doc already hit the wire) is pending;
-    // gates the A3 no-resend assert (composition-crash resumes legitimately
-    // perform a FIRST send — see the A3 comment below).
-    let mut pending_wire_crash = false;
-    for op in ops {
-        if dead_until_reboot && !matches!(op, Op::Reboot | Op::RepeatReboot) {
-            continue; // process is dead — no op reaches the gateway before reboot
+    if st.dead_until_reboot && !matches!(op, Op::Reboot | Op::RepeatReboot) {
+        return None; // process is dead — no op reaches the gateway before reboot
+    }
+    // Peer-tip axis PHASE C.1 (spec §5, MAJOR #6) — the constraint the spec asked for is
+    // DELIBERATELY NOT HERE, and this comment is the reason.
+    //
+    // §5 said: `NotAcceptedOffline` on a hold the peer TOOK rewinds our chain beneath a
+    // document DPS holds, after which "every later drain send earns `-12`, the hold is
+    // offline-origin, and MacReseed is fail-closed refused" — a divergence with no exit, so the
+    // generator should stay out of it. Built, then measured against the real seam
+    // (`phase_c1_offline_hold_the_peer_took_is_a_fork_with_no_exit`), and the chain of reasoning
+    // does not hold up:
+    //   - there are no "later drain sends" — the completion's OLA-cohort cancel EMPTIES the
+    //     backlog (successors → CANCELLED, the held doc → RMR);
+    //   - MacReseed is refused one step EARLIER and for a different reason ("no held
+    //     reservation rests" — the completion already released it), never reaching the
+    //     offline-origin guard the spec named;
+    //   - the FN does park unrecoverably, but as `GoingOnline` + an RMR shift (issuance refused
+    //     `NODE_GOING_ONLINE`, the drain a guarded no-op) — a state that has nothing to do with
+    //     the peer.
+    // And the decisive one: production cannot SEE the peer's truth, so its behaviour is
+    // identical whether the peer took the document or not. The same park is reachable today via
+    // an ordinary `Superseded` drain — a constraint keyed on the peer's truth would remove
+    // freshly-won coverage while preventing nothing.
+    //
+    // So the generator emits it freely, and the two `phase_c1_*` pins hold the ground instead:
+    // one documents the park (and REDs first if production ever grows a way out), one drives the
+    // whole trajectory through this harness. If phase D ever turns the derived `-12` on
+    // GENERATIVELY, revisit — that is the world in which the spec's reasoning would start to
+    // bite.
+    let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
+    let seed_at_op_start = model.seed; // model MAC tip BEFORE the op (B10 B3 structural seed check)
+    let codes_before = ctx.consumed_codes_count().await;
+    let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
+    let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
+    let cohort_before = ctx.full_drain_cohort_count().await; // MH: drain re-drives ≤ cohort
+    let next_lnd_before = ctx.read_next_lnd().await; // MH/B2: a drain/no-op allocates no lnd
+    let doc_count_before = ctx.observed_doc_count().await; // B2: TrueNoMutation mints no row
+                                                           // CS-3 crash/replay (P4): the FN's held reservation BEFORE the op — a crash / reboot must
+                                                           // PRESERVE it (boot recovery may not release or lose a committed PENDING_APPLY hold).
+    let held_res_before = ctx.active_held_reservation().await;
+    // bd hpc — a T=112 replenish is the ONLY op that legitimately moves the chain seed without
+    // minting a document; it GRANTS codes rather than consuming them, so the harness needs the
+    // TOTAL pool size as well as the consumed count. Must be sampled BEFORE the op runs.
+    let codes_total_before = ctx.offline_codes_total().await;
+    // bd PRRO_GATE-2nk (§5b) — generative NotAcceptedOffline: snapshot the rewind target (the held
+    // doc's own immutable previous_hash) + the pre-op cohort so the Release arm asserts the EXACT
+    // rewind + OLA-cohort cancel. The structural seed check only proves the seed CHANGED; this pins
+    // it to the held doc's previous_hash (which may be a non-doc T=112 seed or genesis NULL).
+    let nao_snapshot = if matches!(
+        op,
+        Op::OperatorComplete(OperatorResolutionKind::NotAcceptedOffline)
+    ) {
+        match held_res_before.as_ref() {
+            Some((_res, held_rid)) => Some((
+                ctx.read_previous_hash(held_rid).await,
+                ctx.read_doc_states_by_lnd().await,
+            )),
+            None => None,
         }
-        // Peer-tip axis PHASE C.1 (spec §5, MAJOR #6) — the constraint the spec asked for is
-        // DELIBERATELY NOT HERE, and this comment is the reason.
-        //
-        // §5 said: `NotAcceptedOffline` on a hold the peer TOOK rewinds our chain beneath a
-        // document DPS holds, after which "every later drain send earns `-12`, the hold is
-        // offline-origin, and MacReseed is fail-closed refused" — a divergence with no exit, so the
-        // generator should stay out of it. Built, then measured against the real seam
-        // (`phase_c1_offline_hold_the_peer_took_is_a_fork_with_no_exit`), and the chain of reasoning
-        // does not hold up:
-        //   - there are no "later drain sends" — the completion's OLA-cohort cancel EMPTIES the
-        //     backlog (successors → CANCELLED, the held doc → RMR);
-        //   - MacReseed is refused one step EARLIER and for a different reason ("no held
-        //     reservation rests" — the completion already released it), never reaching the
-        //     offline-origin guard the spec named;
-        //   - the FN does park unrecoverably, but as `GoingOnline` + an RMR shift (issuance refused
-        //     `NODE_GOING_ONLINE`, the drain a guarded no-op) — a state that has nothing to do with
-        //     the peer.
-        // And the decisive one: production cannot SEE the peer's truth, so its behaviour is
-        // identical whether the peer took the document or not. The same park is reachable today via
-        // an ordinary `Superseded` drain — a constraint keyed on the peer's truth would remove
-        // freshly-won coverage while preventing nothing.
-        //
-        // So the generator emits it freely, and the two `phase_c1_*` pins hold the ground instead:
-        // one documents the park (and REDs first if production ever grows a way out), one drives the
-        // whole trajectory through this harness. If phase D ever turns the derived `-12` on
-        // GENERATIVELY, revisit — that is the world in which the spec's reasoning would start to
-        // bite.
-        let prior_tip = ctx.read_seed().await; // real MAC tip BEFORE the op
-        let seed_at_op_start = model.seed; // model MAC tip BEFORE the op (B10 B3 structural seed check)
-        let codes_before = ctx.consumed_codes_count().await;
-        let sends_before = ctx.send_calls(); // wire send count BEFORE the op (A3 no-resend)
-        let shift_before = ctx.read_shift_state().await; // real shift_state BEFORE the op
-        let cohort_before = ctx.full_drain_cohort_count().await; // MH: drain re-drives ≤ cohort
-        let next_lnd_before = ctx.read_next_lnd().await; // MH/B2: a drain/no-op allocates no lnd
-        let doc_count_before = ctx.observed_doc_count().await; // B2: TrueNoMutation mints no row
-                                                               // CS-3 crash/replay (P4): the FN's held reservation BEFORE the op — a crash / reboot must
-                                                               // PRESERVE it (boot recovery may not release or lose a committed PENDING_APPLY hold).
-        let held_res_before = ctx.active_held_reservation().await;
-        // bd hpc — a T=112 replenish is the ONLY op that legitimately moves the chain seed without
-        // minting a document; it GRANTS codes rather than consuming them, so the harness needs the
-        // TOTAL pool size as well as the consumed count. Must be sampled BEFORE the op runs.
-        let codes_total_before = ctx.offline_codes_total().await;
-        // bd PRRO_GATE-2nk (§5b) — generative NotAcceptedOffline: snapshot the rewind target (the held
-        // doc's own immutable previous_hash) + the pre-op cohort so the Release arm asserts the EXACT
-        // rewind + OLA-cohort cancel. The structural seed check only proves the seed CHANGED; this pins
-        // it to the held doc's previous_hash (which may be a non-doc T=112 seed or genesis NULL).
-        let nao_snapshot = if matches!(
-            op,
-            Op::OperatorComplete(OperatorResolutionKind::NotAcceptedOffline)
-        ) {
-            match held_res_before.as_ref() {
-                Some((_res, held_rid)) => Some((
-                    ctx.read_previous_hash(held_rid).await,
-                    ctx.read_doc_states_by_lnd().await,
-                )),
-                None => None,
-            }
-        } else {
-            None
-        };
+    } else {
+        None
+    };
 
-        let real = interp::run_op(&mut ctx, op).await;
-        // O2: an Offline-node Crash that never reached the wire COMPLETES as a real
-        // offline sell (RealOutcome::Doc) — a DETERMINISTIC mutation, not a fault.
-        // Predict it (DB-read-independent) so the crash differential is NOT vacuous
-        // (pre-O2: Op::Crash → Fault → check_differential Ok(()) → the FaultOrRecovery
-        // arm resync'd, silently adopting the real DB).  A wire-reached Crash
-        // (RealOutcome::Crashed) and every Reboot stay Fault.
-        let expected = match (op, &real) {
+    let real = interp::run_op(ctx, op).await;
+    // O2: an Offline-node Crash that never reached the wire COMPLETES as a real
+    // offline sell (RealOutcome::Doc) — a DETERMINISTIC mutation, not a fault.
+    // Predict it (DB-read-independent) so the crash differential is NOT vacuous
+    // (pre-O2: Op::Crash → Fault → check_differential Ok(()) → the FaultOrRecovery
+    // arm resync'd, silently adopting the real DB).  A wire-reached Crash
+    // (RealOutcome::Crashed) and every Reboot stay Fault.
+    let expected = match (op, &real) {
             // O2: an offline-node crash completes as a real offline sell.  With
             // B10 it may interpose a BEGIN (→ `Recovered`, two-doc) or not (→
             // `Doc`, single); either way predict it deterministically via the
@@ -5334,505 +5644,502 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
             _ => model.apply(op),
         };
 
-        let class = oracle::classify(&expected);
-        match class {
-            // bd PRRO_GATE-hpc — T=112 replenish.  NARROW, ASSERTED carve-out from the
-            // "a seed advance implies an issuance" assumption: the seed DID move, and the op DID NOT
-            // allocate an lnd or mint a doc.  Every clause below is asserted in BOTH directions
-            // (granted vs server-reject), so this can never degrade into a blanket exemption.
-            oracle::OpClass::Replenish => {
-                oracle::check_differential(&real, &expected, prior_tip.as_deref()).unwrap_or_else(
-                    |d| panic!("replenish differential divergence on {op:?}: {d:?}"),
-                );
-                let granted = matches!(&real, interp::RealOutcome::Replenished { .. });
-                let seed_after = ctx.read_seed().await;
-                let seed_moved = seed_after.as_deref() != prior_tip.as_deref();
-                assert_eq!(
-                    seed_moved, granted,
-                    "replenish {op:?}: the chain seed must move IFF DPS granted codes \
+    let class = oracle::classify(&expected);
+    match class {
+        // bd PRRO_GATE-hpc — T=112 replenish.  NARROW, ASSERTED carve-out from the
+        // "a seed advance implies an issuance" assumption: the seed DID move, and the op DID NOT
+        // allocate an lnd or mint a doc.  Every clause below is asserted in BOTH directions
+        // (granted vs server-reject), so this can never degrade into a blanket exemption.
+        oracle::OpClass::Replenish => {
+            oracle::check_differential(&real, &expected, prior_tip.as_deref())
+                .unwrap_or_else(|d| panic!("replenish differential divergence on {op:?}: {d:?}"));
+            let granted = matches!(&real, interp::RealOutcome::Replenished { .. });
+            let seed_after = ctx.read_seed().await;
+            let seed_moved = seed_after.as_deref() != prior_tip.as_deref();
+            assert_eq!(
+                seed_moved, granted,
+                "replenish {op:?}: the chain seed must move IFF DPS granted codes \
                      (granted={granted}, seed_moved={seed_moved})"
-                );
-                // The load-bearing half: a replenish allocates NO lnd.  This is what makes the
-                // witness's `lnd_at_write` ordering frame (migration 040) meaningful — a doc that
-                // later consumes that ordinal must win the tie-break against the witness.
+            );
+            // The load-bearing half: a replenish allocates NO lnd.  This is what makes the
+            // witness's `lnd_at_write` ordering frame (migration 040) meaningful — a doc that
+            // later consumes that ordinal must win the tie-break against the witness.
+            assert_eq!(
+                ctx.read_next_lnd().await,
+                next_lnd_before,
+                "replenish {op:?} allocated an lnd — it must not"
+            );
+            assert_eq!(
+                ctx.observed_doc_count().await,
+                doc_count_before,
+                "replenish {op:?} minted a fiscal_documents row — it mints none"
+            );
+            assert_eq!(
+                ctx.consumed_codes_count().await,
+                codes_before,
+                "replenish {op:?} CONSUMED a code — it only grants"
+            );
+            let codes_total_after = ctx.offline_codes_total().await;
+            if granted {
+                // The pool grows by EXACTLY the rows prod reports as inserted. Asserting
+                // "the pool grew" would be wrong: `insert_dps_codes_tx` uses INSERT OR IGNORE
+                // against the partial unique index on (fiscal_number, dps_code), so a code value
+                // DPS re-issues is legitimately deduped and inserts nothing — which is exactly the
+                // idempotency RULING 2 §2 leans on for fresh-request recovery.
+                let (inserted, deduped) = match &real {
+                    interp::RealOutcome::Replenished {
+                        inserted, deduped, ..
+                    } => (*inserted, *deduped),
+                    other => {
+                        panic!("granted replenish with a non-Replenished outcome: {other:?}")
+                    }
+                };
                 assert_eq!(
-                    ctx.read_next_lnd().await,
-                    next_lnd_before,
-                    "replenish {op:?} allocated an lnd — it must not"
-                );
-                assert_eq!(
-                    ctx.observed_doc_count().await,
-                    doc_count_before,
-                    "replenish {op:?} minted a fiscal_documents row — it mints none"
-                );
-                assert_eq!(
-                    ctx.consumed_codes_count().await,
-                    codes_before,
-                    "replenish {op:?} CONSUMED a code — it only grants"
-                );
-                let codes_total_after = ctx.offline_codes_total().await;
-                if granted {
-                    // The pool grows by EXACTLY the rows prod reports as inserted. Asserting
-                    // "the pool grew" would be wrong: `insert_dps_codes_tx` uses INSERT OR IGNORE
-                    // against the partial unique index on (fiscal_number, dps_code), so a code value
-                    // DPS re-issues is legitimately deduped and inserts nothing — which is exactly the
-                    // idempotency RULING 2 §2 leans on for fresh-request recovery.
-                    let (inserted, deduped) = match &real {
-                        interp::RealOutcome::Replenished {
-                            inserted, deduped, ..
-                        } => (*inserted, *deduped),
-                        other => {
-                            panic!("granted replenish with a non-Replenished outcome: {other:?}")
-                        }
-                    };
-                    assert_eq!(
-                        codes_total_after - codes_total_before,
-                        inserted as i64,
-                        "replenish {op:?}: pool delta must equal the reported inserted count \
+                    codes_total_after - codes_total_before,
+                    inserted as i64,
+                    "replenish {op:?}: pool delta must equal the reported inserted count \
                          ({codes_total_before} -> {codes_total_after}, inserted={inserted}, \
                          deduped={deduped})"
-                    );
-                    assert!(
-                        inserted + deduped >= 1,
-                        "a granted replenish {op:?} accounted for NO codes at all \
-                         (inserted={inserted}, deduped={deduped}) — the grant went nowhere"
-                    );
-                } else {
-                    assert_eq!(
-                        codes_total_after, codes_total_before,
-                        "a server-rejected replenish {op:?} must persist NOTHING"
-                    );
-                }
-                // Keep the model's code total in step with reality (the model predicts +1 per grant;
-                // prod dedups by value, so reality is the authority on the exact count).
-                model.codes_issued = codes_total_after;
-            }
-            // Fault / recovery — we do NOT predict recovery; adopt the real DB.
-            oracle::OpClass::FaultOrRecovery => {
-                // MH (B1): a Fault-DEFERRED DRAIN (exotic wire script / mid-wire
-                // cohort the model cannot cleanly predict) was previously BLINDLY
-                // resync'd, leaving the exotic-drain path UNVERIFIED.  Assert the
-                // bounded SAFETY postconds FIRST, so an erroneous exotic drain is
-                // CAUGHT, not adopted.  (Crash / Reboot Faults are NOT drains —
-                // they are covered by A3's no-resend below.)
-                if matches!(
-                    op,
-                    Op::Drain(_) | Op::RepeatDrain | Op::GoOnline(_) | Op::GoOnlineWithoutBacklog
-                ) {
-                    // B10 END-online fix: a drain that FINALIZES mints the DocType=10
-                    // END LAST as an ONLINE ISSUANCE — ONE fresh doc that allocates
-                    // ONE lnd and advances the MAC seed (advance-at-SEND), but
-                    // consumes ZERO offline codes (bare `<MAC>`, `fs_mode='ONLINE'`).
-                    // So: codes are STRICTLY unchanged (a code bump on a drain is now
-                    // a bug — the online END never consumes one, and re-driving the
-                    // already-issued backlog consumes none); lnds relax to +1 (the
-                    // END's lnd); the END-mint signal is the LND ALLOCATION, not a
-                    // code bump.  These bounds are tighter than the pre-fix ones,
-                    // preserving + sharpening the safety teeth.
-                    let codes_after = ctx.consumed_codes_count().await;
-                    assert_eq!(
-                        codes_after,
-                        codes_before,
-                        "MH: exotic drain {op:?} consumed {} codes (the online END consumes NONE; \
-                         a drain must consume zero)",
-                        codes_after - codes_before
-                    );
-                    let next_lnd_after = ctx.read_next_lnd().await;
-                    assert!(
-                        next_lnd_after == next_lnd_before || next_lnd_after == next_lnd_before + 1,
-                        "MH: exotic drain {op:?} allocated {} lnds (> the one END lnd)",
-                        next_lnd_after - next_lnd_before
-                    );
-                    // 3. Seed: unchanged (pure re-drive) OR advanced (the END's
-                    //    advance-at-SEND) — never advanced by re-driving the
-                    //    ALREADY-issued backlog (that would be a double-advance bug),
-                    //    but the END is a fresh online issuance so a single advance is
-                    //    allowed.  The END-mint signal is the lnd allocation (+1);
-                    //    the exact seed value is model-checked in the
-                    //    PredictableMutating path.
-                    let end_minted = next_lnd_after == next_lnd_before + 1;
-                    if !end_minted {
-                        assert_eq!(
-                            ctx.read_seed().await,
-                            prior_tip,
-                            "MH: exotic drain {op:?} advanced the MAC seed without minting an END"
-                        );
-                    }
-                    // 4. Send-delta bounded by the cohort — the drain re-drives
-                    //    each cohort doc a BOUNDED number of times (no unbounded
-                    //    resend loop); 2×+1 allows one MAC-recovery retry per doc.
-                    let send_delta = ctx.send_calls() - sends_before;
-                    assert!(
-                        send_delta <= 2 * cohort_before + 1,
-                        "MH: exotic drain {op:?} send-delta {send_delta} exceeds \
-                         2×cohort({cohort_before})+1 — unbounded re-drive"
-                    );
-                    // 5. Shift unchanged, escalated to RMR, OR legitimately
-                    //    resolved from a pending-drain state.
-                    //    A drain either makes progress (shift unchanged or pending-drain
-                    //    resolved to terminal) or halts-manual (RMR); never some other
-                    //    shift transition.
-                    //    OpenedLocalPendingDrain → Opened: drain re-drove a SENT doc
-                    //    (held from a prior interrupted online attempt) to ACK, resolving
-                    //    the pending-drain state (spec §6.3 edge 6 success path).
-                    //    ClosingLocalPendingDrain → Closed: same resolution for closing.
-                    let shift_after = ctx.read_shift_state().await;
-                    assert!(
-                        shift_after == shift_before
-                            || shift_after == ShiftState::RequiresManualReconciliation
-                            || (shift_before == ShiftState::OpenedLocalPendingDrain
-                                && shift_after == ShiftState::Opened)
-                            || (shift_before == ShiftState::ClosingLocalPendingDrain
-                                && shift_after == ShiftState::Closed),
-                        "MH: exotic drain {op:?} moved shift {shift_before:?} -> {shift_after:?} \
-                         (neither unchanged nor RMR nor legitimate pending-drain resolution)"
-                    );
-                }
-                // U1 D4 — a BadHashPrev online sell routes to the bounded W10.4
-                // MAC-recovery path (DDL `mac_recovery_attempts CHECK IN (0,1)` +
-                // the `mac_recovery_invoked` one-shot flag, stage_send.rs:951/970):
-                // AT MOST ONE re-sign + re-send per `run()`.  The pure model
-                // defers the terminal (Fault), but the WIRE send-count must stay
-                // bounded — no unbounded resend.  A regression that removed the
-                // one-shot guard would resend without limit; this generative gate
-                // catches it (like AUD-K8-1's wire-call bound).  PR-R-fuzz — a
-                // BadHashPrev online RETURN takes the SAME doc-type-agnostic
-                // MAC-recovery path (symmetry (c)), so it is bounded identically.
-                if matches!(
-                    op,
-                    Op::OnlineSell(s) | Op::OnlineReturn(s)
-                        if matches!(s.0.as_slice(), [WireResponse::BadHashPrev, ..])
-                ) {
-                    let send_delta = ctx.send_calls() - sends_before;
-                    // Probe-derived: the real send-delta is exactly 1 (the single
-                    // original send; the W10.4 re-sign's re-send hits the stub's
-                    // empty queue → terminal, no second wire call).  Bound at the
-                    // exact threshold, so ANY extra resend (a reverted one-shot
-                    // guard → send-delta ≥ 2) is caught.
-                    assert!(
-                        send_delta <= 1,
-                        "U1 D4: BadHashPrev online sell wire send-delta {send_delta} exceeds the \
-                         bounded MAC-recovery budget (original send + at most one W10.4 re-send)"
-                    );
-                }
-                model.adopt_fault_deferred(&ctx.pool).await;
-                // Peer-tip axis PHASE C (spec §8.3) — and hand the peer over.
-                //
-                // Everything `adopt_fault_deferred` re-syncs it re-DERIVES from the ledger. The
-                // peer has no ledger row: it is environment state, so a fault window is the one
-                // place the model cannot recover it on its own. Handing it over is the
-                // `sync_fence_active` pattern and carries the same stated boundary — across a
-                // fault the harness verifies *given this peer state, the model behaves correctly*,
-                // not that the model would have derived it. Between faults the mirror is fully
-                // independent, and that is where the assertion above has teeth.
-                let peer_now = as_model_tip(ctx.peer_tip_class().await);
-                // bd `PRRO_GATE-h7b` — hand over the seen-question with the tip, for the same
-                // reason: across a fault the model cannot re-derive which of its symbols DPS would
-                // still recognise, and getting this wrong flips a replenish between "accepted and
-                // re-based" and "-12, tip unmoved".
-                let peer_saw_our_tip = ctx.peer_has_seen(ctx.read_seed().await.as_deref());
-                model.sync_peer_tip(peer_now, peer_saw_our_tip);
-            }
-            // Predictable mutation — differential-match the model.
-            oracle::OpClass::PredictableMutating => {
-                if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
-                    panic!("differential divergence on {op:?}: {d:?}");
-                }
-                // drain / go-online carry no per-doc detail → ledger-delta.
-                if let interp::RealOutcome::Recovered { branch } = &real {
-                    let real_ledger = ctx.read_ledger().await;
-                    if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
-                        panic!("ledger-delta divergence on {op:?}: {d:?}");
-                    }
-                    if branch == "b10_lazy_begin_interposed" {
-                        // B10 — the FIRST offline doc lazily interposed a DocType=9
-                        // BEGIN.  This op DID consume 2 codes + allocate 2 lnds +
-                        // advance the seed (the B3 no-mutation invariants below do
-                        // NOT apply — they are for drain/go-online RE-DRIVE).  TEETH:
-                        // verify the two-doc chain linkage + code accounting so a
-                        // reverted BEGIN-chain REDs (proven by the canary
-                        // `teeth_b10_reverted_begin_chain_reddens_ledger_delta`).
-                        assert_eq!(
-                            ctx.consumed_codes_count().await,
-                            codes_before + 2,
-                            "B10: first-offline op must consume EXACTLY 2 codes \
-                             (BEGIN + business): {op:?}"
-                        );
-                        assert_eq!(
-                            ctx.read_next_lnd().await,
-                            next_lnd_before + 2,
-                            "B10: first-offline op must allocate EXACTLY 2 lnds \
-                             (BEGIN + business): {op:?}"
-                        );
-                        if let Err(d) = ctx
-                            .assert_b10_boundary_chain_linked(prior_tip.as_deref())
-                            .await
-                        {
-                            panic!("B10 boundary-chain divergence on {op:?}: {d}");
-                        }
-                    } else {
-                        // B3 — FULL snapshot beyond lnd→state.  A recovered drain /
-                        // go-online RE-DRIVES already-issued docs (no code / no lnd /
-                        // no seed change) EXCEPT for the B10 DocType=10 END, which a
-                        // finalizing drain mints LAST (consuming one code + one lnd).
-                        // The MODEL predicts the END independently (`drain_backlog`
-                        // AckPath), so assert the real post-op consumed-codes /
-                        // next-lnd match the MODEL's post-op values — this keeps the
-                        // teeth (a spurious extra code/lnd, or a MISSING END, REDs)
-                        // while admitting the one legit END mint.
-                        //
-                        // `codes_before` / `next_lnd_before` are used as a lower
-                        // bound sanity: the model's values are >= the pre-op values.
-                        let end_minted = model.session_has_end
-                            && model
-                                .docs
-                                .values()
-                                .any(|s| matches!(s, DocState::Ack | DocState::Signed));
-                        let _ = end_minted; // documentation of the delta source
-                        assert_eq!(
-                            ctx.consumed_codes_count().await as i64,
-                            model.codes_consumed,
-                            "B3: recovered drain/go-online {op:?} — real consumed-codes must \
-                             equal the model's (which predicts the END's code)"
-                        );
-                        assert!(
-                            model.codes_consumed >= codes_before as i64,
-                            "B3 sanity: model codes_consumed never decreases"
-                        );
-                        assert_eq!(
-                            ctx.read_next_lnd().await,
-                            model.next_lnd,
-                            "B3: recovered drain/go-online {op:?} — real next_lnd must equal \
-                             the model's (which predicts the END's lnd)"
-                        );
-                        assert!(
-                            model.next_lnd >= next_lnd_before,
-                            "B3 sanity: model next_lnd never decreases"
-                        );
-                        // Seed is compared STRUCTURALLY (model uses synthetic
-                        // hashes, reality real crypto hashes — never value-equal):
-                        // the real seed must CHANGE iff the model's seed changed.
-                        // A pure re-drive leaves both unchanged; a finalizing drain
-                        // that issues the B10 END advances BOTH (the END's M2-01
-                        // OLA).  A spurious real re-advance without a model advance
-                        // (or vice-versa) REDs.
-                        let real_seed_after = ctx.read_seed().await;
-                        let real_advanced = real_seed_after.as_deref() != prior_tip.as_deref();
-                        let model_advanced = model.seed != seed_at_op_start;
-                        assert_eq!(
-                            real_advanced, model_advanced,
-                            "B3: recovered drain/go-online {op:?} — real seed-advance \
-                             ({real_advanced}) must match the model's ({model_advanced})"
-                        );
-                    }
-                }
-                if matches!(op, Op::OnlineZReport(_) | Op::OfflineZReport) {
-                    if let Err(d) = oracle::check_latest_z_aggregation(&ctx.pool, ctx.fn_id()).await
-                    {
-                        panic!("Z aggregation oracle on {op:?}: {d:?}");
-                    }
-                }
-                // CS-3 Slice E — HELD delivery-axis witness. For an online wire op whose leaf the
-                // model encodes (`online_held_witness` → Some, i.e. the UnknownStatus ProbeRequired
-                // surface) that ACTUALLY produced a doc RESTING SENDING (the held online outcome),
-                // assert the REAL persisted reservation axes + node halt + FN fence match the model's
-                // INDEPENDENT prediction. The `doc_state == Sending` gate is load-bearing: `inline::run`
-                // dispatches by NODE MODE, so the SAME op on an OFFLINE-seeded node takes the offline
-                // lane (OFFLINE_LOCAL_ACK, no held reservation) — only a genuinely held SENDING doc
-                // carries the delivery-axis witness. A prod regression on the persisted routing_class
-                // (e.g. ProbeRequired → TransientRetry) REDs HERE (canary-proven).
-                if let interp::RealOutcome::Doc(doc) = &real {
-                    if doc.doc_state == DocState::Sending {
-                        if let Some(expected_held) =
-                            op.wire_script().and_then(model::online_held_witness)
-                        {
-                            let rid = ctx
-                                .last_request_id()
-                                .expect("a held online Doc op recorded a last_row");
-                            let observed_held = ctx.read_held_witness(&rid).await;
-                            if let Err(d) =
-                                oracle::check_held_witness(observed_held.as_ref(), &expected_held)
-                            {
-                                panic!("held-witness divergence on {op:?}: {d:?}");
-                            }
-                        }
-                    }
-                }
-            }
-            // No mutation — the differential is permissive here, so the harness
-            // independently asserts NO ISSUANCE (else an erroneously-mutating
-            // invalid op slips through).
-            // B2 — TrueNoMutation: a refusal / replay refused BEFORE any row is
-            // written.  STRICT: the ledger is ENTIRELY unchanged (no row, no lnd,
-            // no seed, no code) — a leaked row is caught HERE, not at a later
-            // ledger-delta.
-            oracle::OpClass::ExpectedNoMutation => {
-                if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
-                    panic!("no-mutation differential on {op:?}: {d:?}");
-                }
-                assert_eq!(
-                    ctx.observed_doc_count().await,
-                    doc_count_before,
-                    "ExpectedNoMutation {op:?} minted a fiscal_documents row (a true no-op must not)"
-                );
-                assert_eq!(
-                    ctx.read_next_lnd().await,
-                    next_lnd_before,
-                    "ExpectedNoMutation {op:?} allocated an lnd (a true no-op must not)"
-                );
-                assert_eq!(
-                    ctx.read_seed().await,
-                    prior_tip,
-                    "ExpectedNoMutation {op:?} advanced the seed (issuance leaked)"
-                );
-                assert_eq!(
-                    ctx.consumed_codes_count().await,
-                    codes_before,
-                    "ExpectedNoMutation {op:?} consumed an offline code (issuance leaked)"
-                );
-                // L6 — X-report turnover snapshot must equal the model totals.
-                // The real X-report returns the ledger-derived cash-on-hand; the
-                // model tracks it independently (`cash_on_hand`).  A divergence
-                // is a turnover-aggregation bug (or a side-effect that mutated
-                // the ledger under the read).  Only the XReport RealOutcome
-                // carries a snapshot; a no-open-shift Refused has none to check.
-                if let interp::RealOutcome::XReport {
-                    cash_on_hand_kop, ..
-                } = &real
-                {
-                    if let Err(d) =
-                        oracle::check_x_report_turnover(*cash_on_hand_kop, model.cash_on_hand())
-                    {
-                        panic!("x-report turnover on {op:?}: {d:?}");
-                    }
-                }
-            }
-            // B2 — NoIssuanceRowAllowed: a refusal that mints a LEGAL non-issued
-            // row (online-reject Rejected / offline-ack Aborted).  The row IS
-            // allowed (the lnd is consumed → next_lnd may bump), but the REFUSED
-            // doc itself is NOT issued: the row matches the model's predicted
-            // non-issued state (ledger-delta) AND the refused doc neither advances
-            // the seed nor consumes a code.
-            //
-            // B10 correction — a co-interposed lazy DocType=9 BEGIN.  When the
-            // refused business doc is the FIRST offline doc of a session, prod
-            // (and the model) FIRST interpose an issued OFFLINE_SESSION_BEGIN
-            // (its own committed OLA envelope: consumes ONE code + advances the
-            // seed, stage_offline_ack.rs:495 / stage_sign.rs:992), THEN the
-            // business doc aborts on pool exhaustion.  That BEGIN is a legitimate
-            // issuance, so within such an op the seed DOES advance and ONE code
-            // IS consumed — a hard `seed == prior_tip` / `codes == codes_before`
-            // freeze is wrong here (both prod AND the model advance).  Assert
-            // STRUCTURALLY against the MODEL instead (mirrors the B3 recovered-
-            // drain pattern): the real seed-advance must equal the model's, and
-            // the real consumed-codes must equal the model's `codes_consumed`.
-            // TEETH PRESERVED: for the pure online-reject case (no BEGIN) the
-            // model advances NOTHING → the real seed must NOT move and NO code
-            // may be consumed — a prod that wrongly advanced/consumed on a refused
-            // doc still REDs (model_advanced=false ≠ real_advanced=true).
-            oracle::OpClass::ExpectedNoIssuanceRow => {
-                if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
-                    panic!("no-issuance-row differential on {op:?}: {d:?}");
-                }
-                let real_ledger = ctx.read_ledger().await;
-                if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
-                    panic!("no-issuance-row ledger-delta on {op:?}: {d:?}");
-                }
-                // Seed advance is compared STRUCTURALLY (model synthetic hashes vs
-                // real crypto hashes never value-match): the real seed must CHANGE
-                // iff the model's did.  A refused doc with NO interposed BEGIN
-                // leaves both unmoved; a BEGIN interposition advances both.
-                let real_seed_after = ctx.read_seed().await;
-                let real_seed_advanced = real_seed_after.as_deref() != prior_tip.as_deref();
-                let model_seed_advanced = model.seed != seed_at_op_start;
-                assert_eq!(
-                    real_seed_advanced, model_seed_advanced,
-                    "ExpectedNoIssuanceRow {op:?} — real seed-advance ({real_seed_advanced}) \
-                     must match the model's ({model_seed_advanced}): a refused doc must not \
-                     advance the seed, but a co-interposed BEGIN legitimately does"
-                );
-                assert_eq!(
-                    ctx.consumed_codes_count().await,
-                    model.codes_consumed,
-                    "ExpectedNoIssuanceRow {op:?} — real consumed-codes must equal the model's \
-                     ({}): a refused doc consumes no code, but a co-interposed BEGIN consumes one",
-                    model.codes_consumed
                 );
                 assert!(
-                    model.codes_consumed >= codes_before as i64,
-                    "ExpectedNoIssuanceRow {op:?} sanity: model codes_consumed never decreases"
+                    inserted + deduped >= 1,
+                    "a granted replenish {op:?} accounted for NO codes at all \
+                         (inserted={inserted}, deduped={deduped}) — the grant went nowhere"
+                );
+            } else {
+                assert_eq!(
+                    codes_total_after, codes_total_before,
+                    "a server-rejected replenish {op:?} must persist NOTHING"
                 );
             }
-            // CS-3 operator-completion (1b) — a release/refuse op. NOT the per-doc differential: a
-            // release TRANSITIONS the held doc (it is not a fresh issuance) and un-halts the node.
-            oracle::OpClass::Release => {
-                let predicted = match &expected {
-                    ExpectedOutcome::Release(r) => r,
-                    _ => unreachable!("classify maps Release ⇒ OpClass::Release"),
-                };
-                match (predicted, &real) {
-                    // Refused-predicted (no hold rests, or an origin cross-check contradiction): prod
-                    // refuses BEFORE any mutation → the hold / no-op is fully intact.
-                    (None, interp::RealOutcome::Refused(_)) => {
-                        assert_eq!(
-                            ctx.observed_doc_count().await,
-                            doc_count_before,
-                            "refused completion {op:?} minted a fiscal_documents row"
-                        );
-                        assert_eq!(
-                            ctx.read_next_lnd().await,
-                            next_lnd_before,
-                            "refused completion {op:?} allocated an lnd"
-                        );
-                        assert_eq!(
-                            ctx.read_seed().await,
-                            prior_tip,
-                            "refused completion {op:?} advanced the seed"
-                        );
-                        // bd 2nk (§5b) — a refused NotAcceptedOffline (fork guard) mutates NO doc state.
-                        if let Some((_rewind, states_before)) = &nao_snapshot {
-                            assert_eq!(
-                                &ctx.read_doc_states_by_lnd().await,
-                                states_before,
-                                "refused NotAcceptedOffline {op:?} (fork guard) mutated doc states"
-                            );
+            // Keep the model's code total in step with reality (the model predicts +1 per grant;
+            // prod dedups by value, so reality is the authority on the exact count).
+            model.codes_issued = codes_total_after;
+        }
+        // Fault / recovery — we do NOT predict recovery; adopt the real DB.
+        oracle::OpClass::FaultOrRecovery => {
+            // MH (B1): a Fault-DEFERRED DRAIN (exotic wire script / mid-wire
+            // cohort the model cannot cleanly predict) was previously BLINDLY
+            // resync'd, leaving the exotic-drain path UNVERIFIED.  Assert the
+            // bounded SAFETY postconds FIRST, so an erroneous exotic drain is
+            // CAUGHT, not adopted.  (Crash / Reboot Faults are NOT drains —
+            // they are covered by A3's no-resend below.)
+            if matches!(
+                op,
+                Op::Drain(_) | Op::RepeatDrain | Op::GoOnline(_) | Op::GoOnlineWithoutBacklog
+            ) {
+                // B10 END-online fix: a drain that FINALIZES mints the DocType=10
+                // END LAST as an ONLINE ISSUANCE — ONE fresh doc that allocates
+                // ONE lnd and advances the MAC seed (advance-at-SEND), but
+                // consumes ZERO offline codes (bare `<MAC>`, `fs_mode='ONLINE'`).
+                // So: codes are STRICTLY unchanged (a code bump on a drain is now
+                // a bug — the online END never consumes one, and re-driving the
+                // already-issued backlog consumes none); lnds relax to +1 (the
+                // END's lnd); the END-mint signal is the LND ALLOCATION, not a
+                // code bump.  These bounds are tighter than the pre-fix ones,
+                // preserving + sharpening the safety teeth.
+                let codes_after = ctx.consumed_codes_count().await;
+                assert_eq!(
+                    codes_after,
+                    codes_before,
+                    "MH: exotic drain {op:?} consumed {} codes (the online END consumes NONE; \
+                         a drain must consume zero)",
+                    codes_after - codes_before
+                );
+                let next_lnd_after = ctx.read_next_lnd().await;
+                assert!(
+                    next_lnd_after == next_lnd_before || next_lnd_after == next_lnd_before + 1,
+                    "MH: exotic drain {op:?} allocated {} lnds (> the one END lnd)",
+                    next_lnd_after - next_lnd_before
+                );
+                // 3. Seed: unchanged (pure re-drive) OR advanced (the END's
+                //    advance-at-SEND) — never advanced by re-driving the
+                //    ALREADY-issued backlog (that would be a double-advance bug),
+                //    but the END is a fresh online issuance so a single advance is
+                //    allowed.  The END-mint signal is the lnd allocation (+1);
+                //    the exact seed value is model-checked in the
+                //    PredictableMutating path.
+                let end_minted = next_lnd_after == next_lnd_before + 1;
+                if !end_minted {
+                    assert_eq!(
+                        ctx.read_seed().await,
+                        prior_tip,
+                        "MH: exotic drain {op:?} advanced the MAC seed without minting an END"
+                    );
+                }
+                // 4. Send-delta bounded by the cohort — the drain re-drives
+                //    each cohort doc a BOUNDED number of times (no unbounded
+                //    resend loop); 2×+1 allows one MAC-recovery retry per doc.
+                let send_delta = ctx.send_calls() - sends_before;
+                assert!(
+                    send_delta <= 2 * cohort_before + 1,
+                    "MH: exotic drain {op:?} send-delta {send_delta} exceeds \
+                         2×cohort({cohort_before})+1 — unbounded re-drive"
+                );
+                // 5. Shift unchanged, escalated to RMR, OR legitimately
+                //    resolved from a pending-drain state.
+                //    A drain either makes progress (shift unchanged or pending-drain
+                //    resolved to terminal) or halts-manual (RMR); never some other
+                //    shift transition.
+                //    OpenedLocalPendingDrain → Opened: drain re-drove a SENT doc
+                //    (held from a prior interrupted online attempt) to ACK, resolving
+                //    the pending-drain state (spec §6.3 edge 6 success path).
+                //    ClosingLocalPendingDrain → Closed: same resolution for closing.
+                let shift_after = ctx.read_shift_state().await;
+                assert!(
+                    shift_after == shift_before
+                        || shift_after == ShiftState::RequiresManualReconciliation
+                        || (shift_before == ShiftState::OpenedLocalPendingDrain
+                            && shift_after == ShiftState::Opened)
+                        || (shift_before == ShiftState::ClosingLocalPendingDrain
+                            && shift_after == ShiftState::Closed),
+                    "MH: exotic drain {op:?} moved shift {shift_before:?} -> {shift_after:?} \
+                         (neither unchanged nor RMR nor legitimate pending-drain resolution)"
+                );
+            }
+            // U1 D4 — a BadHashPrev online sell routes to the bounded W10.4
+            // MAC-recovery path (DDL `mac_recovery_attempts CHECK IN (0,1)` +
+            // the `mac_recovery_invoked` one-shot flag, stage_send.rs:951/970):
+            // AT MOST ONE re-sign + re-send per `run()`.  The pure model
+            // defers the terminal (Fault), but the WIRE send-count must stay
+            // bounded — no unbounded resend.  A regression that removed the
+            // one-shot guard would resend without limit; this generative gate
+            // catches it (like AUD-K8-1's wire-call bound).  PR-R-fuzz — a
+            // BadHashPrev online RETURN takes the SAME doc-type-agnostic
+            // MAC-recovery path (symmetry (c)), so it is bounded identically.
+            if matches!(
+                op,
+                Op::OnlineSell(s) | Op::OnlineReturn(s)
+                    if matches!(s.0.as_slice(), [WireResponse::BadHashPrev, ..])
+            ) {
+                let send_delta = ctx.send_calls() - sends_before;
+                // Probe-derived: the real send-delta is exactly 1 (the single
+                // original send; the W10.4 re-sign's re-send hits the stub's
+                // empty queue → terminal, no second wire call).  Bound at the
+                // exact threshold, so ANY extra resend (a reverted one-shot
+                // guard → send-delta ≥ 2) is caught.
+                assert!(
+                    send_delta <= 1,
+                    "U1 D4: BadHashPrev online sell wire send-delta {send_delta} exceeds the \
+                         bounded MAC-recovery budget (original send + at most one W10.4 re-send)"
+                );
+            }
+            model.adopt_fault_deferred(&ctx.pool).await;
+            // Peer-tip axis PHASE C (spec §8.3) — and hand the peer over.
+            //
+            // Everything `adopt_fault_deferred` re-syncs it re-DERIVES from the ledger. The
+            // peer has no ledger row: it is environment state, so a fault window is the one
+            // place the model cannot recover it on its own. Handing it over is the
+            // `sync_fence_active` pattern and carries the same stated boundary — across a
+            // fault the harness verifies *given this peer state, the model behaves correctly*,
+            // not that the model would have derived it. Between faults the mirror is fully
+            // independent, and that is where the assertion above has teeth.
+            let peer_now = as_model_tip(ctx.peer_tip_class().await);
+            // bd `PRRO_GATE-h7b` — hand over the seen-question with the tip, for the same
+            // reason: across a fault the model cannot re-derive which of its symbols DPS would
+            // still recognise, and getting this wrong flips a replenish between "accepted and
+            // re-based" and "-12, tip unmoved".
+            let peer_saw_our_tip = ctx.peer_has_seen(ctx.read_seed().await.as_deref());
+            model.sync_peer_tip(peer_now, peer_saw_our_tip);
+        }
+        // Predictable mutation — differential-match the model.
+        oracle::OpClass::PredictableMutating => {
+            if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
+                panic!("differential divergence on {op:?}: {d:?}");
+            }
+            // drain / go-online carry no per-doc detail → ledger-delta.
+            if let interp::RealOutcome::Recovered { branch } = &real {
+                let real_ledger = ctx.read_ledger().await;
+                if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
+                    panic!("ledger-delta divergence on {op:?}: {d:?}");
+                }
+                if branch == "b10_lazy_begin_interposed" {
+                    // B10 — the FIRST offline doc lazily interposed a DocType=9
+                    // BEGIN.  This op DID consume 2 codes + allocate 2 lnds +
+                    // advance the seed (the B3 no-mutation invariants below do
+                    // NOT apply — they are for drain/go-online RE-DRIVE).  TEETH:
+                    // verify the two-doc chain linkage + code accounting so a
+                    // reverted BEGIN-chain REDs (proven by the canary
+                    // `teeth_b10_reverted_begin_chain_reddens_ledger_delta`).
+                    assert_eq!(
+                        ctx.consumed_codes_count().await,
+                        codes_before + 2,
+                        "B10: first-offline op must consume EXACTLY 2 codes \
+                             (BEGIN + business): {op:?}"
+                    );
+                    assert_eq!(
+                        ctx.read_next_lnd().await,
+                        next_lnd_before + 2,
+                        "B10: first-offline op must allocate EXACTLY 2 lnds \
+                             (BEGIN + business): {op:?}"
+                    );
+                    if let Err(d) = ctx
+                        .assert_b10_boundary_chain_linked(prior_tip.as_deref())
+                        .await
+                    {
+                        panic!("B10 boundary-chain divergence on {op:?}: {d}");
+                    }
+                } else {
+                    // B3 — FULL snapshot beyond lnd→state.  A recovered drain /
+                    // go-online RE-DRIVES already-issued docs (no code / no lnd /
+                    // no seed change) EXCEPT for the B10 DocType=10 END, which a
+                    // finalizing drain mints LAST (consuming one code + one lnd).
+                    // The MODEL predicts the END independently (`drain_backlog`
+                    // AckPath), so assert the real post-op consumed-codes /
+                    // next-lnd match the MODEL's post-op values — this keeps the
+                    // teeth (a spurious extra code/lnd, or a MISSING END, REDs)
+                    // while admitting the one legit END mint.
+                    //
+                    // `codes_before` / `next_lnd_before` are used as a lower
+                    // bound sanity: the model's values are >= the pre-op values.
+                    let end_minted = model.session_has_end
+                        && model
+                            .docs
+                            .values()
+                            .any(|s| matches!(s, DocState::Ack | DocState::Signed));
+                    let _ = end_minted; // documentation of the delta source
+                    assert_eq!(
+                        ctx.consumed_codes_count().await as i64,
+                        model.codes_consumed,
+                        "B3: recovered drain/go-online {op:?} — real consumed-codes must \
+                             equal the model's (which predicts the END's code)"
+                    );
+                    assert!(
+                        model.codes_consumed >= codes_before as i64,
+                        "B3 sanity: model codes_consumed never decreases"
+                    );
+                    assert_eq!(
+                        ctx.read_next_lnd().await,
+                        model.next_lnd,
+                        "B3: recovered drain/go-online {op:?} — real next_lnd must equal \
+                             the model's (which predicts the END's lnd)"
+                    );
+                    assert!(
+                        model.next_lnd >= next_lnd_before,
+                        "B3 sanity: model next_lnd never decreases"
+                    );
+                    // Seed is compared STRUCTURALLY (model uses synthetic
+                    // hashes, reality real crypto hashes — never value-equal):
+                    // the real seed must CHANGE iff the model's seed changed.
+                    // A pure re-drive leaves both unchanged; a finalizing drain
+                    // that issues the B10 END advances BOTH (the END's M2-01
+                    // OLA).  A spurious real re-advance without a model advance
+                    // (or vice-versa) REDs.
+                    let real_seed_after = ctx.read_seed().await;
+                    let real_advanced = real_seed_after.as_deref() != prior_tip.as_deref();
+                    let model_advanced = model.seed != seed_at_op_start;
+                    assert_eq!(
+                        real_advanced, model_advanced,
+                        "B3: recovered drain/go-online {op:?} — real seed-advance \
+                             ({real_advanced}) must match the model's ({model_advanced})"
+                    );
+                }
+            }
+            if matches!(op, Op::OnlineZReport(_) | Op::OfflineZReport) {
+                if let Err(d) = oracle::check_latest_z_aggregation(&ctx.pool, ctx.fn_id()).await {
+                    panic!("Z aggregation oracle on {op:?}: {d:?}");
+                }
+            }
+            // CS-3 Slice E — HELD delivery-axis witness. For an online wire op whose leaf the
+            // model encodes (`online_held_witness` → Some, i.e. the UnknownStatus ProbeRequired
+            // surface) that ACTUALLY produced a doc RESTING SENDING (the held online outcome),
+            // assert the REAL persisted reservation axes + node halt + FN fence match the model's
+            // INDEPENDENT prediction. The `doc_state == Sending` gate is load-bearing: `inline::run`
+            // dispatches by NODE MODE, so the SAME op on an OFFLINE-seeded node takes the offline
+            // lane (OFFLINE_LOCAL_ACK, no held reservation) — only a genuinely held SENDING doc
+            // carries the delivery-axis witness. A prod regression on the persisted routing_class
+            // (e.g. ProbeRequired → TransientRetry) REDs HERE (canary-proven).
+            if let interp::RealOutcome::Doc(doc) = &real {
+                if doc.doc_state == DocState::Sending {
+                    if let Some(expected_held) =
+                        op.wire_script().and_then(model::online_held_witness)
+                    {
+                        let rid = ctx
+                            .last_request_id()
+                            .expect("a held online Doc op recorded a last_row");
+                        let observed_held = ctx.read_held_witness(&rid).await;
+                        if let Err(d) =
+                            oracle::check_held_witness(observed_held.as_ref(), &expected_held)
+                        {
+                            panic!("held-witness divergence on {op:?}: {d:?}");
                         }
                     }
-                    // Released: the REAL durable witness must match the model's INDEPENDENT contract
-                    // (incl the unconditional anti-BRICK invariant — a released reservation can never
-                    // rest STOP_MODE / fenced), and the seed must advance iff the model advanced.
-                    (Some(w), interp::RealOutcome::Released(obs)) => {
-                        if let Err(d) = oracle::check_release_witness(obs, w) {
-                            panic!("release-witness divergence on {op:?}: {d:?}");
-                        }
-                        let real_advanced =
-                            ctx.read_seed().await.as_deref() != prior_tip.as_deref();
-                        let model_advanced = model.seed != seed_at_op_start;
+                }
+            }
+        }
+        // No mutation — the differential is permissive here, so the harness
+        // independently asserts NO ISSUANCE (else an erroneously-mutating
+        // invalid op slips through).
+        // B2 — TrueNoMutation: a refusal / replay refused BEFORE any row is
+        // written.  STRICT: the ledger is ENTIRELY unchanged (no row, no lnd,
+        // no seed, no code) — a leaked row is caught HERE, not at a later
+        // ledger-delta.
+        oracle::OpClass::ExpectedNoMutation => {
+            if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
+                panic!("no-mutation differential on {op:?}: {d:?}");
+            }
+            assert_eq!(
+                ctx.observed_doc_count().await,
+                doc_count_before,
+                "ExpectedNoMutation {op:?} minted a fiscal_documents row (a true no-op must not)"
+            );
+            assert_eq!(
+                ctx.read_next_lnd().await,
+                next_lnd_before,
+                "ExpectedNoMutation {op:?} allocated an lnd (a true no-op must not)"
+            );
+            assert_eq!(
+                ctx.read_seed().await,
+                prior_tip,
+                "ExpectedNoMutation {op:?} advanced the seed (issuance leaked)"
+            );
+            assert_eq!(
+                ctx.consumed_codes_count().await,
+                codes_before,
+                "ExpectedNoMutation {op:?} consumed an offline code (issuance leaked)"
+            );
+            // L6 — X-report turnover snapshot must equal the model totals.
+            // The real X-report returns the ledger-derived cash-on-hand; the
+            // model tracks it independently (`cash_on_hand`).  A divergence
+            // is a turnover-aggregation bug (or a side-effect that mutated
+            // the ledger under the read).  Only the XReport RealOutcome
+            // carries a snapshot; a no-open-shift Refused has none to check.
+            if let interp::RealOutcome::XReport {
+                cash_on_hand_kop, ..
+            } = &real
+            {
+                if let Err(d) =
+                    oracle::check_x_report_turnover(*cash_on_hand_kop, model.cash_on_hand())
+                {
+                    panic!("x-report turnover on {op:?}: {d:?}");
+                }
+            }
+        }
+        // B2 — NoIssuanceRowAllowed: a refusal that mints a LEGAL non-issued
+        // row (online-reject Rejected / offline-ack Aborted).  The row IS
+        // allowed (the lnd is consumed → next_lnd may bump), but the REFUSED
+        // doc itself is NOT issued: the row matches the model's predicted
+        // non-issued state (ledger-delta) AND the refused doc neither advances
+        // the seed nor consumes a code.
+        //
+        // B10 correction — a co-interposed lazy DocType=9 BEGIN.  When the
+        // refused business doc is the FIRST offline doc of a session, prod
+        // (and the model) FIRST interpose an issued OFFLINE_SESSION_BEGIN
+        // (its own committed OLA envelope: consumes ONE code + advances the
+        // seed, stage_offline_ack.rs:495 / stage_sign.rs:992), THEN the
+        // business doc aborts on pool exhaustion.  That BEGIN is a legitimate
+        // issuance, so within such an op the seed DOES advance and ONE code
+        // IS consumed — a hard `seed == prior_tip` / `codes == codes_before`
+        // freeze is wrong here (both prod AND the model advance).  Assert
+        // STRUCTURALLY against the MODEL instead (mirrors the B3 recovered-
+        // drain pattern): the real seed-advance must equal the model's, and
+        // the real consumed-codes must equal the model's `codes_consumed`.
+        // TEETH PRESERVED: for the pure online-reject case (no BEGIN) the
+        // model advances NOTHING → the real seed must NOT move and NO code
+        // may be consumed — a prod that wrongly advanced/consumed on a refused
+        // doc still REDs (model_advanced=false ≠ real_advanced=true).
+        oracle::OpClass::ExpectedNoIssuanceRow => {
+            if let Err(d) = oracle::check_differential(&real, &expected, prior_tip.as_deref()) {
+                panic!("no-issuance-row differential on {op:?}: {d:?}");
+            }
+            let real_ledger = ctx.read_ledger().await;
+            if let Err(d) = oracle::check_ledger_delta(&model.docs, &real_ledger) {
+                panic!("no-issuance-row ledger-delta on {op:?}: {d:?}");
+            }
+            // Seed advance is compared STRUCTURALLY (model synthetic hashes vs
+            // real crypto hashes never value-match): the real seed must CHANGE
+            // iff the model's did.  A refused doc with NO interposed BEGIN
+            // leaves both unmoved; a BEGIN interposition advances both.
+            let real_seed_after = ctx.read_seed().await;
+            let real_seed_advanced = real_seed_after.as_deref() != prior_tip.as_deref();
+            let model_seed_advanced = model.seed != seed_at_op_start;
+            assert_eq!(
+                real_seed_advanced, model_seed_advanced,
+                "ExpectedNoIssuanceRow {op:?} — real seed-advance ({real_seed_advanced}) \
+                     must match the model's ({model_seed_advanced}): a refused doc must not \
+                     advance the seed, but a co-interposed BEGIN legitimately does"
+            );
+            assert_eq!(
+                ctx.consumed_codes_count().await,
+                model.codes_consumed,
+                "ExpectedNoIssuanceRow {op:?} — real consumed-codes must equal the model's \
+                     ({}): a refused doc consumes no code, but a co-interposed BEGIN consumes one",
+                model.codes_consumed
+            );
+            assert!(
+                model.codes_consumed >= codes_before as i64,
+                "ExpectedNoIssuanceRow {op:?} sanity: model codes_consumed never decreases"
+            );
+        }
+        // CS-3 operator-completion (1b) — a release/refuse op. NOT the per-doc differential: a
+        // release TRANSITIONS the held doc (it is not a fresh issuance) and un-halts the node.
+        oracle::OpClass::Release => {
+            let predicted = match &expected {
+                ExpectedOutcome::Release(r) => r,
+                _ => unreachable!("classify maps Release ⇒ OpClass::Release"),
+            };
+            match (predicted, &real) {
+                // Refused-predicted (no hold rests, or an origin cross-check contradiction): prod
+                // refuses BEFORE any mutation → the hold / no-op is fully intact.
+                (None, interp::RealOutcome::Refused(_)) => {
+                    assert_eq!(
+                        ctx.observed_doc_count().await,
+                        doc_count_before,
+                        "refused completion {op:?} minted a fiscal_documents row"
+                    );
+                    assert_eq!(
+                        ctx.read_next_lnd().await,
+                        next_lnd_before,
+                        "refused completion {op:?} allocated an lnd"
+                    );
+                    assert_eq!(
+                        ctx.read_seed().await,
+                        prior_tip,
+                        "refused completion {op:?} advanced the seed"
+                    );
+                    // bd 2nk (§5b) — a refused NotAcceptedOffline (fork guard) mutates NO doc state.
+                    if let Some((_rewind, states_before)) = &nao_snapshot {
                         assert_eq!(
-                            real_advanced, model_advanced,
-                            "release {op:?} — real seed-advance ({real_advanced}) must match the \
-                             model's ({model_advanced})"
+                            &ctx.read_doc_states_by_lnd().await,
+                            states_before,
+                            "refused NotAcceptedOffline {op:?} (fork guard) mutated doc states"
                         );
-                        // bd 2nk (§5b) — generative NotAcceptedOffline exact cohort-cancel + rewind:
-                        // (1) seed rewound to the held doc's own previous_hash (exact — incl a non-doc
-                        // T=112 seed or genesis NULL); (2) every doc that was OFFLINE_LOCAL_ACK is now
-                        // CANCELLED (a successor) or RMR (the held doc) — a leftover OLA would be a fork
-                        // (cancelled tip, live successor); (3) exactly one held doc → RMR.
-                        if let Some((rewind_target, states_before)) = &nao_snapshot {
-                            assert_eq!(
-                                ctx.read_seed().await.as_deref(),
-                                rewind_target.as_deref(),
-                                "NotAcceptedOffline {op:?}: seed must rewind to the held doc's \
+                    }
+                }
+                // Released: the REAL durable witness must match the model's INDEPENDENT contract
+                // (incl the unconditional anti-BRICK invariant — a released reservation can never
+                // rest STOP_MODE / fenced), and the seed must advance iff the model advanced.
+                (Some(w), interp::RealOutcome::Released(obs)) => {
+                    if let Err(d) = oracle::check_release_witness(obs, w) {
+                        panic!("release-witness divergence on {op:?}: {d:?}");
+                    }
+                    let real_advanced = ctx.read_seed().await.as_deref() != prior_tip.as_deref();
+                    let model_advanced = model.seed != seed_at_op_start;
+                    assert_eq!(
+                        real_advanced, model_advanced,
+                        "release {op:?} — real seed-advance ({real_advanced}) must match the \
+                             model's ({model_advanced})"
+                    );
+                    // bd 2nk (§5b) — generative NotAcceptedOffline exact cohort-cancel + rewind:
+                    // (1) seed rewound to the held doc's own previous_hash (exact — incl a non-doc
+                    // T=112 seed or genesis NULL); (2) every doc that was OFFLINE_LOCAL_ACK is now
+                    // CANCELLED (a successor) or RMR (the held doc) — a leftover OLA would be a fork
+                    // (cancelled tip, live successor); (3) exactly one held doc → RMR.
+                    if let Some((rewind_target, states_before)) = &nao_snapshot {
+                        assert_eq!(
+                            ctx.read_seed().await.as_deref(),
+                            rewind_target.as_deref(),
+                            "NotAcceptedOffline {op:?}: seed must rewind to the held doc's \
                                  previous_hash"
-                            );
-                            let states_after = ctx.read_doc_states_by_lnd().await;
-                            for (lnd, before) in states_before {
-                                if before == "OFFLINE_LOCAL_ACK" {
-                                    let after = states_after
-                                        .iter()
-                                        .find(|(l, _)| l == lnd)
-                                        .map(|(_, s)| s.as_str());
-                                    assert!(
+                        );
+                        let states_after = ctx.read_doc_states_by_lnd().await;
+                        for (lnd, before) in states_before {
+                            if before == "OFFLINE_LOCAL_ACK" {
+                                let after = states_after
+                                    .iter()
+                                    .find(|(l, _)| l == lnd)
+                                    .map(|(_, s)| s.as_str());
+                                assert!(
                                         matches!(
                                             after,
                                             Some("CANCELLED")
@@ -5841,357 +6148,347 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                                         "NotAcceptedOffline {op:?}: lnd {lnd} was OFFLINE_LOCAL_ACK, \
                                          now {after:?} (must be CANCELLED successor or RMR held doc)"
                                     );
-                                }
                             }
-                            let rmr = states_after
-                                .iter()
-                                .filter(|(_, s)| s == "REQUIRES_MANUAL_RECONCILIATION")
-                                .count();
-                            assert_eq!(
-                                rmr, 1,
-                                "NotAcceptedOffline {op:?}: exactly one held doc → RMR, got {rmr}"
-                            );
                         }
+                        let rmr = states_after
+                            .iter()
+                            .filter(|(_, s)| s == "REQUIRES_MANUAL_RECONCILIATION")
+                            .count();
+                        assert_eq!(
+                            rmr, 1,
+                            "NotAcceptedOffline {op:?}: exactly one held doc → RMR, got {rmr}"
+                        );
                     }
-                    (exp, got) => panic!(
-                        "release prediction/real mismatch on {op:?}: model {exp:?} vs real {got:?}"
-                    ),
                 }
+                (exp, got) => panic!(
+                    "release prediction/real mismatch on {op:?}: model {exp:?} vs real {got:?}"
+                ),
             }
         }
+    }
 
-        // CS-3 Increment 2 — at-most-one-ACTIVE delivery reservation per FN (double-issue guard).
-        // UNCONDITIONAL after every op (a HELD reservation is exactly when a second active row would
-        // be the fork, so this must NOT sit behind the `is_settled` gate). Prod enforces `<= 1` via
-        // the `ux_reservation_active` partial unique index (migration 035:53-55); a `> 1` on
-        // unmodified prod is a REAL double-issue finding, not a test bug.
-        let active_reservations = ctx.active_reservation_count().await;
-        assert!(
-            active_reservations <= 1,
-            "double-issue: {active_reservations} ACTIVE delivery reservations for the FN after \
+    // CS-3 Increment 2 — at-most-one-ACTIVE delivery reservation per FN (double-issue guard).
+    // UNCONDITIONAL after every op (a HELD reservation is exactly when a second active row would
+    // be the fork, so this must NOT sit behind the `is_settled` gate). Prod enforces `<= 1` via
+    // the `ux_reservation_active` partial unique index (migration 035:53-55); a `> 1` on
+    // unmodified prod is a REAL double-issue finding, not a test bug.
+    let active_reservations = ctx.active_reservation_count().await;
+    assert!(
+        active_reservations <= 1,
+        "double-issue: {active_reservations} ACTIVE delivery reservations for the FN after \
              {op:?} — at most one may be in-flight per FN (ux_reservation_active)"
-        );
+    );
 
-        // CS-3 Increment 2 part (b) — P3 fence-IDENTITY (standalone, per-op). UNCONDITIONAL after every
-        // op: a PENDING_APPLY hold must be NAMED by the fence at the CURRENT delivery_generation. The
-        // held-witness read only asserts this when a witness is EXPECTED; this catches a foreign /
-        // stale-generation fence over a RESTING hold on any op (incl. settled no-ops the held-witness
-        // read never revisits). Sound by Increment 2 (≤1 active).
-        if let Err(reason) = ctx.fence_integrity().await {
-            panic!("P3 fence-identity violated after {op:?}: {reason}");
-        }
+    // CS-3 Increment 2 part (b) — P3 fence-IDENTITY (standalone, per-op). UNCONDITIONAL after every
+    // op: a PENDING_APPLY hold must be NAMED by the fence at the CURRENT delivery_generation. The
+    // held-witness read only asserts this when a witness is EXPECTED; this catches a foreign /
+    // stale-generation fence over a RESTING hold on any op (incl. settled no-ops the held-witness
+    // read never revisits). Sound by Increment 2 (≤1 active).
+    if let Err(reason) = ctx.fence_integrity().await {
+        panic!("P3 fence-identity violated after {op:?}: {reason}");
+    }
 
-        // CS-3 crash/replay (P4) — a CRASH / REBOOT must PRESERVE a committed PENDING_APPLY held
-        // reservation: boot recovery scans + resumes non-terminal docs, but it may NOT release a hold
-        // (only an operator completes it) nor lose the doc. A change here is an illegal HELD release /
-        // doc loss across recovery. (Drain / GoOnline legitimately mutate holds, so they are excluded
-        // — the operator-completion + count oracles cover those; this is the recovery-specific pin.)
-        if matches!(
-            op,
-            Op::Crash(_) | Op::CrashSend(_) | Op::Reboot | Op::RepeatReboot
-        ) {
-            let held_res_after = ctx.active_held_reservation().await;
-            assert_eq!(
+    // CS-3 crash/replay (P4) — a CRASH / REBOOT must PRESERVE a committed PENDING_APPLY held
+    // reservation: boot recovery scans + resumes non-terminal docs, but it may NOT release a hold
+    // (only an operator completes it) nor lose the doc. A change here is an illegal HELD release /
+    // doc loss across recovery. (Drain / GoOnline legitimately mutate holds, so they are excluded
+    // — the operator-completion + count oracles cover those; this is the recovery-specific pin.)
+    if matches!(
+        op,
+        Op::Crash(_) | Op::CrashSend(_) | Op::Reboot | Op::RepeatReboot
+    ) {
+        let held_res_after = ctx.active_held_reservation().await;
+        assert_eq!(
                 held_res_after, held_res_before,
                 "crash/replay: op {op:?} changed the held reservation (before={held_res_before:?} \
                  after={held_res_after:?}) — a crash/reboot must preserve a committed PENDING_APPLY \
                  hold (no illegal release / no doc loss across recovery)"
             );
-        }
+    }
 
-        // CS-3 (C-ii) — drain-produced HELD witness. A drain (`GoOnline` / `Drain`) holds a re-driven
-        // cohort doc via a DIFFERENT path than a direct send (it returns `Recovered`, not a SENDING
-        // `Doc`), so the direct-send held-witness gate in the PredictableMutating arm never fires for
-        // it. When THIS drain NEWLY produced a fence-authoritative held reservation — `held_res_before`
-        // None → a hold now rests — AND the model encodes the leaf's OFFLINE held tuple, assert the
-        // REAL persisted axes match. The `held_res_before.is_none()` guard is load-bearing: a drain on
-        // an already-halted node merely NO-OPs over a prior op's hold (before == after, both Some), and
-        // that stale hold's leaf need not equal this drain's script — attributing it here would
-        // false-RED. This routes the OFFLINE lane through `offline_held_witness`, pinning the `[Reject]`
-        // origin-key AND the delegated (Superseded / BadHashPrev / UnknownStatus) leaves GENERATIVELY.
-        if let Op::GoOnline(script) | Op::Drain(script) = op {
-            if held_res_before.is_none() {
-                if let (Some((_res_id, rid)), Some(expected_held)) = (
-                    ctx.active_held_reservation().await,
-                    model::offline_held_witness(script),
-                ) {
-                    let observed_held = ctx.read_held_witness(&rid).await;
-                    if let Err(d) =
-                        oracle::check_held_witness(observed_held.as_ref(), &expected_held)
-                    {
-                        panic!("drain-produced held-witness divergence on {op:?}: {d:?}");
-                    }
+    // CS-3 (C-ii) — drain-produced HELD witness. A drain (`GoOnline` / `Drain`) holds a re-driven
+    // cohort doc via a DIFFERENT path than a direct send (it returns `Recovered`, not a SENDING
+    // `Doc`), so the direct-send held-witness gate in the PredictableMutating arm never fires for
+    // it. When THIS drain NEWLY produced a fence-authoritative held reservation — `held_res_before`
+    // None → a hold now rests — AND the model encodes the leaf's OFFLINE held tuple, assert the
+    // REAL persisted axes match. The `held_res_before.is_none()` guard is load-bearing: a drain on
+    // an already-halted node merely NO-OPs over a prior op's hold (before == after, both Some), and
+    // that stale hold's leaf need not equal this drain's script — attributing it here would
+    // false-RED. This routes the OFFLINE lane through `offline_held_witness`, pinning the `[Reject]`
+    // origin-key AND the delegated (Superseded / BadHashPrev / UnknownStatus) leaves GENERATIVELY.
+    if let Op::GoOnline(script) | Op::Drain(script) = op {
+        if held_res_before.is_none() {
+            if let (Some((_res_id, rid)), Some(expected_held)) = (
+                ctx.active_held_reservation().await,
+                model::offline_held_witness(script),
+            ) {
+                let observed_held = ctx.read_held_witness(&rid).await;
+                if let Err(d) = oracle::check_held_witness(observed_held.as_ref(), &expected_held) {
+                    panic!("drain-produced held-witness divergence on {op:?}: {d:?}");
                 }
             }
         }
+    }
 
-        // CS-3 1b — re-sync the model's operator-completion hold PRECONDITION from reality after
-        // every op (a drain can create/clear a CS-3 reservation-hold the pure model does not track).
-        // The release OUTCOME stays independently predicted; only "is a completable hold resting +
-        // its origin" is state-synced (the `adopt_fault_deferred` pattern for docs/mode).
-        model.sync_held_reservation(&ctx.pool).await;
-        // CS-3 S7-2 — and re-sync the WIDER active-reservation FENCE (in-flight
-        // RESERVED_NOT_STARTED / CALL_STARTED too, not just the completable PENDING_APPLY hold).
-        // A crash mid-wire raises the fence with no hold; that is what `[Crash(Send), Replenish]`
-        // exposed at 4096. Must run after `sync_held_reservation`, never instead of it — they answer
-        // two different questions and both have consumers.
-        model.sync_fence_active(&ctx.pool).await;
+    // CS-3 1b — re-sync the model's operator-completion hold PRECONDITION from reality after
+    // every op (a drain can create/clear a CS-3 reservation-hold the pure model does not track).
+    // The release OUTCOME stays independently predicted; only "is a completable hold resting +
+    // its origin" is state-synced (the `adopt_fault_deferred` pattern for docs/mode).
+    model.sync_held_reservation(&ctx.pool).await;
+    // CS-3 S7-2 — and re-sync the WIDER active-reservation FENCE (in-flight
+    // RESERVED_NOT_STARTED / CALL_STARTED too, not just the completable PENDING_APPLY hold).
+    // A crash mid-wire raises the fence with no hold; that is what `[Crash(Send), Replenish]`
+    // exposed at 4096. Must run after `sync_held_reservation`, never instead of it — they answer
+    // two different questions and both have consumers.
+    model.sync_fence_active(&ctx.pool).await;
 
-        // Mode-INDEPENDENT AUD-K8-1 teeth (bounded-postcond on wire calls).
-        // A drain re-tick on a `RequiresManualReconciliation` FN must make NO new
-        // wire send — the re-entry guard (`backlog_drain.rs:725`) halts the drain;
-        // WITHOUT it the drain re-drives the orphaned backlog → a fresh `send_chk`.
-        // Conditioned on the RMR state BEFORE the op (so the op that ITSELF
-        // escalates to RMR — which legitimately sent the rejecting wire call — is
-        // excluded), and counts wire calls rather than running a scan, so it bites
-        // regardless of mode — including the `GoingOnline` window where the
-        // SETTLED-mode scan gate suppresses `assert_clean`.  This is the
-        // mode-independent home of the teeth the SETTLED gate must NOT blunt.
-        if shift_before == ShiftState::RequiresManualReconciliation {
-            assert_eq!(
-                ctx.send_calls(),
-                sends_before,
-                "AUD-K8-1: op {op:?} on an RMR FN made a NEW wire send — the drain \
+    // Mode-INDEPENDENT AUD-K8-1 teeth (bounded-postcond on wire calls).
+    // A drain re-tick on a `RequiresManualReconciliation` FN must make NO new
+    // wire send — the re-entry guard (`backlog_drain.rs:725`) halts the drain;
+    // WITHOUT it the drain re-drives the orphaned backlog → a fresh `send_chk`.
+    // Conditioned on the RMR state BEFORE the op (so the op that ITSELF
+    // escalates to RMR — which legitimately sent the rejecting wire call — is
+    // excluded), and counts wire calls rather than running a scan, so it bites
+    // regardless of mode — including the `GoingOnline` window where the
+    // SETTLED-mode scan gate suppresses `assert_clean`.  This is the
+    // mode-independent home of the teeth the SETTLED gate must NOT blunt.
+    if shift_before == ShiftState::RequiresManualReconciliation {
+        assert_eq!(
+            ctx.send_calls(),
+            sends_before,
+            "AUD-K8-1: op {op:?} on an RMR FN made a NEW wire send — the drain \
                  re-entry guard (backlog_drain.rs:725) must halt a re-tick on a \
                  manual-reconciliation FN"
-            );
-        }
-
-        // U1 D1 — next_lnd is PREDICTED, not adopted, for non-fault ops.  The
-        // model advances its allocator per issuing op (`apply`); assert that
-        // prediction equals the DB SSOT `node_state.next_lnd` (the
-        // `allocate_next_lnd` sequencer, ADR-M3-A1) — per-FN monotonic, no-gap
-        // (`ux_fd_fn_lnd`).  This catches an allocator drift the DOC-lnd
-        // differential CANNOT: a NoMutation op has no doc, and a missed increment
-        // leaves the doc correct but the allocator stale.  Fault ops cannot
-        // predict the crash-window allocation → they adopt via `adopt_fault_deferred`
-        // (the classified deferral, §4 funnel), so D1 skips them.
-        if !matches!(class, oracle::OpClass::FaultOrRecovery) {
-            assert_eq!(
-                model.next_lnd,
-                ctx.read_next_lnd().await,
-                "U1 D1: model next_lnd prediction diverged from node_state.next_lnd on {op:?}"
-            );
-        }
-
-        // U1 D2 — mode / shift_state are PREDICTED, not adopted, for non-fault
-        // ops.  `apply` sets both from the M3b 9-state shift machine + the
-        // node-mode machine (enums.rs); assert the prediction equals the DB.
-        // Fault ops adopt via `adopt_fault_deferred` (adopt_fault_deferred), so D2 skips
-        // them.  §7 #3 RESIDUE SPLIT: the drain / go-online MODE outcome (the
-        // `GoingOnline → Online` CAS in `drain_backlog`) is a MID-TRANSITION
-        // residue the pure model cannot pin — a FORCED `GoingOnline`
-        // (`OfflineSellDuringGoingOnline`) does not complete to `Online` the way a
-        // real go-online does, so `drain_backlog`'s empty-backlog CAS over-predicts
-        // `Online` where reality stays `GoingOnline`.  Those ops therefore DEFER
-        // mode to `adopt_precondition` (adopt_precondition); their SHIFT
-        // (RMR / unchanged) IS predicted and asserted.
-        if !matches!(class, oracle::OpClass::FaultOrRecovery) {
-            assert_eq!(
-                model.shift_state,
-                ctx.read_shift_state().await,
-                "U1 D2: model shift_state prediction diverged from node_state.shift_state on {op:?}"
-            );
-            let mode_is_transition_residue = matches!(
-                op,
-                Op::GoOnline(_) | Op::GoOnlineWithoutBacklog | Op::Drain(_) | Op::RepeatDrain
-            );
-            if !mode_is_transition_residue {
-                assert_eq!(
-                    model.mode,
-                    ctx.read_node_mode().await,
-                    "U1 D2: model mode prediction diverged from node_state.mode on {op:?}"
-                );
-            }
-        }
-
-        // Scan-timing (T5, generalised): scan ONLY in a SETTLED state — NOT
-        // mid-crash AND NOT mid-transition.  This is the principled reading of
-        // spec §7.2 ("a committed-in-flight transient is legal — do not scan
-        // there"): mid-crash and mid-transition are the TWO classes of legitimate
-        // in-flight transient.
-        //   - mid-crash: a Crash opens a committed `SENDING` transient; tracked
-        //     by `pending_crash`.  A Reboot does NOT always resolve it — if the
-        //     node is in `GoingOnline`, boot reconciliation DEFERS the doc to the
-        //     W9 drain loop (branch d, `boot_phase.rs:1739`), so the transient
-        //     persists until a later drain/settle.
-        //   - mid-transition: `GoingOnline` is a transitional mode whose pending
-        //     docs belong to the W9 drain / subsequent online-settle, NOT to a
-        //     quiescent ledger.  SETTLED ⟺ `mode ∈ {Online, Offline}`.
-        // A genuinely-stuck doc is still caught at the post-settle Online boundary
-        // (once the node settles, drain/convergence resolves it and the scan is
-        // either clean or flags a REAL violation).
-        // A1 (HIGH): track the crash-transient from the REAL outcome, not the op
-        // NAME.  A `Crash(stage)` only opens a committed in-flight transient when
-        // it actually reached the wire and was dropped (`RealOutcome::Crashed`);
-        // on an Offline node it never reaches the wire and COMPLETES as a real
-        // offline sell (`RealOutcome::Doc`), leaving the node SETTLED with nothing
-        // to defer — so the settled scan must NOT be suppressed there.
-        // A1: a Crash opens a committed in-flight transient (the SETTLED scan is
-        // suppressed until a reboot resolves it).
-        if matches!(real, interp::RealOutcome::Crashed { .. }) {
-            pending_crash = true;
-            // U3: a stage-composition crash is a PROCESS death — hold every op
-            // until the resolving Reboot (see `dead_until_reboot` above).
-            if matches!(
-                real,
-                interp::RealOutcome::Crashed {
-                    stage: Stage::Sign | Stage::Finalize | Stage::OfflineAck,
-                    ..
-                }
-            ) {
-                dead_until_reboot = true;
-            } else {
-                pending_wire_crash = true;
-            }
-        }
-        // A3: a reboot that RESOLVES a pending WIRE crash must NOT re-send (DPS
-        // does not dedup → a blind resend double-fiscalises) — assert the
-        // no-resend bounded postcond IN the property harness (was: faults only
-        // resync, silently adopting a resend).  Only no-resend is asserted here:
-        // the exact terminal AND the Kvt1 PROBE vary under composition (a SENT
-        // doc at GoingOnline is DEFERRED to the W9 drain → no probe THIS reboot),
-        // so those stay pinned in the directed K3/K4 tests.
-        // U3 scope: WIRE crashes only, and only when NO composition crash is
-        // also pending — a composition-crash doc (SIGNED/OFFLINE_LOCAL_ACK)
-        // was never sent, so its resume legitimately performs a FIRST send
-        // (not a re-send); asserting no-resend there would be a false alarm.
-        if matches!(op, Op::Reboot | Op::RepeatReboot) && pending_crash {
-            if pending_wire_crash && !dead_until_reboot {
-                if let Err(d) = oracle::assert_no_resend(sends_before, ctx.send_calls()) {
-                    panic!("crash-recovery resend on {op:?}: {d:?}");
-                }
-            }
-            pending_crash = false;
-            pending_wire_crash = false;
-        }
-        // U3: the Reboot ran boot reconciliation — the process is alive again.
-        if matches!(op, Op::Reboot | Op::RepeatReboot) {
-            dead_until_reboot = false;
-        }
-        //   - RMR: `is_settled` also admits `RequiresManualReconciliation` (a
-        //     legitimate durable operator terminal, AUD-K8-1) even at mode
-        //     GoingOnline — a reject-halt rests there and MUST be scanned in
-        //     place (a violation there is a REAL finding, not suppressed).
-        let mode_now = ctx.read_node_mode().await;
-        let shift_now = ctx.read_shift_state().await;
-        if !pending_crash && is_settled(mode_now, shift_now) {
-            oracle::assert_clean(&ctx.pool).await;
-            if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
-                panic!("mirror drift on {op:?}: {d:?}");
-            }
-            // O3: the referential chain oracle trusts the stored hash; recompute
-            // sha256(PAYLOAD_XML) and catch a stored-hash/payload divergence.
-            if let Err(d) = oracle::check_payload_hash_integrity(&ctx.pool).await {
-                panic!("payload-hash integrity (O3) on {op:?}: {d:?}");
-            }
-        }
-
-        // After a NON-fault op, adopt ONLY the precondition state (mode /
-        // shift_state / active session) from the real DB so the NEXT op
-        // dispatches from reality.  The transition seams (go_online / drain /
-        // the force-ops) move mode/shift/session in ways the pure model need
-        // not perfectly mirror; the LEDGER (which the differential just checked)
-        // and the mirrors (which the scan just checked) are what we hold the
-        // model to.  Fault ops already did a FULL resync above.
-        if !matches!(class, oracle::OpClass::FaultOrRecovery) {
-            model.adopt_precondition(&ctx.pool).await;
-        }
-
-        // ── Peer-tip axis PHASE A: the movers-table load test ──────────────
-        //
-        // Spec `2026-07-31-spec-fuzzer-peer-tip-axis.md` §9.  The harness models
-        // the DPS peer's chain tip and advances it per WIRE CALL (accepting
-        // reply ⇒ the peer took that document).  Phase A overrides NOTHING; it
-        // asserts one property:
-        //
-        //     while the run has not diverged, EVERY outgoing document's
-        //     `previous_hash` already equals the peer's tip.
-        //
-        // That is exactly what makes the movers table (spec §4) falsifiable.
-        // Wire a mover wrong — say "an offline issuance advances the peer" —
-        // and the two sides desynchronise; the very next send records a mismatch
-        // on a run where nothing legitimately diverged, and this fires.
-        //
-        // Note the offline lane is NOT an exception, which is the subtle part:
-        // an OLA issuance advances OUR seed only, so the node seed runs ahead of
-        // the peer for the whole backlog — yet each DRAINED document chains onto
-        // its own predecessor, so per-document the two sides stay in step. That
-        // is the per-DOCUMENT formulation of the rule; the per-node-seed one is
-        // false, and phase A is what proves the difference empirically.
-        if let Some(reason) = ctx.peer_diverged() {
-            let _ = reason; // divergence is legitimate from here on
-        } else {
-            let mismatches = ctx.peer_mismatches();
-            assert!(
-                mismatches.is_empty(),
-                "peer-tip axis (phase A) on {op:?}: {} outgoing document(s) disagreed with the \
-                 peer's tip on a run that never diverged — the movers table (spec §4) is wrong, \
-                 or production regressed. peer_tip={:?} mismatches={mismatches:#?}",
-                mismatches.len(),
-                ctx.peer_tip_hex()
-            );
-        }
-
-        // ── Peer-tip axis PHASE C (spec §8) — the model's tip must NAME what reality's names ──
-        //
-        // Until now the seed differential was purely "did it move": `check_differential` compares
-        // `seed_after` against the prior tip STRUCTURALLY, and `adopt_fault_deferred` re-seats the
-        // model on a synthetic placeholder after every fault.  Nothing ever asserted that the
-        // placeholder points at the RIGHT document.  Phase C needs that, because a peer comparison
-        // is only as good as the two symbols being compared: `previous_hash == peer_tip` is
-        // meaningless if `previous_hash` is a marker the model chose for its own bookkeeping.
-        //
-        // So: project both sides onto the same three structural cases and demand they agree.  This
-        // is the model-side twin of phase A's peer assertion — an empirical load test of the seed
-        // algebra rather than a comment claiming it holds.
-        let real_tip = as_model_tip(ctx.real_tip_class().await);
-        let model_tip = model::model_tip_class(model.seed);
-        assert!(
-            model_tip == real_tip,
-            "peer-tip axis (phase C) on {op:?}: the model's MAC tip names {model_tip:?} but the \
-             real tip is {real_tip:?} — the model's symbolic seed algebra has drifted from the \
-             ledger, so any tip COMPARISON built on it (the peer mirror, the derived -12) would be \
-             built on sand. real_seed={:?}",
-            ctx.read_seed().await.map(|s| hex_of_slice(&s))
         );
+    }
 
-        // ── Peer-tip axis PHASE C (spec §4, §8) — and the model's PEER mirror must agree too ──
-        //
-        // Phase A made the harness peer falsifiable by asserting it against the outgoing documents'
-        // own chain links, and found a missing mover on its first run. This is the same test one
-        // level up: the model derives the peer INDEPENDENTLY, from the movers table alone, and the
-        // two derivations must name the same document. Wire a model mover wrong — say "an offline
-        // issuance advances the peer", or forget that the drain-finalize END is an ONLINE issuance
-        // the peer also takes — and this fires on the very next op.
-        //
-        // Gated on the model still CLAIMING to know. A held or ambiguous wire outcome, and a crash
-        // parked inside the wire call, leave the peer's acceptance genuinely undetermined; the
-        // model says so (`peer_unknown`) instead of guessing, and a comparison against a guess
-        // would be worse than no comparison at all. Phase C-2's `Took`/`NotTook` leaf is what
-        // narrows this gate — and the gate is exactly the measure of how much it will buy.
-        if !model.peer_unknown {
-            let real_peer = as_model_tip(ctx.peer_tip_class().await);
-            let model_peer = model::model_tip_class(model.peer_tip);
-            assert!(
-                model_peer == real_peer,
-                "peer-tip axis (phase C) on {op:?}: the model's peer mirror names {model_peer:?} \
-                 but the harness peer is on {real_peer:?} — a §4 mover is wrong on the model side. \
-                 peer_tip={:?}",
-                ctx.peer_tip_hex()
+    // U1 D1 — next_lnd is PREDICTED, not adopted, for non-fault ops.  The
+    // model advances its allocator per issuing op (`apply`); assert that
+    // prediction equals the DB SSOT `node_state.next_lnd` (the
+    // `allocate_next_lnd` sequencer, ADR-M3-A1) — per-FN monotonic, no-gap
+    // (`ux_fd_fn_lnd`).  This catches an allocator drift the DOC-lnd
+    // differential CANNOT: a NoMutation op has no doc, and a missed increment
+    // leaves the doc correct but the allocator stale.  Fault ops cannot
+    // predict the crash-window allocation → they adopt via `adopt_fault_deferred`
+    // (the classified deferral, §4 funnel), so D1 skips them.
+    if !matches!(class, oracle::OpClass::FaultOrRecovery) {
+        assert_eq!(
+            model.next_lnd,
+            ctx.read_next_lnd().await,
+            "U1 D1: model next_lnd prediction diverged from node_state.next_lnd on {op:?}"
+        );
+    }
+
+    // U1 D2 — mode / shift_state are PREDICTED, not adopted, for non-fault
+    // ops.  `apply` sets both from the M3b 9-state shift machine + the
+    // node-mode machine (enums.rs); assert the prediction equals the DB.
+    // Fault ops adopt via `adopt_fault_deferred` (adopt_fault_deferred), so D2 skips
+    // them.  §7 #3 RESIDUE SPLIT: the drain / go-online MODE outcome (the
+    // `GoingOnline → Online` CAS in `drain_backlog`) is a MID-TRANSITION
+    // residue the pure model cannot pin — a FORCED `GoingOnline`
+    // (`OfflineSellDuringGoingOnline`) does not complete to `Online` the way a
+    // real go-online does, so `drain_backlog`'s empty-backlog CAS over-predicts
+    // `Online` where reality stays `GoingOnline`.  Those ops therefore DEFER
+    // mode to `adopt_precondition` (adopt_precondition); their SHIFT
+    // (RMR / unchanged) IS predicted and asserted.
+    if !matches!(class, oracle::OpClass::FaultOrRecovery) {
+        assert_eq!(
+            model.shift_state,
+            ctx.read_shift_state().await,
+            "U1 D2: model shift_state prediction diverged from node_state.shift_state on {op:?}"
+        );
+        let mode_is_transition_residue = matches!(
+            op,
+            Op::GoOnline(_) | Op::GoOnlineWithoutBacklog | Op::Drain(_) | Op::RepeatDrain
+        );
+        if !mode_is_transition_residue {
+            assert_eq!(
+                model.mode,
+                ctx.read_node_mode().await,
+                "U1 D2: model mode prediction diverged from node_state.mode on {op:?}"
             );
         }
     }
 
-    // A2/A4: terminal liveness + scan.  The per-op scan is suppressed mid-crash
-    // and mid-transition; without a terminal pass an unpaired crash or a
-    // GoingOnline terminal would NEVER be recovered/scanned.  This drives bounded
-    // REAL recovery until the node settles, then scans (or fails liveness on a
-    // genuine non-settling settle-path; a forced-mode artifact asserts no-resend).
-    settle_and_scan(&mut ctx, pending_crash).await;
-    // U3: hand the ctx back so directed pins can inspect the settled ledger
-    // (e.g. the dead-until-reboot doc-count pin) — the capstones ignore it.
-    ctx
+    // Scan-timing (T5, generalised): scan ONLY in a SETTLED state — NOT
+    // mid-crash AND NOT mid-transition.  This is the principled reading of
+    // spec §7.2 ("a committed-in-flight transient is legal — do not scan
+    // there"): mid-crash and mid-transition are the TWO classes of legitimate
+    // in-flight transient.
+    //   - mid-crash: a Crash opens a committed `SENDING` transient; tracked
+    //     by `pending_crash`.  A Reboot does NOT always resolve it — if the
+    //     node is in `GoingOnline`, boot reconciliation DEFERS the doc to the
+    //     W9 drain loop (branch d, `boot_phase.rs:1739`), so the transient
+    //     persists until a later drain/settle.
+    //   - mid-transition: `GoingOnline` is a transitional mode whose pending
+    //     docs belong to the W9 drain / subsequent online-settle, NOT to a
+    //     quiescent ledger.  SETTLED ⟺ `mode ∈ {Online, Offline}`.
+    // A genuinely-stuck doc is still caught at the post-settle Online boundary
+    // (once the node settles, drain/convergence resolves it and the scan is
+    // either clean or flags a REAL violation).
+    // A1 (HIGH): track the crash-transient from the REAL outcome, not the op
+    // NAME.  A `Crash(stage)` only opens a committed in-flight transient when
+    // it actually reached the wire and was dropped (`RealOutcome::Crashed`);
+    // on an Offline node it never reaches the wire and COMPLETES as a real
+    // offline sell (`RealOutcome::Doc`), leaving the node SETTLED with nothing
+    // to defer — so the settled scan must NOT be suppressed there.
+    // A1: a Crash opens a committed in-flight transient (the SETTLED scan is
+    // suppressed until a reboot resolves it).
+    if matches!(real, interp::RealOutcome::Crashed { .. }) {
+        st.pending_crash = true;
+        // U3: a stage-composition crash is a PROCESS death — hold every op
+        // until the resolving Reboot (see `dead_until_reboot` above).
+        if matches!(
+            real,
+            interp::RealOutcome::Crashed {
+                stage: Stage::Sign | Stage::Finalize | Stage::OfflineAck,
+                ..
+            }
+        ) {
+            st.dead_until_reboot = true;
+        } else {
+            st.pending_wire_crash = true;
+        }
+    }
+    // A3: a reboot that RESOLVES a pending WIRE crash must NOT re-send (DPS
+    // does not dedup → a blind resend double-fiscalises) — assert the
+    // no-resend bounded postcond IN the property harness (was: faults only
+    // resync, silently adopting a resend).  Only no-resend is asserted here:
+    // the exact terminal AND the Kvt1 PROBE vary under composition (a SENT
+    // doc at GoingOnline is DEFERRED to the W9 drain → no probe THIS reboot),
+    // so those stay pinned in the directed K3/K4 tests.
+    // U3 scope: WIRE crashes only, and only when NO composition crash is
+    // also pending — a composition-crash doc (SIGNED/OFFLINE_LOCAL_ACK)
+    // was never sent, so its resume legitimately performs a FIRST send
+    // (not a re-send); asserting no-resend there would be a false alarm.
+    if matches!(op, Op::Reboot | Op::RepeatReboot) && st.pending_crash {
+        if st.pending_wire_crash && !st.dead_until_reboot {
+            if let Err(d) = oracle::assert_no_resend(sends_before, ctx.send_calls()) {
+                panic!("crash-recovery resend on {op:?}: {d:?}");
+            }
+        }
+        st.pending_crash = false;
+        st.pending_wire_crash = false;
+    }
+    // U3: the Reboot ran boot reconciliation — the process is alive again.
+    if matches!(op, Op::Reboot | Op::RepeatReboot) {
+        st.dead_until_reboot = false;
+    }
+    //   - RMR: `is_settled` also admits `RequiresManualReconciliation` (a
+    //     legitimate durable operator terminal, AUD-K8-1) even at mode
+    //     GoingOnline — a reject-halt rests there and MUST be scanned in
+    //     place (a violation there is a REAL finding, not suppressed).
+    //   - W6 slice 2b: the predicate is PROCESS-wide (`process_settled`) — the
+    //     scan reads the whole database, so another tenant mid-transition
+    //     suppresses it exactly like this tenant's own transition would.
+    if !st.pending_crash && !st.defer_scan && process_settled(&ctx.pool).await {
+        oracle::assert_clean(&ctx.pool).await;
+        if let Err(d) = oracle::check_mirrors(&ctx.pool).await {
+            panic!("mirror drift on {op:?}: {d:?}");
+        }
+        // O3: the referential chain oracle trusts the stored hash; recompute
+        // sha256(PAYLOAD_XML) and catch a stored-hash/payload divergence.
+        if let Err(d) = oracle::check_payload_hash_integrity(&ctx.pool).await {
+            panic!("payload-hash integrity (O3) on {op:?}: {d:?}");
+        }
+    }
+
+    // After a NON-fault op, adopt ONLY the precondition state (mode /
+    // shift_state / active session) from the real DB so the NEXT op
+    // dispatches from reality.  The transition seams (go_online / drain /
+    // the force-ops) move mode/shift/session in ways the pure model need
+    // not perfectly mirror; the LEDGER (which the differential just checked)
+    // and the mirrors (which the scan just checked) are what we hold the
+    // model to.  Fault ops already did a FULL resync above.
+    if !matches!(class, oracle::OpClass::FaultOrRecovery) {
+        model.adopt_precondition(&ctx.pool).await;
+    }
+
+    // ── Peer-tip axis PHASE A: the movers-table load test ──────────────
+    //
+    // Spec `2026-07-31-spec-fuzzer-peer-tip-axis.md` §9.  The harness models
+    // the DPS peer's chain tip and advances it per WIRE CALL (accepting
+    // reply ⇒ the peer took that document).  Phase A overrides NOTHING; it
+    // asserts one property:
+    //
+    //     while the run has not diverged, EVERY outgoing document's
+    //     `previous_hash` already equals the peer's tip.
+    //
+    // That is exactly what makes the movers table (spec §4) falsifiable.
+    // Wire a mover wrong — say "an offline issuance advances the peer" —
+    // and the two sides desynchronise; the very next send records a mismatch
+    // on a run where nothing legitimately diverged, and this fires.
+    //
+    // Note the offline lane is NOT an exception, which is the subtle part:
+    // an OLA issuance advances OUR seed only, so the node seed runs ahead of
+    // the peer for the whole backlog — yet each DRAINED document chains onto
+    // its own predecessor, so per-document the two sides stay in step. That
+    // is the per-DOCUMENT formulation of the rule; the per-node-seed one is
+    // false, and phase A is what proves the difference empirically.
+    if let Some(reason) = ctx.peer_diverged() {
+        let _ = reason; // divergence is legitimate from here on
+    } else {
+        let mismatches = ctx.peer_mismatches();
+        assert!(
+            mismatches.is_empty(),
+            "peer-tip axis (phase A) on {op:?}: {} outgoing document(s) disagreed with the \
+                 peer's tip on a run that never diverged — the movers table (spec §4) is wrong, \
+                 or production regressed. peer_tip={:?} mismatches={mismatches:#?}",
+            mismatches.len(),
+            ctx.peer_tip_hex()
+        );
+    }
+
+    // ── Peer-tip axis PHASE C (spec §8) — the model's tip must NAME what reality's names ──
+    //
+    // Until now the seed differential was purely "did it move": `check_differential` compares
+    // `seed_after` against the prior tip STRUCTURALLY, and `adopt_fault_deferred` re-seats the
+    // model on a synthetic placeholder after every fault.  Nothing ever asserted that the
+    // placeholder points at the RIGHT document.  Phase C needs that, because a peer comparison
+    // is only as good as the two symbols being compared: `previous_hash == peer_tip` is
+    // meaningless if `previous_hash` is a marker the model chose for its own bookkeeping.
+    //
+    // So: project both sides onto the same three structural cases and demand they agree.  This
+    // is the model-side twin of phase A's peer assertion — an empirical load test of the seed
+    // algebra rather than a comment claiming it holds.
+    let real_tip = as_model_tip(ctx.real_tip_class().await);
+    let model_tip = model::model_tip_class(model.seed);
+    assert!(
+        model_tip == real_tip,
+        "peer-tip axis (phase C) on {op:?}: the model's MAC tip names {model_tip:?} but the \
+             real tip is {real_tip:?} — the model's symbolic seed algebra has drifted from the \
+             ledger, so any tip COMPARISON built on it (the peer mirror, the derived -12) would be \
+             built on sand. real_seed={:?}",
+        ctx.read_seed().await.map(|s| hex_of_slice(&s))
+    );
+
+    // ── Peer-tip axis PHASE C (spec §4, §8) — and the model's PEER mirror must agree too ──
+    //
+    // Phase A made the harness peer falsifiable by asserting it against the outgoing documents'
+    // own chain links, and found a missing mover on its first run. This is the same test one
+    // level up: the model derives the peer INDEPENDENTLY, from the movers table alone, and the
+    // two derivations must name the same document. Wire a model mover wrong — say "an offline
+    // issuance advances the peer", or forget that the drain-finalize END is an ONLINE issuance
+    // the peer also takes — and this fires on the very next op.
+    //
+    // Gated on the model still CLAIMING to know. A held or ambiguous wire outcome, and a crash
+    // parked inside the wire call, leave the peer's acceptance genuinely undetermined; the
+    // model says so (`peer_unknown`) instead of guessing, and a comparison against a guess
+    // would be worse than no comparison at all. Phase C-2's `Took`/`NotTook` leaf is what
+    // narrows this gate — and the gate is exactly the measure of how much it will buy.
+    if !model.peer_unknown {
+        let real_peer = as_model_tip(ctx.peer_tip_class().await);
+        let model_peer = model::model_tip_class(model.peer_tip);
+        assert!(
+            model_peer == real_peer,
+            "peer-tip axis (phase C) on {op:?}: the model's peer mirror names {model_peer:?} \
+                 but the harness peer is on {real_peer:?} — a §4 mover is wrong on the model side. \
+                 peer_tip={:?}",
+            ctx.peer_tip_hex()
+        );
+    }
+
+    Some(class)
 }
 
 fn drive(ops: &[Op], offline: bool) {
@@ -6215,6 +6512,33 @@ fn drive(ops: &[Op], offline: bool) {
             )
             .await;
         }
+    });
+}
+
+/// W6 slice 2b — the multi-FN capstone glue: TWO tenants on ONE App/database, each op routed
+/// by its index.  `mixed=false` seeds both tenants online-open; `mixed=true` seeds tenant 0
+/// OFFLINE-open (3 codes, the capstone sizing) and tenant 1 online-open, so the interleave
+/// crosses the offline lane (sessions, codes, drains) against online traffic.
+fn drive_multi(ops: &[(usize, Op)], mixed: bool) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (a, ma) = if mixed {
+            (
+                interp::FuzzCtx::new_offline_open_shift(3).await,
+                RefModel::new_offline_open_shift(3),
+            )
+        } else {
+            (
+                interp::FuzzCtx::new_online_open_shift().await,
+                RefModel::new_online_open_shift(),
+            )
+        };
+        let b = a.sibling_online_open_shift("4000000002").await;
+        let mb = RefModel::new_online_open_shift().for_fn("4000000002");
+        run_harness_multi(ops, vec![(a, ma), (b, mb)]).await;
     });
 }
 
@@ -6381,6 +6705,33 @@ proptest! {
     #[test]
     fn harness_offline_seeded(ops in strategy::op_sequence()) {
         drive(&ops, true);
+    }
+}
+
+proptest! {
+    // W6 slice 2b — the MULTI-FN capstone lane.  Its OWN regression file: the seeds replay
+    // through `multi_fn_op_sequence`, and mixing them into the single-FN corpus would replay
+    // every historical single-FN find through a different strategy for no coverage.
+    #![proptest_config(ProptestConfig {
+        cases: fuzz_cases(),
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/invariant_fuzzer.multi.regressions"
+        )))),
+        ..ProptestConfig::default()
+    })]
+
+    /// TWO online tenants on one App/database, generatively interleaved.
+    #[test]
+    fn harness_multi_fn_online_seeded(ops in strategy::multi_fn_op_sequence()) {
+        drive_multi(&ops, false);
+    }
+
+    /// OFFLINE tenant 0 against ONLINE tenant 1 — the interleave crosses sessions, codes and
+    /// drains against online traffic (the lane where every slice-2a unscoped read used to lie).
+    #[test]
+    fn harness_multi_fn_mixed_seeded(ops in strategy::multi_fn_op_sequence()) {
+        drive_multi(&ops, true);
     }
 }
 

@@ -212,3 +212,12 @@ fn op() -> impl Strategy<Value = Op> {
 pub fn op_sequence() -> impl Strategy<Value = Vec<Op>> {
     prop::collection::vec(op(), 1..=8)
 }
+
+/// W6 slice 2b — the multi-FN intent-stream: each op is routed to one of two tenants by index.
+/// A NEW strategy fn (appended, its own capstone + regression namespace) rather than a changed
+/// `op_sequence`: the single-FN corpus indices must keep decoding to the same ops.  Sequences
+/// run a little longer (1..=10) than the single-FN lane so a two-tenant interleave still gives
+/// each tenant a usable share.
+pub fn multi_fn_op_sequence() -> impl Strategy<Value = Vec<(usize, Op)>> {
+    prop::collection::vec((0..2usize, op()), 1..=10)
+}
