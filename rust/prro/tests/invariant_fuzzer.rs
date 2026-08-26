@@ -3100,10 +3100,11 @@ async fn h7b_a_granted_replenish_is_refused_on_a_tip_dps_never_accepted() {
 // production topology (one process, many FNs; the pid-lock singleton forbids anything else).
 // The oracle throughout is the dossier's: no cross-FN lnd/seed/pool/session/shift bleed.
 //
-// Deliberately NOT here (slice 2+, excluded loudly rather than silently): the generative
-// interleaving harness (run_harness is single-FN; RefModel's fault-adoption reads are unscoped),
-// the N=200 soak lane, fairness/starvation, and shutdown-with-held-leases. Cut breadth, not
-// discipline.
+// Deliberately NOT here (excluded loudly rather than silently): the generative interleaving
+// harness — run_harness is still single-FN (slice 2b); slice 2a below has already FN-scoped
+// RefModel's adoption/sync reads and the oracle mirrors, which were the prerequisite. Also
+// deferred: the N=200 soak lane, fairness/starvation, and shutdown-with-held-leases. Cut
+// breadth, not discipline.
 
 /// Two FNs, interleaved sells, and every per-FN axis stays its own: lnd sequences, chain seeds,
 /// document ledgers. The whole-DB `invariant_scan` (already multi-FN-aware — it GROUPs by
@@ -3338,6 +3339,178 @@ async fn w6_prod_fn_gate_serialises_same_fn_and_overlaps_different_fns() {
     assert!(after.is_ok(), "released gate must be acquirable again");
     drop(overlapped);
     drop(after);
+}
+
+// ── W6 slice 2a — FN-scoping of the MODEL's reality-reads and the ORACLE mirrors ──
+//
+// The generative multi-FN harness (slice 2b) is impossible while the model's adoption/sync
+// reads and the oracle's X2 / Mirror-2 / Z checks read the WHOLE database: with two FNs they
+// either adopt the other tenant's state or false-fire on a legal fleet topology.  These pins
+// were written RED-first against the unscoped reads.
+
+/// One active offline session PER FN is the legal fleet topology (`ux_offline_active` is a
+/// per-FN partial-unique index) — the oracle's X2 sentinel and the model's precondition/fault
+/// adoption must treat it as clean, and each model must see only ITS OWN session and code pool.
+#[tokio::test]
+async fn w6_two_offline_sessions_one_per_fn_are_legal() {
+    let a = interp::FuzzCtx::new_offline_open_shift(3).await;
+    let b = a.sibling_offline_open_shift("4000000002", 2).await;
+
+    // The oracle: two OPEN sessions, one per FN — NOT an X2 single-active-session breach.
+    oracle::check_mirrors(&a.pool)
+        .await
+        .expect("one active session per FN is the fleet topology, not an X2 breach");
+
+    // The model, FN-A: the precondition resync must neither panic on the second FN's session
+    // nor adopt it — and the fault adoption must count only A's code pool (A=3, B=2 — sized
+    // differently so an unscoped COUNT(*) of 5 shows up loudly).
+    let mut ma = RefModel::new_offline_open_shift(3);
+    ma.adopt_precondition(&a.pool).await;
+    assert_eq!(
+        ma.session,
+        Some(prro::db::models::enums::OfflineSessionState::Open),
+        "A's precondition resync sees A's own OPEN session"
+    );
+    ma.adopt_fault_deferred(&a.pool).await;
+    assert_eq!(
+        ma.codes_issued, 3,
+        "A's fault adoption counts only A's codes — an unscoped COUNT would see both pools"
+    );
+
+    // And FN-B's model, scoped to B, sees the 2-code pool.
+    let mut mb = RefModel::new_offline_open_shift(2).for_fn(b.fn_id());
+    mb.adopt_fault_deferred(&b.pool).await;
+    assert_eq!(
+        mb.codes_issued, 2,
+        "B's fault adoption counts only B's codes"
+    );
+}
+
+/// A fault re-sync adopts ONLY its own FN's ledger: documents, allocator, mode/shift.  With two
+/// FNs on one database an unscoped adoption merges both ledgers keyed by (per-FN!) lnd and
+/// takes `node_state LIMIT 1` — whichever tenant SQLite yields.
+#[tokio::test]
+async fn w6_fault_adoption_reads_only_its_own_fn() {
+    let mut a = interp::FuzzCtx::new_online_open_shift().await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+
+    // B mints two documents, A mints one — asymmetric so any merge is visible.
+    for tag in ["b1", "b2"] {
+        let out = interp::run_op(&mut b, &Op::OnlineSell(DpsScript::ack_path())).await;
+        assert!(matches!(out, interp::RealOutcome::Doc(_)), "{tag}: {out:?}");
+    }
+    let out = interp::run_op(&mut a, &Op::OnlineSell(DpsScript::ack_path())).await;
+    assert!(matches!(out, interp::RealOutcome::Doc(_)), "a1: {out:?}");
+
+    let mut ma = RefModel::new_online_open_shift();
+    ma.adopt_fault_deferred(&a.pool).await;
+    assert_eq!(
+        ma.docs.len(),
+        1,
+        "A's adoption holds exactly A's one document — 2 here means B's ledger merged in \
+         (both tenants' lnds collide in one BTreeMap)"
+    );
+    assert_eq!(
+        ma.next_lnd, 2,
+        "A's allocator is A's own (1 minted → next 2)"
+    );
+
+    let mut mb = RefModel::new_online_open_shift().for_fn(b.fn_id());
+    mb.adopt_fault_deferred(&b.pool).await;
+    assert_eq!(
+        mb.docs.len(),
+        2,
+        "B's adoption holds exactly B's two documents"
+    );
+    assert_eq!(mb.next_lnd, 3, "B's allocator: 2 minted → next 3");
+}
+
+/// The Z-aggregation oracle checks the Z of the FN THAT CLOSED, not the global max-lnd "latest"
+/// — lnd is a per-FN ordinal, so a cross-FN `ORDER BY lnd DESC LIMIT 1` picks an arbitrary
+/// tenant's Z and silently never checks the other's (vacuity, proven by the corruption probe).
+#[tokio::test]
+async fn w6_z_oracle_checks_the_closing_fn_not_the_global_latest() {
+    let mut a = interp::FuzzCtx::new_online_open_shift().await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+
+    // A: one sell + Z (lnd 1,2). B: two sells + Z (lnd 1,2,3) — B's Z carries the higher lnd,
+    // so the unscoped "latest" looks at B and never at A.
+    let _ = interp::run_op(&mut a, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let _ = interp::run_op(&mut a, &Op::OnlineZReport(DpsScript::ack_path())).await;
+    let _ = interp::run_op(&mut b, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let _ = interp::run_op(&mut b, &Op::OnlineSell(DpsScript::ack_path())).await;
+    let _ = interp::run_op(&mut b, &Op::OnlineZReport(DpsScript::ack_path())).await;
+
+    // Both FNs pass their OWN scoped check.
+    oracle::check_latest_z_aggregation(&a.pool, a.fn_id())
+        .await
+        .expect("A's Z aggregates A's receipts");
+    oracle::check_latest_z_aggregation(&b.pool, b.fn_id())
+        .await
+        .expect("B's Z aggregates B's receipts");
+
+    // Vacuity probe: corrupt A's Z totals in place.  The scoped check for A MUST fire; the
+    // unscoped one would look at B's (higher-lnd, still-valid) Z and vacuously pass.
+    sqlx::query(
+        "UPDATE fiscal_documents SET payload_json = replace(payload_json, '15000', '99999') \
+         WHERE fiscal_number = ? AND doc_type = 'Z_REPORT'",
+    )
+    .bind(a.fn_id())
+    .execute(&a.pool)
+    .await
+    .expect("corrupt A's Z payload");
+    assert!(
+        oracle::check_latest_z_aggregation(&a.pool, a.fn_id())
+            .await
+            .is_err(),
+        "a corrupted Z on FN-A must fail A's check — passing here means the oracle looked at \
+         the other tenant's Z (the vacuity this pin exists to kill)"
+    );
+    assert!(
+        oracle::check_latest_z_aggregation(&b.pool, b.fn_id())
+            .await
+            .is_ok(),
+        "…and B's check still passes: the corruption was A's alone"
+    );
+}
+
+/// The hold and fence PRECONDITIONS are per-FN: FN-B's held reservation must not become FN-A's
+/// model precondition, and B's active fence must not fence A.
+#[tokio::test]
+async fn w6_hold_and_fence_preconditions_are_fn_scoped() {
+    let a = interp::FuzzCtx::new_online_open_shift().await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+
+    // Drive B through the production hold path: a held wire outcome leaves B with a
+    // PENDING_APPLY reservation and an active fence.
+    let _ = interp::run_op(
+        &mut b,
+        &Op::OnlineSell(DpsScript::held_with_peer(PeerTruth::NotTook)),
+    )
+    .await;
+
+    let mut mb = RefModel::new_online_open_shift().for_fn(b.fn_id());
+    mb.sync_held_reservation(&b.pool).await;
+    assert!(
+        mb.held_reservation.is_some(),
+        "the fixture is live: B really holds a PENDING_APPLY reservation"
+    );
+    mb.sync_fence_active(&b.pool).await;
+    assert!(mb.fence_active, "…and B's fence is really up");
+
+    // FN-A's model must see NEITHER.
+    let mut ma = RefModel::new_online_open_shift();
+    ma.sync_held_reservation(&a.pool).await;
+    assert!(
+        ma.held_reservation.is_none(),
+        "B's hold must not become A's precondition — an unscoped LIMIT 1 hands one tenant's \
+         hold to every model"
+    );
+    ma.sync_fence_active(&a.pool).await;
+    assert!(
+        !ma.fence_active,
+        "B's fence must not fence A — an unscoped EXISTS raises every tenant's fence at once"
+    );
 }
 
 /// Peer-tip axis PHASE C — the ONE place reality's tip vocabulary is translated into the model's.
@@ -4107,7 +4280,7 @@ async fn z_aggregation_oracle_checks_taxable_sell_return_turnover() {
     let real = interp::run_op(&mut ctx, &z_op).await;
     oracle::check_differential(&real, &expected, prior_tip.as_deref())
         .unwrap_or_else(|d| panic!("taxable online Z_REPORT must match model: {d:?}"));
-    oracle::check_latest_z_aggregation(&ctx.pool)
+    oracle::check_latest_z_aggregation(&ctx.pool, ctx.fn_id())
         .await
         .unwrap_or_else(|d| panic!("taxable Z aggregation oracle must pass: {d:?}"));
 }
@@ -4220,7 +4393,7 @@ async fn offline_full_day_z_aggregation_survives_return_online_drain() {
     let real = interp::run_op(&mut ctx, &Op::OfflineZReport).await;
     oracle::check_differential(&real, &expected, prior_tip.as_deref())
         .unwrap_or_else(|d| panic!("taxable offline Z_REPORT must match model: {d:?}"));
-    oracle::check_latest_z_aggregation(&ctx.pool)
+    oracle::check_latest_z_aggregation(&ctx.pool, ctx.fn_id())
         .await
         .unwrap_or_else(|d| panic!("offline local Z aggregation oracle must pass: {d:?}"));
 
@@ -4233,7 +4406,7 @@ async fn offline_full_day_z_aggregation_survives_return_online_drain() {
     oracle::check_shift_state(ctx.read_shift_state().await, Some(model.shift_state))
         .expect("offline full-day drain shift state must match model");
     assert_eq!(model.shift_state, ShiftState::Closed);
-    oracle::check_latest_z_aggregation(&ctx.pool)
+    oracle::check_latest_z_aggregation(&ctx.pool, ctx.fn_id())
         .await
         .unwrap_or_else(|d| panic!("drained offline Z aggregation oracle must still pass: {d:?}"));
 }
@@ -5043,6 +5216,14 @@ async fn settle_and_scan(ctx: &mut interp::FuzzCtx, pending_crash: bool) {
 /// classification, with the T5 scan-timing rule (never mid-crash) and re-sync
 /// after a fault.
 async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) -> interp::FuzzCtx {
+    // W6 slice 2 — the model's adoption/sync reads are scoped to ITS fiscal number, so a
+    // ctx/model pair built for different FNs would silently adopt nothing (or the wrong
+    // tenant). Fail loudly at the seam instead.
+    assert_eq!(
+        model.fn_id(),
+        ctx.fn_id(),
+        "run_harness needs a ctx/model pair for the SAME fiscal number"
+    );
     // A crash transient opened but not yet resolved by a reboot (A1 scan-gate
     // suppresses the scan while set; A3 asserts the no-resend postcond on the
     // resolving reboot).
@@ -5446,7 +5627,8 @@ async fn run_harness(ops: &[Op], mut ctx: interp::FuzzCtx, mut model: RefModel) 
                     }
                 }
                 if matches!(op, Op::OnlineZReport(_) | Op::OfflineZReport) {
-                    if let Err(d) = oracle::check_latest_z_aggregation(&ctx.pool).await {
+                    if let Err(d) = oracle::check_latest_z_aggregation(&ctx.pool, ctx.fn_id()).await
+                    {
                         panic!("Z aggregation oracle on {op:?}: {d:?}");
                     }
                 }
