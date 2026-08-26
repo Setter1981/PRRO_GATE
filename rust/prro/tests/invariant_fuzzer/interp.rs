@@ -327,6 +327,44 @@ impl FuzzCtx {
         }
     }
 
+    /// W6 slice 2 — an OFFLINE sibling: a second fiscal number on the SAME App/database with an
+    /// open shift, an OPEN offline session and its own `codes` pool.  The per-FN partial-unique
+    /// index `ux_offline_active` (`001_baseline.sql`) makes one-active-session-PER-FN the legal
+    /// fleet topology — this constructor exists so tests can prove the ORACLES accept it too.
+    /// Same sharing/drop contract as `sibling_online_open_shift` (primary owns the TempDir).
+    pub async fn sibling_offline_open_shift(&self, fn_id: &str, codes: i64) -> Self {
+        assert_ne!(
+            fn_id, self.fn_id,
+            "a sibling is a DIFFERENT fiscal number — two ctxs on one FN would violate the very \
+             invariant (#2) the multi-FN tier exists to prove"
+        );
+        let pool = self.pool.clone();
+        let pool_secure = self.pool_secure.clone();
+        let peer_pool = pool.clone();
+        seed_fn_config(&pool, fn_id).await;
+        let shift_id = seed_open_shift(&pool, fn_id).await;
+        seed_node_state(&pool, fn_id, NodeMode::Offline, shift_id).await;
+        seed_open_offline_session(&pool, fn_id).await;
+        for code_lnd in 1..=codes {
+            seed_offline_code(&pool, fn_id, code_lnd).await;
+        }
+        Self {
+            pool,
+            pool_secure,
+            _tempdir: None,
+            app: self.app.clone(),
+            sign_ctx: det_signing_ctx(),
+            fn_sign: fn_sign_blob(),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            fn_id: fn_id.to_string(),
+            send_calls: Arc::new(AtomicUsize::new(0)),
+            last_calls: Arc::new(AtomicUsize::new(0)),
+            seq: 0,
+            last_row: None,
+            peer: PeerLedger::new(peer_pool, fn_id.to_string()),
+        }
+    }
+
     /// Fixture variant used by the cleanup test: keep all DB tempdirs under a
     /// caller-owned base dir without mutating the process-global `TMPDIR`.
     async fn new_online_open_shift_in(base: &Path) -> Self {

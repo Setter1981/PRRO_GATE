@@ -415,26 +415,36 @@ pub fn check_x_report_turnover(real_cash: i64, model_cash: i64) -> Result<(), Di
 /// persisted receipt payloads + persisted signing snapshots.  This catches the
 /// fiscally expensive class where the state machine is correct but Z turnover /
 /// tax totals are silently wrong.
-pub async fn check_latest_z_aggregation(pool: &SqlitePool) -> Result<(), Divergence> {
+pub async fn check_latest_z_aggregation(
+    pool: &SqlitePool,
+    fiscal_number: &str,
+) -> Result<(), Divergence> {
+    // W6 slice 2 — "latest" is a PER-FN notion: lnd is a per-FN ordinal, so a cross-FN
+    // `ORDER BY lnd DESC LIMIT 1` picks an arbitrary tenant's Z and silently never checks
+    // the caller's (the vacuity `w6_z_oracle_checks_the_closing_fn_not_the_global_latest`
+    // pins).  The receipt join below scopes itself: `shift_id` is globally unique.
     let z_payload: Option<String> = sqlx::query_scalar(
         "SELECT payload_json \
          FROM fiscal_documents \
-         WHERE doc_type IN ('Z_REPORT','SHIFT_CLOSE') \
+         WHERE doc_type IN ('Z_REPORT','SHIFT_CLOSE') AND fiscal_number = ? \
          ORDER BY lnd DESC \
          LIMIT 1",
     )
+    .bind(fiscal_number)
     .fetch_optional(pool)
     .await
     .map_err(|e| Divergence(format!("Z oracle: latest Z query failed: {e}")))?;
     let z_payload = z_payload.ok_or_else(|| {
-        Divergence("Z oracle: no Z_REPORT/SHIFT_CLOSE document found".to_string())
+        Divergence(format!(
+            "Z oracle: no Z_REPORT/SHIFT_CLOSE document found for fn {fiscal_number}"
+        ))
     })?;
 
     let receipt_rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "WITH latest_z AS ( \
              SELECT shift_id \
              FROM fiscal_documents \
-             WHERE doc_type IN ('Z_REPORT','SHIFT_CLOSE') \
+             WHERE doc_type IN ('Z_REPORT','SHIFT_CLOSE') AND fiscal_number = ? \
              ORDER BY lnd DESC \
              LIMIT 1 \
          ) \
@@ -446,6 +456,7 @@ pub async fn check_latest_z_aggregation(pool: &SqlitePool) -> Result<(), Diverge
            AND d.state IN ('ACK','OFFLINE_LOCAL_ACK') \
          ORDER BY d.lnd",
     )
+    .bind(fiscal_number)
     .fetch_all(pool)
     .await
     .map_err(|e| Divergence(format!("Z oracle: receipt query failed: {e}")))?;
@@ -1009,34 +1020,42 @@ pub async fn check_mirrors(pool: &SqlitePool) -> Result<(), Divergence> {
         )));
     }
 
-    // Mirror-2 — the active (OPEN / DRAINING) session for this FN (the cohort the
+    // Mirror-2 — the active (OPEN / DRAINING) session PER FN (the cohort the
     // drain scopes to; mirrors `current_open_or_draining_session`).
     //
-    // X2: fetch ALL active sessions with a deterministic `ORDER BY` and guard the
-    // single-active-session invariant.  `ux_offline_active` (partial unique index
-    // on OPENING/OPEN/DRAINING) guarantees ≤1 on a clean DB, so this never fires
-    // in a normal run — it is a defense-in-depth sentinel surfacing a >1-active
-    // breach (e.g. a schema-guard regression) the bare `LIMIT 1` would have
-    // silently MASKED by picking an arbitrary row.
-    let active_ids: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT lower(hex(offline_session_id)) FROM offline_sessions \
-         WHERE state IN ('OPEN', 'DRAINING') ORDER BY opened_at, offline_session_id",
+    // X2 (W6 slice 2 — per-FN): fetch ALL active sessions with a deterministic
+    // `ORDER BY` and guard the single-active-session-PER-FN invariant.
+    // `ux_offline_active` is a partial unique index ON (fiscal_number), so one
+    // active session per tenant is the LEGAL fleet topology — the breach this
+    // sentinel surfaces is two active sessions on ONE fn (a schema-guard
+    // regression a bare `LIMIT 1` would silently MASK by picking an arbitrary
+    // row).
+    let active_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT fiscal_number, lower(hex(offline_session_id)) FROM offline_sessions \
+         WHERE state IN ('OPEN', 'DRAINING') ORDER BY fiscal_number, opened_at, \
+         offline_session_id",
     )
     .fetch_all(pool)
     .await
     .map_err(|e| Divergence(format!("active-session query failed: {e}")))?;
-    if active_ids.len() > 1 {
-        return Err(Divergence(format!(
-            "X2: multiple active OPEN/DRAINING offline sessions (single-active-session \
-             invariant breach): {active_ids:?}"
-        )));
+    let mut active_by_fn: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (fiscal_number, session_id) in active_rows {
+        if let Some(first) = active_by_fn.get(&fiscal_number) {
+            return Err(Divergence(format!(
+                "X2: multiple active OPEN/DRAINING offline sessions on ONE fn \
+                 {fiscal_number} (single-active-session-per-FN invariant breach): \
+                 [{first:?}, {session_id:?}]"
+            )));
+        }
+        active_by_fn.insert(fiscal_number, session_id);
     }
-    let active: Option<String> = active_ids.into_iter().next();
 
     // Every drain-cohort doc (offline-origin, in a non-terminal cohort state —
-    // mirrors `list_drain_candidates_for_fn_ordered_by_lnd`).
-    let cohort: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT lower(hex(document_id)), \
+    // mirrors `list_drain_candidates_for_fn_ordered_by_lnd`), checked against ITS
+    // OWN fn's active session.
+    let cohort: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT fiscal_number, lower(hex(document_id)), \
                 CASE WHEN offline_session_id IS NULL THEN NULL \
                      ELSE lower(hex(offline_session_id)) END \
          FROM fiscal_documents \
@@ -1047,8 +1066,8 @@ pub async fn check_mirrors(pool: &SqlitePool) -> Result<(), Divergence> {
     .await
     .map_err(|e| Divergence(format!("cohort query failed: {e}")))?;
 
-    for (doc_hex, doc_session) in cohort {
-        match (doc_session, &active) {
+    for (doc_fn, doc_hex, doc_session) in cohort {
+        match (doc_session, active_by_fn.get(&doc_fn)) {
             // NULL session — invisible to the session-scoped cohort.
             (None, _) => {
                 return Err(Divergence(format!(
@@ -1061,14 +1080,15 @@ pub async fn check_mirrors(pool: &SqlitePool) -> Result<(), Divergence> {
             // Non-null but MISMATCHED (the gap check-6d misses).
             (Some(d), Some(a)) => {
                 return Err(Divergence(format!(
-                    "Mirror-2: drain-cohort doc {doc_hex} session {d} != active session {a}"
+                    "Mirror-2: drain-cohort doc {doc_hex} session {d} != its fn's \
+                     ({doc_fn}) active session {a}"
                 )));
             }
             // A cohort doc with no active OPEN/DRAINING session — orphaned cohort.
             (Some(d), None) => {
                 return Err(Divergence(format!(
                     "Mirror-2: drain-cohort doc {doc_hex} references session {d} \
-                     but no OPEN/DRAINING session is active"
+                     but its fn ({doc_fn}) has no active OPEN/DRAINING session"
                 )));
             }
         }

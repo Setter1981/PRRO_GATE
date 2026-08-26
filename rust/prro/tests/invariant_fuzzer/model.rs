@@ -299,6 +299,13 @@ pub struct RefModel {
     /// fence state, the fenced op behaves correctly* — it does NOT independently verify that the fence
     /// rises in the right circumstances.  That is the job of `tests/fn_fence_active.rs`.
     pub fence_active: bool,
+
+    /// W6 slice 2 — the fiscal number this model predicts for.  Every reality-adopting /
+    /// reality-syncing read (`adopt_fault_deferred`, `adopt_precondition`, `sync_held_reservation`,
+    /// `sync_fence_active`) scopes its SQL to THIS fn: with two FNs on one database an unscoped
+    /// read would adopt the OTHER tenant's ledger/mode/fence as this one's.  Defaults to the
+    /// primary fixture FN (mirrors `interp.rs` `FN`); siblings override via [`Self::for_fn`].
+    fn_id: String,
 }
 
 /// L0 — the cash amount used by every SELL/RETURN in the fuzzer fixture.
@@ -307,7 +314,26 @@ pub struct RefModel {
 /// mirrors U1 D3 discipline for the cash oracle).
 pub const CASH_AMOUNT_KOP: i64 = 15_000;
 
+/// The primary fixture fiscal number — mirrors `interp.rs` `FN` ("4000000001").  Deliberately a
+/// SEPARATE constant (anti-shared-const, same discipline as [`CASH_AMOUNT_KOP`]): the harness
+/// asserts the pair agrees (`run_harness` entry), so drift fails loudly instead of silently
+/// scoping the model's adoption reads to a fiscal number the interpreter never writes.
+const DEFAULT_FN: &str = "4000000001";
+
 impl RefModel {
+    /// W6 slice 2 — rebind this model to a sibling fiscal number (builder-style, for the
+    /// multi-FN fixtures).  The fixture SHAPE (shift/session/codes) stays whatever the
+    /// constructor set; only the scoping identity changes.
+    pub fn for_fn(mut self, fn_id: &str) -> Self {
+        self.fn_id = fn_id.to_string();
+        self
+    }
+
+    /// The fiscal number this model predicts for.
+    pub fn fn_id(&self) -> &str {
+        &self.fn_id
+    }
+
     /// Fixture: an ONLINE node with an open shift, no offline session, genesis
     /// seed, lnd counting from 1.
     pub fn new_online_open_shift() -> Self {
@@ -334,6 +360,7 @@ impl RefModel {
             peer_tip: None,
             peer_unknown: false,
             fence_active: false,
+            fn_id: DEFAULT_FN.to_string(),
         }
     }
 
@@ -362,6 +389,7 @@ impl RefModel {
             peer_tip: None,
             peer_unknown: false,
             fence_active: false,
+            fn_id: DEFAULT_FN.to_string(),
         }
     }
 
@@ -392,6 +420,7 @@ impl RefModel {
             peer_tip: None,
             peer_unknown: false,
             fence_active: false,
+            fn_id: DEFAULT_FN.to_string(),
         }
     }
 
@@ -420,6 +449,7 @@ impl RefModel {
             peer_tip: None,
             peer_unknown: false,
             fence_active: false,
+            fn_id: DEFAULT_FN.to_string(),
         }
     }
 
@@ -2194,8 +2224,10 @@ impl RefModel {
     /// recovered state — recovery is a Phase-1 wildcard — we ADOPT the real DB
     /// state, so subsequent ops are differential-clean again from there.
     ///
-    /// The fuzzer uses ONE fiscal_number per DB, so the reads are unfiltered
-    /// (they adopt that FN's real state).  The seed is adopted STRUCTURALLY:
+    /// W6 slice 2 — every read is scoped to `self.fn_id`: the fleet topology is
+    /// many FNs on one database, and an unscoped read would adopt the OTHER
+    /// tenant's ledger/allocator/mode as this one's (the two ledgers' per-FN
+    /// lnds collide in one map).  The seed is adopted STRUCTURALLY:
     /// `Some` iff the real `node_state` has a seed, else `None` — a synthetic
     /// per-tip-lnd placeholder, since the exact bytes are never compared (the
     /// differential is structural — advance-iff + chain-continuity vs the real
@@ -2209,8 +2241,9 @@ impl RefModel {
     pub async fn adopt_fault_deferred(&mut self, pool: &SqlitePool) {
         // docs ← the real ledger (lnd → state).
         let docs: Vec<(i64, DocState)> = sqlx::query_as::<_, (i64, prro::db::types::DbDocState)>(
-            "SELECT lnd, state FROM fiscal_documents ORDER BY lnd",
+            "SELECT lnd, state FROM fiscal_documents WHERE fiscal_number = ? ORDER BY lnd",
         )
+        .bind(&self.fn_id)
         .fetch_all(pool)
         .await
         .unwrap()
@@ -2221,35 +2254,41 @@ impl RefModel {
         // A.3 PR-C — re-derive the offline-origin set (offline_fiscal_no set):
         // needed by the D5-gate blocker predicate to tell an offline-ER (issued)
         // from an online-ER (blocker) after a fault re-sync.
-        let offline_lnds: Vec<(i64,)> =
-            sqlx::query_as("SELECT lnd FROM fiscal_documents WHERE offline_fiscal_no IS NOT NULL")
-                .fetch_all(pool)
-                .await
-                .unwrap();
+        let offline_lnds: Vec<(i64,)> = sqlx::query_as(
+            "SELECT lnd FROM fiscal_documents \
+                 WHERE offline_fiscal_no IS NOT NULL AND fiscal_number = ?",
+        )
+        .bind(&self.fn_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
         self.offline_origin_lnds = offline_lnds.into_iter().map(|(lnd,)| lnd).collect();
         let shift_lifecycle_lnds: Vec<(i64,)> = sqlx::query_as(
             "SELECT lnd FROM fiscal_documents \
-             WHERE doc_type IN ('SHIFT_OPEN','SHIFT_CLOSE','Z_REPORT')",
+             WHERE doc_type IN ('SHIFT_OPEN','SHIFT_CLOSE','Z_REPORT') AND fiscal_number = ?",
         )
+        .bind(&self.fn_id)
         .fetch_all(pool)
         .await
         .unwrap();
         self.shift_lifecycle_lnds = shift_lifecycle_lnds.into_iter().map(|(lnd,)| lnd).collect();
 
         // mode / shift_state / next_lnd ← node_state.
-        let (mode, shift_state, next_lnd): (NodeMode, ShiftState, i64) =
-            sqlx::query_as::<
-                _,
-                (
-                    prro::db::types::DbNodeMode,
-                    prro::db::types::DbShiftState,
-                    i64,
-                ),
-            >("SELECT mode, shift_state, next_lnd FROM node_state LIMIT 1")
-            .fetch_one(pool)
-            .await
-            .map(|(m, s, n)| (m.0, s.0, n))
-            .unwrap();
+        let (mode, shift_state, next_lnd): (NodeMode, ShiftState, i64) = sqlx::query_as::<
+            _,
+            (
+                prro::db::types::DbNodeMode,
+                prro::db::types::DbShiftState,
+                i64,
+            ),
+        >(
+            "SELECT mode, shift_state, next_lnd FROM node_state WHERE fiscal_number = ?",
+        )
+        .bind(&self.fn_id)
+        .fetch_one(pool)
+        .await
+        .map(|(m, s, n)| (m.0, s.0, n))
+        .unwrap();
         self.mode = mode;
         self.shift_state = shift_state;
         self.next_lnd = next_lnd;
@@ -2284,13 +2323,14 @@ impl RefModel {
         // that advance is recorded structurally on a NEGATIVE ordinal. So the correct
         // adoption is to KEEP whatever structural marker the model already holds,
         // never to alias it onto a document ordinal.
-        let real_seed = Self::read_seed_fixture(pool).await;
+        let real_seed = Self::read_seed_fixture(pool, &self.fn_id).await;
         let tip_lnd: Option<i64> = match &real_seed {
             Some(seed) => sqlx::query_scalar::<_, i64>(
                 "SELECT lnd FROM fiscal_documents WHERE unsigned_xml_sha256 = ? \
-                 ORDER BY lnd DESC LIMIT 1",
+                 AND fiscal_number = ? ORDER BY lnd DESC LIMIT 1",
             )
             .bind(&seed[..])
+            .bind(&self.fn_id)
             .fetch_optional(pool)
             .await
             .unwrap(),
@@ -2318,15 +2358,19 @@ impl RefModel {
         //
         // Without this, a document minted inside a fault window carries no recorded link, and a
         // later `NotAcceptedOffline` rewind would silently fall back to genesis.
-        let doc_links: Vec<(i64, Option<Vec<u8>>)> =
-            sqlx::query_as("SELECT lnd, previous_hash FROM fiscal_documents")
-                .fetch_all(pool)
-                .await
-                .unwrap();
+        let doc_links: Vec<(i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT lnd, previous_hash FROM fiscal_documents WHERE fiscal_number = ?",
+        )
+        .bind(&self.fn_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
         let issued_hashes: Vec<(Vec<u8>, i64)> = sqlx::query_as(
             "SELECT unsigned_xml_sha256, MAX(lnd) FROM fiscal_documents \
-             WHERE unsigned_xml_sha256 IS NOT NULL GROUP BY unsigned_xml_sha256",
+             WHERE unsigned_xml_sha256 IS NOT NULL AND fiscal_number = ? \
+             GROUP BY unsigned_xml_sha256",
         )
+        .bind(&self.fn_id)
         .fetch_all(pool)
         .await
         .unwrap();
@@ -2344,19 +2388,26 @@ impl RefModel {
 
         // offline session + codes ← real.
         self.session = sqlx::query_scalar::<_, prro::db::types::DbOfflineSessionState>(
-            "SELECT state FROM offline_sessions ORDER BY opened_at DESC LIMIT 1",
+            "SELECT state FROM offline_sessions WHERE fiscal_number = ? \
+             ORDER BY opened_at DESC LIMIT 1",
         )
+        .bind(&self.fn_id)
         .fetch_optional(pool)
         .await
         .unwrap()
         .map(|w| w.0);
-        self.codes_issued = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM offline_codes")
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        self.codes_consumed = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM offline_codes WHERE consumed_at IS NOT NULL",
+        self.codes_issued = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM offline_codes WHERE fiscal_number = ?",
         )
+        .bind(&self.fn_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        self.codes_consumed = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM offline_codes \
+             WHERE consumed_at IS NOT NULL AND fiscal_number = ?",
+        )
+        .bind(&self.fn_id)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -2378,8 +2429,10 @@ impl RefModel {
         let issued_boundaries: Vec<(String,)> = sqlx::query_as(
             "SELECT doc_type FROM fiscal_documents \
              WHERE doc_type IN ('OFFLINE_SESSION_BEGIN', 'OFFLINE_SESSION_END') \
-               AND state IN ('OFFLINE_LOCAL_ACK', 'SENT', 'KVT1', 'KVT2', 'ACK')",
+               AND state IN ('OFFLINE_LOCAL_ACK', 'SENT', 'KVT1', 'KVT2', 'ACK') \
+               AND fiscal_number = ?",
         )
+        .bind(&self.fn_id)
         .fetch_all(pool)
         .await
         .unwrap();
@@ -2406,11 +2459,10 @@ impl RefModel {
         // post-adoption state edge (a doc leaving or entering the counted set) still moves
         // the drawer.  `docs` is adopted ABOVE, so the legs are re-classified against
         // reality's states before the anchor is solved for.
-        let fiscal_number: String =
-            sqlx::query_scalar("SELECT fiscal_number FROM node_state LIMIT 1")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        // W6 slice 2 — the drawer's FN is the MODEL's identity, not an arbitrary
+        // `node_state LIMIT 1` row (with two tenants that read handed one FN's drawer
+        // to the other's model).
+        let fiscal_number: String = self.fn_id.clone();
         // bd PRRO_GATE-6hl — the legs' SHIFT SCOPE is adopted too, not just their states.
         //
         // The model normally scopes them itself: a shift-open clears `cash_by_lnd`, mirroring
@@ -2461,8 +2513,9 @@ impl RefModel {
                 "SELECT fd.lnd, fd.offline_fiscal_no, fd.doc_type FROM delivery_reservation dr \
              JOIN fiscal_documents fd \
                ON fd.document_id = dr.document_id AND fd.fiscal_number = dr.fiscal_number \
-             WHERE dr.apply_state = 'PENDING_APPLY' LIMIT 1",
+             WHERE dr.apply_state = 'PENDING_APPLY' AND dr.fiscal_number = ? LIMIT 1",
             )
+            .bind(&self.fn_id)
             .fetch_optional(pool)
             .await
             .unwrap()
@@ -2480,13 +2533,15 @@ impl RefModel {
     /// (`tests/fn_fence_active.rs`) pins it byte-for-byte against the migration 035 index + trigger,
     /// so drift fails CI there, at the right layer.
     ///
-    /// Not FN-scoped: the fuzzer fixture is single-FN by construction, and the partial-unique index
-    /// guarantees at most one active row per FN anyway.
+    /// FN-scoped (W6 slice 2): the fleet topology is many FNs on one database, and one tenant's
+    /// fence must not fence another — the partial-unique index guarantees ≤1 active row PER FN.
     pub async fn sync_fence_active(&mut self, pool: &SqlitePool) {
         let pred = prro::db::repositories::delivery_reservation::ACTIVE_FENCE_STATE_PREDICATE;
         let active: i64 = sqlx::query_scalar(&format!(
-            "SELECT EXISTS(SELECT 1 FROM delivery_reservation WHERE {pred})"
+            "SELECT EXISTS(SELECT 1 FROM delivery_reservation \
+             WHERE fiscal_number = ? AND ({pred}))"
         ))
+        .bind(&self.fn_id)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -2498,10 +2553,11 @@ impl RefModel {
     /// (`node_state.last_known_unsigned_xml_sha256`) the model grounds on.  The
     /// value is adopted STRUCTURALLY (`Some`/`None`) — the exact bytes are never
     /// compared (the differential is structural: advance-iff + chain-continuity).
-    async fn read_seed_fixture(pool: &SqlitePool) -> Option<Vec<u8>> {
+    async fn read_seed_fixture(pool: &SqlitePool, fn_id: &str) -> Option<Vec<u8>> {
         sqlx::query_scalar::<_, Option<Vec<u8>>>(
-            "SELECT last_known_unsigned_xml_sha256 FROM node_state LIMIT 1",
+            "SELECT last_known_unsigned_xml_sha256 FROM node_state WHERE fiscal_number = ?",
         )
+        .bind(fn_id)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -2517,8 +2573,9 @@ impl RefModel {
     pub async fn adopt_precondition(&mut self, pool: &SqlitePool) {
         let (mode, shift_state): (NodeMode, ShiftState) =
             sqlx::query_as::<_, (prro::db::types::DbNodeMode, prro::db::types::DbShiftState)>(
-                "SELECT mode, shift_state FROM node_state LIMIT 1",
+                "SELECT mode, shift_state FROM node_state WHERE fiscal_number = ?",
             )
+            .bind(&self.fn_id)
             .fetch_one(pool)
             .await
             .map(|(m, s)| (m.0, s.0))
@@ -2535,9 +2592,11 @@ impl RefModel {
         // an arbitrary row).
         let active_states: Vec<OfflineSessionState> =
             sqlx::query_scalar::<_, prro::db::types::DbOfflineSessionState>(
-                "SELECT state FROM offline_sessions WHERE state IN ('OPEN', 'DRAINING') \
+                "SELECT state FROM offline_sessions \
+                 WHERE state IN ('OPEN', 'DRAINING') AND fiscal_number = ? \
                  ORDER BY opened_at DESC, offline_session_id",
             )
+            .bind(&self.fn_id)
             .fetch_all(pool)
             .await
             .unwrap()
