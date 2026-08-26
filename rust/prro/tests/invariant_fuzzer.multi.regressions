@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ef999bea3f16df6b2e54cba90dbda5c17b0bfe396b44743d74aecb04d72f1ae7 # shrinks to ops = [(1, Crash(Send))]
+cc 9bceb63fd067ddc459c9fa2d496601acfd07e9202841df4b7d42a2a2e211e637 # shrinks to ops = [(1, CrashSend(Took))]
+cc ff4415157791621f419c5050e1b77139f3df7294bcc9ac34f5417cf99f1f8687 # shrinks to ops = [(1, Crash(Sign)), (1, RepeatReboot)]
+cc e74b4686d9d7cca3c03df4eb1bd3ed337ab46716a40d88a2b58f58354e9c533d # shrinks to ops = [(1, CrashSend(Took)), (1, RepeatReboot)]
+cc 5f6cebb134da9a1690cc065be74f21b6a54500ce9aefe3c8dc23c442b2c41e91 # shrinks to ops = [(0, CrashSend(Took)), (0, OfflineSellDuringGoingOnline)]
