@@ -1537,6 +1537,8 @@ test-support	prro	prro::invariant_fuzzer	w6_prod_fn_gate_serialises_same_fn_and_
 test-support	prro	prro::invariant_fuzzer	w6_same_idempotency_key_on_two_fns_mints_on_both	false
 test-support	prro	prro::invariant_fuzzer	w6_two_offline_sessions_one_per_fn_are_legal	false
 test-support	prro	prro::invariant_fuzzer	w6_z_oracle_checks_the_closing_fn_not_the_global_latest	false
+test-support	prro	prro::invariant_fuzzer	w6c_concurrent_sell_pairs_hold_the_full_oracle_stack	false
+test-support	prro	prro::invariant_fuzzer	w6c_different_fns_overlap_inside_the_live_write_path	false
 test-support	prro	prro::invariant_fuzzer	z_aggregation_oracle_checks_taxable_sell_return_turnover	false
 test-support	prro	prro::invariant_scan	aborted_doc_does_not_trip_chain_walk	false
 test-support	prro	prro::invariant_scan	clean_consistent_ledger_scans_clean	false
