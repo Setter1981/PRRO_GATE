@@ -3735,6 +3735,165 @@ async fn w6c_concurrent_sell_pairs_hold_the_full_oracle_stack() {
         .expect("mirrors clean after five concurrent rounds");
 }
 
+/// W6 slice 4 — the FLEET SOAK (dossier §7: "fleet soak/load at N=200").  Two hundred fiscal
+/// numbers on ONE App/database — 180 online tenants issuing three sells each (in concurrent
+/// chunks of 8 — the load shape), 20 offline tenants issuing one offline sell each (the lazy
+/// B10 BEGIN makes it a two-document event) — then every per-FN axis and the whole-DB oracles.
+/// This is load breadth, not schedule depth: the two hard schedules are slice 1 (same-FN
+/// serializes through the prod gate) and slice 3 (different FNs overlap mid-wire).
+#[tokio::test]
+async fn w6_fleet_soak_two_hundred_fns_on_one_database() {
+    let primary = interp::FuzzCtx::new_online_open_shift().await;
+
+    let mut online: Vec<interp::FuzzCtx> = Vec::with_capacity(179);
+    for i in 0..179u32 {
+        online.push(
+            primary
+                .sibling_online_open_shift(&format!("41{:08}", i))
+                .await,
+        );
+    }
+    let mut offline: Vec<interp::FuzzCtx> = Vec::with_capacity(20);
+    for i in 0..20u32 {
+        offline.push(
+            primary
+                .sibling_offline_open_shift(&format!("42{:08}", i), 3)
+                .await,
+        );
+    }
+
+    // Load phase: three rounds of sells across the online fleet, eight tenants in flight at a
+    // time; then one offline sell per offline tenant (chunked the same way).
+    let sell = Op::OnlineSell(DpsScript::ack_path());
+    for round in 0..3 {
+        for chunk in online.chunks_mut(8) {
+            let outs =
+                futures::future::join_all(chunk.iter_mut().map(|c| interp::run_op(c, &sell))).await;
+            for out in outs {
+                assert!(
+                    matches!(out, interp::RealOutcome::Doc(_)),
+                    "soak round {round}: an online tenant failed to issue: {out:?}"
+                );
+            }
+        }
+    }
+    for chunk in offline.chunks_mut(8) {
+        let outs = futures::future::join_all(
+            chunk
+                .iter_mut()
+                .map(|c| interp::run_op(c, &Op::OfflineSell)),
+        )
+        .await;
+        for out in outs {
+            assert!(
+                matches!(
+                    out,
+                    interp::RealOutcome::Doc(_) | interp::RealOutcome::Recovered { .. }
+                ),
+                "soak: an offline tenant failed to issue (B10 two-doc event expected): {out:?}"
+            );
+        }
+    }
+
+    // Per-FN axes: every tenant's ledger is exactly its own, gap-free.
+    let mut tips = std::collections::BTreeSet::new();
+    for ctx in online.iter() {
+        assert_eq!(
+            ctx.read_ledger().await.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "online tenant {} lost or gained an lnd under fleet load",
+            ctx.fn_id()
+        );
+        tips.insert(ctx.read_seed().await.expect("issued ⇒ has a tip"));
+    }
+    for ctx in offline.iter() {
+        assert_eq!(
+            ctx.read_ledger().await.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2],
+            "offline tenant {} must hold BEGIN + SELL exactly",
+            ctx.fn_id()
+        );
+        assert_eq!(
+            ctx.offline_codes_total().await,
+            3,
+            "offline tenant {}'s code pool is its own",
+            ctx.fn_id()
+        );
+        tips.insert(ctx.read_seed().await.expect("issued ⇒ has a tip"));
+    }
+    assert_eq!(
+        tips.len(),
+        199,
+        "199 issuing tenants ⇒ 199 DISTINCT chain tips — a collision is cross-FN seed bleed"
+    );
+
+    // Whole-DB oracles once, at the settled end (the scan iterates per-FN internally).
+    prro::db::invariant_scan::assert_clean(&primary.pool).await;
+    oracle::check_mirrors(&primary.pool)
+        .await
+        .expect("mirrors clean across the 200-FN fleet");
+}
+
+/// W6 — fairness (dossier §7: "fairness/no starvation").  The production per-FN gate serves
+/// same-FN waiters in ARRIVAL ORDER, and none of them starves while ANOTHER tenant hammers
+/// its own gate: three queued waiters on FN-A's held gate all complete (bounded) and in FIFO
+/// order, under 50 acquire/release cycles of cross-FN noise on FN-B.  A gate swapped for an
+/// unfair primitive (a try-loop, a parking-lot-unfair mutex) reorders or starves the queue.
+#[tokio::test]
+async fn w6_fn_gate_is_fifo_fair_under_cross_fn_noise() {
+    let a = interp::FuzzCtx::new_online_open_shift().await;
+    let b = a.sibling_online_open_shift("4000000002").await;
+
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let held = a.app.acquire_fn_gate(a.fn_id()).await;
+
+    // Queue three same-FN waiters in a KNOWN arrival order (yield after each spawn so the
+    // task provably reaches the gate's wait queue before the next one starts).
+    let mut waiters = Vec::new();
+    for i in 0..3u32 {
+        let app = a.app.clone();
+        let fn_id = a.fn_id().to_string();
+        let order = order.clone();
+        waiters.push(tokio::spawn(async move {
+            let g = app.acquire_fn_gate(&fn_id).await;
+            order.lock().unwrap().push(i);
+            drop(g);
+        }));
+        tokio::task::yield_now().await;
+    }
+
+    // Cross-FN noise: B hammers ITS gate the whole time.
+    let noise = tokio::spawn({
+        let app = b.app.clone();
+        let fn_id = b.fn_id().to_string();
+        async move {
+            for _ in 0..50 {
+                let g = app.acquire_fn_gate(&fn_id).await;
+                drop(g);
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    tokio::task::yield_now().await;
+
+    // Release the head; the queue must drain bounded and in order.
+    drop(held);
+    for (i, w) in waiters.into_iter().enumerate() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), w)
+            .await
+            .unwrap_or_else(|_| panic!("waiter {i} STARVED on FN-A's gate — fairness broken"))
+            .expect("waiter task panicked");
+    }
+    noise.await.expect("noise task panicked");
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec![0, 1, 2],
+        "same-FN waiters must be served in arrival (FIFO) order — reordering means the gate \
+         lost its fairness guarantee and a hot tenant can starve a queued request"
+    );
+}
+
 /// Peer-tip axis PHASE C — the ONE place reality's tip vocabulary is translated into the model's.
 ///
 /// Written out as an explicit match rather than derived or `#[repr]`-aliased, because this mapping

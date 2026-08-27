@@ -1529,6 +1529,8 @@ test-support	prro	prro::invariant_fuzzer	teeth_x2_single_active_session_not_flag
 test-support	prro	prro::invariant_fuzzer	teeth_x_report_side_effect_free_and_snapshots_model	false
 test-support	prro	prro::invariant_fuzzer	w6_crash_on_fn_a_leaves_fn_b_progressing_and_recovery_scoped	false
 test-support	prro	prro::invariant_fuzzer	w6_fault_adoption_reads_only_its_own_fn	false
+test-support	prro	prro::invariant_fuzzer	w6_fleet_soak_two_hundred_fns_on_one_database	false
+test-support	prro	prro::invariant_fuzzer	w6_fn_gate_is_fifo_fair_under_cross_fn_noise	false
 test-support	prro	prro::invariant_fuzzer	w6_hold_and_fence_preconditions_are_fn_scoped	false
 test-support	prro	prro::invariant_fuzzer	w6_interleaved_sells_keep_two_fns_fully_isolated	false
 test-support	prro	prro::invariant_fuzzer	w6_multi_harness_routes_ops_and_resyncs_the_bystander_across_a_fault	false
