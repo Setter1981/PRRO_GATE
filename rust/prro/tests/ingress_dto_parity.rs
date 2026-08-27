@@ -662,3 +662,115 @@ fn read_only_and_unsupported_command_types_rejected_at_ingress_boundary() {
         "ServiceOut must be Signable (L3)"
     );
 }
+
+// ═══════════ bd PRRO_GATE-arx — unknown fields are rejected, at EVERY request level ═══════════
+
+/// A maximal SELL exercising every REQUEST-side DTO struct (goods line with discount /
+/// excise / barcode / uktzed / article_code, payment with a full acquirer slip, dual-tax
+/// mode, a raw frame) — the base the typo-injection cases below mutate one level at a time.
+const FIXTURE_FULL_SELL: &str = r#"{
+  "schema_version": "1.0",
+  "fiscal_number": "3001234567",
+  "command_type": "SELL",
+  "idempotency_key": "maria304:3001234567:sess123:9",
+  "cashier_id": "csh-007",
+  "department": "1",
+  "return_check_number": null,
+  "payload": {
+    "direction": "SALE",
+    "goods": [
+      {
+        "name": "Паляниця",
+        "uktzed": "1905903000",
+        "quantity_milli": 1000,
+        "price_kopecks": 2500,
+        "tax_group_1": 1,
+        "tax_group_2": 0,
+        "article_code": 4820000000001,
+        "discount": {
+          "direction": "DISCOUNT",
+          "name": "знижка",
+          "amount_kopecks": 100
+        },
+        "excise_stamps": ["AB1234567890"],
+        "barcode": "4820000000001"
+      }
+    ],
+    "payments": [
+      {
+        "type": "CASH",
+        "amount_kopecks": 2400,
+        "acquirer_slip": {
+          "payment_form_index": 1,
+          "merchant_id": "M1",
+          "terminal_id": "T1",
+          "operation_type": "PURCHASE",
+          "pan": "444433******1111",
+          "approval_code": "123456",
+          "payment_system": "VISA",
+          "transaction_code": "TX1",
+          "fee_kopecks": 0,
+          "cashier_signature_placeholder": false,
+          "cardholder_signature_placeholder": false
+        }
+      }
+    ],
+    "dual_tax_mode": {
+      "tax_group_1": 1,
+      "tax_group_2": 0
+    },
+    "totals": {
+      "sale_kopecks": 2400,
+      "return_kopecks": 0
+    },
+    "raw_frames": [
+      {
+        "opcode": "0x2B",
+        "body": "00"
+      }
+    ]
+  }
+}"#;
+
+/// bd `PRRO_GATE-arx` — a typo'd/unknown field must be REJECTED loudly at every level of the
+/// adapter-authored request DTO, not silently dropped.  The internal signer structs were all
+/// strict (`stage_sign.rs` `deny_unknown_fields`) while the ONE struct third parties actually
+/// author tolerated typos: an integrator misspelling e.g. a discount or price field got a 200
+/// and a receipt issued WITHOUT it — the gateway could not tell "not sent" from "sent, spelled
+/// wrong, dropped".  Wire behavior after the fix: `serde_json::from_slice` fails in
+/// `server.rs` → 400 `MALFORMED_JSON` (detail server-side-logged only).
+#[test]
+fn unknown_fields_are_rejected_at_every_request_dto_level() {
+    // Guard: the maximal base parses — a RED below is the injection, never a broken base.
+    let _: CanonicalCommand =
+        serde_json::from_str(FIXTURE_FULL_SELL).expect("the full fixture parses");
+
+    // (struct under injection, unique anchor after which the unknown key is inserted)
+    let cases = [
+        ("CanonicalCommand", r#""fiscal_number": "3001234567","#),
+        ("ReceiptPayload", r#""direction": "SALE","#),
+        ("FiscalLine", r#""name": "Паляниця","#),
+        ("Discount", r#""name": "знижка","#),
+        ("CanonicalPayment", r#""type": "CASH","#),
+        ("AcquirerSlip", r#""merchant_id": "M1","#),
+        ("DualTaxMode", r#""dual_tax_mode": {"#),
+        ("Totals", r#""sale_kopecks": 2400,"#),
+        ("RawFrame", r#""opcode": "0x2B","#),
+    ];
+    for (label, anchor) in cases {
+        let mutated =
+            FIXTURE_FULL_SELL.replacen(anchor, &format!("{anchor} \"typo_field\": 1,"), 1);
+        assert_ne!(mutated, FIXTURE_FULL_SELL, "{label}: the anchor must hit");
+        let res: Result<CanonicalCommand, _> = serde_json::from_str(&mutated);
+        assert!(
+            res.is_err(),
+            "{label}: an unknown field must be rejected loudly — a silent drop means a \
+             fiscally material field can vanish from a receipt without a trace"
+        );
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "{label}: the error must NAME the problem for the server-side log: {err}"
+        );
+    }
+}

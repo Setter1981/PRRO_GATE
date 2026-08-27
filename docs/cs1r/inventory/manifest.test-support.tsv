@@ -1326,6 +1326,7 @@ test-support	prro	prro::ingress_dto_parity	read_only_and_unsupported_command_typ
 test-support	prro	prro::ingress_dto_parity	schema_version_mismatch_returns_typed_error	false
 test-support	prro	prro::ingress_dto_parity	sell_fixture_without_article_code_is_rejected_by_convert	false
 test-support	prro	prro::ingress_dto_parity	sell_with_article_code_converts_to_stage_sign_ready_payload	false
+test-support	prro	prro::ingress_dto_parity	unknown_fields_are_rejected_at_every_request_dto_level	false
 test-support	prro	prro::ingress_module_compiles	ingress_public_surface_reachable	false
 test-support	prro	prro::invariant_fuzzer	a1_offline_crash_send_completes_as_doc_so_settled_scan_runs	false
 test-support	prro	prro::invariant_fuzzer	a2_terminal_settle_resolves_unpaired_crash_and_scans	false
