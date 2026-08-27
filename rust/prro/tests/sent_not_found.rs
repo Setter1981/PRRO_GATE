@@ -126,6 +126,21 @@ async fn sn01_sent_not_found_escalates_atomically() {
         count_audit(&pool, "SENT_NOT_FOUND_ESCALATED_MANUAL").await,
         1
     );
+    // bd PRRO_GATE-m6e — the Critical audit's entity_id IS the operator's pointer to the
+    // escalated document: assert the exact lowercase hex of the doc id (retro-1rw survivors
+    // `hex_lower -> "xyzzy"/""` proved nothing pinned it — a corrupted id would strand the
+    // operator with an unlocatable RMR doc).
+    let entity_id: String = sqlx::query_scalar(
+        "SELECT entity_id FROM audit_log WHERE event_type='SENT_NOT_FOUND_ESCALATED_MANUAL'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        entity_id,
+        "11".repeat(16),
+        "audit entity_id must be the lowercase hex of the escalated doc id"
+    );
 }
 
 #[tokio::test]
