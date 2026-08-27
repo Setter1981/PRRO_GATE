@@ -482,3 +482,75 @@ fn boot_pass_module_has_no_wire_access() {
         "the boot-first reservation pass must have no wire access"
     );
 }
+
+/// bd `PRRO_GATE-ixf` (retro-1rw survivor, re-mapped on the current tree): the boot pass's
+/// BENIGN STALE-DROP lane — a recorded PENDING_APPLY reservation whose generation the node has
+/// moved past — had ZERO coverage: the full suite stayed green under the `dropped -= 1` mutant
+/// (a u64 underflow panic on the first stale drop).  Production reaches this state via the §7
+/// apply-replay frame (a later re-authorize on the same node supersedes the recorded one); the
+/// generation bump below is that supersession's minimal seed.
+///
+/// Teeth: under the mutant this test REDs (the underflow panics inside `reconcile_pending`);
+/// the behavioral half pins the drop's contract — NOTHING is mutated: the reservation rests
+/// exactly as recorded, the doc keeps SENDING, no sfn stamp, no seed advance.  A skipped
+/// generation-CAS would instead APPLY the stale outcome (doc → SENT + sfn + seed advance),
+/// reddening all four asserts.
+#[tokio::test]
+async fn s7_boot_pass_drops_a_stale_generation_reservation_without_mutation() {
+    let (_d, app, pool) = boot_app_with_db("s7stale.db").await;
+    seed_fn(&pool, FN_CS).await;
+    let doc = seed_sending_doc(&pool, FN_CS, 0xD1).await;
+    authorize(&pool, new_res(0xD0, doc, FN_CS)).await;
+    record(
+        &pool,
+        0xD0,
+        None,
+        "NoNodeEffect",
+        "Accepted",
+        Some("5100000009"),
+        None,
+        Some("5100000009"),
+    )
+    .await;
+
+    // Supersede: the node's delivery generation moves past the recorded reservation.
+    sqlx::query(
+        "UPDATE node_state SET delivery_generation = delivery_generation + 1 \
+         WHERE fiscal_number = ?",
+    )
+    .bind(FN_CS)
+    .execute(&pool)
+    .await
+    .expect("bump generation");
+    let seed_before = node_seed(&pool, FN_CS).await;
+
+    app.reconcile_pending()
+        .await
+        .expect("a stale reservation must DROP benignly, never fail boot (invariant #9)");
+
+    assert_eq!(
+        reservation_apply_state(&pool, 0xD0).await.as_deref(),
+        Some("PENDING_APPLY"),
+        "a stale drop mutates NOTHING — the reservation rests exactly as recorded"
+    );
+    // The doc is NOT applied from the stale outcome (that would be SENT + sfn + seed): the
+    // per-FN boot loop AFTER the pass resumes the crashed SENDING doc down the ORDINARY
+    // recovery lane (Sending → ErrorRetryable, zero re-sends) — the stale reservation had no
+    // say in it.
+    assert_eq!(
+        doc_state(&pool, 0xD1).await,
+        "ERROR_RETRYABLE",
+        "the doc takes the ordinary boot-resume lane; SENT here would mean the stale \
+         outcome was applied past the generation CAS"
+    );
+    assert_eq!(
+        doc_sfn(&pool, 0xD1).await,
+        None,
+        "…no server_fiscal_no stamp from a stale outcome"
+    );
+    assert_eq!(
+        node_seed(&pool, FN_CS).await,
+        seed_before,
+        "…and the chain seed does not advance on a dropped stale apply"
+    );
+}
