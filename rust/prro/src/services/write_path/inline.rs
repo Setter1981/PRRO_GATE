@@ -1,8 +1,8 @@
 //! RS-3 A2.1b-core — the inline `fiscalize` orchestrator (SELL/RETURN only).
 //!
-//! Lands DORMANT: the production binding (`UnimplementedWritePath` →
-//! `InlineWritePath`) is flipped in A2.4, so nothing here is reachable from a
-//! live request yet. See `docs/superpowers/plans/2026-06-09-rs3-a2-1b-core-impl.md`.
+//! **LIVE** — the production binding (`InlineWritePath`, `inline_binding.rs`) routes every
+//! ingress fiscalize here; auto-Z is the second caller.
+//! History: landed dormant in A2.1b, flipped live at A2.4.
 //!
 //! **A2.4 ACTIVATION PREREQUISITE (AUD-L2-1a)**: before that binding flip,
 //! resolve the online-lane chain SEED-FORK — the seed advances only at
@@ -628,11 +628,10 @@ async fn terminalise_inbox_pre_acquire(
 /// `build_canonical → stage_acquire → stage_sign → dispatch → (Online) send →
 /// online_confirm → advance_to_ack → finalize` into a `FiscalOutcome`.
 ///
-/// **DORMANT**: no production caller yet (the binding flip is A2.4). `fn_gate`
-/// is the A4 per-FN gate proof — the A2.4 binding MUST hold
-/// `App::acquire_fn_gate(&row.fiscal_number)` across this call (invariant #2 at
-/// the runtime level; the DB lease CAS in `stage_acquire` is the durable
-/// backstop). `run` opens NO `with_immediate` itself; every envelope is owned
+/// **LIVE** — the production ingress binding (`inline_binding.rs:124`) and auto-Z
+/// (`auto_z.rs:268`) call this holding `App::acquire_fn_gate(&row.fiscal_number)`
+/// (invariant #2 at the runtime level; the DB lease CAS in `stage_acquire` is the
+/// durable backstop). `run` opens NO `with_immediate` itself; every envelope is owned
 /// by a reused stage, and the only IO (crypto sign, DPS send, inline lastChk)
 /// sits strictly BETWEEN envelopes (invariant #1).
 ///

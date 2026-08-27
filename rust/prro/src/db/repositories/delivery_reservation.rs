@@ -6,10 +6,10 @@
 //! `ReservedNotStarted → CallStarted → OutcomeObserved` and delivery
 //! certainty via the three orthogonal Spec #2 §2 fields.
 //!
-//! **INACTIVE (CS-2 §2b).**  This repo exists but has **NO production
-//! caller** — nothing in the write-path, boot-resume, or drain paths
-//! reads or writes it.  Activation (record-then-apply with
-//! `ObservedOutcomeV1`, the fence-token seed advance) is CS-3.  The only
+//! **LIVE since the S7-1 cutover (#336).**  The write path authorizes and
+//! records through this repo (`stage_send.rs:1873`/`:1188`), boot resolves
+//! its residue (`reservation_boot_pass.rs`), and the fence guards every
+//! foreign writer.  The only
 //! consumers in CS-2 are the migration / persistence regression tests
 //! (`tests/migration_032_delivery_reservation.rs`).  The static
 //! call-graph pin (merge pin §6.4) asserts exactly that.
@@ -35,8 +35,8 @@ use prro_domain::delivery::{
     NodeEffect, ObservedOutcomeV1, SubmissionCertainty, SubmissionEvidence,
 };
 
-/// Fresh 16-byte reservation identity.  Minimal by design (CS-2 is
-/// INACTIVE): a bare `[u8; 16]` rather than a domain newtype, mirroring
+/// Fresh 16-byte reservation identity.  Minimal by design (a CS-2 decision
+/// kept since): a bare `[u8; 16]` rather than a domain newtype, mirroring
 /// the raw-blob binding style `outbox.rs` uses for `payload_sha256`.
 /// CS-3 promotes this to a typed id if the activation contract needs it.
 pub type ReservationId = [u8; 16];
@@ -79,7 +79,7 @@ pub struct NewReservation {
 /// outcome fields NULL and no `call_started_at` (the `insert_state`
 /// trigger and the RESERVED_NOT_STARTED structural CHECK enforce it).
 ///
-/// **INACTIVE:** invoked only from persistence tests in CS-2.
+/// Production caller: `authorize_submission` (the sole minting path); also persistence tests.
 pub async fn insert(tx: &mut WriteTxConn<'_>, row: NewReservation) -> sqlx::Result<i64> {
     // Next attempt for this document, monotonic from 1.  Append-only:
     // the delete trigger forbids row removal, so MAX never regresses.
@@ -198,9 +198,9 @@ pub const ACTIVE_FENCE_STATE_PREDICATE: &str = "state IN ('RESERVED_NOT_STARTED'
 ///
 /// `apply_outcome` is the active reservation itself and MUST NOT self-fence.
 ///
-/// **INACTIVE until S7-1 cutover:** no reservation is ever active in production while
-/// the delivery FSM is dormant, so this returns `false` for every live call today; the
-/// wiring + teeth exist so the fence already guards each writer when the FSM activates.
+/// **LIVE since the S7-1 cutover (#336):** reservations are minted on every online send,
+/// so this fence answers real questions at every foreign-writer call site
+/// (`stage_sign.rs`, `stage_offline_ack.rs`, `backlog_drain.rs`, `offline_code_replenish.rs`).
 pub async fn fn_fence_active_tx(
     tx: &mut WriteTxConn<'_>,
     fiscal_number: &str,
@@ -249,7 +249,8 @@ pub async fn fn_fence_active_pool(
     Ok(active == 1)
 }
 
-/// **INACTIVE:** invoked only from persistence tests in CS-2.
+/// Advisory pool-bound read (see `fn_fence_active_pool`); production reads go through the
+/// tx-bound fence and the boot-pass queries. Exercised by persistence tests.
 pub async fn get_active_for_fn(
     pool: &sqlx::SqlitePool,
     fiscal_number: &str,
@@ -524,9 +525,8 @@ pub enum AuthorizeError {
 /// non-single-row update) returns an [`AuthorizeError`]; the caller propagates it so the
 /// whole transaction rolls back and NO wire I/O is performed (sole-caller wire gate).
 ///
-/// **INACTIVE (CS-3 Slice 3):** no production caller is wired yet; the live send path
-/// (`stage_send::run`) is gated on this only at the whole-fence cutover (Slice 7).  Exercised
-/// by authorization tests today.
+/// **LIVE since the S7-1 cutover (PR #336):** the sole production caller is
+/// `stage_send::run` (`stage_send.rs:1873`); this is no longer dormant.
 pub async fn authorize_submission(
     tx: &mut WriteTxConn<'_>,
     row: NewReservation,
@@ -662,8 +662,8 @@ pub enum RecordError {
 /// `SubmissionEvidence`). An inconsistent combination trips the matrix trigger and surfaces as
 /// [`RecordError::Db`] with the whole record rolled back.
 ///
-/// **INACTIVE (CS-3 Slice 7 gap 1):** no production caller wires it until the S7-1 cutover
-/// composes `authorize → submit_authorized → record_outcome → apply_outcome`. Exercised by
+/// **LIVE since the S7-1 cutover (PR #336):** `stage_send::run` records every wire outcome
+/// through this (`stage_send.rs:1188`). Also exercised by
 /// `tests/record_outcome.rs` today.
 pub async fn record_outcome(
     tx: &mut WriteTxConn<'_>,
@@ -849,8 +849,9 @@ pub enum ApplyError {
 /// [`ApplyError::HeldNotAutoRelease`] (it stays `PENDING_APPLY` under STOP_MODE for the operator,
 /// Slice 5).
 ///
-/// **INACTIVE (CS-3 Slice 4):** shadows the live `stage_send::run` 4-b; no production caller wires
-/// it until the whole-fence cutover (Slice 7).
+/// **LIVE since the S7-1 cutover (PR #336):** reached through the single apply funnel
+/// `apply_orchestration::apply_recorded_outcome` (live send `stage_send.rs:1992` + boot
+/// `reservation_boot_pass.rs:98`).
 pub async fn apply_outcome(
     tx: &mut WriteTxConn<'_>,
     reservation_id: ReservationId,

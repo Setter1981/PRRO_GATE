@@ -569,8 +569,8 @@ impl App {
         // CS-3 S7-1 · A3 — boot-first delivery-reservation pass (§7.1/§7.2). GLOBAL and pre-loop:
         // it normalises crashed `CALL_STARTED` reservations, applies recorded `OUTCOME_OBSERVED +
         // PENDING_APPLY` ones, and reconstructs any FN whose `node_state` was lost, BEFORE the per-FN
-        // dispatch runs.  No wire I/O (invariant #1); runs under the recon mutex.  INACTIVE until the
-        // Slice-7 cutover mints reservations — the queries are empty today, so this is a no-op.
+        // dispatch runs.  No wire I/O (invariant #1); runs under the recon mutex.  LIVE since the
+        // S7-1 cutover (#336): every online send mints a reservation, so this resolves real rows.
         // Ordering is LOAD-BEARING (S7-P4-BOOT order-swap canary): running it after the loop would let
         // the loop resume a crashed `Sending` doc to `ErrorRetryable` before the STOP flip.
         let res_pass =

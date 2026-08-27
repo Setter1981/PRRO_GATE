@@ -25,9 +25,9 @@
 //! It performs **no wire I/O and no crypto** — every step is a short DB transaction (invariant #1).
 //! No new state-machine edges (`resume`/`apply` are the landed Slice-4 transitions).
 //!
-//! **INACTIVE until the Slice-7 cutover.** `authorize_submission` has no production caller yet, so no
-//! `NewReservation` is minted in production and both boot queries return empty → this is a provable
-//! no-op today.  It is landed + tested now so the atomic cutover only has to flip the live wire.
+//! **LIVE since the S7-1 cutover (PR #336).** `authorize_submission` is called by the live send
+//! path (`stage_send.rs:1873`), so crashed / recorded reservations are a real production
+//! population and this pass is the boot-first authority that resolves them.
 //!
 //! This file is the sanctioned production caller of the still-INACTIVE `resume`/`apply`/`list_*`
 //! lifecycle helpers; it is therefore excluded from the `inactive_lifecycle_scan` "no production

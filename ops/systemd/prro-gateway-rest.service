@@ -1,3 +1,7 @@
+# ⚠️ LEGACY — RETIRED PYTHON SCAFFOLD. DO NOT INSTALL.
+# This unit starts the dead pre-Rust Python runtime. The live gateway is the Rust binary:
+#   cargo run -p prro -- serve --config <path>   (see CLAUDE.md)
+# A Rust-era unit will ship with the installer work (CS-9+). Kept as history (review 2026-08-27).
 [Unit]
 Description=PRRO Gateway REST Runtime
 After=network.target
