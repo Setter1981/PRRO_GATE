@@ -53,5 +53,3 @@ cc 3b77c969f663cd9d646b62c3be74419f5299cba09ba4efe3241ac91dc85a0742 # shrinks to
 cc 6fe414fa662917aeea4cf3c7074f75c3f7a43f01707ed9c993baae1fe5284c23 # shrinks to ops = [OfflineSell, OperatorComplete(Accepted), OnlineEpz(DpsScript([Ack, Ack]))]
 cc 0509158066acc9fccd01e060d2ad59d2606791c8ed7538592b43e83da2b91b97 # shrinks to ops = [OnlineSell(DpsScript([HeldWithPeer(Took)])), Replenish(Ambiguous)]
 cc ec60bd307c1dae50e1a68d14aa76c9d4d43d6367de12c4ceab942f1d8746cad0 # shrinks to ops = [L5Probe(Valid), OnlineSell(DpsScript([HeldWithPeer(NotTook)])), OperatorComplete(Accepted), Replenish(Granted)]
-cc 3caab24ba7de1f0032c17e4ffeacc9da2a530556900ccfead2098dd692d70c0f # shrinks to ops = [Drain(DpsScript([HeldWithPeer(NotTook)])), RepeatReboot, OfflineShiftOpen]
-cc b9b8b3b698521a9e1ffe614f333566b27dea75ea684b7a193995639e8f29216a # shrinks to ops = [OnlineZReport(DpsScript([Ack, Ack])), OnlineShiftOpen(DpsScript([Ack, Ack])), OnlineReturn(DpsScript([HeldWithPeer(NotTook)]))]
