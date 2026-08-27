@@ -48,6 +48,13 @@ use thiserror::Error;
 pub const SCHEMA_VERSION: &str = "1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// bd PRRO_GATE-arx — the adapter-authored REQUEST surface is strict, matching the signer
+// structs (`stage_sign.rs`): a typo'd field from an integrator must be a loud 400
+// (`MALFORMED_JSON`, detail server-side-logged), never a receipt silently issued WITHOUT
+// the field — the gateway cannot tell "not sent" from "sent, spelled wrong, dropped".
+// Every nested request struct below carries the same attribute; the RESPONSE structs stay
+// tolerant (we author those, and driver mirrors ignore additive fields by design).
+#[serde(deny_unknown_fields)]
 pub struct CanonicalCommand {
     pub schema_version: String,
     pub fiscal_number: String,
@@ -274,6 +281,7 @@ pub enum ReceiptDirection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptPayload {
     #[serde(default)]
     pub direction: ReceiptDirection,
@@ -289,12 +297,14 @@ pub struct ReceiptPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RawFrame {
     pub opcode: String,
     pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FiscalLine {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,6 +324,7 @@ pub struct FiscalLine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Discount {
     pub direction: DiscountDirection,
     pub name: String,
@@ -328,6 +339,7 @@ pub enum DiscountDirection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalPayment {
     #[serde(rename = "type")]
     pub kind: PaymentKind,
@@ -349,6 +361,7 @@ pub enum PaymentKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AcquirerSlip {
     pub payment_form_index: u8,
     pub merchant_id: String,
@@ -364,12 +377,14 @@ pub struct AcquirerSlip {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DualTaxMode {
     pub tax_group_1: u8,
     pub tax_group_2: u8,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Totals {
     pub sale_kopecks: u64,
     pub return_kopecks: u64,
