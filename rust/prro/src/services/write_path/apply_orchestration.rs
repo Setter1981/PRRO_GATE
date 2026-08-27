@@ -194,7 +194,8 @@ async fn derive_closing_cash_for_apply(pool: &SqlitePool, ctx: &ApplyContext) ->
 /// EXPECTED result for `-12`/`-6`/SubmittedUnknown holds and the boot consumer
 /// MUST treat it as non-fatal.
 ///
-/// **INACTIVE** until the Slice-7 live cutover wires it into `stage_send`.
+/// **LIVE since the S7-1 cutover (#336):** called by `stage_send.rs:1992` (live send) and
+/// `reservation_boot_pass.rs:98` (boot) — the single apply funnel.
 pub async fn apply_recorded_outcome(
     pool: &SqlitePool,
     reservation_id: ReservationId,

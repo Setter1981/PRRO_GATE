@@ -7,8 +7,8 @@
 //! survives the call — the same authorization can never reach the wire twice (P2 Layer 3). A refusal
 //! (rebind / binding mismatch) performs ZERO wire I/O.
 //!
-//! **INACTIVE (S7-1 foundation).** No production caller wires it yet; at the whole-fence cutover
-//! `stage_send::run` becomes its sole caller and the wire relocates here from `stage_send.rs:1568`.
+//! **LIVE since the S7-1 cutover (#336):** `stage_send::run` is the sole production caller —
+//! this IS the one wire door.
 
 use crate::db::repositories::delivery_reservation::{AttemptObservation, Authorization};
 use crate::services::write_path::shadow_map::map_send_reply;

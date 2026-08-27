@@ -10,3 +10,5 @@ cc ff4415157791621f419c5050e1b77139f3df7294bcc9ac34f5417cf99f1f8687 # shrinks to
 cc e74b4686d9d7cca3c03df4eb1bd3ed337ab46716a40d88a2b58f58354e9c533d # shrinks to ops = [(1, CrashSend(Took)), (1, RepeatReboot)]
 cc 5f6cebb134da9a1690cc065be74f21b6a54500ce9aefe3c8dc23c442b2c41e91 # shrinks to ops = [(0, CrashSend(Took)), (0, OfflineSellDuringGoingOnline)]
 cc 91dfa3b6da7454e8e7110df38ff1da628b1fb4cd971eba1ccc52a74d784d5b43 # shrinks to ops = [(0, CrashSend(Took)), (0, OfflineSellDuringGoingOnline), (1, Reboot)]
+cc 1e22a1a590e717a12067942608eeb0440ca3b9a0112d1fe65c312fdb193a5f01 # shrinks to ops = [(1, OnlineZReport(DpsScript([Superseded]))), (0, GoOnline(DpsScript([Superseded])))]
+cc a60c579cd836e2e112f3813ddd8b5b0511f05aee3653ac9a951d1dd88e5a3670 # shrinks to ops = [(0, L5Probe(Underpaid))]

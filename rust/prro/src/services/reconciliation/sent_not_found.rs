@@ -26,9 +26,8 @@
 //! `shifts::force_to_manual_reconciliation_with_audit` (that does not update the node mirror and
 //! shift-RMR has no exit).
 //!
-//! **INACTIVE (CS-3 Slice 6):** the two live producers (the boot/convergence shared path in
-//! `boot_phase.rs` and the offline drain path in `kvt2_confirm.rs`) are retargeted to call this only
-//! at the whole-fence cutover (Slice 7); exercised by tests today.
+//! **LIVE since the S7-1 cutover (#336):** called by the boot/convergence shared path
+//! (`boot_phase.rs:967`) and the offline drain path (`kvt2_confirm.rs:1688`).
 
 use crate::db::models::enums::{DocState, Severity};
 use crate::db::models::ids::DocumentId;
