@@ -3608,6 +3608,133 @@ fn multi_fn_generator_routes_both_tenants_across_the_alphabet() {
     );
 }
 
+// ── W6 slice 3 — CONCURRENT cross-FN write paths (the dossier's "two hard schedules") ──
+//
+// Slice 2b interleaves at OP granularity (sequential); these pins force genuine concurrency
+// INSIDE the write path.  Same-FN serialization through the PRODUCTION gate is already pinned
+// by `w6_prod_fn_gate_serialises_same_fn_and_overlaps_different_fns` (slice 1); what was
+// missing is the other hard schedule: different FNs demonstrably OVERLAP on the LIVE write
+// path — no accidental global writer lock anywhere in inline::run's stack.
+
+/// FN-A parks INSIDE its wire call (write gate held, doc resting SENDING) while FN-B's sell
+/// runs to completion through the same App/database.  A regression that serialised tenants
+/// globally — a coarse lock around inline::run, a DB-wide BEGIN IMMEDIATE held across the
+/// wire await (frozen invariant #1), a global transport mutex — stalls B here and the timeout
+/// names it.  Then A is released and BOTH documents must have issued cleanly.
+#[tokio::test]
+async fn w6c_different_fns_overlap_inside_the_live_write_path() {
+    let mut a = interp::FuzzCtx::new_online_open_shift().await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+
+    // The block scopes `fut_a`'s &mut borrow of `a` so the post-overlap reads below compile.
+    let out_a = {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (block_tx, block_rx) = tokio::sync::oneshot::channel();
+        let fut_a = a.run_sell_gated(reached_tx, block_rx);
+        tokio::pin!(fut_a);
+
+        // Drive A until it is provably parked inside its wire call.
+        tokio::select! {
+            _ = &mut fut_a => {
+                panic!("A completed before its wire gate — the hang hook is not wired")
+            }
+            r = reached_rx => r.expect("the stub signals `reached` when A's send is in flight"),
+        }
+
+        // While A rests mid-wire: B must issue to completion.  5s is orders of magnitude
+        // above a healthy sell; exhausting it means a cross-FN writer lock.
+        let out_b = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            interp::run_op(&mut b, &Op::OnlineSell(DpsScript::ack_path())),
+        )
+        .await
+        .expect(
+            "GLOBAL WRITER LOCK: FN-B stalled while FN-A was parked inside ITS OWN wire call \
+             — INV-2 scopes the single-writer discipline PER fiscal number, never process-wide",
+        );
+        assert!(
+            matches!(out_b, interp::RealOutcome::Doc(_)),
+            "B must issue normally while A is mid-wire, got {out_b:?}"
+        );
+
+        // Release A; it completes its own issuance.
+        block_tx.send(()).expect("A is parked on this channel");
+        fut_a.await
+    };
+    assert!(
+        matches!(out_a, interp::RealOutcome::Doc(_)),
+        "A must complete once released, got {out_a:?}"
+    );
+
+    // Isolation held under genuine overlap: one doc each, distinct tips, clean ledger.
+    assert_eq!(
+        a.read_ledger().await.keys().copied().collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        b.read_ledger().await.keys().copied().collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_ne!(
+        a.read_seed().await,
+        b.read_seed().await,
+        "two tenants' tips must stay their own even when issued concurrently"
+    );
+    prro::db::invariant_scan::assert_clean(&a.pool).await;
+}
+
+/// Repeated genuinely-concurrent sell pairs (tokio::join! — both write paths in flight at
+/// once on one database), then the FULL oracle stack: per-FN differentials against each
+/// model, allocator (D1) equality, and the whole-DB scan + mirrors.  Concurrency must be
+/// invisible to every per-FN oracle — the pair commutes because the models are FN-scoped.
+#[tokio::test]
+async fn w6c_concurrent_sell_pairs_hold_the_full_oracle_stack() {
+    let mut a = interp::FuzzCtx::new_online_open_shift().await;
+    let mut b = a.sibling_online_open_shift("4000000002").await;
+    let mut ma = RefModel::new_online_open_shift();
+    let mut mb = RefModel::new_online_open_shift().for_fn(b.fn_id());
+
+    let sell = Op::OnlineSell(DpsScript::ack_path());
+    for round in 0..5 {
+        let tip_a = a.read_seed().await;
+        let tip_b = b.read_seed().await;
+        let (ra, rb) = tokio::join!(interp::run_op(&mut a, &sell), interp::run_op(&mut b, &sell));
+        let ea = ma.apply(&sell);
+        let eb = mb.apply(&sell);
+        if let Err(d) = oracle::check_differential(&ra, &ea, tip_a.as_deref()) {
+            panic!("round {round}: A's differential diverged under concurrency: {d:?}");
+        }
+        if let Err(d) = oracle::check_differential(&rb, &eb, tip_b.as_deref()) {
+            panic!("round {round}: B's differential diverged under concurrency: {d:?}");
+        }
+        assert_eq!(
+            ma.next_lnd,
+            a.read_next_lnd().await,
+            "round {round}: A's allocator (D1)"
+        );
+        assert_eq!(
+            mb.next_lnd,
+            b.read_next_lnd().await,
+            "round {round}: B's allocator (D1)"
+        );
+    }
+
+    assert_eq!(
+        a.read_ledger().await.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5],
+        "A minted its five, gap-free"
+    );
+    assert_eq!(
+        b.read_ledger().await.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5],
+        "B minted its five, gap-free"
+    );
+    prro::db::invariant_scan::assert_clean(&a.pool).await;
+    oracle::check_mirrors(&a.pool)
+        .await
+        .expect("mirrors clean after five concurrent rounds");
+}
+
 /// Peer-tip axis PHASE C — the ONE place reality's tip vocabulary is translated into the model's.
 ///
 /// Written out as an explicit match rather than derived or `#[repr]`-aliased, because this mapping

@@ -664,6 +664,44 @@ impl FuzzCtx {
         }
     }
 
+    /// W6 slice 3 (concurrency) — an ONLINE sell whose wire call PARKS until released: the
+    /// stub signals `reached` when the send is in flight (the FN's write gate is held, the
+    /// doc rests SENDING), then awaits `block` before answering the scripted Ack.  This is the
+    /// deterministic overlap probe: while this future is parked inside FN-A's write path, a
+    /// DIFFERENT fn's ops must still complete (INV-2 — no accidental global writer lock).
+    pub async fn run_sell_gated(
+        &mut self,
+        reached: tokio::sync::oneshot::Sender<()>,
+        block: tokio::sync::oneshot::Receiver<()>,
+    ) -> RealOutcome {
+        let idem = self.next_idem();
+        let row = seed_inbox_keyed(&self.pool, &self.fn_id, &idem, "SELL").await;
+        let dps = self.new_dps();
+        load_script(&dps, &DpsScript::ack_path());
+        dps.hang_send(reached, block);
+        let guard = self.gate.clone().lock_owned().await;
+        let result = inline::run(
+            &self.pool,
+            &self.pool_secure,
+            &dps,
+            &self.sign_ctx,
+            &self.fn_sign,
+            &guard,
+            &row,
+            prro::services::time_budget::system_gate(),
+        )
+        .await;
+        drop(guard);
+        match result {
+            Ok(_outcome) => {
+                let observed = self.observe_doc_by_request_id(&row.request_id).await;
+                self.last_row = Some(row);
+                RealOutcome::Doc(observed)
+            }
+            Err(e) => RealOutcome::Refused(format!("{e:?}")),
+        }
+    }
+
     fn next_idem(&mut self) -> String {
         self.seq += 1;
         format!("idem-fuzz-{}", self.seq)
