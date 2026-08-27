@@ -266,6 +266,20 @@ async fn k3y_a_operator_accepted_shift_open_commits_the_forward_shift_edge() {
         "k3y: the Critical OPERATOR_COMPLETION audit is the durable operator evidence for a \
          manual fiscal decision — it must exist"
     );
+    // bd PRRO_GATE-m6e — and its entity_id must be the exact lowercase hex of the RESERVATION
+    // id (the operator's pointer back to the completed hold): the retro-1rw `hex_lower`
+    // mutants proved nothing pinned it here either (same duplicated fn as sent_not_found's).
+    let entity_id: String = sqlx::query_scalar(
+        "SELECT entity_id FROM audit_log WHERE event_type='OPERATOR_COMPLETION'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        entity_id,
+        "0a".repeat(16),
+        "OPERATOR_COMPLETION entity_id must be the lowercase hex of the reservation id"
+    );
 }
 
 // ═══════════ k3y_b — a later boot must not orphan the issued shift ═══════════
