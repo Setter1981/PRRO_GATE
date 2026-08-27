@@ -1,3 +1,10 @@
+> **Orientation (2026-08-27):** this README describes the Claude Code autonomy kit, not the
+> gateway itself. The sources of truth for the CURRENT system are `CLAUDE.md` (commands +
+> architecture), the Rust workspace under `rust/`, its tests, `docs/CONSOLIDATION_SPRINT_ROADMAP.md`
+> and `docs/LEGAL_INVARIANTS.md`. Several older docs under `docs/` are historical dossiers;
+> `docs/INSTALL.md` / `docs/OPERATIONS.md` describe the retired Python scaffold and carry legacy
+> banners.
+
 # Claude Code autonomy kit for PRRO Gateway
 
 This kit is a **project-scoped operating system** for Claude Code, tuned for a high-autonomy engineering workflow with low operator intervention.

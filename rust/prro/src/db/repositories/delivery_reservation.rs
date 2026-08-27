@@ -524,9 +524,8 @@ pub enum AuthorizeError {
 /// non-single-row update) returns an [`AuthorizeError`]; the caller propagates it so the
 /// whole transaction rolls back and NO wire I/O is performed (sole-caller wire gate).
 ///
-/// **INACTIVE (CS-3 Slice 3):** no production caller is wired yet; the live send path
-/// (`stage_send::run`) is gated on this only at the whole-fence cutover (Slice 7).  Exercised
-/// by authorization tests today.
+/// **LIVE since the S7-1 cutover (PR #336):** the sole production caller is
+/// `stage_send::run` (`stage_send.rs:1873`); this is no longer dormant.
 pub async fn authorize_submission(
     tx: &mut WriteTxConn<'_>,
     row: NewReservation,
@@ -662,8 +661,8 @@ pub enum RecordError {
 /// `SubmissionEvidence`). An inconsistent combination trips the matrix trigger and surfaces as
 /// [`RecordError::Db`] with the whole record rolled back.
 ///
-/// **INACTIVE (CS-3 Slice 7 gap 1):** no production caller wires it until the S7-1 cutover
-/// composes `authorize → submit_authorized → record_outcome → apply_outcome`. Exercised by
+/// **LIVE since the S7-1 cutover (PR #336):** `stage_send::run` records every wire outcome
+/// through this (`stage_send.rs:1188`). Also exercised by
 /// `tests/record_outcome.rs` today.
 pub async fn record_outcome(
     tx: &mut WriteTxConn<'_>,
@@ -849,8 +848,9 @@ pub enum ApplyError {
 /// [`ApplyError::HeldNotAutoRelease`] (it stays `PENDING_APPLY` under STOP_MODE for the operator,
 /// Slice 5).
 ///
-/// **INACTIVE (CS-3 Slice 4):** shadows the live `stage_send::run` 4-b; no production caller wires
-/// it until the whole-fence cutover (Slice 7).
+/// **LIVE since the S7-1 cutover (PR #336):** reached through the single apply funnel
+/// `apply_orchestration::apply_recorded_outcome` (live send `stage_send.rs:1992` + boot
+/// `reservation_boot_pass.rs:98`).
 pub async fn apply_outcome(
     tx: &mut WriteTxConn<'_>,
     reservation_id: ReservationId,
